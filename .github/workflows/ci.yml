@@ -42,6 +42,9 @@ jobs:
       - name: Format (ruff check)
         run: uv run ruff format --check .
 
+      - name: Shell syntax
+        run: bash -n install.sh uninstall.sh resources/*.sh
+
       - name: Tests (offline, mocked LLM)
         # The default offline gate: no network, no API key. Markers deselected:
         #   macos       — needs real AX permission / Swift capture helpers

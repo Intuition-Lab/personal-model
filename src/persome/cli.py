@@ -2037,16 +2037,18 @@ def _warn_if_running() -> None:
         )
 
 
-def _clean_captures() -> int:
+def _clean_captures() -> tuple[int, int]:
     buf = paths.capture_buffer_dir()
-    if not buf.exists():
-        return 0
-    n = 0
-    for p in buf.iterdir():
-        if p.suffix == ".json" and p.is_file():
-            p.unlink()
-            n += 1
-    return n
+    files = 0
+    if buf.exists():
+        for p in buf.iterdir():
+            if p.suffix == ".json" and p.is_file():
+                p.unlink()
+                files += 1
+    with fts.cursor() as conn:
+        rows = int(conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
+        conn.execute("DELETE FROM captures")
+    return files, rows
 
 
 def _clean_timeline() -> int:
@@ -2056,8 +2058,37 @@ def _clean_timeline() -> int:
     return n
 
 
-def _clean_memory() -> tuple[int, int]:
-    """Delete memory Markdown files + reset entries/files tables. Returns (files, entries)."""
+_MODEL_TABLES = (
+    "memory_deltas",
+    "memory_contradictions",
+    "relation_edges",
+    "schema_faces",
+    "evo_nodes",
+    "projection_state",
+    "entry_metadata",
+    "entry_retrieval_stats",
+    "entry_temporal",
+    "entry_vectors",
+    "vector_queue",
+    "entries",
+    "files",
+)
+
+
+def _remove_path(path: Path) -> int:
+    """Remove one data artifact and return the number of files it contained."""
+    if not path.exists():
+        return 0
+    if path.is_dir():
+        count = sum(1 for item in path.rglob("*") if item.is_file())
+        shutil.rmtree(path)
+        return count
+    path.unlink()
+    return 1
+
+
+def _clean_memory() -> tuple[int, int, int, int]:
+    """Delete all personal-model projections, canonical state, and exports."""
     mem = paths.memory_dir()
     files = 0
     if mem.exists():
@@ -2066,18 +2097,30 @@ def _clean_memory() -> tuple[int, int]:
                 p.unlink()
                 files += 1
     with fts.cursor() as conn:
-        entries = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-        conn.execute("DELETE FROM entries")
-        conn.execute("DELETE FROM files")
-    return files, entries
-
-
-def _clean_writer_state() -> bool:
-    p = paths.writer_state()
-    if p.exists():
-        p.unlink()
-        return True
-    return False
+        entries = int(conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0])
+        model_rows = 0
+        for table in _MODEL_TABLES:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name=?",
+                (table,),
+            ).fetchone()
+            if exists is None:
+                continue
+            if table not in {"entries", "files"}:
+                model_rows += int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            conn.execute(f"DELETE FROM {table}")
+    artifacts = sum(
+        _remove_path(path)
+        for path in (
+            paths.exports_dir(),
+            paths.backup_dir(),
+            paths.root() / "projection-md",
+            paths.model_build_manifest(),
+            paths.model_build_lock(),
+            paths.session_model_lock(),
+        )
+    )
+    return files, entries, model_rows, artifacts
 
 
 @clean_app.command("captures")
@@ -2093,8 +2136,10 @@ def clean_captures(
     if not _confirm("Proceed?", yes):
         console.print("[yellow]Aborted.[/yellow]")
         raise typer.Exit(1)
-    n = _clean_captures()
-    console.print(f"[green]Deleted {n} capture file(s).[/green]")
+    files, rows = _clean_captures()
+    console.print(
+        f"[green]Deleted {files} capture file(s) and {rows} indexed capture row(s).[/green]"
+    )
 
 
 @clean_app.command("timeline")
@@ -2124,17 +2169,24 @@ def clean_memory(
     with fts.cursor() as conn:
         entry_count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
         file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        model_count = sum(
+            int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in _MODEL_TABLES
+            if table not in {"entries", "files"}
+        )
     console.print(
         f"About to delete {md_count} Markdown file(s) under {mem} "
-        f"and reset {entry_count} entries / {file_count} files in the index."
+        f"and reset {entry_count} entries / {file_count} files / "
+        f"{model_count} canonical model row(s), plus exports and backups."
     )
     _warn_if_running()
     if not _confirm("Proceed?", yes):
         console.print("[yellow]Aborted.[/yellow]")
         raise typer.Exit(1)
-    files, entries = _clean_memory()
+    files, entries, model_rows, artifacts = _clean_memory()
     console.print(
-        f"[green]Deleted {files} Markdown file(s); cleared {entries} index entries.[/green]"
+        f"[green]Deleted {files} Markdown file(s), {entries} index entries, "
+        f"{model_rows} canonical model row(s), and {artifacts} export/backup artifact(s).[/green]"
     )
 
 
@@ -2142,7 +2194,7 @@ def clean_memory(
 def clean_all(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
 ) -> None:
-    """Delete captures, timeline blocks, memory, and writer state. Config is kept."""
+    """Delete all personal data while keeping config, env, venv, and custom skills."""
     _init()
     buf = paths.capture_buffer_dir()
     mem = paths.memory_dir()
@@ -2157,21 +2209,37 @@ def clean_all(
         f"  - {capture_count} capture file(s)\n"
         f"  - {tlb_count} timeline block(s)\n"
         f"  - {md_count} memory Markdown file(s) and {entry_count} index entries\n"
-        f"  - writer state\n"
-        "[bold]Config ({}) is kept.[/bold]".format(paths.config_file())
+        "  - canonical model, exports, backups, Chat history, and logs\n"
+        "[bold]Config, env, installed venv, and custom skills are kept.[/bold]"
     )
     _warn_if_running()
     if not _confirm("Proceed with full wipe?", yes):
         console.print("[yellow]Aborted.[/yellow]")
         raise typer.Exit(1)
 
-    c = _clean_captures()
-    t = _clean_timeline()
-    f, e = _clean_memory()
-    s = _clean_writer_state()
+    known_personal_data = (
+        paths.capture_buffer_dir(),
+        paths.memory_dir(),
+        paths.logs_dir(),
+        paths.exports_dir(),
+        paths.backup_dir(),
+        paths.root() / "projection-md",
+        paths.root() / "chat-history",
+        paths.index_db(),
+        paths.index_db().with_name(f"{paths.index_db().name}-wal"),
+        paths.index_db().with_name(f"{paths.index_db().name}-shm"),
+        paths.writer_state(),
+        paths.model_build_manifest(),
+        paths.model_build_lock(),
+        paths.session_model_lock(),
+        paths.paused_flag(),
+        paths.integrity_recovery_marker(),
+        paths.pid_file(),
+    )
+    removed = sum(_remove_path(path) for path in known_personal_data)
     console.print(
-        f"[green]Done. Removed {c} captures, {t} timeline blocks, "
-        f"{f} memory files, {e} index entries, writer_state={s}.[/green]"
+        f"[green]Done. Removed {removed} personal data artifact(s). "
+        "Config, env, venv, and custom skills were kept.[/green]"
     )
 
 
