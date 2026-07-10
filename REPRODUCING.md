@@ -92,6 +92,19 @@ Without a configured LLM key, capture and BM25 retrieval still run, while LLM
 stages report degradation. Real Point/Line/Face/Volume/Root construction needs
 the configured stages to produce enough stable evidence.
 
+The release wheel carries the Swift helper sources, local Three.js assets, and
+PP-OCRv6 weights. Verify a built wheel from outside the source checkout:
+
+```bash
+uv build
+uv venv /tmp/persome-wheel-venv --python 3.11
+uv pip install --python /tmp/persome-wheel-venv/bin/python dist/persome_core-*.whl
+cd /tmp
+/tmp/persome-wheel-venv/bin/persome doctor
+```
+
+`persome ocr-selftest <image>` performs the full bundled OCR inference check.
+
 ## 6. Reproducibility record
 
 Every `model build` writes `<PERSOME_ROOT>/model-build.json` with:

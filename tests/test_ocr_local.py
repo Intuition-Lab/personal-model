@@ -71,6 +71,18 @@ class TestModelResolution:
         monkeypatch.setenv("PERSOME_OCR_MODELS_DIR", str(tmp_path))
         assert ocr_local._models_root() == tmp_path
 
+    def test_models_root_finds_installed_package_bundle(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        module = tmp_path / "persome" / "capture" / "ocr_local.py"
+        packaged = tmp_path / "persome" / "_bundled" / "ocr_models"
+        packaged.mkdir(parents=True)
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.touch()
+        monkeypatch.setattr(ocr_local, "__file__", str(module))
+
+        assert ocr_local._models_root() == packaged
+
 
 # ─── recognize: fail-open + parsing ──────────────────────────────────────────
 

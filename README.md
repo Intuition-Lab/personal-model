@@ -70,7 +70,8 @@ Bring your own key. No key ships with the code. Without a key, capture and BM25 
 
 The optional Chat surface is model-focused by default. Shell, arbitrary
 filesystem, and Web tools require the explicit
-`[chat] unsafe_local_tools_enabled = true` opt-in.
+`[chat] unsafe_local_tools_enabled = true` opt-in. Web search/page fetch also
+requires installing the `chat` extra (`persome-core[chat]`).
 
 ## Use it from your agent (MCP)
 

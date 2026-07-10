@@ -32,7 +32,8 @@ configured capabilities:
    enabled and a provider is configured.
 3. Chat Web search/page fetch and arbitrary local tools are excluded from the
    default paper Chat surface. Setting
-   `[chat] unsafe_local_tools_enabled = true` explicitly exposes them.
+   `[chat] unsafe_local_tools_enabled = true` explicitly exposes them; Web tools
+   additionally require the optional `chat` dependency extra.
 4. Additional Chat MCP servers can make their own network calls when the user
    explicitly configures them.
 

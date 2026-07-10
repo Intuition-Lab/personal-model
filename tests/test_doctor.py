@@ -153,7 +153,40 @@ def test_helpers_missing_fail_with_install_hint(
     monkeypatch.setattr(doctor, "_helper_candidates", lambda name: [tmp_path / name])
     checks = doctor.check_helpers()
     assert all(c.status == "fail" for c in checks)
-    assert "install.sh" in checks[0].detail
+    assert "reinstall" in checks[0].detail
+
+
+def test_helpers_bundled_source_warns_without_compiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PERSOME_AX_HELPER", raising=False)
+    monkeypatch.delenv("PERSOME_AX_WATCHER", raising=False)
+    for name in ("mac-ax-helper", "mac-ax-watcher"):
+        (tmp_path / f"{name}.swift").write_text("// synthetic")
+    monkeypatch.setattr(doctor, "_helper_candidates", lambda name: [tmp_path / name])
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/swiftc")
+
+    checks = doctor.check_helpers()
+
+    assert all(c.status == "warn" for c in checks)
+    assert all("first capture" in c.detail for c in checks)
+    assert not any((tmp_path / name).exists() for name in ("mac-ax-helper", "mac-ax-watcher"))
+
+
+def test_helpers_bundled_source_without_swiftc_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PERSOME_AX_HELPER", raising=False)
+    monkeypatch.delenv("PERSOME_AX_WATCHER", raising=False)
+    for name in ("mac-ax-helper", "mac-ax-watcher"):
+        (tmp_path / f"{name}.swift").write_text("// synthetic")
+    monkeypatch.setattr(doctor, "_helper_candidates", lambda name: [tmp_path / name])
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+
+    checks = doctor.check_helpers()
+
+    assert all(c.status == "fail" for c in checks)
+    assert all("Command Line Tools" in c.detail for c in checks)
 
 
 # ── AX trust ──────────────────────────────────────────────────────────────────

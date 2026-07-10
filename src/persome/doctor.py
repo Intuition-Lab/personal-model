@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import socket
 import stat
 from dataclasses import dataclass
@@ -131,7 +132,7 @@ def check_base_url() -> Check:
 
 
 def check_helpers() -> list[Check]:
-    """The Swift capture helpers are compiled (binary present + executable)."""
+    """Check compiled helpers or the prerequisites for first-run compilation."""
     out: list[Check] = []
     for name, env_var in _HELPERS:
         override = os.environ.get(env_var)
@@ -142,16 +143,34 @@ def check_helpers() -> list[Check]:
             else:
                 out.append(Check(name, "fail", f"{env_var}={p} is not an executable file"))
             continue
-        found = next((c for c in _helper_candidates(name) if _is_executable_file(c)), None)
+        candidates = _helper_candidates(name)
+        found = next((c for c in candidates if _is_executable_file(c)), None)
         if found is not None:
             out.append(Check(name, "ok", str(found)))
+        elif any(candidate.with_suffix(".swift").is_file() for candidate in candidates):
+            if shutil.which("swiftc"):
+                out.append(
+                    Check(
+                        name,
+                        "warn",
+                        "bundled Swift source found — compiles on first capture/start",
+                    )
+                )
+            else:
+                out.append(
+                    Check(
+                        name,
+                        "fail",
+                        "bundled Swift source found but swiftc is unavailable — "
+                        "install Xcode Command Line Tools",
+                    )
+                )
         else:
             out.append(
                 Check(
                     name,
                     "fail",
-                    "binary not found — run install.sh (or bash scripts inside "
-                    "resources/) to compile the Swift helpers",
+                    "binary and bundled Swift source not found — reinstall persome-core",
                 )
             )
     return out

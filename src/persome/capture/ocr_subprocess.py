@@ -58,9 +58,15 @@ def _default_spawn() -> subprocess.Popen:
 class OCRWorkerClient:
     """Manages one reused OCR worker subprocess. All methods are fail-open."""
 
-    def __init__(self, spawn: Spawn | None = None, timeout: float = 20.0) -> None:
+    def __init__(
+        self,
+        spawn: Spawn | None = None,
+        timeout: float = 20.0,
+        startup_timeout: float | None = None,
+    ) -> None:
         self._spawn = spawn or _default_spawn
         self._timeout = timeout
+        self._startup_timeout = timeout if startup_timeout is None else startup_timeout
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
 
@@ -85,12 +91,13 @@ class OCRWorkerClient:
 
     def _request(self, tier: str, image_bytes: bytes) -> ocr_protocol.Detailed | None:
         with self._lock:
-            proc = self._ensure_worker_locked()
+            proc, just_spawned = self._ensure_worker_locked()
             if proc is None:
                 return None
             try:
                 self._send(proc, tier, image_bytes)
-                body = self._recv_deadline(proc, time.monotonic() + self._timeout)
+                timeout = self._startup_timeout if just_spawned else self._timeout
+                body = self._recv_deadline(proc, time.monotonic() + timeout)
             except _WorkerGone as exc:
                 logger.warning("ocr worker gone (%s); failing open, will respawn", exc)
                 self._kill_worker_locked()
@@ -101,20 +108,20 @@ class OCRWorkerClient:
                 return None
             return ocr_protocol.decode_response(body)
 
-    def _ensure_worker_locked(self) -> subprocess.Popen | None:
+    def _ensure_worker_locked(self) -> tuple[subprocess.Popen | None, bool]:
         proc = self._proc
         if proc is not None and proc.poll() is None:
-            return proc
+            return proc, False
         if proc is not None:  # dead worker lingering — reap it
             self._kill_worker_locked()
         try:
             self._proc = self._spawn()
             logger.info("spawned ocr worker (pid=%s)", self._proc.pid)
-            return self._proc
+            return self._proc, True
         except Exception as exc:  # noqa: BLE001
             logger.warning("ocr worker spawn failed: %s; OCR degrades to none", exc)
             self._proc = None
-            return None
+            return None, False
 
     def _send(self, proc: subprocess.Popen, tier: str, image_bytes: bytes) -> None:
         req = ocr_protocol.encode_request(tier, image_bytes)
@@ -191,15 +198,31 @@ def get_client() -> OCRWorkerClient:
     global _client
     with _client_lock:
         if _client is None:
-            _client = OCRWorkerClient(timeout=_timeout_from_env())
+            _client = OCRWorkerClient(
+                timeout=_timeout_from_env(),
+                startup_timeout=_startup_timeout_from_env(),
+            )
         return _client
 
 
 def _timeout_from_env() -> float:
     try:
-        return float(os.environ.get("PERSOME_OCR_WORKER_TIMEOUT") or os.environ.get("MENS_CONTEXT_OCR_WORKER_TIMEOUT", "20"))  # Mens is the legacy name
+        return float(
+            os.environ.get("PERSOME_OCR_WORKER_TIMEOUT")
+            or os.environ.get("MENS_CONTEXT_OCR_WORKER_TIMEOUT", "20")
+        )  # Mens is the legacy name
     except ValueError:
         return 20.0
+
+
+def _startup_timeout_from_env() -> float:
+    try:
+        return float(
+            os.environ.get("PERSOME_OCR_WORKER_STARTUP_TIMEOUT")
+            or os.environ.get("MENS_CONTEXT_OCR_WORKER_STARTUP_TIMEOUT", "120")
+        )
+    except ValueError:
+        return 120.0
 
 
 def reset_client_for_tests(client: OCRWorkerClient | None) -> None:
