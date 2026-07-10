@@ -8,6 +8,7 @@ from typing import Any
 
 from persome import config as config_mod
 from persome import paths
+from persome.store import entries as entries_store
 from persome.store import fts
 from persome.timeline import store as timeline_store
 from persome.writer import llm as llm_mod
@@ -88,10 +89,11 @@ def test_pattern_detector_creates_workflow(ac_root: Path, monkeypatch) -> None:
                     {
                         "path": "skills/skill-morning-routine.md",
                         "content": (
+                            "stage: observed\n\n"
                             "**Pattern**: Weekday mornings 9:00, user opens Mail → Slack → Cursor.\n"
                             "**Confidence**: high (3 consecutive days)\n"
-                            "**Trigger**: weekday, 9:00\n"
-                            "**Suggested automation**: macOS Shortcut to launch the three apps"
+                            "**Context**: weekday, 9:00\n"
+                            "**Evidence**: three independent sessions"
                         ),
                         "tags": ["pattern", "detected"],
                     },
@@ -283,3 +285,29 @@ def test_collect_candidates_finds_app_sequences(ac_root: Path) -> None:
     title = candidates["repeated_titles"][0]
     assert title["value"] == "project-persome — Cursor"
     assert title["count"] == 3
+
+
+def test_collect_candidates_uses_durable_event_memory_not_intents(ac_root: Path) -> None:
+    with fts.cursor() as conn:
+        entries_store.create_file(
+            conn,
+            name="event-2026-05-11.md",
+            description="Synthetic activity",
+            tags=["event"],
+        )
+        entry_id = entries_store.append_entry(
+            conn,
+            name="event-2026-05-11.md",
+            content="Reviewed the runtime architecture twice this week.",
+            tags=["work"],
+        )
+        candidates = pd_mod._collect_candidates(
+            conn,
+            lookback_start=datetime.now().astimezone() - timedelta(days=1),
+            window_end=datetime.now().astimezone() + timedelta(days=1),
+            min_occurrences=2,
+        )
+
+    assert "intents" not in candidates
+    assert candidates["event_memory"][0]["id"] == entry_id
+    assert candidates["event_memory"][0]["receipt"] == (f"⟨{entry_id}:event-2026-05-11.md⟩")

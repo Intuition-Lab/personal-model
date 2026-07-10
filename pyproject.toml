@@ -30,24 +30,14 @@ dependencies = [
     # declare it so a future `mcp` slim-down can't silently break the server.
     "uvicorn>=0.30",
     "httpx[socks]>=0.27",
-    "requests>=2.31",
-    "ddgs>=7.0",
-    "beautifulsoup4>=4.12",
     "tomli>=2.0; python_version < '3.11'",
     "anthropic>=0.50",
-    "jieba>=0.42",
     # On-device OCR for AX-poor apps (WeChat/Feishu). PP-OCRv6 via paddleocr on the
     # paddlepaddle CPU runtime; weights are vendored in ocr_models/ and loaded from a
-    # local dir (no network). Pinned to the versions validated in the tier benchmark.
-    # NB: paddlepaddle ships wheels only for CPython 3.11/3.12 AND arm64 macOS only —
-    # no x86_64 macOS wheel exists for v3.3.1+; x86_64 PyInstaller bundles skip OCR.
+    # local dir (no network). Paddle's macOS wheel is arm64-only; Intel installs
+    # keep the AX pipeline and degrade cleanly without local OCR.
     "paddleocr==3.7.0; platform_machine == 'arm64'",
     "paddlepaddle==3.3.1; platform_machine == 'arm64'",
-    # NOTE: the optional bge-small-zh slow-pre-gate semantic discriminator
-    # (intent.gate_model, gated on intent_recognizer.pregate_mode) is NOT bundled —
-    # the default pre-gate is "regex". To opt back in, `pip install onnxruntime
-    # tokenizers` and point `[intent_recognizer] pregate_bge_model_dir` at your own
-    # exported model dir; the code fail-opens to regex whenever it is absent.
     # Semantic fact-space visualization (persome memory-viz / src/persome/viz/sem_layout.py):
     # community detection (louvain_communities) over the fact k-NN graph. Declared
     # explicitly — it is only transitively present via paddle on arm64, and the x86_64
@@ -57,6 +47,12 @@ dependencies = [
     # path both import numpy on every platform — do not rely on the transitive
     # copy that only paddle/onnxruntime happen to pull in.
     "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+chat = [
+    "ddgs>=7.0",
+    "beautifulsoup4>=4.12",
 ]
 
 [project.scripts]
@@ -80,12 +76,9 @@ packages = ["src/persome"]
 "resources/build-mac-ax-helper.sh" = "persome/_bundled/build-mac-ax-helper.sh"
 "resources/mac-ax-watcher.swift" = "persome/_bundled/mac-ax-watcher.swift"
 "resources/build-mac-ax-watcher.sh" = "persome/_bundled/build-mac-ax-watcher.sh"
-"resources/mac-audio-capture.swift" = "persome/_bundled/mac-audio-capture.swift"
 "resources/mac-url-handlers.swift" = "persome/_bundled/mac-url-handlers.swift"
-"resources/mac-ax-actuator.swift" = "persome/_bundled/mac-ax-actuator.swift"
-"resources/build-mac-ax-actuator.sh" = "persome/_bundled/build-mac-ax-actuator.sh"
-"resources/mac-virtual-stage.swift" = "persome/_bundled/mac-virtual-stage.swift"
-"resources/build-mac-virtual-stage.sh" = "persome/_bundled/build-mac-virtual-stage.sh"
+"resources/model_assets" = "persome/_bundled/model_assets"
+"ocr_models" = "persome/_bundled/ocr_models"
 
 [dependency-groups]
 dev = [

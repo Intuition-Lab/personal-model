@@ -60,6 +60,15 @@ def test_get_schema() -> None:
     assert "Memory Organization Spec" in out["schema"]
 
 
+def test_get_model_snapshot_uses_versioned_contract(ac_root: Path) -> None:
+    with fts.cursor() as conn:
+        out = mcp_server._get_model_snapshot(conn)
+    assert out["schema_version"] == 1
+    assert out["points"] == []
+    assert out["root"] is None
+    assert out["stats"]["roots"] == 0
+
+
 # ─── search_captures + current_context ────────────────────────────────────
 
 

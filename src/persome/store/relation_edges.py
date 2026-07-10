@@ -1,8 +1,7 @@
 """DAO for ``relation_edges`` — the横轴 relation layer of the user-centric graph memory.
 
-Spec: ``docs/superpowers/specs/2026-07-01-user-centric-relation-graph-memory-design.md``
-§4.2 (predicate closed set + ``src×dst`` completeness table) and §4.6 (DDL + as-of-T
-traversal). This is P0-1 (#427): schema + write entrances + an as-of-T read helper.
+Implements the predicate closed set, ``src×dst`` completeness table, schema,
+write entrances, and an as-of-T read helper.
 
 **Why a separate table (§2.5/§2.6).** evomem (``evo_nodes`` + SUPERSEDE chains) is the
 *vertical / temporal* axis — each node's own version history. This table is the ORTHOGONAL
@@ -139,6 +138,12 @@ _EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("src_kind", "TEXT"),
     ("dst_kind", "TEXT"),
     ("polarity", "TEXT NOT NULL DEFAULT '0'"),
+    # Evidence handle for model exports. Nullable keeps old non-activity
+    # extractors compatible; when one field is supplied, add_edge requires all
+    # three so an exported line never carries a half-formed receipt.
+    ("source_kind", "TEXT"),
+    ("source_id", "TEXT"),
+    ("source_receipt", "TEXT"),
 )
 
 
@@ -172,6 +177,9 @@ def add_edge(
     edge_id: str | None = None,
     observations: int = 1,
     polarity: str = "0",
+    source_kind: str | None = None,
+    source_id: str | None = None,
+    source_receipt: str | None = None,
 ) -> str:
     """Append one relation edge. Returns its ``edge_id``.
 
@@ -213,6 +221,14 @@ def add_edge(
     pol = str(polarity)
     if pol not in POLARITIES:
         raise ValueError(f"relation_edges: polarity {pol!r} not in {sorted(POLARITIES)}")
+    source = tuple(
+        str(value).strip() if value is not None else ""
+        for value in (source_kind, source_id, source_receipt)
+    )
+    if any(source) and not all(source):
+        raise ValueError(
+            "relation_edges: source_kind, source_id, and source_receipt must be supplied together"
+        )
 
     eid = edge_id or uuid.uuid4().hex
     vf = valid_from or _now_iso()
@@ -222,8 +238,9 @@ def add_edge(
         INSERT INTO relation_edges
             (edge_id, src_identity, dst_identity, predicate, label, valid_from,
              valid_to, provenance, confidence, quote, status, created_at, observations,
-             src_kind, dst_kind, polarity, last_observed_at)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             src_kind, dst_kind, polarity, last_observed_at, source_kind, source_id,
+             source_receipt)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             eid,
@@ -242,6 +259,9 @@ def add_edge(
             dk.value,
             pol,
             vf,  # birth stamp: last observed = the first evidence moment
+            source[0] or None,
+            source[1] or None,
+            source[2] or None,
         ),
     )
     conn.commit()
@@ -473,6 +493,7 @@ def promote_edges(
     Idempotent (already-ACTIVE edges count against their identity's cap but
     are not rewritten). Never demotes. Returns the number promoted.
     """
+    ensure_schema(conn)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT edge_id, src_identity, observations, status FROM relation_edges"

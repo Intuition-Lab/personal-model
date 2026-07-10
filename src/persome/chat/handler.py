@@ -22,7 +22,7 @@ from .agent import AgentTurnResult, ChatAgent, _OnTokenT, _OnToolCallT, complete
 from .memory_extractor import maybe_extract as maybe_extract_memories
 from .skills import LoadedSkills, load_all_skills
 from .tool_handlers import TOOL_HANDLERS
-from .tools import CHAT_SCHEMA_NAMES, CHAT_SCHEMAS
+from .tools import CHAT_SCHEMA_NAMES, CHAT_SCHEMAS, SAFE_CHAT_SCHEMA_NAMES
 
 _logger = _get_logger("persome.chat")
 
@@ -33,9 +33,12 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 console = Console()
 
 
-def _load_skills() -> LoadedSkills:
+def _load_skills(*, allow_executable_tools: bool = False) -> LoadedSkills:
     """Load all skills and return the LoadedSkills object."""
-    return load_all_skills(builtin_names=CHAT_SCHEMA_NAMES)
+    return load_all_skills(
+        builtin_names=CHAT_SCHEMA_NAMES,
+        allow_executable_tools=allow_executable_tools,
+    )
 
 
 def _load_system_prompt(loaded: LoadedSkills | None = None) -> str:
@@ -50,28 +53,6 @@ def _load_system_prompt(loaded: LoadedSkills | None = None) -> str:
 
 
 # ─── tool execution ───────────────────────────────────────────────────────
-
-
-def _exec_tool(
-    name: str,
-    args: dict[str, Any],
-    extra_handlers: dict[str, Any] | None = None,
-) -> str:
-    """Synchronous tool dispatcher kept for tests and the API helper.
-
-    The streaming ChatAgent has its own async dispatcher with timing /
-    callbacks; this one is the bare logic both share.
-    """
-    handler = TOOL_HANDLERS.get(name)
-    if handler is None and extra_handlers:
-        handler = extra_handlers.get(name)
-    if handler is None:
-        return json.dumps({"error": f"unknown tool: {name}"})
-    try:
-        result = handler(args)
-        return json.dumps(result, ensure_ascii=False, default=str)
-    except Exception as exc:
-        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
 
 # ─── conversation compression ─────────────────────────────────────────────
@@ -487,9 +468,18 @@ class TurnResult:
 
 def _build_agent(cfg: config_mod.Config) -> ChatAgent:
     """Construct a fresh ChatAgent with the current skill set merged in."""
-    loaded = _load_skills()
-    all_schemas = CHAT_SCHEMAS + loaded.schemas
-    all_handlers = {**TOOL_HANDLERS, **loaded.handlers}
+    loaded = _load_skills(allow_executable_tools=cfg.chat.unsafe_local_tools_enabled)
+    enabled_names = (
+        CHAT_SCHEMA_NAMES if cfg.chat.unsafe_local_tools_enabled else SAFE_CHAT_SCHEMA_NAMES
+    )
+    built_in_schemas = [
+        schema for schema in CHAT_SCHEMAS if schema["function"]["name"] in enabled_names
+    ]
+    built_in_handlers = {
+        name: handler for name, handler in TOOL_HANDLERS.items() if name in enabled_names
+    }
+    all_schemas = built_in_schemas + loaded.schemas
+    all_handlers = {**built_in_handlers, **loaded.handlers}
     daemon_url = ""
     if cfg.chat.mcp_connect_daemon:
         daemon_url = f"http://{cfg.mcp.host}:{cfg.mcp.port}/mcp"

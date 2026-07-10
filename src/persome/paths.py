@@ -23,22 +23,6 @@ def root() -> Path:
     return new
 
 
-def app_data_root() -> Path:
-    """The Swift app's data dir (``~/.persome``), where it writes tasks.json / settings.json /
-    meetings.json — the read surface for the Agent-Native Persome app-data MCP tools (Phase 2,
-    docs/superpowers/specs/2026-06-25-agent-native-persome-design.md).
-
-    Distinct from :func:`root` (the *chronicle* root): the packaged app points
-    ``PERSOME_ROOT`` at ``<app data dir>/chronicle``, so the app's JSON sits in the parent;
-    a bare CLI/dev run with no override has ``root()`` already == ``~/.persome``. An explicit
-    ``PERSOME_APP_DATA_DIR`` override wins when set."""
-    override = (os.environ.get("PERSOME_APP_DATA_DIR") or os.environ.get("MENS_APP_DATA_DIR"))  # Mens is the legacy name
-    if override:
-        return Path(override).expanduser().resolve()
-    r = root()
-    return r.parent if r.name == "chronicle" else r
-
-
 def memory_dir() -> Path:
     return root() / "memory"
 
@@ -51,13 +35,22 @@ def logs_dir() -> Path:
     return root() / "logs"
 
 
-def ocr_samples_dir() -> Path:
-    """Local-only OCR training samples (geometry + structured result, NEVER screenshots).
+def exports_dir() -> Path:
+    """Generated, user-shareable artifacts such as the paper model snapshot."""
+    return root() / "exports"
 
-    Written when `[capture] ocr_collect_training_data` is on; bounded by a keep-newest
-    prune. No upload path exists — these stay on the user's machine.
-    """
-    return root() / "ocr-samples"
+
+def model_build_lock() -> Path:
+    return root() / "model-build.lock"
+
+
+def session_model_lock() -> Path:
+    """Cross-process lock for terminal session modeling/finalization."""
+    return root() / "session-model.lock"
+
+
+def model_build_manifest() -> Path:
+    return root() / "model-build.json"
 
 
 def config_file() -> Path:
@@ -65,9 +58,7 @@ def config_file() -> Path:
 
 
 def env_file() -> Path:
-    """Dotenv-format secret store. Written by Mens.app (single SoT), sourced
-    by `persome start` before forking the daemon so business code can
-    just `os.environ.get(...)`. CLI users may edit it directly."""
+    """Owner-only dotenv secret store sourced before the daemon forks."""
     return root() / "env"
 
 
@@ -90,9 +81,8 @@ def writer_state() -> Path:
 
 def integrity_recovery_marker() -> Path:
     """One-time marker written by the startup integrity check when it had to
-    quarantine a corrupt DB / config (#202). Mens.app reads it to show a
-    single recovery notice, then deletes it. JSON payload, see
-    ``integrity.py``."""
+    quarantine a corrupt DB / config (#202). Operators and embedding clients
+    may surface and acknowledge its JSON payload; see ``integrity.py``."""
     return root() / ".integrity-recovery.json"
 
 

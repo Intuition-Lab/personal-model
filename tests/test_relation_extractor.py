@@ -19,6 +19,7 @@ from persome.evomem import relation_extractor as rx
 from persome.evomem.engine import EvoMemory
 from persome.evomem.person_graph import PersonEvent, PersonGraph
 from persome.evomem.reconciler import Reconciler
+from persome.store import entries as entries_store
 from persome.store import fts
 from persome.store import relation_edges as edges
 
@@ -173,11 +174,26 @@ def test_new_evidence_reinforces_strength(ac_root):
 def _seed_intent(
     *, status, people=(), rationale="做完的事", kind="reminder", iid=None, resolution_outcome=None
 ):
-    from persome.intent import store as intent_store
-
     ts = _ts(22).isoformat()
     with fts.cursor() as conn:
-        intent_store.ensure_schema(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                dedup_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolution_outcome TEXT
+            )
+            """
+        )
         conn.execute(
             "INSERT INTO intents (ts, scope, kind, confidence, status, rationale, "
             "payload, evidence, dedup_key, created_at, resolution_outcome) "
@@ -216,11 +232,49 @@ def test_terminal_intents_become_activity_points(ac_root):
     assert all(r[1].startswith("event:") for r in part)
     srcs = sorted(r[0] for r in part)
     assert srcs == ["Alice", "self", "self"]
-    # consumed（用户亲为）= user_committed；resolved（系统判定）= inferred
-    provs = {r[0:2][0] + "→" + r[1]: r[4] for r in part}
-    assert "user_committed" in provs.values() and "inferred" in provs.values()
+    # Legacy intent rows are read through the neutral Activity adapter and no
+    # longer carry product status semantics into relation provenance.
+    assert {r[4] for r in part} == {"inferred"}
     # open/armed 一条都没进：participates_in 只有 3 条
     assert res.written_count >= 3
+
+
+def test_durable_event_entry_becomes_sourced_activity_edge(ac_root):
+    with fts.cursor() as conn:
+        entries_store.create_file(
+            conn,
+            name="event-2026-07-10.md",
+            description="Synthetic activity",
+            tags=["event"],
+        )
+        entry_id = entries_store.append_entry(
+            conn,
+            name="event-2026-07-10.md",
+            content="Reviewed the Persome runtime architecture.",
+            tags=["work"],
+        )
+        assert (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'intents'"
+            ).fetchone()
+            is None
+        )
+
+    result = rx.run_relation_extraction(
+        _on(), memory=_mem(), llm_call=_empty_llm, conn_factory=fts.cursor
+    )
+    with fts.cursor() as conn:
+        row = conn.execute(
+            "SELECT dst_identity, source_kind, source_id, source_receipt "
+            "FROM relation_edges WHERE predicate='participates_in'"
+        ).fetchone()
+    assert result.deterministic_count == 1
+    assert tuple(row) == (
+        f"event:entry:{entry_id}",
+        "entry",
+        entry_id,
+        f"⟨{entry_id}:event-2026-07-10.md⟩",
+    )
 
 
 def test_resolved_rejected_is_not_an_activity(ac_root):
@@ -444,7 +498,7 @@ def test_knows_edges_carry_first_evidence_time(ac_root):
     assert vf[("Alice", "Bob", "knows")] == str(_ts(22).isoformat())[:16]
 
 
-def test_activity_edges_carry_intent_recognition_time(ac_root):
+def test_activity_edges_carry_source_event_time(ac_root):
     mem = _mem()
     _ingest(
         mem,
@@ -496,8 +550,7 @@ def test_event_about_org_reconnects_typed_point(ac_root):
         row = conn.execute(
             "SELECT src_kind, dst_kind, provenance FROM relation_edges WHERE predicate='about'"
         ).fetchone()
-    # the legal §4.2 cell EVENT→ORG, user_committed because the intent was consumed
-    assert tuple(row) == ("event", "org", "user_committed")
+    assert tuple(row) == ("event", "org", "inferred")
 
 
 def test_tools_stay_honest_orphans_no_about(ac_root):

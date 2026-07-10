@@ -1,16 +1,17 @@
 """Relation-edge extraction — deterministic + LLM, writes SHADOW edges (P0-2 / #428).
 
-Spec ``docs/superpowers/specs/2026-07-01-user-centric-relation-graph-memory-design.md`` §4.3.
+Extracts auditable user-centric relations from durable activities.
 
-**Working object = the PAST layer, cut by LIFECYCLE (not by table).** The memory graph is the
-user's *weights* (过去式). The tense rule is a lifecycle cut, not a table blacklist:
+**Working object = the PAST layer.** The memory graph is the user's *weights*
+(过去式), so relation extraction reads durable event entries, ended sessions,
+and an optional read-only legacy-intent adapter:
 
 - ``person_graph`` entities + interaction timelines (evo_nodes) — consolidated past → read.
-- ``intents`` rows in a DONE terminal status (``consumed``/``resolved``/``completed``) — the
-  commitment/task **happened and finished**; that is a past fact → read, becomes an Activity
-  (EVENT) point with ``participates_in`` edges (§4.0 residue ①).
-- ``intents`` rows still ``open``/``armed`` — pending future (Prediction) → NEVER read.
-- ``workthread`` — the present (Runtime) → never read here.
+- durable event entries and ended sessions become Activity points with sourced
+  ``participates_in`` edges;
+- old completed intent rows remain readable through ``ActivitySource`` but new
+  installs do not create or produce them;
+- transient runtime state is never read here.
 
 Edge **strength = observations = count of distinct supporting evidence** (event 蒸馏计数),
 computed FROM the evidence each run and ratcheted monotonically (``reinforce_edge`` MAX
@@ -51,19 +52,11 @@ logger = get("persome.evomem.relation_extractor")
 
 # The user (graph centre). A sentinel identity distinct from any person canonical.
 SELF_IDENTITY = "self"
-# Activity (EVENT) identities minted from done-terminal intents: "event:<intents.id>".
+# Activity (EVENT) identities use the model contract namespace:
+# event:intent:<legacy-id> | event:entry:<entry-id> | event:session:<session-id>.
 EVENT_PREFIX = "event:"
-# Done terminals only — the thing actually happened (§4.0 tense gate). dropped terminals
-# (dismissed/expired/failed) are past facts too but carry no accomplished activity; P0 skips them.
-# `consumed`/`completed` are unconditionally DONE. `resolved` is the evidence-driven auto-close
-# channel and is DONE ONLY when resolution_outcome='done' — a resolved intent auto-closed as
-# 'rejected' (user later declined / didn't do it) or 'superseded' (replaced) did NOT happen and must
-# never enter the graph as an accomplished activity (#461). So `resolved` is gated separately in the
-# query, not listed here.
-_DONE_STATUSES = ("consumed", "completed")
-
 _MAX_PEOPLE = 200  # cap persons scanned from the past layer
-_MAX_ACTIVITIES = 200  # cap done-terminal intents scanned
+_MAX_ACTIVITIES = 200  # cap sourced past activities scanned
 _LLM_MAX_PEOPLE = 40  # cap the LLM evidence roster
 _MAX_PEOPLE_PER_GROUP = 6  # skip combinatorial blowup on huge co-occurrence groups
 _LLM_MIN_CONFIDENCE = 0.7  # precision gate for LLM-proposed edges
@@ -106,14 +99,17 @@ class _People:
 
 @dataclass
 class _Activity:
-    """One DONE-terminal intent = a past Activity (EVENT) point (§4.0 residue ①)."""
+    """One versioned past Activity (EVENT) point (§4.0 residue ①)."""
 
-    identity: str  # "event:<intents.id>"
-    label: str  # intent kind
-    quote: str  # rationale (past evidence text)
-    status: str  # consumed | resolved | completed
+    identity: str
+    label: str
+    quote: str
+    status: str
     participants: list[str]  # canonical person identities (consolidated only)
-    ts: str | None = None  # recognition time — the activity edge's valid_from
+    ts: str | None = None  # source-event time — the activity edge's valid_from
+    source_kind: str = ""
+    source_id: str = ""
+    source_receipt: str = ""
     # typed non-person mentions (identity, kind∈{org,project}) — the §1.3 about
     # leg: EVENT→ORG/PROJECT is the one legal cell that reconnects retyped
     # entities to USER (self→event→org) without inventing a predicate.
@@ -205,59 +201,62 @@ def _load_typed_entities(conn) -> dict[str, tuple[str, str]]:
 
 
 def _load_terminal_activities(conn, people: _People) -> list[_Activity]:
-    """DONE-terminal intents → past Activity points. Lifecycle cut: the recognition record of a
-    finished commitment/task is a PAST fact and may enter the weights; open/armed rows (pending
-    future) are never read. Participants are linked only when already consolidated in
-    person_graph (unknown names are skipped, not minted). Typed non-person
-    mentions (org/project points) are matched against the adjudicated typed
-    roster for the about leg."""
-    typed_roster = _load_typed_entities(conn)
-    try:
-        placeholders = ",".join("?" * len(_DONE_STATUSES))
-        conn.row_factory = None
-        # `resolved` is DONE only when resolution_outcome='done' (#461): rejected/superseded closes
-        # are past facts that never happened, so they must not become participates_in activities.
-        rows = conn.execute(
-            f"SELECT id, kind, rationale, payload, status, ts FROM intents "
-            f"WHERE status IN ({placeholders}) "
-            f"OR (status = 'resolved' AND resolution_outcome = 'done') "
-            f"ORDER BY ts DESC LIMIT ?",
-            (*_DONE_STATUSES, _MAX_ACTIVITIES),
-        ).fetchall()
-    except Exception:  # noqa: BLE001 — intents table may not exist in a bare install
-        logger.debug("relation_extractor: terminal-intent read failed, empty", exc_info=True)
-        return []
+    """Load durable activities plus the read-only legacy terminal-intent fallback.
 
+    Participants are linked only when already consolidated in person_graph (unknown names are
+    skipped, not minted). Typed non-person mentions are matched against the adjudicated typed
+    roster for the about leg. A missing legacy intents table must not disable durable activities.
+    """
+    typed_roster = _load_typed_entities(conn)
+    from ..model.activity_source import ActivitySource
     from .person_graph import _norm
 
     out: list[_Activity] = []
-    for iid, kind, rationale, payload_text, status, ts in rows:
-        try:
-            payload = json.loads(payload_text or "{}")
-        except (TypeError, ValueError):
-            payload = {}
-        raw_people = payload.get("with") or payload.get("participants") or []
+
+    def resolve_participants(raw_names: list[str], summary: str) -> list[str]:
+        candidates = {_norm(name) for name in raw_names if _norm(name)}
+        normalized_summary = _norm(summary)
+        candidates.update(
+            alias for alias in people.aliases if alias and alias in normalized_summary
+        )
+        resolved: list[str] = []
+        for alias in candidates:
+            if canonical := people.aliases.get(alias):
+                resolved.append(canonical)
+            elif typed := typed_roster.get(alias):
+                identity, kind = typed
+                resolved.append(f"{kind}:{identity}")
+        return list(dict.fromkeys(resolved))
+
+    for event in ActivitySource(
+        conn,
+        participant_resolver=resolve_participants,
+        include_legacy_intents=True,
+        limit=_MAX_ACTIVITIES,
+    ).events():
+        summary_norm = _norm(event.summary)
+        typed_mentions = [
+            typed for alias, typed in typed_roster.items() if alias and alias in summary_norm
+        ]
         participants: list[str] = []
-        typed_mentions: list[tuple[str, str]] = []
-        if isinstance(raw_people, list):
-            for name in raw_people:
-                norm_name = _norm(str(name))
-                canonical = people.aliases.get(norm_name)
-                if canonical and canonical not in participants:
-                    participants.append(canonical)
-                    continue
-                typed = typed_roster.get(norm_name)
-                if typed and typed not in typed_mentions:
-                    typed_mentions.append(typed)
+        for participant in event.participant_ids:
+            kind, separator, identity = participant.partition(":")
+            if separator and kind in {"org", "project"}:
+                typed_mentions.append((identity, kind))
+            else:
+                participants.append(participant)
         out.append(
             _Activity(
-                identity=f"{EVENT_PREFIX}{iid}",
-                label=str(kind or "") or "activity",
-                quote=(rationale or "").strip() or f"已完成的 {kind} 事项",
-                status=str(status),
+                identity=event.stable_id,
+                label="activity",
+                quote=event.summary,
+                status="completed",
                 participants=participants,
-                ts=str(ts) if ts else None,
-                typed_mentions=typed_mentions,
+                ts=event.occurred_at,
+                source_kind=event.source_kind,
+                source_id=event.source_id,
+                source_receipt=event.source_receipt,
+                typed_mentions=list(dict.fromkeys(typed_mentions)),
             )
         )
     return out
@@ -277,6 +276,10 @@ def _kind_of(identity: str) -> EntityKind:
 def _edge_key(src: str, dst: str, predicate_value: str) -> tuple[str, str, str]:
     """Dedup key. Undirected predicates (``knows``) canonicalize endpoint order so
     (A,B,knows) and (B,A,knows) are the same edge (#436)."""
+    from ..model.activity_source import normalize_activity_identity
+
+    src = normalize_activity_identity(src)
+    dst = normalize_activity_identity(dst)
     if predicate_value == Predicate.KNOWS.value:
         a, b = sorted((src, dst))
         return (a, b, predicate_value)
@@ -318,6 +321,9 @@ def _upsert_shadow(
     dst_kind: str | None = None,
     polarity: str = "0",
     additive: bool = False,
+    source_kind: str | None = None,
+    source_id: str | None = None,
+    source_receipt: str | None = None,
 ) -> None:
     """New evidence → add a shadow edge; existing open edge → ratchet its strength.
 
@@ -348,6 +354,9 @@ def _upsert_shadow(
         observations=observations,
         valid_from=valid_from,
         polarity=polarity,
+        source_kind=source_kind,
+        source_id=source_id,
+        source_receipt=source_receipt,
     )
     seen[key] = new_id
     tally.new += 1
@@ -457,15 +466,15 @@ def _project_pass(conn, seen: dict[tuple[str, str, str], str], tally: _Tally) ->
 def _activity_pass(
     conn, activities: list[_Activity], seen: dict[tuple[str, str, str], str], tally: _Tally
 ) -> None:
-    """DONE-terminal intents → Activity(EVENT) points via ``participates_in`` edges (§4.0 ①).
+    """Sourced past activities → EVENT points via ``participates_in`` edges.
 
-    provenance: ``consumed`` was the USER acting on it → user_committed; ``resolved``/
-    ``completed`` are system-detected → inferred. Each terminal intent is ONE evidence item
-    (observations=1); a re-scan is a no-op because the event identity is stable.
+    Each activity is one evidence item; a re-scan is a no-op because its source
+    identity is stable. Legacy intent activities remain inferred because the
+    neutral Activity contract intentionally carries no product status semantics.
     """
     for act in activities:
-        prov = "user_committed" if act.status == "consumed" else "inferred"
-        conf = 0.9 if prov == "user_committed" else 0.7
+        prov = "inferred"
+        conf = 0.7
         try:
             _upsert_shadow(
                 conn,
@@ -479,6 +488,9 @@ def _activity_pass(
                 label=act.label,
                 provenance=prov,
                 valid_from=act.ts,
+                source_kind=act.source_kind,
+                source_id=act.source_id,
+                source_receipt=act.source_receipt,
             )
         except ValueError:
             continue
@@ -496,12 +508,15 @@ def _activity_pass(
                     label=act.label,
                     provenance=prov,
                     valid_from=act.ts,
+                    source_kind=act.source_kind,
+                    source_id=act.source_id,
+                    source_receipt=act.source_receipt,
                 )
             except ValueError:
                 continue
         # §1.3 about leg: the event mentions an adjudicated org/project point —
         # EVENT→ORG/PROJECT is the legal cell that reconnects typed entities to
-        # USER (self→event→org), no invented predicate, evidence = the intent.
+        # USER (self→event→org), no invented predicate, evidence = the activity.
         for ident, tkind in act.typed_mentions:
             try:
                 _upsert_shadow(
@@ -518,6 +533,9 @@ def _activity_pass(
                     valid_from=act.ts,
                     src_kind="event",
                     dst_kind=tkind,
+                    source_kind=act.source_kind,
+                    source_id=act.source_id,
+                    source_receipt=act.source_receipt,
                 )
             except ValueError:
                 continue

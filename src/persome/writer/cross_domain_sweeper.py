@@ -20,14 +20,14 @@ the Anthropic transport has no embedding endpoint):
   (behavior-near + source-distinct) are sent to the LLM, which decides whether the
   two schemas share a higher-level pattern and, if so, fuses them.
 
-The fused schema lands as ``schema-xdomain-<a>__<b>.md`` — same ``schema-`` prefix,
-so the existing :func:`intent.schema_prior.active_schema_inferences` consumer reads
-it back with **zero changes** (stable tag + confidence ranking, same as any schema).
+The fused schema lands as ``schema-xdomain-<a>__<b>.md`` — the same ``schema-``
+prefix read by :func:`persome.model.schema_reader.active_schema_inferences`
+(stable tag + confidence ranking, like any other schema face).
 
 Gated off by default (``[schema] cross_domain_enabled``): unlike the batch-1
 confidence flag (safe-by-construction), the sweeper actively *writes* new schema
-files that bias the recognizer, so it ships behind a flag until its output quality
-is validated. Runs as the tail of the ``schema-tick`` daemon task — no new task.
+files, so it ships behind a flag until its output quality is validated. Runs as
+the tail of the ``schema-tick`` daemon task — no new task.
 """
 
 from __future__ import annotations
@@ -272,8 +272,8 @@ def _load_stable_schemas(conn: sqlite3.Connection) -> list[_StableSchema]:
     """Live, stable, **non-xdomain** schemas — the base material the sweeper pairs.
 
     Excludes ``schema-xdomain-*`` so a fused schema is never itself re-fused
-    (no recursive collisions), and keeps only ``stable`` ones (the same authority
-    bar the intent prior uses).
+    (no recursive collisions), and keeps only ``stable`` ones (the authority bar
+    used by active model reads).
     """
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -443,8 +443,8 @@ def _persist_cross_schema(
     )
     tags = ["schema", "xdomain", status, f"confidence:{collision.confidence:.2f}"]
     # A still-``forming`` fusion is born/kept ``dormant`` so it stays out of
-    # default ``list_memories`` (and the intent prior, which only injects
-    # ``stable``) until it matures — mirrors the miner's #440 rule. Pre-fix the
+    # default ``list_memories`` and active model reads until it matures — mirrors
+    # the miner's #440 rule. Pre-fix the
     # sweeper dropped the ``status=`` kwarg on ``create_file`` (defaulting to
     # ``active``) and never re-set it on re-sweep, so low-quality fusions born
     # ``forming`` leaked into the default surface (#631 nit P).

@@ -1,6 +1,6 @@
 """Dense-retrieval vector index for memory entries.
 
-Spec: docs/superpowers/specs/2026-06-25-production-hybrid-retrieval-design.md (Phase 1).
+The public retrieval behavior is documented in ``docs/architecture.md``.
 
 A new ``entry_vectors`` table holds one embedding per memory entry (text-embedding-3-large,
 3072-d float32 BLOB). Writes do NOT embed inline (that would block capture on a network call):
@@ -169,7 +169,9 @@ def _validity_token(conn: sqlite3.Connection) -> str:
         if r["name"] == "main":
             dbfile = r["file"] or ""
             break
-    row = conn.execute("SELECT COUNT(*), COALESCE(MAX(embedded_at), '') FROM entry_vectors").fetchone()
+    row = conn.execute(
+        "SELECT COUNT(*), COALESCE(MAX(embedded_at), '') FROM entry_vectors"
+    ).fetchone()
     return f"{dbfile}|{int(row[0])}|{row[1]}"
 
 

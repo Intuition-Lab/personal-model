@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from persome.config import Config
-from persome.intent import schema_prior
+from persome.model import schema_reader
 from persome.store import entries as entries_mod
 from persome.store import files as files_mod
 from persome.timeline import store as timeline_store
@@ -150,7 +150,7 @@ def test_sweep_fuses_and_is_consumed(ac_root):
         name = res.written[0].path
         assert name.startswith("schema-xdomain-")
         # fused schema flows through the existing schema消费链 (zero consumer change)
-        infs = schema_prior.active_schema_inferences(conn)
+        infs = schema_reader.active_schema_inferences(conn)
         assert any("自动化" in x for x in infs)
 
 

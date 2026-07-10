@@ -1,13 +1,12 @@
 """Agent-Native Persome Phase 3 — durable memory write-back from a dispatched agent.
 
-The load-bearing loop (spec docs/superpowers/specs/2026-06-25-agent-native-persome-design.md §6):
-an agent's findings become durable Persome memory the NEXT agent / the recognizer / the supervisor
+An agent's findings become durable Persome memory that a later model consumer
 can reuse. Writes funnel through the canonical memory writer (``store.entries.append_entry``), so
 they pass the same ``ensure_writes_allowed`` integrity gate + evomem write-inversion as every other
 writer — NO bypass.
 
 Every agent-written entry is force-tagged ``source:agent-run`` so it stays distinguishable from
-recognizer- and user-authored memory forever (queryable, auditable, reversible). An optional
+observed and user-authored memory forever (queryable, auditable, reversible). An optional
 ``run_id`` (the agent passes its ``$PERSOME_TASK_ID``) adds ``run:<id>`` for per-run attribution —
 the daemon is a shared process and can't infer which dispatched run is calling.
 """

@@ -1,0 +1,808 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Persome API",
+    "description": "Local-first screen-context memory — REST API layer.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Health",
+        "description": "健康检查，返回服务存活状态。",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/permissions": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Permissions",
+        "description": "返回 daemon 自身需要的 macOS 权限实时状态。\n\n辅助功能（Accessibility）由 **daemon 进程**申请——真正读 AX 树的\n``mac-ax-helper`` / ``mac-ax-watcher`` 都由 daemon 派生，TCC 按 daemon 的\n身份记授权。GUI app 自己从不读 AX 树，所以引导页应轮询本端点反映 daemon\n的真实信任态，而不是在 app 进程里自查（那会多出一个冗余 TCC 主体、多弹一次框）。\n\n``accessibility`` 取值 ``granted`` / ``denied``（非 macOS 主机恒为 ``denied``）。",
+        "operationId": "permissions_permissions_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Status",
+        "description": "获取完整运行状态，包括版本、守护进程状态、运行时长、捕获状态、记忆统计、各阶段 LLM 连通性等。",
+        "operationId": "status_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/captures/ingest": {
+      "post": {
+        "tags": [
+          "capture"
+        ],
+        "summary": "Ingest Capture",
+        "description": "接收可信本地生产者采集的一帧 capture，完成富化、去重和持久化。\n\n采集层（AX 树 + 焦点窗口截图）已搬进持有 Accessibility / Screen-Recording 的 Swift\n进程（``capture.source = \"ingest\"``）；daemon 自身不再 spawn watcher、不再抓屏，因而\n不需要任何系统权限。落库和去重与 daemon 自采路径共用同一 runner。",
+        "operationId": "ingest_capture_captures_ingest_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CaptureIngestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/model": {
+      "get": {
+        "tags": [
+          "model"
+        ],
+        "summary": "Model View",
+        "description": "Render the local Point/Line/Face/Volume/Root model explorer.",
+        "operationId": "model_view_model_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/model/graph": {
+      "get": {
+        "tags": [
+          "model"
+        ],
+        "summary": "Model Graph",
+        "description": "Read-only model graph: nodes (USER + roster identities +\nActivity endpoints), relation_edges (both statuses — the shadow/ACTIVE\nsplit IS the point), and the schema_faces tower, each carrying its\nbitemporal fields so the client can replay f(T) without refetching.\nZero-LLM; fail-open per section (a store predating a table contributes\nan empty list).",
+        "operationId": "model_graph_model_graph_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Model Graph Model Graph Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/model/node": {
+      "get": {
+        "tags": [
+          "model"
+        ],
+        "summary": "Model Node",
+        "description": "Raw receipts behind one graph node (§2.1 每个向量指回符号收据 — the\nclick-through from the 记忆图 to the symbolic layer). Lazy per-node fetch\nso the graph payload stays lean. Zero-LLM, read-only, fail-open:\n\n- ``event:<source-kind>:<source-id>`` → the canonical Activity source;\n- any other identity → the latest ACTIVE evo_nodes of its typed entity file\n  entity file (newest first, bounded, truncated) — the consolidation\n  trail the point was distilled from.",
+        "operationId": "model_node_model_node_get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Model Node Model Node Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chat/sessions": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "List Sessions",
+        "description": "列出所有聊天会话，包括活跃会话和已持久化到磁盘的会话。",
+        "operationId": "list_sessions_chat_sessions_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Create Session",
+        "description": "创建一个新的聊天会话，返回会话 ID 和初始信息。",
+        "operationId": "create_session_chat_sessions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chat/sessions/{session_id}": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Get Session",
+        "description": "获取指定会话的详情，包括消息历史。",
+        "operationId": "get_session_chat_sessions__session_id__get",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "会话 ID（8 位短 UUID）",
+              "title": "Session Id"
+            },
+            "description": "会话 ID（8 位短 UUID）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Delete Session",
+        "description": "删除指定会话及其持久化文件。",
+        "operationId": "delete_session_chat_sessions__session_id__delete",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "会话 ID（8 位短 UUID）",
+              "title": "Session Id"
+            },
+            "description": "会话 ID（8 位短 UUID）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chat/sessions/{session_id}/messages": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Get Session Messages",
+        "description": "获取指定会话的消息历史（不含 system 消息）。",
+        "operationId": "get_session_messages_chat_sessions__session_id__messages_get",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "会话 ID（8 位短 UUID）",
+              "title": "Session Id"
+            },
+            "description": "会话 ID（8 位短 UUID）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Send Message",
+        "description": "向指定会话发送一条消息，以 SSE 流式回放 assistant token、工具调用。\n\nSSE 帧类型见 :data:`SendMessageEvent`：\n- ``reply``      增量 token（``content`` 字段）\n- ``tool_call``  工具调用开始（``name`` + ``arguments``）\n- ``tool_result``工具调用结果（``name`` + ``content``）\n- ``error``      本轮失败（``message`` 字段）\n- ``done``       本轮正常结束\n\nSession 持久化在 stream 结束时执行。客户端断开时会取消正在跑的 LLM 任务。",
+        "operationId": "send_message_chat_sessions__session_id__messages_post",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "会话 ID（8 位短 UUID）",
+              "title": "Session Id"
+            },
+            "description": "会话 ID（8 位短 UUID）"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events 流。每帧为 ``data: <json>\\n\\n``，其中 ``<json>`` 形如 ``SendMessageEvent`` 联合体。流以 ``data: [DONE]\\n\\n`` 结束。",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$defs": {
+                    "SSEDoneEvent": {
+                      "properties": {
+                        "type": {
+                          "const": "done",
+                          "description": "事件类型常量；表示本轮 SSE 正常完成",
+                          "title": "Type",
+                          "type": "string"
+                        },
+                        "ttft_ms": {
+                          "anyOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "description": "本轮首 token 到达耗时（毫秒，time-to-first-token）；无 token 流出时为 null",
+                          "title": "Ttft Ms"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "title": "SSEDoneEvent",
+                      "type": "object"
+                    },
+                    "SSEErrorEvent": {
+                      "properties": {
+                        "type": {
+                          "const": "error",
+                          "description": "事件类型常量",
+                          "title": "Type",
+                          "type": "string"
+                        },
+                        "message": {
+                          "description": "错误描述",
+                          "title": "Message",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "message"
+                      ],
+                      "title": "SSEErrorEvent",
+                      "type": "object"
+                    },
+                    "SSEReasoningEvent": {
+                      "properties": {
+                        "type": {
+                          "const": "reasoning",
+                          "description": "事件类型常量",
+                          "title": "Type",
+                          "type": "string"
+                        },
+                        "content": {
+                          "description": "增量 thinking / 推理片段（extended thinking）",
+                          "title": "Content",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "content"
+                      ],
+                      "title": "SSEReasoningEvent",
+                      "type": "object"
+                    },
+                    "SSEReplyEvent": {
+                      "properties": {
+                        "type": {
+                          "const": "reply",
+                          "description": "事件类型常量",
+                          "title": "Type",
+                          "type": "string"
+                        },
+                        "content": {
+                          "description": "增量 token 文本片段",
+                          "title": "Content",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "content"
+                      ],
+                      "title": "SSEReplyEvent",
+                      "type": "object"
+                    },
+                    "SSEToolCallEvent": {
+                      "properties": {
+                        "type": {
+                          "const": "tool_call",
+                          "description": "事件类型常量",
+                          "title": "Type",
+                          "type": "string"
+                        },
+                        "name": {
+                          "description": "工具调用名称",
+                          "title": "Name",
+                          "type": "string"
+                        },
+                        "arguments": {
+                          "additionalProperties": true,
+                          "description": "工具调用参数",
+                          "title": "Arguments",
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "name",
+                        "arguments"
+                      ],
+                      "title": "SSEToolCallEvent",
+                      "type": "object"
+                    },
+                    "SSEToolResultEvent": {
+                      "properties": {
+                        "type": {
+                          "const": "tool_result",
+                          "description": "事件类型常量",
+                          "title": "Type",
+                          "type": "string"
+                        },
+                        "name": {
+                          "description": "工具调用名称",
+                          "title": "Name",
+                          "type": "string"
+                        },
+                        "content": {
+                          "description": "工具调用结果字符串",
+                          "title": "Content",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "name",
+                        "content"
+                      ],
+                      "title": "SSEToolResultEvent",
+                      "type": "object"
+                    }
+                  },
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/SSEReplyEvent"
+                    },
+                    {
+                      "$ref": "#/$defs/SSEReasoningEvent"
+                    },
+                    {
+                      "$ref": "#/$defs/SSEToolCallEvent"
+                    },
+                    {
+                      "$ref": "#/$defs/SSEToolResultEvent"
+                    },
+                    {
+                      "$ref": "#/$defs/SSEErrorEvent"
+                    },
+                    {
+                      "$ref": "#/$defs/SSEDoneEvent"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success",
+            "description": "请求是否成功",
+            "default": true
+          },
+          "data": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "响应数据"
+          }
+        },
+        "type": "object",
+        "title": "ApiResponse",
+        "description": "Common response envelope for the local runtime API."
+      },
+      "CaptureIngestBody": {
+        "properties": {
+          "timestamp": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timestamp",
+            "description": "ISO8601 采集时间；缺省则服务端补"
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger",
+            "description": "触发元数据 {event_type, bundle_id, window_title, details?}"
+          },
+          "window_meta": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Window Meta",
+            "description": "{app_name, title, bundle_id}"
+          },
+          "ax_tree": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ax Tree",
+            "description": "AX 树 raw_json（apps→windows→elements），缺省视为 AX 不可用"
+          },
+          "ax_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ax Metadata",
+            "description": "AX 采集元数据"
+          },
+          "screenshot": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screenshot",
+            "description": "{image_base64, mime_type, width, height}（明文，由服务端按配置加密落盘）"
+          },
+          "ocr_jpeg_b64": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ocr Jpeg B64",
+            "description": "AX 贫瘠窗口的焦点窗口截图 JPEG（base64），供本地 OCR 兜底"
+          },
+          "ocr_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ocr Tier",
+            "description": "OCR 档位覆盖；缺省用配置值"
+          }
+        },
+        "type": "object",
+        "title": "CaptureIngestBody",
+        "description": "Swift \"Persome\" 主程序推送的一帧 capture（``capture.source = \"ingest\"`` 模式）。\n\n采集层（AX 树 + 焦点窗口截图）已搬进持有 Accessibility / Screen-Recording 的 Swift\n进程；daemon 收到后只跑富化与落库，自身不再需要任何系统权限。字段与\ndaemon 自采路径 ``_build_capture`` 的产物对齐，缺省宽松（缺字段降级，不崩）。"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "SendMessageRequest": {
+        "properties": {
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "用户消息内容"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "title": "SendMessageRequest"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

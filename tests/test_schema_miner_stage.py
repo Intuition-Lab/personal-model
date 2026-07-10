@@ -4,7 +4,7 @@ End-to-end of the mining half (acceptance ① / ②):
   - seed several fact entries into one durable file → clustering yields a bundle;
   - run mining with a *fake* ``llm_call`` (no network) returning a canned schema;
   - a ``schema-<slug>.md`` is written, the ``schema-`` prefix is accepted, the
-    files table holds the row, and ``intent.schema_prior.active_schema_inferences``
+    files table holds the row, and ``intent.schema_reader.active_schema_inferences``
     reads the schema's inferences back (the provider seam closes the loop).
 
 The fake-llm injection mirrors ``tests/test_evomem/test_schema_miner.py``.
@@ -16,7 +16,7 @@ import json
 from types import SimpleNamespace
 
 from persome import config as config_mod
-from persome.intent import schema_prior
+from persome.model import schema_reader
 from persome.store import entries as entries_mod
 from persome.store import files as files_mod
 from persome.store import fts
@@ -73,7 +73,7 @@ def test_mining_writes_stable_schema_and_files_row(ac_root):
             ],
         )
 
-        result = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        result = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
 
         # ① exactly one schema written, born stable (confidence 0.85 >= 0.6).
         assert result.written_count == 1
@@ -90,7 +90,7 @@ def test_mining_writes_stable_schema_and_files_row(ac_root):
         assert row.entry_count == 1
 
         # ② the provider reads the stable schema's inferences back out.
-        inferences = schema_prior.active_schema_inferences(conn)
+        inferences = schema_reader.active_schema_inferences(conn)
     assert "会拒绝引入大型框架/重 SDK，倾向手搓等价实现" in inferences
     assert "评估新工具时优先看依赖体积与可审计性" in inferences
 
@@ -106,11 +106,11 @@ def test_low_confidence_schema_is_forming_and_not_injected(ac_root):
             name="topic-weak.md",
             facts=["事实一", "事实二", "事实三", "事实四"],
         )
-        result = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(payload))
+        result = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(payload))
         assert result.written_count == 1
         assert result.written[0].status == "forming"
         # forming schemas are written (grep-able) but never injected as priors.
-        assert schema_prior.active_schema_inferences(conn) == []
+        assert schema_reader.active_schema_inferences(conn) == []
 
 
 def test_forming_schema_is_born_dormant(ac_root):
@@ -122,7 +122,7 @@ def test_forming_schema_is_born_dormant(ac_root):
     payload = {**_STABLE_PAYLOAD, "confidence": 0.3}
     with fts.cursor() as conn:
         _seed_facts(conn, name="topic-forming.md", facts=["事实一", "事实二", "事实三", "事实四"])
-        result = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(payload))
+        result = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(payload))
         path = result.written[0].path
 
         row = fts.get_file(conn, path)
@@ -148,14 +148,14 @@ def test_remine_promotes_forming_schema_to_active(ac_root):
     with fts.cursor() as conn:
         _seed_facts(conn, name="project-tooling.md", facts=facts)
         # ① first mine is weak → forming → dormant.
-        r1 = stage.run_schema_mining(
+        r1 = stage.mine_schemas_for_user(
             cfg, conn, llm_call=_fake_llm({**_STABLE_PAYLOAD, "confidence": 0.3})
         )
         path = r1.written[0].path
         assert fts.get_file(conn, path).status == "dormant"
 
         # ② re-mine the same source as stable → promoted to active in both places.
-        r2 = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        r2 = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
         assert r2.written[0].status == "stable"
         assert fts.get_file(conn, path).status == "active"
         assert files_mod.read_file(files_mod.memory_path(path)).status == "active"
@@ -168,7 +168,7 @@ def test_bundle_below_min_facts_is_skipped(ac_root):
     cfg.memory_delta.apply_enabled = False  # 测 entries 源的挖掘逻辑；apply_enabled=True 下 mine 读 evo_nodes（见 from_evomem 专测）
     with fts.cursor() as conn:
         _seed_facts(conn, name="topic-thin.md", facts=["只有一条事实"])
-        result = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        result = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
     assert result.written_count == 0
 
 
@@ -176,10 +176,10 @@ def test_no_facts_writes_nothing(ac_root):
     cfg = config_mod.load(ac_root / "config.toml")
     cfg.memory_delta.apply_enabled = False  # 测 entries 源的挖掘逻辑；apply_enabled=True 下 mine 读 evo_nodes（见 from_evomem 专测）
     with fts.cursor() as conn:
-        result = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        result = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
         assert result.written_count == 0
         # ③ the P0 seam holds: no schema files → provider returns [].
-        assert schema_prior.active_schema_inferences(conn) == []
+        assert schema_reader.active_schema_inferences(conn) == []
 
 
 def test_render_then_parse_roundtrips_inferences():
@@ -214,7 +214,7 @@ def test_remine_updates_same_file_not_a_new_one(ac_root):
     with fts.cursor() as conn:
         _seed_facts(conn, name="project-tooling.md", facts=facts)
 
-        first = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        first = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
         assert first.written_count == 1
         assert first.written[0].path == "schema-project-tooling.md"
         assert first.written[0].updated_in_place is False
@@ -225,7 +225,7 @@ def test_remine_updates_same_file_not_a_new_one(ac_root):
             "central_proposition": "用户对工具链的极简偏好进一步固化",
             "expected_inferences": ["新的推论：会主动删依赖"],
         }
-        second = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(updated_payload))
+        second = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(updated_payload))
         assert second.written_count == 1
         assert second.written[0].path == "schema-project-tooling.md"
         assert second.written[0].updated_in_place is True
@@ -234,7 +234,7 @@ def test_remine_updates_same_file_not_a_new_one(ac_root):
         # not the stale one (the old entry was superseded).
         schema_files = [f for f in fts.list_files(conn) if f.path.startswith("schema-")]
         assert [f.path for f in schema_files] == ["schema-project-tooling.md"]
-        inferences = schema_prior.active_schema_inferences(conn)
+        inferences = schema_reader.active_schema_inferences(conn)
     assert "新的推论：会主动删依赖" in inferences
     assert "会拒绝引入大型框架/重 SDK，倾向手搓等价实现" not in inferences
 
@@ -246,7 +246,7 @@ def test_two_source_files_yield_two_schema_files(ac_root):
     with fts.cursor() as conn:
         _seed_facts(conn, name="project-alpha.md", facts=four)
         _seed_facts(conn, name="topic-beta.md", facts=four)
-        result = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        result = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
         paths = sorted(w.path for w in result.written)
     assert paths == ["schema-project-alpha.md", "schema-topic-beta.md"]
 
@@ -261,7 +261,7 @@ def test_tool_and_org_prefixes_are_mined(ac_root):
     with fts.cursor() as conn:
         _seed_facts(conn, name="tool-ripgrep.md", facts=four)
         _seed_facts(conn, name="org-acme.md", facts=four)
-        result = stage.run_schema_mining(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        result = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
         paths = sorted(w.path for w in result.written)
     assert paths == ["schema-org-acme.md", "schema-tool-ripgrep.md"]
 
@@ -284,10 +284,16 @@ def test_collect_fact_bundles_from_evomem_reads_evo_nodes(ac_root):
         ],
     }
     with fts.cursor() as conn:
-        _seed_facts(conn, name="person-李四.md", facts=[f"李四事实{i}" for i in range(4)])  # legacy entries
+        _seed_facts(
+            conn, name="person-李四.md", facts=[f"李四事实{i}" for i in range(4)]
+        )  # legacy entries
         delta_apply.apply_delta(conn, cfg_da, clean, memory=EvoMemory())  # 重建 evo_nodes
-        legacy = {b.source_path for b in stage.collect_fact_bundles(conn, from_evomem=False, min_facts=4)}
-        evo = {b.source_path for b in stage.collect_fact_bundles(conn, from_evomem=True, min_facts=4)}
+        legacy = {
+            b.source_path for b in stage.collect_fact_bundles(conn, from_evomem=False, min_facts=4)
+        }
+        evo = {
+            b.source_path for b in stage.collect_fact_bundles(conn, from_evomem=True, min_facts=4)
+        }
     # entries 路只见 legacy 的李四；evo_nodes 路只见重建的张伟——两条路各读各的层
     assert "person-李四.md" in legacy and "person-张伟.md" not in legacy
     assert "person-张伟.md" in evo and "person-李四.md" not in evo

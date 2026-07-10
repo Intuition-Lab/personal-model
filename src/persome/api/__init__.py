@@ -23,7 +23,6 @@ from ..trace import generate_trace_id, set_trace_id
 from .chat_routes import set_config as _set_chat_config
 from .routes import router
 from .routes import set_config as _set_route_config
-from .runs_routes import set_config as _set_runs_config
 
 _access_logger = _get_logger("persome.api.chat")
 
@@ -64,11 +63,10 @@ def _is_rebinding_host(host: str | None) -> bool:
 # ── Middleware: PURE ASGI, deliberately NOT BaseHTTPMiddleware ────────────────
 # Starlette's ``BaseHTTPMiddleware`` / ``@app.middleware("http")`` pumps the
 # response body through an anyio memory stream, which is incompatible with a
-# long-lived streaming response (the ``GET /events/stream`` SSE): when the client
+# long-lived streaming response (such as Chat message SSE): when the client
 # disconnects, the pump raises ``anyio.EndOfStream`` / ``CancelledError`` and the
 # middleware ends with ``RuntimeError: No response returned``, which uvicorn logs
-# as a spurious HTTP 500 (Sentry MENS-MACOS-15: ~143 of the events/stream 500s were
-# exactly this teardown, not a server error). Pure ASGI middleware passes
+# as a spurious HTTP 500. Pure ASGI middleware passes
 # ``receive`` / ``send`` straight through, so an SSE disconnect is a clean
 # cancellation the route handles — no synthetic 500. Keep these pure ASGI; do not
 # reintroduce BaseHTTPMiddleware on this app (tests/test_api_middleware_asgi.py).
@@ -199,8 +197,8 @@ def build_api_app(cfg: Config | None = None) -> FastAPI:
         openapi_url="/openapi.json",
     )
 
-    # Three pure-ASGI middleware (NOT BaseHTTPMiddleware — it breaks the
-    # /events/stream SSE with spurious 500s on disconnect; see the class docs).
+    # Three pure-ASGI middleware (NOT BaseHTTPMiddleware — it breaks streaming
+    # responses with spurious 500s on disconnect; see the class docs).
     # Starlette applies middleware LIFO by add order, so the LAST added is
     # OUTERMOST. Add innermost→outermost: access_log (closest to the route, so it
     # sees the final status, incl. ExceptionMiddleware-converted 4xx) → trace_id
@@ -216,26 +214,6 @@ def build_api_app(cfg: Config | None = None) -> FastAPI:
     app.add_middleware(_OriginGuardMiddleware, require_local_origin=require_local_origin)
 
     app.include_router(router)
-
-    from .meeting_routes import router as meeting_router
-
-    app.include_router(meeting_router)
-
-    from .book_highlights_routes import router as book_highlights_router
-
-    app.include_router(book_highlights_router)
-
-    from .book_chapters_routes import router as book_chapters_router
-
-    app.include_router(book_chapters_router)
-
-    from .book_generate_routes import router as book_generate_router
-
-    app.include_router(book_generate_router)
-
-    from .runs_routes import router as runs_router
-
-    app.include_router(runs_router)
     # FastAPI's lazy openapi() regeneration can misidentify list[str] query
     # params as requestBody. Lock the schema unconditionally at build time so
     # the runtime /openapi.json endpoint always serves the correct version.
@@ -253,7 +231,6 @@ def render_openapi_json() -> str:
     cfg = Config()
     _set_route_config(cfg)
     _set_chat_config(cfg)
-    _set_runs_config(cfg)
     app = build_api_app(cfg)
     return json.dumps(app.openapi_schema, indent=2, ensure_ascii=False) + "\n"
 
@@ -270,9 +247,6 @@ def register_routes(server: Any, cfg: Config | None = None) -> None:
     # Wire config so endpoints can resolve settings without re-reading disk
     set_config(cfg)
     set_chat_config(cfg)
-    from .runs_routes import set_config as set_runs_config
-
-    set_runs_config(cfg)
 
     api_app = build_api_app(cfg)
     server._custom_starlette_routes.append(Mount("", app=api_app))

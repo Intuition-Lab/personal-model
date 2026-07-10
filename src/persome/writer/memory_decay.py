@@ -1,8 +1,7 @@
 """Text-axis graded forgetting — 细节链 → 粗摘要 → 一行事实.
 
-Spec ``docs/superpowers/specs/2026-07-03-text-axis-graded-forgetting-design.md``
-(the text half of memory-rebuild §1.5-5; the pixel half is cleanup_buffer's
-thumbnail tier). Old durable-memory entries that were NEVER read-reinforced
+This is the text half of graded forgetting; the pixel half is cleanup_buffer's
+thumbnail tier. Old durable-memory entries that were NEVER read-reinforced
 (``entry_retrieval_stats.retrieval_count`` — the testing-effect signal: a
 retrieved memory is load-bearing and immune) are nightly distilled into a
 coarser summary — precision degrades in tiers, nothing is ever binary-deleted.
@@ -10,7 +9,7 @@ coarser summary — precision degrades in tiers, nothing is ever binary-deleted.
 Eligibility is the MECE cell table (spec §2): only **old ∧ weak ∧
 unprotected** entries decay. Protections: conflicted (⚠ pending human
 adjudication — never destroy evidence), non-fact prefixes (event-* / schema-*
-/ intent-* / thread-* have their own lifecycles), and ``decayed:2`` (the
+/ intent-* have their own lifecycles), and ``decayed:2`` (the
 one-line floor — coarser than one line is deletion, which §1.5-4 forbids).
 
 The decay op is a COMPOSITION of existing choke-point verbs (spec §4 — zero
@@ -164,7 +163,7 @@ def find_decay_clusters(
 
 def _build_llm_call(cfg: Config) -> Callable[[list[dict]], Any]:
     def _call(messages: list[dict]) -> Any:
-        return llm_mod.call_llm(cfg, _STAGE, cfg.model_for(_STAGE), messages)
+        return llm_mod.call_llm(cfg, _STAGE, messages=messages)
 
     return _call
 

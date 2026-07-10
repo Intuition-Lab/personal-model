@@ -156,6 +156,11 @@ class TestWarm:
         finally:
             client.shutdown()
 
+    def test_cold_start_has_a_separate_timeout(self) -> None:
+        client = ocr_subprocess.OCRWorkerClient(timeout=20, startup_timeout=120)
+        assert client._timeout == 20
+        assert client._startup_timeout == 120
+
 
 class TestRouting:
     """`ocr_local` routes to the isolated client by default; env hatches change that."""

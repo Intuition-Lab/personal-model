@@ -1,13 +1,10 @@
-"""Session-end memory_delta consolidator — Memory-rebuild Phase 0 shadow channel.
+"""Session-end structured modeling: observations to auditable Points and Lines.
 
-Spec docs/superpowers/specs/2026-07-02-memory-rebuild-design.md §4.1/§6.2: ONE
-LLM reading of the just-ended session, multiple structured heads —
-``memory_delta {entities, assertions, relations, events}`` — the channel that
-will (Phase 1, after dual-run parity) retire the four scattered extractors
-(person name-source / relation LLM pass / case extraction / classifier
-attribution). Phase 0 lands it SHADOW: the gated delta is persisted verbatim
-into ``memory_deltas`` (status='shadow'); consumers are ``persome delta-report``
-and the Phase-1 parity eval only — nothing writes memory from it yet.
+One LLM reading of the just-ended session, multiple structured heads —
+``memory_delta {entities, assertions, relations, events}``. The gated delta is
+persisted first, then ``delta_apply`` deterministically mints or reinforces
+evomem Points and relation Lines. Persist-before-apply makes the terminal path
+auditable and retryable.
 
 §4.1 discipline — judgment belongs to the LLM (this one call), identity and
 gating to code:
@@ -22,8 +19,8 @@ gating to code:
 - **Confidence floor**: items below ``memory_delta.min_confidence`` drop.
 
 Everything here is fail-open: an LLM error, malformed JSON, or a store error
-logs a warning and returns ``written=False`` — the session-end chain
-(classifier → pattern detector → workthread) is never disturbed.
+logs a warning and returns ``written=False``. The terminal finalizer leaves the
+session unmodeled so recovery can retry it.
 """
 
 from __future__ import annotations
@@ -35,7 +32,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from .. import events as events_mod
 from .. import prompts
 from ..evomem import identity as identity_mod
 from ..logger import get
@@ -177,11 +173,15 @@ def _canonicalize(
     ref = obj.get("ref")
     if isinstance(ref, str) and ref.strip():
         res = identity_mod.resolve_identity(ref, roster)
-        return {"ref": res.canonical} if res.matched else None
+        if not res.matched:
+            return None
+        assert res.canonical is not None
+        return {"ref": res.canonical}
     new = obj.get("new_entity")
     if isinstance(new, str) and new.strip() and _norm_ws(new) in session_text_norm:
         res = identity_mod.resolve_identity(new, roster)
         if res.matched:
+            assert res.canonical is not None
             return {"ref": res.canonical}  # "new" name is a known identity — fold
         return {"new_entity": new.strip()}
     return None
@@ -293,14 +293,19 @@ def gate_delta(
     # 召回损失（LLM 只加富关系 reports_to/part_of/directed）。门控（默认 on）。
     if cooccurrence:
         persons = sorted(
-            {c for e in clean["entities"] if e.get("kind") == "person"
-             and (c := (e.get("ref") or e.get("new_entity")))}
+            {
+                c
+                for e in clean["entities"]
+                if e.get("kind") == "person" and (c := (e.get("ref") or e.get("new_entity")))
+            }
         )
         have = {
-            frozenset((
-                r["src"].get("ref") or r["src"].get("new_entity") or "",
-                r["dst"].get("ref") or r["dst"].get("new_entity") or "",
-            ))
+            frozenset(
+                (
+                    r["src"].get("ref") or r["src"].get("new_entity") or "",
+                    r["dst"].get("ref") or r["dst"].get("new_entity") or "",
+                )
+            )
             for r in clean["relations"]
             if r.get("predicate") == "knows"
         }
@@ -308,11 +313,19 @@ def gate_delta(
             for j in range(i + 1, len(persons)):
                 if frozenset((persons[i], persons[j])) in have:
                     continue
-                clean["relations"].append({
-                    "src": {"ref": persons[i]}, "dst": {"ref": persons[j]},
-                    "predicate": "knows", "label": "共现", "quote": "",
-                    "confidence": 0.6, "polarity": "0", "ended": False, "cooccurrence": True,
-                })
+                clean["relations"].append(
+                    {
+                        "src": {"ref": persons[i]},
+                        "dst": {"ref": persons[j]},
+                        "predicate": "knows",
+                        "label": "共现",
+                        "quote": "",
+                        "confidence": 0.6,
+                        "polarity": "0",
+                        "ended": False,
+                        "cooccurrence": True,
+                    }
+                )
 
     return clean, dropped
 
@@ -357,7 +370,7 @@ def run_after_session(
     # 跨 772 次命中；roster 短窗内稳定（随抽取缓慢增长）→ 单独一块，前缀 system+roster
     # 一起缓存；session_events 每场变，独立成块不缓存。热路缓存把重放的输入 token 时间砍掉。
     _cache = {"type": "ephemeral"}
-    messages = [
+    messages: list[dict[str, Any]] = [
         {
             "role": "system",
             "content": [
@@ -377,19 +390,16 @@ def run_after_session(
         },
     ]
 
-    events_mod.publish(STAGE, "stage_start", {"session_id": session_id})
     try:
         call = llm_call or _default_llm_call
         response = call(cfg, STAGE, messages)
         raw = _safe_json(llm_mod.extract_text(response))
     except Exception:  # noqa: BLE001 — LLM errors never disturb the chain
         logger.warning("memory_delta %s: LLM call failed", session_id, exc_info=True)
-        events_mod.publish(STAGE, "stage_end", {"session_id": session_id, "written": 0})
         result.skipped_reason = "llm_failed"
         return result
 
     if not raw:
-        events_mod.publish(STAGE, "stage_end", {"session_id": session_id, "written": 0})
         result.skipped_reason = "unparseable"
         return result
 
@@ -408,10 +418,14 @@ def run_after_session(
                 payload=clean,
                 model=cfg.model_for(STAGE).model,
                 dropped=dropped,
+                apply_status=(
+                    "pending"
+                    if getattr(cfg.memory_delta, "apply_enabled", False)
+                    else "not_requested"
+                ),
             )
     except Exception:  # noqa: BLE001
         logger.warning("memory_delta %s: persist failed", session_id, exc_info=True)
-        events_mod.publish(STAGE, "stage_end", {"session_id": session_id, "written": 0})
         result.skipped_reason = "persist_failed"
         return result
 
@@ -424,6 +438,7 @@ def run_after_session(
 
             with fts.cursor() as conn:
                 ar = delta_apply.apply_delta(conn, cfg, clean)
+                deltas_store.set_apply_status(conn, delta_id, "applied")
             logger.info(
                 "memory_delta %s: applied (entities +%d/=%d, edges +%d~%d closed %d, events %d)",
                 session_id,
@@ -436,6 +451,8 @@ def run_after_session(
             )
             result.applied = True
         except Exception:  # noqa: BLE001 — apply 失败绝不冒泡到 session 末链
+            with fts.cursor() as conn:
+                deltas_store.set_apply_status(conn, delta_id, "failed")
             logger.warning("memory_delta %s: apply failed", session_id, exc_info=True)
 
     result.written = True
@@ -449,9 +466,59 @@ def run_after_session(
         ", ".join(f"{h}={n}" for h, n in result.counts.items()),
         dropped,
     )
-    events_mod.publish(
-        STAGE,
-        "stage_end",
-        {"session_id": session_id, "written": sum(result.counts.values()), "dropped": dropped},
+    return result
+
+
+def ensure_after_session(
+    cfg: Any,
+    *,
+    session_id: str,
+    start_time: datetime | None,
+    end_time: datetime | None,
+    llm_call: LlmCallFn | None = None,
+) -> DeltaResult:
+    """Run one session delta once, retrying only a previously failed apply.
+
+    Terminal session finalization is retryable. A retry must not spend another
+    LLM call or reinforce relation observations twice after a successful run.
+    """
+    with fts.cursor() as conn:
+        existing = deltas_store.latest_for_session(conn, session_id)
+    if existing is None:
+        return run_after_session(
+            cfg,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+            llm_call=llm_call,
+        )
+
+    result = DeltaResult(
+        session_id=session_id,
+        delta_id=int(existing["id"]),
+        skipped_reason="already_processed",
     )
+    status = str(existing["apply_status"] or "unknown")
+    result.applied = status in {"applied", "unknown"}
+    if not getattr(cfg.memory_delta, "apply_enabled", False) or status not in {
+        "pending",
+        "failed",
+        "not_requested",
+    }:
+        return result
+
+    try:
+        payload = json.loads(existing["payload"] or "{}")
+        from . import delta_apply
+
+        with fts.cursor() as conn:
+            delta_apply.apply_delta(conn, cfg, payload)
+            deltas_store.set_apply_status(conn, result.delta_id, "applied")
+        result.applied = True
+        result.skipped_reason = "resumed_apply"
+    except Exception:  # noqa: BLE001 - leave retryable state for the next finalizer run
+        with fts.cursor() as conn:
+            deltas_store.set_apply_status(conn, result.delta_id, "failed")
+        result.skipped_reason = "apply_failed"
+        logger.warning("memory_delta %s: retry apply failed", session_id, exc_info=True)
     return result

@@ -1,11 +1,10 @@
 """增量影子写 evo_nodes（SSOT 切换设计稿 §4.2 双写影子期，PR-3）。
 
-设计稿：``docs/superpowers/specs/2026-06-10-evomem-ssot-switch-design.md``。
+Maintains the non-authoritative evomem shadow projection.
 
-挂点收口：设计稿 §1.3 列举的全部写站点（intent/sink、chat memory_extractor、
-chat tool_handlers、bootstrap/sink、writer/tools、session_reducer、
-schema_miner_stage、cross_domain_sweeper、timeline/aggregator，外加
-intent/schema_feedback）最终都收敛到 ``store/entries.py`` 的三条写路
+挂点收口：当前全部写站点（chat memory_extractor、chat tool_handlers、
+writer/tools、session_reducer、schema_miner_stage、cross_domain_sweeper、
+timeline/aggregator）最终都收敛到 ``store/entries.py`` 的三条写路
 （``append_entry`` / ``supersede_entry`` / ``mark_entry_deleted``）。影子 hook
 挂在这三条写路的锁尾——任何现有/未来 caller 自动被覆盖（设计稿风险 1
 「绕过主写+影子机制的写路径」的最强对冲）。唯一已知绕路站点是
@@ -136,7 +135,7 @@ def note_out_of_band_rewrite(names: Sequence[str]) -> None:
                 prefix = files_mod.validate_prefix(files_mod.memory_path(name).name)
             except ValueError:
                 continue
-            if prefix in ("event", "task-outcome"):
+            if prefix == "event":
                 continue
             _record_miss(f"{name}: 整文件重写（compact）绕过影子写，evo_nodes 对该文件已滞后")
     except Exception:  # noqa: BLE001
@@ -169,7 +168,7 @@ def _shadow_write(conn: sqlite3.Connection, *, name: str, entry_ids: list[str]) 
         return
     path = files_mod.memory_path(name)
     prefix = files_mod.validate_prefix(path.name)
-    if prefix in ("event", "task-outcome"):  # Q2 / G1 豁免：by design 不进 evo_nodes，不算 miss
+    if prefix == "event":  # Q2 豁免：append-only 日志不进 evo_nodes，不算 miss
         return
     if not _evo_ready(conn):
         _record_miss(

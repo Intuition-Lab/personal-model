@@ -1,25 +1,22 @@
-"""EvoMemory engine —— 编排 store + reconciler + chain + schema_miner（teardown §0/§4/§5/§6）。
+"""EvoMemory engine —— 编排 store + reconciler + evolution chains.
 
 三系统对外入口（SSOT 切换设计 §1.3：engine 是唯一写口，两类入口对应两类写需求）：
 - ``add``  —— **reconcile 路径**：System1 同步写，召回候选 → LLM 四操作决策 +
-  铁律兜底 → 执行 ops。classifier / chat 记忆抽取 / dream 这类「新事实 vs 旧记忆
+  铁律兜底 → 执行 ops。classifier / chat 记忆抽取这类「新事实 vs 旧记忆
   要调和」的站点走这条。
 - ``apply_ops`` / ``add_direct`` —— **确定性路径**：不调 LLM，直接落已确定的 op。
-  intent 投影、reducer 行、bootstrap 画像、schema miner 原地 supersede 这类
+  intent 投影、reducer 行、schema miner 原地 supersede 这类
   「写什么早已确定」的站点走这条（纲领不变式三：确定性写入不许塞进 LLM 决策）。
 - ``commit_node`` / ``commit_supersede`` / ``commit_retire`` —— **反转写口
   （PR-6b）**：接收 caller 已按共享映射（``backfill.map_entry_to_node``）备好的
   ``MemoryNode``，过 ``_validated_file_name`` 栅栏（event 硬拒，Q2）后单事务原子
   落 evo_nodes。``write_authority="evomem"`` 时 ``evomem/inversion.py`` 把九个
   写站点收敛到的三条写口动词（append/supersede/delete）经此落真相——op 决策已
-  在站点侧完成（chat 抽取 / dream agent / miner 各自的 LLM 或确定性逻辑），
+  在站点侧完成（chat 抽取 / classifier / miner 各自的 LLM 或确定性逻辑），
   engine 不再调 reconciler 重新决策，保证「同输入 → 投影 byte-identical」的
   迁移纪律；reconcile 调和（``add``）作为语义升级与写权反转解耦，留待后续
   按站点显式启用。
 - ``search`` —— 召回 + 演化链折叠，返回链头代表 + ``evolution_chain``。
-- ``run_system2`` —— 认知层同步入口：跑 schema miner，把 schema 四元组全字段写成
-  L6_SCHEMA 节点（schema_summary/schema_inferences/schema_confidence 三列 +
-  central 进 content）。
 """
 
 from __future__ import annotations
@@ -32,7 +29,6 @@ from . import vector_recall
 from .chain import expand_evolution_chains
 from .models import MemoryLayer, MemoryNode, ReconcileAction, ReconcileOp
 from .reconciler import Reconciler
-from .schema_miner import SchemaMiner, SchemaResult
 from .store import NodeStore
 
 # add() 召回候选时，除子串命中外再兜底纳入的活跃链头数量上限（MVP，小库够用）。
@@ -83,11 +79,8 @@ def _validated_file_name(file_name: str) -> str:
         return ""
     name = file_name if file_name.endswith(".md") else f"{file_name}.md"
     prefix = files_mod.validate_prefix(name)
-    if prefix in ("event", "task-outcome"):
-        raise ValueError(
-            f"{prefix}-* entries are exempt from evo_nodes (Q2 / reverse-loop G1);"
-            " keep these writes on the legacy markdown path"
-        )
+    if prefix == "event":
+        raise ValueError("event-* entries are exempt from evo_nodes; keep them on markdown")
     return name
 
 
@@ -98,7 +91,6 @@ class EvoMemory:
         user_id: str = "default",
         agent_id: str = "default",
         reconciler: Reconciler | None = None,
-        schema_miner: SchemaMiner | None = None,
         store: NodeStore | None = None,
         cfg: object | None = None,
     ) -> None:
@@ -107,7 +99,6 @@ class EvoMemory:
         self.user_id = user_id
         self.agent_id = agent_id
         self._reconciler = reconciler
-        self._schema_miner = schema_miner
         self._store = store or NodeStore(user_id=user_id, agent_id=agent_id)
         # 向量召回开关源（默认关 → 行为与改动前逐字节一致）。``None`` 时惰性读全局
         # config；测试可直接注入 ``SimpleNamespace(evomem_vector_recall_enabled=True)``。
@@ -152,7 +143,7 @@ class EvoMemory:
     ) -> list[str]:
         """确定性写入口（§1.3）：不调 LLM，按序执行**已经确定**的 op 列表。
 
-        intent 投影（append-only 永不入链）、reducer 行、bootstrap 画像、schema
+        intent 投影（append-only 永不入链）、reducer 行、schema
         miner 的原地 supersede 这类「写什么早已确定」的写需求走这条——把它们塞进
         ``add`` 的 reconcile 决策违反纲领不变式三（确定性优先）。op 形态与
         reconcile 路径完全同构（同一 ``_apply_op``），只是决策方从 LLM 换成 caller。
@@ -406,30 +397,3 @@ class EvoMemory:
             cfg=self._resolve_cfg(),
             candidates_provider=self._store.all_latest,
         )
-
-    # -- System2: 认知层 -------------------------------------------------
-
-    def run_system2(self, facts: list[str]) -> SchemaResult | None:
-        """同步跑 schema miner；成功则把 schema 四元组**全字段**写成一个 L6_SCHEMA 节点。
-
-        审计 3.3 修复（SSOT 切换设计 §5，PR-6a）：旧状只存 ``central_proposition``，
-        丢 ``supporting_summary`` / ``expected_inferences`` / ``confidence``——schema
-        的预测价值（尤其 ``expected_inferences``）全在那里丢失。现在三者分别落
-        evo_nodes 的 ``schema_summary`` / ``schema_inferences`` / ``schema_confidence``
-        列（PR-2 已建），central 留在 ``content``，与 backfill 对 ``schema-*`` 条目
-        的列映射同构。生产 schema 归纳目前仍走 ``writer/schema_miner_stage.py``
-        （markdown 主写），其经 engine 落库的迁移属 PR-6b；本方法自此为全保真路径，
-        原「勿作生产路径」警告解除。
-        """
-        if self._schema_miner is None:
-            return None
-        result = self._schema_miner.mine_schema(facts)
-        if result.success:
-            self._save_head(
-                result.central_proposition,
-                MemoryLayer.L6_SCHEMA,
-                schema_summary=result.supporting_summary or None,
-                schema_inferences=list(result.expected_inferences) or None,
-                schema_confidence=result.confidence,
-            )
-        return result

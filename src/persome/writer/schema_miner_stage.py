@@ -4,7 +4,7 @@
 ``SchemaResult(central_proposition, supporting_summary, expected_inferences,
 confidence)``. That miner is an isolated pure function: it neither reads facts
 from anywhere nor writes its output to disk. This stage is the landing layer
-that closes both gaps for acme (design ``2026-06-06-migration-D2-cognition.md``):
+that closes both gaps for Persome:
 
 1. **Input adapter (screen modality, not chat)** — :func:`collect_fact_bundles`
    assembles "关联事实集" from acme's durable fact memory. The MVP clusters
@@ -13,8 +13,8 @@ that closes both gaps for acme (design ``2026-06-06-migration-D2-cognition.md``)
    when it writes them, so a file *is* a natural semantic cluster (design §2.3:
    "同一 topic 文件的事实归一簇，纯启发不引向量/DBSCAN"). A bundle smaller than
    ``min_facts`` is dropped — too few facts can't support a generalisation
-   (aligns with Hy-Memory's ``MIN_FACTS_FOR_INDUCTION``). Wiring the richer dream
-   Stage-1 cross-session clusters in is a later step; it feeds the same
+   (aligns with Hy-Memory's ``MIN_FACTS_FOR_INDUCTION``). Wiring richer
+   cross-session clusters in is a later step; it feeds the same
    :class:`FactBundle` interface, so this stage doesn't change when it lands.
 
 2. **Landing form + lifecycle (idempotent)** — :func:`mine_bundles_and_write`
@@ -28,11 +28,10 @@ that closes both gaps for acme (design ``2026-06-06-migration-D2-cognition.md``)
    mine creates the file via ``create_file`` / ``append_entry``.
 
 Status is derived from the miner's confidence: ``confidence >= stable_threshold``
-→ ``stable`` (the only status the intent prior injects — design §2.4 / §4②),
-otherwise ``forming``. The ``central``, ``summary`` and ``inferences`` are
-rendered into the entry body so the seam provider (:mod:`intent.schema_prior`)
-can read the inferences back out; ``confidence`` rides as a heading tag so the
-provider can rank by it.
+→ ``stable`` (the only status exposed by the active model reader), otherwise
+``forming``. The ``central``, ``summary`` and ``inferences`` are rendered into
+the entry body so :mod:`persome.model.schema_reader` can read the inferences back
+out; ``confidence`` rides as a heading tag so the reader can rank by it.
 
 写权反转（PR-6b，SSOT 切换设计 §1.3/§5）：``write_authority="evomem"`` 时本站点
 的写（create / append / 原地 supersede / ``set_file_status`` 的 dormant↔active
@@ -47,8 +46,7 @@ Tests inject a fake ``llm_call`` (no network), mirroring
 ``tests/test_evomem/test_schema_miner.py``.
 
 This stage only ever writes the ``schema-*.md`` prefix — it never touches
-``skill-*`` / ``event-*`` / ``user-*`` etc., the same write-boundary discipline
-the classifier and consolidator hold (design §2.2 硬隔离).
+``skill-*`` / ``event-*`` / ``user-*`` etc.; every writer owns a narrow prefix.
 """
 
 from __future__ import annotations
@@ -69,10 +67,9 @@ from . import llm as llm_mod
 logger = get("persome.writer")
 
 # Prefixes whose entries are durable user *facts* — the raw material a schema is
-# induced from. Aligned with the canonical fact set in ``intent/recall.py`` (minus
-# ``intent-``, a derived projection of the unified stream that must NOT be
-# re-abstracted). ``event-*`` (raw activity) and ``skill-*`` / ``intent-*`` /
-# ``schema-*`` (derived artefacts) are deliberately excluded: a schema must
+# induced from. Aligned with the canonical fact set in ``retrieval/layered.py``.
+# ``event-*`` (raw activity) and ``skill-*`` / ``schema-*`` (derived artefacts)
+# are deliberately excluded: a schema must
 # generalise grounded facts, not re-abstract other abstractions.
 _FACT_PREFIXES: tuple[str, ...] = ("user", "project", "topic", "person", "org", "tool")
 
@@ -81,9 +78,8 @@ _FACT_PREFIXES: tuple[str, ...] = ("user", "project", "topic", "person", "org", 
 _DEFAULT_MIN_FACTS = 4
 
 # Confidence at/above which a freshly mined schema is born ``stable`` (and thus
-# eligible to be injected as an intent prior). Below it the schema is ``forming``
-# — it exists and is grep-able, but stays out of recognition until more evidence
-# (or an explicit accept) promotes it. Design §2.4.
+# eligible for active model reads). Below it the schema is ``forming`` — it exists
+# and is grep-able, but stays out of snapshots until more evidence promotes it.
 _DEFAULT_STABLE_THRESHOLD = 0.6
 
 # How many durable entries to pull per file when clustering. A generous cap — a
@@ -131,7 +127,7 @@ class SchemaRunResult:
         return len(self.written)
 
 
-# ── body rendering / parsing (shared with intent.schema_prior) ───────────────
+# ── body rendering / parsing (shared with model.schema_reader) ───────────────
 
 
 def render_schema_body(
@@ -140,7 +136,7 @@ def render_schema_body(
     supporting_summary: str,
     expected_inferences: list[str],
 ) -> str:
-    """Render a schema entry body (the form :mod:`intent.schema_prior` parses back).
+    """Render a schema entry body for :mod:`persome.model.schema_reader`.
 
     Layout (design §3.3) — ``central``/``summary`` one-liners, then an
     ``inferences:`` marker followed by ``- `` bullets, one inference per line::
@@ -306,8 +302,8 @@ def _persist_schema(
     )
     tags = ["schema", status, f"confidence:{result.confidence:.2f}"]
     # A still-``forming`` schema is born ``dormant`` so it stays out of default
-    # ``list_memories`` (and the intent prior, which only injects ``stable``) until
-    # it matures; a ``stable`` schema is ``active`` (design §5 / MCP-05, issue #440).
+    # ``list_memories`` and active model reads until it matures; a ``stable``
+    # schema is ``active`` (design §5 / MCP-05, issue #440).
     file_status = "dormant" if status == "forming" else "active"
 
     path = files_mod.memory_path(name)
@@ -470,7 +466,7 @@ def mine_schemas_for_user(
 ) -> SchemaRunResult:
     """Top-level, testable entry point: collect fact bundles, mine, and land them.
 
-    This is the function a dream tick (or a manual/CLI trigger) would call. It
+    This is the function a scheduled tick or manual model build calls. It
     wires :func:`collect_fact_bundles` (the per-file MVP clustering) into
     :func:`mine_bundles_and_write`. Wiring it into the daemon registry is a later
     step — keeping it a plain function here makes the whole chain unit-testable
@@ -489,7 +485,3 @@ def mine_schemas_for_user(
         stable_threshold=stable_threshold,
         llm_call=llm_call,
     )
-
-
-# Back-compat alias: the first cut named the entry point ``run_schema_mining``.
-run_schema_mining = mine_schemas_for_user

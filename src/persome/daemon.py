@@ -1,9 +1,9 @@
 """Top-level daemon: capture scheduler + timeline aggregator + session cutter.
 
-The v2 writer is driven by session boundaries. ``SessionManager.on_session_end``
-(wired in ``session/tick.py``) spawns the S2 reducer on a daemon thread, and
-the reducer's success callback kicks the classifier. No periodic writer loop
-is needed — each session produces exactly one reducer + classifier pass.
+The writer is driven by session boundaries. ``SessionManager.on_session_end``
+(wired in ``session/tick.py``) spawns the S2 reducer on a daemon thread, then
+the shared terminal finalizer runs classification, pattern detection, and
+memory-delta modeling. A retry task recovers transient reducer failures.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
-from . import events as events_mod
 from . import paths
 from .capture import ocr_local
 from .capture import scheduler as capture_scheduler
@@ -74,12 +73,6 @@ async def _shutdown_tasks(tasks: list[asyncio.Task], *, timeout: float) -> None:
             timeout,
             sorted(t.get_name() for t in pending),
         )
-
-
-async def _run_dispatcher_loop(cfg: Config) -> None:
-    from .runs.dispatcher import run_dispatcher
-
-    await run_dispatcher(cfg)
 
 
 async def _mcp_loop(cfg: Config) -> None:
@@ -140,6 +133,11 @@ def _build_task_registry() -> list[TaskDefinition]:
             create=lambda cfg, sm: session_tick.run_check_cuts(cfg, sm),
         ),
         TaskDefinition(
+            name="reducer-retry",
+            enabled=lambda cfg, capture_only: cfg.reducer.enabled,
+            create=lambda cfg, sm: session_tick.run_reducer_retry_tick(cfg),
+        ),
+        TaskDefinition(
             name="daily-safety-net",
             enabled=lambda cfg, capture_only: True,
             create=lambda cfg, sm: session_tick.run_daily_safety_net(cfg, sm),
@@ -156,7 +154,9 @@ def _build_task_registry() -> list[TaskDefinition]:
         ),
         TaskDefinition(
             name="classifier-tick",
-            enabled=lambda cfg, capture_only: not capture_only,
+            enabled=lambda cfg, capture_only: (
+                not capture_only and not cfg.memory_delta.apply_enabled
+            ),
             create=lambda cfg, sm: session_tick.run_classifier_tick(cfg, sm),
         ),
         TaskDefinition(
@@ -165,31 +165,9 @@ def _build_task_registry() -> list[TaskDefinition]:
             create=lambda cfg, sm: session_tick.run_vector_embed_tick(cfg),
         ),
         TaskDefinition(
-            name="dream-tick",
-            enabled=lambda cfg, capture_only: not capture_only and cfg.dream.enabled,
-            create=lambda cfg, sm: session_tick.run_dream_tick(cfg),
-        ),
-        TaskDefinition(
             name="schema-tick",
             enabled=lambda cfg, capture_only: not capture_only and cfg.schema.enabled,
             create=lambda cfg, sm: session_tick.run_schema_tick(cfg),
-        ),
-        TaskDefinition(
-            name="evomem-enrichment-tick",
-            enabled=lambda cfg, capture_only: (
-                not capture_only
-                and (
-                    getattr(cfg, "person_graph_enabled", False)
-                    or getattr(cfg, "case_extraction_enabled", False)
-                    or getattr(cfg, "relation_extraction_enabled", False)
-                )
-            ),
-            create=lambda cfg, sm: session_tick.run_evomem_enrichment_tick(cfg),
-        ),
-        TaskDefinition(
-            name="run-dispatcher",
-            enabled=lambda cfg, capture_only: not capture_only,
-            create=lambda cfg, sm: _run_dispatcher_loop(cfg),
         ),
         TaskDefinition(
             name="mcp",
@@ -224,7 +202,6 @@ def _create_tasks_from_registry(
 async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = False) -> None:
     paths.ensure_dirs()
     paths.pid_file().write_text(str(os.getpid()))
-    events_mod.init(asyncio.get_running_loop())
 
     # Register this daemon ("Persome Backend") in the macOS Screen Recording list + prompt,
     # so screenshots capture real app windows instead of just the desktop wallpaper (and
@@ -235,22 +212,6 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
 
     screen_recording.request_screen_recording()
 
-    # Any dream_runs row still 'running' is a leftover from a prior process
-    # that died mid-dream; flip it to 'failed' so the UI doesn't display a
-    # perpetually-pending row.
-    from .store import agent_runs as agent_runs_mod
-    from .store import dream_runs as dream_runs_mod
-    from .store import fts as fts_mod
-
-    with fts_mod.cursor() as conn:
-        dream_runs_mod.mark_orphans_failed(conn)
-        # Phase 1b: recycle agent_runs rows stuck in 'running' from a prior
-        # process death. 'queued' rows are preserved — they are still valid
-        # work and the dispatcher will pick them up normally.
-        n_orphans = agent_runs_mod.mark_orphans_running(conn)
-        if n_orphans:
-            logger.info("boot: recycled %d orphaned agent_run(s) running→failed", n_orphans)
-
     # evomem survivability base (SSOT switch design §3.3): chain-invariant
     # self-check at startup. Gated on [evomem] integrity_check_enabled (the
     # hook itself no-ops when off); alert-only unless freeze_writes_on_failure
@@ -258,32 +219,6 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
     from .evomem import integrity as evo_integrity
 
     await asyncio.to_thread(evo_integrity.startup_check, cfg)
-
-    # Intent expiry catch-up (#628): the expiry harvest otherwise only fires at
-    # the 23:55 ``daily-safety-net`` tick, so a daemon that was stopped / running
-    # old code / never reached 23:55 misses a whole day's harvest — overdue
-    # grounded intents (``open`` and #629 ``armed``), #532-stale armed rows, and
-    # #612-stale UNGROUNDED ``open`` rows stay un-flipped and keep leaking into
-    # recall's scene layer (real ids 6/7/9 sat ``open`` ≥3 days; the #612 backlog
-    # was 66/70). Replay the SAME harvest once at boot so a missed 23:55 is
-    # repaired immediately instead of waiting for the next one. The harvest is
-    # idempotent (only touches still-``open``/``armed`` overdue/stale rows),
-    # one-shot (not per-tick), and a pure side channel — a failure alerts and
-    # never blocks boot.
-    try:
-        expired, dismissed_armed, stale_open = await asyncio.to_thread(
-            session_tick.expire_overdue_intents
-        )
-        if expired or dismissed_armed or stale_open:
-            logger.info(
-                "boot: intent expiry catch-up — %d open/armed → expired, "
-                "%d armed → dismissed (#628), %d ungrounded open → expired (#612)",
-                expired,
-                dismissed_armed,
-                stale_open,
-            )
-    except Exception as exc:  # noqa: BLE001 - catch-up must never block boot
-        logger.warning("boot: intent expiry catch-up failed: %s", exc)
 
     # (OCR warmup is started AFTER the signal handlers below, because importing
     # PaddleOCR/paddle hijacks the fatal signals — see _install_signal_handlers.)
@@ -367,12 +302,11 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
 
     if hard_exit:
         # Real daemon process (launchd/app `start --foreground`). Do ONLY the
-        # fast, durable shutdown work, then hard-exit — deliberately SKIP the
-        # async task drain (_shutdown_tasks) and the virtual-display close_all().
+        # fast, durable shutdown work, then hard-exit — deliberately skip the
+        # async task drain (_shutdown_tasks).
         #
-        # Both of those run Python — spinning the event loop for up to
-        # _SHUTDOWN_TIMEOUT_SECONDS awaiting task cancellation, and tearing down
-        # native stage resources — WHILE the daemon's background LLM-recognition
+        # The drain runs Python — spinning the event loop for up to
+        # _SHUTDOWN_TIMEOUT_SECONDS awaiting task cancellation — while background LLM modeling
         # and te3-large embedding calls are still mid-flight on the default
         # executor (asyncio.to_thread), parked in a TLS read (_ssl__SSLSocket_read).
         # On a real app quit there are typically several such SSL workers live;
@@ -384,8 +318,7 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
         # force_end + pidfile unlink are a fast DB write + a syscall; os._exit
         # then kills the abandoned tasks and their SSL worker threads with the
         # process. SQLite WAL is crash-safe, the boot safety-net force-ends any
-        # session still open, and the virtual-display stages fall back to their
-        # stdin-EOF teardown. This collapses the SSL-live window to ~one DB write.
+        # session still open. This collapses the SSL-live window to ~one DB write.
         with suppress(Exception):
             session_manager.force_end(reason="daemon-shutdown")
         with suppress(FileNotFoundError):
@@ -404,13 +337,6 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
     with suppress(Exception):
         session_manager.force_end(reason="daemon-shutdown")
 
-    # Reap any live virtual-display stages (off-screen agent app instances) so no display leaks on a
-    # graceful stop. The helper's stdin-EOF teardown is the backstop if this is skipped/crashes.
-    with suppress(Exception):
-        from .actuation.stage import registry as _stage_registry
-
-        _stage_registry.close_all()
-
     with suppress(FileNotFoundError):
         paths.pid_file().unlink()
     logger.info("daemon stopped")
@@ -420,7 +346,7 @@ def run(cfg: Config, *, capture_only: bool = False) -> None:
     """Boot the daemon event loop, block until a stop signal, then hard-exit.
 
     Two cooperating pieces stop the app-quit / launchd-bootout teardown SIGSEGV,
-    whose root is the daemon's background LLM-recognition / te3-large embedding
+    whose root is the daemon's background LLM-modeling / te3-large embedding
     calls: every off-loop blocking call goes through ``asyncio.to_thread`` → the
     default executor, and at quit time several of those workers are parked in a
     TLS read (``_ssl__SSLSocket_read``). Running *any* event-loop / interpreter
@@ -429,7 +355,7 @@ def run(cfg: Config, *, capture_only: bool = False) -> None:
 
     1. ``_run(..., hard_exit=True)`` does ONLY the fast durable shutdown
        (force-end the session, unlink the pidfile) and then ``os._exit(0)`` — it
-       SKIPS the async task drain and ``close_all`` so almost no Python runs while
+       SKIPS the async task drain so almost no Python runs while
        the SSL workers are live. (The crash used to fire *inside* that skipped
        window, before ``_run`` returned, which is why a trailing ``os._exit`` here
        alone was not enough.)

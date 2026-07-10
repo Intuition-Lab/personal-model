@@ -88,9 +88,9 @@ def _load_capture(path: Path) -> dict[str, Any] | None:
 def _count_ax_nodes(ax_tree: Any) -> int:
     """Bounded count of AX-element-like dicts in the raw ax_tree.
 
-    A rough "how much did AX see" metric for the dev dashboard. Counts dicts
+    A rough "how much did AX see" metric for capture-context consumers. Counts dicts
     that look like an AX element (carry a role / children key). Iterative +
-    capped so a pathological tree can't blow up a dashboard read.
+    capped so a pathological tree can't blow up a context read.
     """
     if not isinstance(ax_tree, (dict, list)):
         return 0
@@ -125,7 +125,7 @@ def _resolve_text(result: dict[str, Any], data: dict[str, Any], capture_id: str)
       * both empty                   → ``text_source="none"``.
 
     ``visible_text`` stays the resolved text (AX else OCR) for back-compat, and
-    we surface an ``ocr`` status block so the dashboard can explain WHY a window
+    we surface an ``ocr`` status block so clients can explain WHY a window
     is blank (OCR not run / submitted-but-empty / recognized).
     """
     ax_text = data.get("visible_text") or ""
@@ -192,7 +192,7 @@ def _format_response(
         },
         "visible_text": ax_text,
         "screenshot_stripped": bool(data.get("screenshot_stripped")),
-        # ── capture status / provenance (dev dashboard) ──────────────────
+        # ── capture status / provenance ──────────────────────────────────
         "trigger": trigger.get("event_type") if isinstance(trigger, dict) else None,
         "schema_version": data.get("schema_version"),
         "ax": {
@@ -234,11 +234,25 @@ def read_recent_capture(
     """Return the capture that best matches the given time + filters.
 
     ``at`` None → newest matching capture overall.
-    ``at`` set → nearest-in-time match, bounded by ``max_age_minutes`` on either side.
+    ``at`` set to a returned ``file_stem`` → that exact capture.
+    Other ``at`` values → nearest-in-time match, bounded by
+    ``max_age_minutes`` on either side.
     """
     buf = paths.capture_buffer_dir()
     if not buf.exists():
         return None
+
+    if at and "/" not in at and "\\" not in at and ".." not in at:
+        exact = buf / f"{at}.json"
+        if exact.is_file() and _parse_stem(at) is not None:
+            data = _load_capture(exact)
+            if data is None or not _matches(data, app_name, window_title_substring):
+                return None
+            return _resolve_text(
+                _format_response(exact, data, include_screenshot, include_ax_tree),
+                data,
+                exact.stem,
+            )
 
     target: datetime | None = _parse_at(at) if at else None
 
@@ -278,32 +292,6 @@ def read_recent_capture(
     if best is None:
         return None
     _, path, data = best
-    return _resolve_text(
-        _format_response(path, data, include_screenshot, include_ax_tree), data, path.stem
-    )
-
-
-def read_capture_by_stem(
-    stem: str,
-    *,
-    include_screenshot: bool = False,
-    include_ax_tree: bool = False,
-) -> dict[str, Any] | None:
-    """Exact capture lookup by file stem (the ``file_stem`` headlines carry).
-
-    The HH:MM ``at`` path only resolves to the *nearest* capture for an app
-    within a tolerance window, so two captures in the same minute (or a shared
-    cwd) can mis-resolve. The dashboard already knows the exact stem, so this
-    avoids that whole class of cross-attribution.
-    """
-    if not stem or "/" in stem or "\\" in stem or ".." in stem:
-        return None
-    path = paths.capture_buffer_dir() / f"{stem}.json"
-    if not path.is_file():
-        return None
-    data = _load_capture(path)
-    if data is None:
-        return None
     return _resolve_text(
         _format_response(path, data, include_screenshot, include_ax_tree), data, path.stem
     )
@@ -448,7 +436,7 @@ def current_context(
                 }
             )
         timeline = _recent_timeline_blocks(conn, timeline_limit)
-        # Lightweight per-headline preview so the dashboard list shows content
+        # Lightweight per-headline preview so a context list shows content
         # (incl. OCR-backfilled WeChat text) at a glance. One indexed SELECT per
         # headline (≤ headline_limit) — cheap; no JSON reads on this hot path.
         head_text: dict[str, str] = {

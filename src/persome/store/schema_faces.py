@@ -249,18 +249,25 @@ def maybe_promote(
     min_observations: int = 2,
     stability_threshold: float = STABILITY_THRESHOLD,
 ) -> bool:
-    """§3.1 转正 = 常驻资格, behind TWO gates: provenance ``both`` (two
-    independent signals) AND resampling stability (≥2 footprint snapshots with
-    min pairwise Jaccard ≥ threshold — a churning cluster is not a regularity).
-    Idempotent; returns True iff the face is ACTIVE after the call."""
+    """§3.1 promotion gate for Face/Volume residency.
+
+    Level 1 Face requires two extractor signals (``provenance=both``) plus stable
+    resampling. Level 2 Volume has one honest producer, the cross-domain sweeper,
+    so its independent evidence is two stable sweeper resamples; requiring
+    ``provenance=both`` there made every production Volume permanently shadow.
+    Idempotent; returns True iff the object is ACTIVE after the call.
+    """
     row = _row_face(conn, face_id)
     if row is None or row["valid_to"] is not None:
         return False
     if row["status"] == MemoryStatus.ACTIVE.value:
         return True
     footprints = json.loads(row["footprints"])
+    provenance_ready = row["provenance"] == PROVENANCE_BOTH or (
+        row["level"] == 2 and row["provenance"] == PROVENANCE_EMERGENT
+    )
     if (
-        row["provenance"] == PROVENANCE_BOTH
+        provenance_ready
         and row["observations"] >= min_observations
         and len(footprints) >= 2
         and stability(footprints) >= stability_threshold

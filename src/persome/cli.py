@@ -19,10 +19,8 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import typer
 from rich.console import Console
@@ -198,7 +196,9 @@ def _watch_parent_death() -> None:
     so the daemon truly "dies with the app". No-op when ``PERSOME_PARENT_PID`` is unset (e.g. a plain
     ``persome start`` from a terminal, where the daemon is meant to outlive the shell).
     """
-    raw = (os.environ.get("PERSOME_PARENT_PID") or os.environ.get("MENS_PARENT_PID"))  # Mens is the legacy name
+    raw = os.environ.get("PERSOME_PARENT_PID") or os.environ.get(
+        "MENS_PARENT_PID"
+    )  # Mens is the legacy name
     if not raw:
         return
     try:
@@ -232,9 +232,8 @@ def start(
 ) -> None:
     """Start the Persome daemon."""
     cfg = _init()
-    # Source the env file (managed by Mens.app, single SoT for LLM secrets)
-    # before any fork so the daemon — and every subsystem reading os.environ —
-    # sees the same values regardless of who started us.
+    # Source the owner-only env file before any fork so the daemon and every
+    # subsystem reading os.environ see the same values regardless of launcher.
     env_file_mod.load_env_file(paths.env_file())
     pid = _read_pid()
     if pid:
@@ -396,16 +395,6 @@ def status() -> None:
             )
         else:
             table.add_row("Sessions", "(none)")
-        # `sessions.end_time` is aware-local; bind a tz-correct cutoff instead of
-        # `datetime('now','-7 days')` (UTC, space-sep — same #586-class skew).
-        since_7d = (datetime.now().astimezone() - timedelta(days=7)).isoformat()
-        cost_row = conn.execute(
-            "SELECT SUM(total_cost_usd)/7.0 FROM sessions"
-            " WHERE end_time > ? AND total_cost_usd IS NOT NULL",
-            (since_7d,),
-        ).fetchone()
-        if cost_row and cost_row[0] is not None:
-            table.add_row("Avg daily cost (7d)", f"${cost_row[0]:.4f}")
         active = fts.list_files(conn, include_dormant=False)
         dormant = [f for f in fts.list_files(conn, include_dormant=True) if f.status == "dormant"]
         total_entries = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
@@ -565,35 +554,6 @@ def _ocr_worker() -> None:
     paths.ensure_dirs()
     logger_mod.setup(console=False)  # file sinks only — keep stdout a clean data channel
     raise typer.Exit(code=ocr_worker.serve())
-
-
-@app.command("intent-audit")
-def intent_audit(
-    db: str = typer.Option("", help="index.db path (default: <root>/index.db)."),
-    json_out: str = typer.Option("", help="Also write the structured audit JSON here."),
-) -> None:
-    """Audit the recognizer's precision · lifecycle from the intents table.
-
-    Read-only, deterministic, zero-LLM. Prints status distribution, stale-open
-    age + ungrounded rate, duplicate-cluster heat, the handled-then-reopened
-    re-mention count, the fold-gap, and accept:dismiss (splitting real user
-    rejections from engine-TTL harvests) — the measurable oracle that turns
-    precision tuning data-driven. PII-free: only counts/rates leave the tool.
-    """
-    from pathlib import Path
-
-    from . import paths
-    from .intent import audit as intent_audit_mod
-
-    db_path = db or str(paths.index_db())
-    typer.echo(intent_audit_mod.render_text(db_path))
-    if json_out:
-        import json as _json
-
-        Path(json_out).write_text(
-            _json.dumps(intent_audit_mod.build_report(db_path), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
 
 
 @app.command("delta-report")
@@ -1083,48 +1043,17 @@ def decay_report(
         )
 
 
-@app.command("feedback-report")
-def feedback_report(
-    dir: str = typer.Option(  # noqa: A002 — CLI flag name
-        "", help="logs dir holding context-feedback.jsonl (default: <root>/logs)."
-    ),
-    json_out: str = typer.Option("", help="Also write the structured report JSON here."),
-) -> None:
-    """Report the real context-feedback loop (accept↔importance + usefulness + funnel).
-
-    Reads the app-written ``context-feedback.jsonl`` (+ ``context-sentinel.jsonl``) under
-    the data dir's ``logs/`` and prints the accept-rate-by-importance correlation, the
-    accepted→completed usefulness gap, and the gate funnel — with an accrual line showing
-    how close each bucket is to the ≥5-sample decidability floor. HONEST: UNDECIDABLE
-    until enough real feedback accrues (it never manufactures a ratio).
-    """
-    from pathlib import Path
-
-    from . import paths
-    from .feedback import report as fb_report
-
-    d = Path(dir) if dir else paths.logs_dir()
-    typer.echo(fb_report.render_text(d))
-    if json_out:
-        import json as _json
-
-        Path(json_out).write_text(
-            _json.dumps(fb_report.build_report(d), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-
 @app.command("memory-viz")
 def memory_viz(
     out: str = typer.Option("", help="Write sem_facts.json here (default: <root>/sem_facts.json)."),
 ) -> None:
-    """Precompute the semantic fact-space layout for the /dev/memory 3D dashboard.
+    """Precompute the semantic fact-space layout for the /model 3D explorer.
 
     Reads the local index.db (read-only, zero-LLM, zero-network) and writes
     ``sem_facts.json`` to the chronicle root: fact point cloud (XZ = semantic
     layout), k-NN semantic edges (or the symbolic-graph fallback on stores
     without embeddings — labeled via ``edge_source``), and emergent face
-    clusters. The dashboard (``/dev/memory``) picks the file up on next load.
+    clusters. The model explorer (``/model``) picks the file up on next load.
     """
     from pathlib import Path as _Path
 
@@ -1141,199 +1070,6 @@ def memory_viz(
         f"sem_facts: {stats['facts']} fact(s), {stats['edges']} edge(s) "
         f"({stats['edge_source']}), {stats['faces']} face(s) -> {stats['out']}"
     )
-
-
-@app.command()
-def watch(
-    url: str = typer.Option("http://127.0.0.1:8742", help="Daemon base URL."),
-) -> None:
-    """Live pipeline monitor — watch every agent tool call in real time."""
-    from .tui.watch import watch as _watch
-
-    _watch(url=url)
-
-
-@app.command("intent-restamp")
-def intent_restamp() -> None:
-    """存量意图补章 + 过期收割（stale-daemon 修复工具，幂等）.
-
-    旧 daemon 进程写下的 open/armed 行可能缺 temporal grounding（resolved_at/
-    valid_until 全 NULL → 永不语义折叠、永不过期）。本命令对它们重跑
-    stamp_temporal（含 meeting_hint 的 7 天 TTL）落库，随后立即跑一次
-    expire_overdue 把已过期者收割掉，并对超龄的 armed 行（永不触发的死意图，
-    #532）做一次 14 天 TTL 收割（armed → expired，系统/陈旧关，非用户拒；§9 审计），
-    最后对仍无 grounding 的超龄 open 行（#612 无界堆积，实测 66/70）做 30 天 TTL
-    收割（open → expired）。
-    """
-    _init()
-    from datetime import datetime as _dt
-
-    from .intent import store as intent_store_mod
-    from .store import fts as fts_mod
-
-    now = _dt.now().isoformat(timespec="seconds")
-    with fts_mod.cursor() as conn:
-        rescanned, restamped = intent_store_mod.restamp_overdue_grounding(conn)
-        expired = len(intent_store_mod.expire_overdue(conn, now=now))
-        expired_armed = len(intent_store_mod.expire_stale_armed(conn, now=now))
-        # #612: after restamp, rows that STILL can't be grounded are reaped by age
-        # so the existing ungrounded backlog drains instead of sitting open forever.
-        stale_open = len(intent_store_mod.expire_stale_open(conn, now=now))
-    typer.echo(
-        f"rescanned={rescanned} restamped={restamped} expired={expired} "
-        f"expired_armed={expired_armed} stale_open={stale_open}"
-    )
-
-
-thread_app = typer.Typer(
-    help=(
-        "WorkThread 工作线：查看/纠错『现在进行时』层（spec 2026-06-12）。"
-        "review-day 是 H1 日终标注屏（标签工厂），correct 是零成本纠错口。"
-    )
-)
-app.add_typer(thread_app, name="thread")
-
-
-@thread_app.command("tui")
-def thread_tui(
-    day: str = typer.Option("", help="YYYY-MM-DD; default today (TAB toggles yesterday)."),
-) -> None:
-    """H1 标注屏的 Terminal 图形化：挂终端的 Rich Live 面板，单键即标.
-
-    上半屏实时工作线，下半屏当日重建（⚠ 分歧行置顶）。a 都对 / y 对 / x 不是 /
-    r 改名 / m 并入 / p 钉住 / TAB 切昨天 / q 退出——零二级确认，每次按键铸标签。
-    """
-    _init()
-    import sys
-
-    from .tui import thread_review
-
-    if not sys.stdin.isatty():
-        typer.echo("thread tui needs an interactive terminal (stdin is not a TTY)")
-        raise typer.Exit(1)
-    thread_review.run(day=day)
-
-
-@thread_app.command("list")
-def thread_list(
-    status: str = typer.Option("", help="Filter: active/background/done/stale/superseded."),
-) -> None:
-    """List work threads (newest activity first)."""
-    _init()
-    from .store import fts as fts_mod
-    from .workthread import store as wt_store
-
-    with fts_mod.cursor() as conn:
-        statuses = (status,) if status else None
-        threads = wt_store.list_threads(conn, statuses=statuses)
-        if not threads:
-            typer.echo("(no work threads)")
-            raise typer.Exit()
-        for t in threads:
-            approx = "≈" if t.approximate else ""
-            pin = " 📌" if t.pinned else ""
-            actor = f"（{t.origin_actor} 交办）" if t.origin_actor else ""
-            typer.echo(
-                f"{t.id}  [{t.status}]{pin} {t.title}{actor} — "
-                f"{t.total_active_minutes}{approx}min, conf={t.confidence:.2f}, "
-                f"last={t.last_active}"
-            )
-
-
-@thread_app.command("review-day")
-def thread_review_day(
-    day: str = typer.Option("", help="YYYY-MM-DD; default today."),
-) -> None:
-    """H1 日终一屏标注：当日线重建 + 待标注队列（每日全量真值的采集口）."""
-    _init()
-    from .store import fts as fts_mod
-    from .workthread import review as wt_review
-
-    with fts_mod.cursor() as conn:
-        rv = wt_review.build_day_review(conn, day=day or None)
-        typer.echo(f"== {rv.day} 工作线重建（对吗?） ==")
-        if not rv.lines:
-            typer.echo("(no threads touched this day)")
-        for line in rv.lines:
-            h = line["day_minutes"] / 60
-            approx = "≈" if line["approximate"] else ""
-            actor = f"（{line['origin_actor']}）" if line["origin_actor"] else ""
-            typer.echo(
-                f"  {line['thread_id']}  {line['title']}{actor} — 今日 {h:.1f}{approx}h"
-                f" [{line['status']}] conf={line['confidence']:.2f}"
-            )
-        if rv.pending_labels:
-            typer.echo(f"⚠ {rv.pending_labels} 个分歧窗口待标注（H2 队列，优先看这些线）")
-        typer.echo(
-            "点头: thread correct <id> confirm · 修正: not_this / "
-            "--rename / merge --into <id> / pin"
-        )
-
-
-@thread_app.command("correct")
-def thread_correct(
-    thread_id: str = typer.Argument(..., help="Thread id (from thread list)."),
-    action: str = typer.Argument(..., help="confirm | not_this | rename | merge | pin（纠错闭集）"),
-    rename: str = typer.Option("", "--rename", help="New title (action=rename)."),
-    into: str = typer.Option("", "--into", help="Absorbing thread id (action=merge)."),
-) -> None:
-    """零成本纠错口：每次纠错同时铸一条真值标签回流 confidence（spec §十）."""
-    _init()
-    from .store import fts as fts_mod
-    from .workthread import review as wt_review
-
-    with fts_mod.cursor() as conn:
-        result = wt_review.apply_correction(
-            conn, thread_id=thread_id, action=action, new_title=rename, into_id=into
-        )
-    if not result.get("ok"):
-        typer.echo(f"✗ {result.get('error')}")
-        raise typer.Exit(1)
-    typer.echo(f"✓ {action} {thread_id}")
-
-
-@thread_app.command("stats")
-def thread_stats() -> None:
-    """Churn / revive / disagreement telemetry（辅助形状指标，真值以 H1 为准）."""
-    _init()
-    import json as json_mod
-
-    from .store import fts as fts_mod
-    from .workthread import store as wt_store
-
-    with fts_mod.cursor() as conn:
-        typer.echo(json_mod.dumps(wt_store.stats(conn), ensure_ascii=False, indent=2))
-
-
-@thread_app.command("unfreeze")
-def thread_unfreeze() -> None:
-    """解冻 open（churn 超阈后由人工确认重新放开新开线）."""
-    _init()
-    from .store import fts as fts_mod
-    from .workthread import store as wt_store
-
-    with fts_mod.cursor() as conn:
-        wt_store.unfreeze_open(conn)
-    typer.echo("✓ open unfrozen")
-
-
-@thread_app.command("export-golden")
-def thread_export_golden(
-    day: str = typer.Argument(..., help="YYYY-MM-DD — an H1-labeled day."),
-) -> None:
-    """把已标注日导出为 S2 金标准夹具骨架（生产持续铸造 eval 集，spec 10.4）."""
-    _init()
-    import json as json_mod
-
-    from .store import fts as fts_mod
-    from .workthread import review as wt_review
-
-    with fts_mod.cursor() as conn:
-        typer.echo(
-            json_mod.dumps(
-                wt_review.export_day_fixture(conn, day=day), ensure_ascii=False, indent=2
-            )
-        )
 
 
 install_app = typer.Typer(help="Register the MCP server with common LLM clients.")
@@ -1914,10 +1650,82 @@ def timeline_list(
 writer_app = typer.Typer(help="Writer subcommands.")
 app.add_typer(writer_app, name="writer")
 
+model_app = typer.Typer(help="Build, inspect, and export the personal model.")
+app.add_typer(model_app, name="model")
+
+
+@model_app.command("build")
+def model_build(
+    wait_seconds: float = typer.Option(
+        30.0, "--wait-seconds", min=0.0, help="Seconds to wait for another build."
+    ),
+    no_wait: bool = typer.Option(False, "--no-wait", help="Return busy immediately."),
+) -> None:
+    """Run the shared one-shot Point/Line/Face/Volume/Root build."""
+    from .model import ModelBuildBusy, run_model_build
+
+    cfg = _init()
+    try:
+        result = run_model_build(cfg, wait_seconds=0.0 if no_wait else wait_seconds)
+    except ModelBuildBusy as exc:
+        console.print(f"[yellow]busy: {exc}[/yellow]")
+        raise typer.Exit(2) from exc
+    counts = result.stats
+    console.print(
+        f"[bold]model build: {result.status}[/bold]  "
+        f"points={counts['points']} lines="
+        f"{counts['evolution_lines'] + counts['relation_lines']} "
+        f"faces={counts['faces']} volumes={counts['volumes']} roots={counts['roots']}"
+    )
+    console.print(f"manifest: {result.manifest_path}")
+
+
+@model_app.command("export")
+def model_export(
+    out: str = typer.Option("", "--out", help="Output JSON path (default: root exports dir)."),
+    raw: bool = typer.Option(False, "--raw", help="Include unredacted local text."),
+) -> None:
+    """Export the current versioned model snapshot; redacted by default."""
+    from .model import export_snapshot, load_last_manifest
+
+    _init()
+    if raw:
+        console.print("[yellow]warning: --raw may contain sensitive personal data[/yellow]")
+    target = Path(out).expanduser() if out else None
+    with fts.cursor() as conn:
+        path = export_snapshot(
+            conn,
+            out_path=target,
+            redact=not raw,
+            build_metadata=load_last_manifest(),
+        )
+    console.print(f"model snapshot: {path}")
+
+
+@model_app.command("status")
+def model_status_cmd() -> None:
+    """Show live model readiness, geometry counts, and the last build id."""
+    from .model import load_last_manifest, model_status
+
+    _init()
+    with fts.cursor() as conn:
+        status = model_status(conn)
+    last = load_last_manifest()
+    counts = status["stats"]
+    console.print(
+        f"[bold]model: {'ready' if status['ready'] else 'not ready'}[/bold]  "
+        f"points={counts['points']} lines="
+        f"{counts['evolution_lines'] + counts['relation_lines']} "
+        f"faces={counts['faces']} volumes={counts['volumes']} roots={counts['roots']}"
+    )
+    if status["issues"]:
+        console.print(f"issues: {', '.join(status['issues'])}")
+    console.print(f"last build: {last.get('build_id') if last else 'none'}")
+
 
 @writer_app.command("run")
 def writer_run() -> None:
-    """Reduce any pending sessions and run the classifier on each result."""
+    """Reduce pending sessions and finish their personal-model stages."""
     cfg = _init()
     from .writer import agent
 
@@ -1925,6 +1733,7 @@ def writer_run() -> None:
     console.print(
         f"[bold]reduced={result.reduced} "
         f"classified={result.classified} "
+        f"modeled={result.modeled} "
         f"written={len(result.written_ids)}[/bold]"
     )
     for s in result.summaries:
@@ -2285,31 +2094,6 @@ def chat() -> None:
     run_chat_sync(cfg)
 
 
-@app.command()
-def bootstrap(
-    no_llm: bool = typer.Option(
-        False, "--no-llm", help="跳过 LLM 合成,只打印结构化报告(离线兜底)。"
-    ),
-    dry_run: bool = typer.Option(False, "--dry-run", help="采集 + 报告,但不写入 memory。"),
-    as_json: bool = typer.Option(
-        False, "--json", help="输出原始信号 bundle 为 JSON(供管道/调试)。"
-    ),
-    shallow: bool = typer.Option(
-        False, "--shallow", help="只遍历目录结构、不读文件正文(更保守的隐私边界)。"
-    ),
-) -> None:
-    """Day-0 冷启动:榨取本机本地 context,合成「这个人是谁」的画像并写入 memory。"""
-    cfg = _init()
-    # Source the managed env file so LLM keys are available for synthesis,
-    # exactly like `start` does before the daemon forks.
-    env_file_mod.load_env_file(paths.env_file())
-    from .bootstrap import runner
-
-    raise typer.Exit(
-        runner.run(cfg, use_llm=not no_llm, dry_run=dry_run, as_json=as_json, deep=not shallow)
-    )
-
-
 clean_app = typer.Typer(help="Delete past data. Destructive — use with care.")
 app.add_typer(clean_app, name="clean")
 
@@ -2473,102 +2257,6 @@ debug_app = typer.Typer(help="Diagnostics for in-flight pipeline stages.")
 app.add_typer(debug_app, name="debug")
 
 
-def _parse_duration(spec: str) -> datetime:
-    """Parse ``1h`` / ``30m`` / ``2d`` into an absolute timestamp ``now - delta``.
-
-    Accepts a trailing unit of ``s`` / ``m`` / ``h`` / ``d``. Defaults to
-    minutes when the unit is missing. Raises ``typer.BadParameter`` on
-    malformed input so the CLI surface shows a clean error instead of a
-    Python traceback.
-    """
-    from datetime import timedelta
-
-    raw = spec.strip().lower()
-    if not raw:
-        raise typer.BadParameter("duration is empty")
-    unit = raw[-1] if raw[-1].isalpha() else "m"
-    body = raw[:-1] if raw[-1].isalpha() else raw
-    try:
-        value = int(body)
-    except ValueError as exc:
-        raise typer.BadParameter(f"invalid duration {spec!r}") from exc
-    if value <= 0:
-        raise typer.BadParameter("duration must be positive")
-    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    if unit not in multipliers:
-        raise typer.BadParameter(f"invalid duration unit {unit!r}; use s / m / h / d")
-    delta = timedelta(seconds=value * multipliers[unit])
-    return datetime.now().astimezone() - delta
-
-
-@debug_app.command("intents")
-def debug_intents(
-    last: str = typer.Option(
-        "1h",
-        "--last",
-        "-l",
-        help="Lookback window (e.g. 30m, 1h, 2d). Default 1h.",
-    ),
-    scope: str = typer.Option(
-        "",
-        "--scope",
-        help="Filter by scene scope (e.g. session-<id>, fast-K1). Default: all.",
-    ),
-    status: str = typer.Option(
-        "",
-        "--status",
-        help="Filter by status (open / armed / consumed / dismissed). Default: all.",
-    ),
-) -> None:
-    """Show recognized intents from the unified intent stream in the lookback window.
-
-    Diagnostic tool over the ``intents`` table — the table-of-record every
-    recognizer (slow trajectory + fast K1 + scene packs) persists into.
-    """
-    _init()
-    from datetime import datetime as _dt
-
-    from .intent import store as intent_store
-
-    since = _parse_duration(last)
-    with fts.cursor() as conn:
-        intents = intent_store.recent_intents(
-            conn,
-            start=since.isoformat(),
-            end=_dt.now().astimezone().isoformat(),
-            scope=scope or None,
-            status=status or None,
-        )
-
-    if not intents:
-        console.print(f"[yellow]No intents since {since.isoformat()}[/yellow]")
-        return
-
-    for it in intents:
-        when = it.payload.get("when_text", "")
-        with_list = ", ".join(it.payload.get("with") or []) or "—"
-        channel = it.payload.get("channel", "")
-        console.print(
-            f"[bold]{it.ts}[/bold] [cyan]{it.kind}[/cyan] "
-            f"scope=[magenta]{it.scope}[/magenta] status={it.status} "
-            f"confidence={it.confidence:.2f}"
-        )
-        detail = f"  when={when!r} with=[{with_list}]"
-        if channel:
-            detail += f" channel={channel}"
-        console.print(detail)
-        if it.rationale:
-            console.print(f"    rationale: {it.rationale}")
-        for ev in it.evidence:
-            if ev.quote:
-                console.print(f"    evidence: {ev.quote}")
-        if it.fire_on:
-            fired = it.fired_at or "not yet"
-            console.print(f"    fire_on={it.fire_on} fired_at={fired}")
-
-    console.print(f"\n[dim]{len(intents)} intent(s) since {since.isoformat()}.[/dim]")
-
-
 @debug_app.command("chat-captures")
 def debug_chat_captures(
     app: str = typer.Option(
@@ -2619,78 +2307,6 @@ def debug_chat_captures(
     )
     console.print(f"[dim]window: {start} → {end}[/dim]\n")
     console.print(text)
-
-
-def _make_dream_verbose_handler(con: Console) -> Callable[[str, dict[str, Any]], None]:
-    def on_event(event_type: str, data: dict[str, Any]) -> None:
-        if event_type == "llm_text":
-            reasoning = (data.get("reasoning") or "").strip()
-            text = (data.get("text") or "").strip()
-            if reasoning:
-                con.print(f"\n[dim]💭 {reasoning}[/dim]")
-            if text:
-                con.print(f"\n[bold]◉ LLM[/bold] {text}")
-        elif event_type == "tool_call":
-            con.print(f"  [cyan]▶[/cyan] {data.get('name', '')}")
-
-    return on_event
-
-
-@app.command()
-def dream(
-    days: int = typer.Option(
-        0,
-        "--days",
-        "-d",
-        help="Override lookback_days (0 = use config default).",
-        min=0,
-    ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Print LLM replies and tool calls in real time.",
-    ),
-) -> None:
-    """Run the Dream stage manually: detect workflows from the last N days of activity."""
-    _init()
-    cfg = config_mod.load()
-    if days > 0:
-        from dataclasses import replace
-
-        cfg = replace(cfg, dream=replace(cfg.dream, lookback_days=days))
-
-    from .writer import dream as dream_mod
-
-    on_event = _make_dream_verbose_handler(console) if verbose else None
-    result = dream_mod.run_dream(cfg, on_event=on_event)
-
-    if result.skipped_reason:
-        console.print(f"[yellow]Dream skipped: {result.skipped_reason}[/yellow]")
-        return
-
-    status = "[green]committed[/green]" if result.committed else "[yellow]not committed[/yellow]"
-    console.print(f"\nDream finished ({status}) — {result.iterations} iteration(s)")
-    if result.summary:
-        console.print(f"  {result.summary}")
-    if result.written_ids:
-        console.print(f"  written: {', '.join(result.written_ids)}")
-    if result.created_paths:
-        console.print(f"  created: {', '.join(result.created_paths)}")
-
-
-@app.command()
-def meeting_server(
-    host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
-    port: int = typer.Option(8750, "--port", help="Bind port."),
-) -> None:
-    """Start HTTP server to control meeting assistant via API."""
-    _init()
-    env_file_mod.load_env_file(paths.env_file())
-
-    from .meeting.server import run_server
-
-    run_server(host=host, port=port)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@
 - 只见一次的低置信人名按保守策略处理（不报错、不上提）。
 
 写入只走 evomem 公共写入口（``add_direct`` / ``commit_*``）；播种 fixture 用注入的
-假 name source（不触发 intent recognizer）。
+假 name source（不触发采集或分类）。
 """
 
 from __future__ import annotations
@@ -19,11 +19,7 @@ from types import SimpleNamespace
 
 from persome.evomem.engine import EvoMemory
 from persome.evomem.models import MemoryLayer, MemoryStatus
-from persome.evomem.person_graph import (
-    IntentPersonNameSource,
-    PersonEvent,
-    PersonGraph,
-)
+from persome.evomem.person_graph import PersonEvent, PersonGraph
 from persome.evomem.reconciler import Reconciler
 
 
@@ -250,58 +246,7 @@ def test_empty_or_invalid_name_is_ignored(ac_root):
     assert graph.list_persons() == []
 
 
-# ── 默认 name source：从 intents 表读 payload.with ───────────────────────────
-
-
-def test_intent_name_source_reads_payload_with(ac_root):
-    """默认 seam 从 intents 表的 payload.with 提取人名事件（只读 recognizer 产出）。"""
-    import json
-
-    from persome.intent import store as intent_store
-    from persome.store import fts
-
-    with fts.cursor() as conn:
-        intent_store.ensure_schema(conn)
-        conn.execute(
-            "INSERT INTO intents (ts, scope, kind, confidence, status, rationale, "
-            "payload, evidence, dedup_key, created_at) "
-            "VALUES (?, ?, ?, ?, 'open', ?, ?, '[]', ?, ?)",
-            (
-                _ts(20).isoformat(),
-                "timeline",
-                "meeting",
-                0.9,
-                "周会同步",
-                json.dumps({"with": ["王五", "Bob"]}, ensure_ascii=False),
-                "k1",
-                _ts(20).isoformat(),
-            ),
-        )
-
-    source = IntentPersonNameSource()
-    events = source.events()
-    names = {e.name for e in events}
-    assert names == {"王五", "Bob"}
-    assert all(e.confidence == 0.9 for e in events)
-    assert all(e.summary == "周会同步" for e in events)
-
-    # 端到端：用默认 seam 入图
-    graph = PersonGraph(_mem(), cfg=_on(), name_source=source)
-    graph.ingest()
-    assert {p.canonical for p in graph.list_persons()} == {"王五", "Bob"}
-
-
-def test_intent_name_source_failsafe_on_bad_data(ac_root):
-    """来源读不到/坏数据 → 空列表，绝不抛。"""
-
-    def bad_factory():
-        raise RuntimeError("db down")
-
-    source = IntentPersonNameSource(conn_factory=bad_factory)
-    assert source.events() == []
-
-
-# ── 混合 naive/aware 时间戳（2026-07-03 生产 bootstrap 实测炸点）────────────────
+# ── 混合 naive/aware 时间戳 ─────────────────────────────────────────────────
 
 
 def test_person_timeline_survives_mixed_naive_and_aware_timestamps(ac_root):

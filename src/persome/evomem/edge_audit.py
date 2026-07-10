@@ -5,8 +5,8 @@ extraction quality gets a number instead of a vibe. Two tiers:
 
 **Deterministic tier (zero LLM, always on)** — structural hallucination:
 every minted edge is traceable by construction (quote ≤120 chars excerpted
-from its source; ``event:<intents.id>`` identities point at the minting
-intent; person/project edges point at their entity files), so the checks
+from its source; ``event:intent|entry|session:*`` identities point at their
+minting source; person/project edges point at their entity files), so the checks
 re-derive what ``add_edge``/the extractor claimed:
 
 - ``src_exists`` / ``dst_exists`` — the endpoint identity still resolves
@@ -52,7 +52,6 @@ from ..store import relation_edges as edges_store
 
 logger = get("persome.evomem.edge_audit")
 
-_DONE_STATUSES = ("consumed", "resolved", "completed")
 _ENTITY_PREFIXES = ("person-", "org-", "project-", "tool-")
 
 # the extractor's honest synthetic fallbacks (constructions, not excerpts)
@@ -70,6 +69,66 @@ def _norm_ws(text: str) -> str:
 
 def _is_synthetic(quote: str) -> bool:
     return any(p.match(quote or "") for p in _SYNTHETIC_PATTERNS)
+
+
+def _activity_source(identity: str) -> tuple[str, str] | None:
+    from ..model.activity_source import normalize_activity_identity
+
+    normalized = normalize_activity_identity(identity)
+    parts = normalized.split(":", 2)
+    if len(parts) != 3 or parts[0] != "event" or parts[1] not in {"intent", "entry", "session"}:
+        return None
+    return parts[1], parts[2]
+
+
+def _activity_evidence(conn, identity: str, row: Any | None = None) -> tuple[bool, list[str], str]:
+    """Resolve one Activity identity/source triplet to live evidence text."""
+    source = _activity_source(identity)
+    if row is not None:
+        try:
+            kind = str(row["source_kind"] or "")
+            source_id = str(row["source_id"] or "")
+            if kind and source_id:
+                source = (kind, source_id)
+        except (IndexError, KeyError, TypeError):
+            pass
+    if source is None:
+        return False, [], "unknown"
+    kind, source_id = source
+    try:
+        if kind == "intent":
+            record = conn.execute(
+                "SELECT status, rationale, resolution_outcome FROM intents WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+            if record is None:
+                return False, [], kind
+            done = str(record[0]) in {"consumed", "completed"} or (
+                str(record[0]) == "resolved" and str(record[2] or "") == "done"
+            )
+            return done, [str(record[1] or "")], kind
+        if kind == "entry":
+            record = conn.execute(
+                "SELECT content FROM entries WHERE id = ? AND prefix = 'event' "
+                "AND superseded = 0 LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            return record is not None, [str(record[0] or "")] if record else [], kind
+        if kind == "session":
+            from ..model.activity_source import ActivitySource
+
+            event = next(
+                (
+                    item
+                    for item in ActivitySource(conn, include_legacy_intents=False).events()
+                    if item.stable_id == f"event:session:{source_id}"
+                ),
+                None,
+            )
+            return event is not None, [event.summary] if event else [], kind
+    except Exception:  # noqa: BLE001 — old/missing stores are an honest unavailable source
+        return False, [], kind
+    return False, [], kind
 
 
 @dataclass
@@ -103,13 +162,8 @@ def _derived_kind(conn, identity: str) -> str | None:
     if identity == "self":
         return "self"
     if identity.startswith("event:"):
-        try:
-            row = conn.execute(
-                "SELECT status FROM intents WHERE id = ?", (identity.removeprefix("event:"),)
-            ).fetchone()
-        except Exception:  # noqa: BLE001 — table may predate this build
-            row = None
-        return "event" if row is not None else None
+        exists, _texts, _kind = _activity_evidence(conn, identity)
+        return "event" if exists else None
     for prefix, kind in (
         ("person-", "person"),
         ("org-", "org"),
@@ -201,17 +255,16 @@ def audit_edge(conn, row: Any, *, llm_call: Any | None = None) -> EdgeVerdict:
     # source existence + quote traceability, per edge family
     source_ok = True
     trace_ok = True
-    event_id = None
+    event_identity = None
     for ident in (src, dst):
         if ident.startswith("event:"):
-            event_id = ident.removeprefix("event:")
-    if event_id is not None:
-        srow = conn.execute(
-            "SELECT status, rationale FROM intents WHERE id = ?", (event_id,)
-        ).fetchone()
-        source_ok = srow is not None and str(srow[0]) in _DONE_STATUSES
+            event_identity = ident
+    if event_identity is not None:
+        source_ok, source_texts, source_kind = _activity_evidence(conn, event_identity, row)
+        if not source_ok and source_kind == "intent":
+            v.notes.append("legacy_source_unavailable")
         if source_ok and quote and not _is_synthetic(quote):
-            trace_ok = _norm_ws(quote) in _norm_ws(str(srow[1] or ""))
+            trace_ok = any(_norm_ws(quote) in _norm_ws(text) for text in source_texts)
     elif _is_synthetic(quote) and "曾在同一场景出现" in quote:
         # co-occurrence: re-derive the shared minute bucket instead of text trace
         trace_ok = _shared_bucket(conn, src, dst)

@@ -482,7 +482,57 @@ def test_ensure_schema_backfills_axis_columns(ac_root) -> None:
     )
     edges.ensure_schema(c)
     cols = {r[1] for r in c.execute("PRAGMA table_info(relation_edges)")}
-    assert {"src_kind", "dst_kind", "polarity", "observations", "recall_count"} <= cols
+    assert {
+        "src_kind",
+        "dst_kind",
+        "polarity",
+        "observations",
+        "recall_count",
+        "source_kind",
+        "source_id",
+        "source_receipt",
+    } <= cols
+
+
+def test_source_receipt_round_trips_as_one_contract(ac_root) -> None:
+    with fts.cursor() as conn:
+        eid = edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity="persome",
+            predicate="participates_in",
+            src_kind="self",
+            dst_kind="project",
+            provenance="inferred",
+            confidence=0.9,
+            source_kind="session",
+            source_id="event:session:synthetic-1",
+            source_receipt="⟨event:session:synthetic-1:fixtures/session-1.json⟩",
+        )
+        row = conn.execute(
+            "SELECT source_kind, source_id, source_receipt FROM relation_edges WHERE edge_id=?",
+            (eid,),
+        ).fetchone()
+    assert tuple(row) == (
+        "session",
+        "event:session:synthetic-1",
+        "⟨event:session:synthetic-1:fixtures/session-1.json⟩",
+    )
+
+
+def test_source_receipt_rejects_partial_contract(ac_root) -> None:
+    with fts.cursor() as conn, pytest.raises(ValueError, match="must be supplied together"):
+        edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity="persome",
+            predicate="participates_in",
+            src_kind="self",
+            dst_kind="project",
+            provenance="inferred",
+            confidence=0.9,
+            source_kind="session",
+        )
 
 
 # ── §4.6-2 结束判定器·人裁联动: close_edges_quoted_in ──

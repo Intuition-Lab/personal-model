@@ -8,7 +8,7 @@
 - embedding 不可用时优雅回退纯 LIKE,不抛、不崩。
 - 维度不写死(用 2 维假向量即可跑通,证明未绑定具体维度)。
 
-embedding 走依赖注入式 monkeypatch(`persome.intent.embeddings`),不依赖真实模型/网络。
+embedding 走依赖注入式 monkeypatch(`persome.retrieval.local_embeddings`),不依赖真实模型/网络。
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ def _fake_embed(text: str) -> np.ndarray | None:
 
 @pytest.fixture
 def _embeddings_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("persome.intent.embeddings.available", lambda: True)
-    monkeypatch.setattr("persome.intent.embeddings.embed", _fake_embed)
+    monkeypatch.setattr("persome.retrieval.local_embeddings.available", lambda: True)
+    monkeypatch.setattr("persome.retrieval.local_embeddings.embed", _fake_embed)
     # cosine 用真实实现(对 numpy 向量直接算)。
 
 
@@ -82,7 +82,7 @@ def test_flag_on_but_embeddings_unavailable_falls_back(
     ac_root, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """开关 on 但模型不可用 → 优雅回退纯 LIKE(与 off 一致),不抛。"""
-    monkeypatch.setattr("persome.intent.embeddings.available", lambda: False)
+    monkeypatch.setattr("persome.retrieval.local_embeddings.available", lambda: False)
     mem = EvoMemory(cfg=SimpleNamespace(evomem_vector_recall_enabled=True))
     _seed(mem)
     hits = mem.search(_PARAPHRASE_QUERY, top_k=10)

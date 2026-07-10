@@ -1,9 +1,6 @@
 # persome-core
 
-persome-core is a local-first screen-context memory daemon for macOS.
-
-<!-- hero: 3D memory geometry visualization (persome memory-viz) — video/gif here -->
-<!-- ![3D memory geometry visualization](TODO: hero video/gif from `persome memory-viz`) -->
+persome-core is the local-first Personal Model Runtime for macOS.
 
 ![CI](https://github.com/Persome-ai/persome-core/actions/workflows/ci.yml/badge.svg)
 ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
@@ -12,9 +9,12 @@ persome-core is a local-first screen-context memory daemon for macOS.
 
 ## What it is / Why
 
-persome-core captures macOS Accessibility tree events as you work. For AX-poor apps, it falls back to on-device screenshot OCR using PP-OCRv6 with 6.2 MB bundled weights and zero network.
+persome-core captures macOS Accessibility tree events as a person works. For
+AX-poor apps, optional on-device PP-OCRv6 can read a focused-window screenshot
+without network egress. OCR is bundled but disabled by default; AX capture is
+the default observation path.
 
-It distills captures into durable Markdown memory files plus SQLite with FTS5 and a vector index. In our production data, the memory geometry contains 3846 points, 1043 lines, 88 faces, and 1 body. These are layers of abstraction: a point is a single fact, a line a relation between two facts, a face a behavioral pattern that emerges over a cluster of facts, and the body the worldview those patterns roll up into.
+It distills captures into durable Markdown memory files plus SQLite with FTS5 and a vector index. The model has explicit layers: a Point is a sourced fact, a Line is an evolution or semantic relation, a Face is a behavioral pattern, a Volume is a cross-domain structure, and Root is the single apex that can be expanded back to its receipts.
 
 The [Personome paper](https://persome-ai.github.io/persome/) states the thesis: an LLM predicts the next token, and a Personome predicts a person's next action, with memory as the weights of your personal model.
 
@@ -32,6 +32,10 @@ bash install.sh
 open **System Settings → Privacy & Security → Accessibility** and enable the terminal
 you launch persome from (Terminal, iTerm2, Warp, VS Code, …). Without this grant the
 daemon runs but captures nothing.
+
+If you enable `[capture] enable_ocr_fallback = true` or retain screenshots,
+also grant **Screen Recording** to the same executable. Restart Persome after
+changing either macOS permission.
 
 Configure your LLM key (bring your own — nothing ships in the tree):
 
@@ -58,12 +62,47 @@ persome doctor   # ✓/✗ per prerequisite (env file, key, Swift helpers, AX gr
 
 persome start
 # MCP HTTP endpoint: http://127.0.0.1:8742/mcp
+# Local Point/Line/Face/Volume/Root explorer: http://127.0.0.1:8742/model
+
+# Use the same model from a local terminal chat (there is no browser Chat UI):
+persome chat
+
+# Build and inspect the current personal model:
+persome model build
+persome model status
+persome model export
 
 # Or use stdio:
 persome mcp
 ```
 
 Bring your own key. No key ships with the code. Without a key, capture and BM25 retrieval still work, and LLM-dependent stages degrade cleanly.
+
+### From observation to a personal model
+
+Leave the daemon running while you work. It groups observations into one-minute
+timeline blocks and deterministic work sessions. When a session ends, the
+terminal finalizer reduces its activity, extracts an evidence-gated structured
+memory delta, and deterministically applies durable entities, assertions,
+events, and relations as Points and Lines. It also records repeated behavioral
+patterns as evidence-backed skill memory.
+
+At 00:15 local time by default, the daemon runs the same locked build as
+`persome model build`: pending session recovery, case extraction, schema mining,
+cross-domain synthesis, Root synthesis, vectors, and semantic layout. A new or
+sparse store is expected to be `degraded` until repeated evidence is sufficient
+for a Face, Volume, and Root. `persome model status` explains which geometry is
+missing; the viewer reflects the current store rather than filling gaps with
+synthetic data.
+
+An LLM key is therefore optional for collection and BM25 access, but required
+for real semantic modeling. `PERSOME_LLM_MOCK=1` exists only for deterministic
+tests and produces synthetic verification output, not a real person's model.
+
+The optional Chat surface is model-focused by default. Shell, arbitrary
+filesystem, and Web tools require the explicit
+`[chat] unsafe_local_tools_enabled = true` opt-in. Web search/page fetch also
+requires installing the `chat` extra (`persome-core[chat]`).
 
 ## Use it from your agent (MCP)
 
@@ -102,26 +141,25 @@ Cursor over stdio:
 ## Architecture
 
 ```text
-Swift watcher
+Swift watcher / trusted ingest
   -> S0 debounce
   -> S1 parse (focused_element / visible_text / url)
   -> capture buffer
   -> 1-minute timeline blocks
   -> session segmentation (three deterministic rules)
   -> reducer
-  -> classifier
-  -> memory/*.md
+  -> terminal model finalizer
 
-+-------------------+
-| Consolidation     |
-|                   |
-| memory_delta      | one LLM read per session + deterministic gates
-| schema mining     |
-| schema_faces      | points / lines / faces / bodies
-| root apex         |
-| tiered forgetting | read = immunity
-| adjudication      | semantic contradictions
-+-------------------+
++-----------------------+
+| Personal model        |
+|                       |
+| memory_delta          | evidence gates -> Points / relation Lines
+| pattern detector      | repeated behavior -> skill memory
+| case + schema mining  | reusable solutions -> Faces
+| cross-domain + Root   | Volumes -> one auditable apex
+| tiered forgetting     | read = reinforcement
+| adjudication          | explicit correction / contradiction queue
++-----------------------+
 
 +-------------------+
 | Retrieval         |
@@ -134,14 +172,16 @@ Swift watcher
 
 ## Privacy
 
-- All data stays on the machine under `~/.persome`.
-- The only network egress is the LLM endpoint you configure, plus an optional embeddings endpoint.
+- Persistent model data stays under `~/.persome`.
+- Enabled LLM stages send derived context to the endpoint you configure; optional dense retrieval sends embedding inputs to its configured endpoint.
 - There is no telemetry.
-- OCR is fully local.
+- OCR is optional, subprocess-isolated, and fully local.
 - Secrets live in a 0600 env file at `~/.persome/env`.
 - The capture buffer has a tiered retention policy.
-- Egress paths are few enough to verify by grepping the source.
-- Computer-use actuation is off by default in the open-source build. When enabled, it uses opt-in config, a per-action confirmation loop, and a kill switch. See [SECURITY.md](SECURITY.md).
+- The runtime does not include computer-use actuation, meeting audio capture, or filesystem profiling.
+
+See [SECURITY_PRIVACY.md](SECURITY_PRIVACY.md) for the exact egress and trust
+boundary.
 
 ## How it compares
 
@@ -153,11 +193,22 @@ Swift watcher
 
 ## Provenance
 
-persome-core is derived from Einsia/OpenChronicle (MIT, notices preserved in NOTICE / THIRD_PARTY_NOTICES); of the current 66,480-line tree, retained upstream code is ~11% (8,472 upstream lines, 89% kept), and ~89% is new to this project.
+persome-core is derived from Einsia/OpenChronicle (MIT). Its provenance and retained upstream license notices are preserved in [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 
 ## Paper
 
-[Personome](https://persome-ai.github.io/persome/): an LLM predicts the next token, and a Personome predicts a person's next action, with memory as the weights of your personal model.
+[Personome](https://persome-ai.github.io/persome/): an LLM predicts the next token, and a Personome predicts a person's next action, with memory as the weights of your personal model. This repository implements state formation, personal weights, provenance, and model access. It does not claim to ship the paper's next-action predictor. Prediction datasets, metrics, and ablations belong in the separate `persome-bench` repository so evaluation can pin a released Runtime version without coupling benchmark code to private local storage.
+
+The exact claim-to-code boundary is in [PAPER.md](PAPER.md). Reproduce the
+fresh-root synthetic model with [REPRODUCING.md](REPRODUCING.md).
+
+## Documentation
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Runtime boundary and pipeline.
+- [MODEL_FORMAT.md](MODEL_FORMAT.md) — versioned model snapshot.
+- [MCP.md](MCP.md) — public agent interface.
+- [SECURITY_PRIVACY.md](SECURITY_PRIVACY.md) — data, egress, and threat model.
+- [docs/INDEX.md](docs/INDEX.md) — maintainer references.
 
 ## License
 

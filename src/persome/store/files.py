@@ -81,15 +81,6 @@ VALID_PREFIXES = (
     # write through the same markdown-SSOT path (create_file/append_entry →
     # validate_prefix → files table). See migration-D2-cognition §3.3 / MCP-05.
     "schema-",
-    # WorkThread layer (spec 2026-06-12): ``thread-*.md`` is the markdown
-    # projection of the ``work_threads`` state machine — the "现在进行时" lines.
-    "thread-",
-    # Reverse-loop G1 (spec 2026-06-26 §3.1.3): ``task-outcome-*.md`` is the ONLY
-    # content-bearing reverse channel — an app-distilled, desensitized summary of
-    # what a completed proactive task produced, ingested via ``POST /memory/ingest``.
-    # Like ``event-*`` it is **evo_nodes-exempt** (Q2): append-only execution-product
-    # log, markdown + FTS only, never the entity chain.
-    "task-outcome-",
 )
 
 # Subdirectories of memory_dir() that are allowed in path names.
@@ -321,21 +312,6 @@ def _parse_entries(body: str) -> list[ParsedEntry]:
 def render_heading(*, timestamp: str, entry_id: str, tags: list[str]) -> str:
     tag_part = "".join(f" #{t}" for t in tags) if tags else ""
     return f"## [{timestamp}] {{id: {entry_id}}}{tag_part}"
-
-
-def render_file(
-    *, fm: dict[str, Any], entries: list[ParsedEntry], header_lines: list[str] | None = None
-) -> str:
-    parts: list[str] = []
-    if header_lines:
-        parts.extend(header_lines)
-        parts.append("")
-    for e in entries:
-        parts.append(e.heading_line)
-        if e.body:
-            parts.append(e.body)
-        parts.append("")
-    return "\n".join(parts).rstrip() + "\n"
 
 
 def update_frontmatter(path: Path, updates: dict[str, Any]) -> None:

@@ -71,6 +71,18 @@ class TestModelResolution:
         monkeypatch.setenv("PERSOME_OCR_MODELS_DIR", str(tmp_path))
         assert ocr_local._models_root() == tmp_path
 
+    def test_models_root_finds_installed_package_bundle(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        module = tmp_path / "persome" / "capture" / "ocr_local.py"
+        packaged = tmp_path / "persome" / "_bundled" / "ocr_models"
+        packaged.mkdir(parents=True)
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.touch()
+        monkeypatch.setattr(ocr_local, "__file__", str(module))
+
+        assert ocr_local._models_root() == packaged
+
 
 # ─── recognize: fail-open + parsing ──────────────────────────────────────────
 
@@ -171,22 +183,6 @@ class TestDisableKillSwitch:
 
 
 # ─── result extraction ───────────────────────────────────────────────────────
-
-
-class TestExtractTexts:
-    def test_dict_form(self) -> None:
-        assert ocr_local._extract_texts([{"rec_texts": ["a", "b"]}]) == ["a", "b"]
-
-    def test_attr_form(self) -> None:
-        class _R:
-            rec_texts = ["c"]
-
-        assert ocr_local._extract_texts([_R()]) == ["c"]
-
-    def test_empty_and_none(self) -> None:
-        assert ocr_local._extract_texts([]) == []
-        assert ocr_local._extract_texts(None) == []
-        assert ocr_local._extract_texts([{"rec_texts": None}]) == []
 
 
 # ─── real inference (integration; deselected by the default gate) ─────────────

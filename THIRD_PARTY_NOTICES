@@ -27,15 +27,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================
-cua-driver (trycua/cua) — https://github.com/trycua/cua
-The background-actuation click recipe in
-resources/mac-ax-actuator.swift (SkyLight event synthesis; the
-MouseInput.stamp / postBoth sequences) is ported from this project.
+three.js — https://github.com/mrdoob/three.js
 ================================================================
 
 MIT License
 
-Copyright (c) 2025 Cua AI, Inc.
+Copyright © 2010-2024 three.js authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

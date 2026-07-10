@@ -53,14 +53,6 @@ class TestWeChatStructuring:
         md = ocr_structure.to_markdown(st)
         assert "X" not in md
 
-    def test_quality_metrics(self):
-        t, b, s = self._two_col()
-        st = ocr_structure.structure(t, b, s, bundle_id=WECHAT, img_w=960)
-        q = ocr_structure.quality(st)
-        assert q["chats"] == 1
-        assert q["time_ok"] == 1.0
-        assert q["contact_clean"] == 1.0
-
 
 class TestGenericFallback:
     def test_unknown_app_degrades_to_regions_no_fields(self):
@@ -107,11 +99,12 @@ class TestRealWeChatFixtures:
         st = ocr_structure.structure(
             d["texts"], d["boxes"], d["scores"], bundle_id=WECHAT, img_w=d["img_w"]
         )
-        q = ocr_structure.quality(st)
+        chats = st["sidebar"]["chats"]
         # baseline measured in the experiment: time/contact 100%, several chats parsed
-        assert q["chats"] >= 8
-        assert q["time_ok"] == 1.0, f"time field accuracy regressed: {q}"
-        assert q["contact_clean"] == 1.0, f"contact cleanliness regressed: {q}"
+        assert len(chats) >= 8
+        assert all(ocr_structure.TIME.match(c.get("time", "")) for c in chats)
+        assert all(c.get("contact", "").strip() for c in chats)
+        assert all(not ocr_structure.TIME.match(c.get("contact", "")) for c in chats)
         # the structured markdown is field-labeled and non-empty
         md = ocr_structure.to_markdown(st)
         assert "会话列表" in md and "联系人" in md
@@ -133,7 +126,7 @@ class TestRealWeChatFixtures:
 class TestConversationSenders:
     def _chat(self):
         # title (top-left) + my right bubble + peer left bubble + a centered timestamp
-        texts = ["周正雷", "我没化过妆", "-般gay都化", "13:27", "想你啦"]
+        texts = ["测试联系人", "我在写论文", "记得补上复现实验", "13:27", "已经更新结果"]
         boxes = [
             [352, 20, 392, 36],  # title, top, left
             [806, 60, 875, 76],  # me (right)
@@ -148,23 +141,14 @@ class TestConversationSenders:
         t, b, s = self._chat()
         st = ocr_structure.structure(t, b, s, bundle_id=WECHAT, img_w=960)
         conv = st["conversation"]
-        assert conv["name"] == "周正雷"
+        assert conv["name"] == "测试联系人"
         # title must NOT appear as a message line
-        assert all(ln["text"] != "周正雷" for ln in conv["lines"])
+        assert all(ln["text"] != "测试联系人" for ln in conv["lines"])
         by_text = {ln["text"]: ln["name"] for ln in conv["lines"]}
-        assert by_text["我没化过妆"] == "我"
-        assert by_text["-般gay都化"] == "对方"
-        assert by_text["想你啦"] == "我"
+        assert by_text["我在写论文"] == "我"
+        assert by_text["记得补上复现实验"] == "对方"
+        assert by_text["已经更新结果"] == "我"
         assert by_text["13:27"] == "timeline"
-
-    def test_conversation_quality_metric(self):
-        t, b, s = self._chat()
-        st = ocr_structure.structure(t, b, s, bundle_id=WECHAT, img_w=960)
-        q = ocr_structure.conversation_quality(st)
-        assert q["name_extracted"] is True
-        assert q["title_not_in_lines"] is True
-        assert q["lines_typed"] == 1.0
-        assert q["sender_coverage"] == 1.0  # every non-timeline line tagged 我/对方
 
     def test_pure_left_all_peer(self):
         # all left bubbles → all 对方
@@ -194,22 +178,21 @@ class TestConversationSenders:
         assert st["conversation"]["lines"] == []
         assert st["conversation"]["name"] is None
 
-    def test_real_chat_fixture(self):
+    def test_synthetic_chat_fixture(self):
         d = _fixture("wechat_chat.json")
         st = ocr_structure.structure(
             d["texts"], d["boxes"], d["scores"], bundle_id=WECHAT, img_w=d["img_w"]
         )
         conv = st["conversation"]
-        assert conv["name"] == "周正雷"
+        assert conv["name"] == "测试联系人"
         by_text = {ln["text"]: ln["name"] for ln in conv["lines"]}
-        # spot-check sender tagging against the real on-device geometry
-        assert by_text.get("我没化过妆") == "我"
-        assert by_text.get("没事你化又不出门") == "对方"
+        # Spot-check sender tagging against synthetic desktop geometry.
+        assert by_text.get("我在写论文") == "我"
+        assert by_text.get("记得补上复现实验") == "对方"
         assert by_text.get("13:27") == "timeline"
         # title lifted out of the message stream
-        assert all(ln["text"] != "周正雷" for ln in conv["lines"])
-        q = ocr_structure.conversation_quality(st)
-        assert q["lines_typed"] == 1.0 and q["name_extracted"] and q["title_not_in_lines"]
+        assert all(ln["text"] != "测试联系人" for ln in conv["lines"])
+        assert all(isinstance(line, dict) for line in conv["lines"])
 
 
 # ─── v3: adaptive sidebar↔conversation divider (window/sidebar-width robust) ─────
@@ -248,8 +231,8 @@ class TestAdaptiveDivider:
         )
         chats = st["sidebar"]["chats"]
         assert len(chats) > 0, "narrow sidebar must still yield a chat list (was 0 under fixed)"
-        q = ocr_structure.quality(st)
-        assert q["time_ok"] == 1.0 and q["contact_clean"] == 1.0
+        assert all(ocr_structure.TIME.match(c.get("time", "")) for c in chats)
+        assert all(c.get("contact", "").strip() for c in chats)
 
     def test_wide_sidebar_no_conversation_leak(self):
         # END-TO-END: the bug was conversation lines leaking into the chat list as

@@ -1,6 +1,6 @@
 """Async daemon wiring for the session/reducer pipeline.
 
-Three asyncio tasks live here:
+The daemon tasks wired here include:
 
   * ``run_check_cuts`` — calls ``SessionManager.check_cuts`` every
     ``session.tick_seconds`` so idle gaps / soft cuts fire even when
@@ -9,6 +9,8 @@ Three asyncio tasks live here:
     ``reducer.daily_tick_hour/minute``), force-ends the currently open
     session, retries any ``failed`` sessions, and covers the edge case
     where the process was offline across midnight.
+  * ``run_reducer_retry_tick`` — retries due failed reductions once per minute
+    and sends terminal success or heuristic fallback through model finalization.
   * ``build_manager`` — factory that wires ``on_session_end`` to
     persist a ``sessions`` row and spawn the S2 reducer thread.
 """
@@ -16,36 +18,23 @@ Three asyncio tasks live here:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 
-from .. import events as events_mod
 from ..config import Config
 from ..evomem import backup as evo_backup
 from ..evomem import integrity as evo_integrity
 from ..evomem import inversion as evo_inversion
-from ..intent import store as intent_store
 from ..logger import get
-from ..store import cooldown_suppressions as cooldown_suppressions_store
 from ..store import fts
-from ..store import intent_fold_ticks as intent_fold_ticks_store
-from ..store import outcomes as outcomes_store
 from ..store import parser_ticks as parser_ticks_store
-from ..store import recall_budget_ticks as recall_budget_ticks_store
-from ..workthread import executor as workthread_executor
-from ..workthread import store as workthread_store
-from ..workthread import tracker as workthread_tracker
+from ..writer import agent as writer_agent
 from ..writer import classifier as classifier_mod
 from ..writer import (
     contradiction_check,
-    cross_domain_sweeper,
     memory_decay,
     orphan_reaper,
-    root_synthesis,
-    schema_miner_stage,
     session_reducer,
 )
-from ..writer import pattern_detector as pattern_detector_mod
 from . import store as session_store
 from .manager import SessionManager
 
@@ -53,34 +42,9 @@ logger = get("persome.session")
 
 
 def _prune_telemetry_tables() -> dict[str, int]:
-    """Bound the per-call audit tables (``recall_budget_ticks`` /
-    ``recognition_ticks`` / ``parser_ticks`` / ``cooldown_suppressions`` /
-    ``fast_path_ticks`` / ``intent_fold_ticks`` / ``outcomes``).
-
-    Each records a row on *every* recall / recognition / parser tick (or every
-    cooldown drop, or every fast-path capture, or every finished execution) and
-    ships a ``prune(keep=...)`` advertised as "bounded telemetry", but nothing
-    ever called it — so on a long-running daemon the tables grew unbounded (the
-    "bounded" only ever lived in the docstring; #508). ``cooldown_suppressions``
-    (#533) is a sibling table that fell into the exact same trap, and
-    ``fast_path_ticks`` (#622) records a row per fast-path capture — the
-    highest-frequency table of the lot — so it is wired in here from birth to
-    avoid repeating #508. ``outcomes`` (#378) is the G4 execution-result ledger:
-    lower frequency (one row per accepted follow-up / supervised finish, not per
-    tick) but ``kind_success_rate`` reads it through a ``since`` window, so rows
-    outside the window are dead weight and it fell into the same trap. The daily
-    safety-net tick is the natural retention hook. Each ``prune`` commits on its
-    own connection.
-    """
-    deleted: dict[str, int] = {}
+    """Bound the parser audit table from the daily safety-net tick."""
     with fts.cursor() as conn:
-        deleted["recall_budget_ticks"] = recall_budget_ticks_store.prune(conn)
-        deleted["parser_ticks"] = parser_ticks_store.prune(conn)
-        deleted["cooldown_suppressions"] = cooldown_suppressions_store.prune(conn)
-        deleted["intent_fold_ticks"] = intent_fold_ticks_store.prune(conn)
-        deleted["outcomes"] = outcomes_store.prune(conn)
-    return deleted
-
+        return {"parser_ticks": parser_ticks_store.prune(conn)}
 
 
 def build_manager(cfg: Config) -> SessionManager:
@@ -127,148 +91,23 @@ def build_manager(cfg: Config) -> SessionManager:
         )
 
     def _after_reduce(result: session_reducer.ReduceResult) -> None:
-        """Terminal reducer succeeded → classify any window the 30-min tick missed."""
-        if not result.written or not result.entry_id or not result.path:
-            return
+        """Terminal reducer completion -> run the shared model finalizer."""
         if not result.is_final:
-            # Incremental flushes are handled by run_classifier_tick on its
-            # own cadence — the reducer callback only fires the terminal
-            # catch-up for any trailing window the tick hadn't reached yet.
             return
-        window_start: datetime | None = None
-        if result.end_time is not None:
-            with fts.cursor() as conn:
-                row = session_store.get_by_id(conn, result.session_id)
-                if row and row.classified_end:
-                    window_start = row.classified_end
-        try:
-            events_mod.publish("classifier", "stage_start", {"session_id": result.session_id})
-            classify = classifier_mod.classify_after_reduce(
-                cfg,
-                session_id=result.session_id,
-                event_daily_path=result.path,
-                just_written_entry_id=result.entry_id,
-                session_start=result.start_time,
-                session_end=result.end_time,
-                window_start=window_start,
-                on_event=events_mod.make_on_event("classifier"),
-            )
-            if classify.committed and classify.written_ids:
-                logger.info(
-                    "classifier %s: wrote %d entries into %s",
-                    result.session_id,
-                    len(classify.written_ids),
-                    ", ".join(classify.created_paths) or "existing files",
-                )
-            elif classify.skipped_reason:
-                logger.info(
-                    "classifier %s: skipped (%s)", result.session_id, classify.skipped_reason
-                )
-            else:
-                logger.info("classifier %s: committed with no writes", result.session_id)
-            events_mod.publish(
-                "classifier",
-                "stage_end",
-                {
-                    "session_id": result.session_id,
-                    "summary": classify.summary or "",
-                    "written": len(classify.written_ids),
-                },
-            )
-            if classify.committed and result.end_time is not None:
-                with fts.cursor() as conn:
-                    session_store.set_classified_end(
-                        conn,
-                        result.session_id,
-                        result.end_time,
-                    )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("classifier %s: crashed: %s", result.session_id, exc, exc_info=True)
-
-        # Pattern detection runs after classifier, using the same session window.
-        try:
-            events_mod.publish("pattern_detector", "stage_start", {"session_id": result.session_id})
-            detect = pattern_detector_mod.detect_after_classify(
-                cfg,
-                session_id=result.session_id,
-                event_daily_path=result.path,
-                session_start=result.start_time,
-                session_end=result.end_time,
-            )
-            if detect.committed and detect.written_ids:
-                logger.info(
-                    "pattern_detector %s: wrote %d entries into %s",
-                    result.session_id,
-                    len(detect.written_ids),
-                    ", ".join(detect.created_paths) or "existing files",
-                )
-            elif detect.skipped_reason:
-                logger.info(
-                    "pattern_detector %s: skipped (%s)",
-                    result.session_id,
-                    detect.skipped_reason,
-                )
-            else:
-                logger.info(
-                    "pattern_detector %s: committed with no writes",
-                    result.session_id,
-                )
-            events_mod.publish(
-                "pattern_detector",
-                "stage_end",
-                {
-                    "session_id": result.session_id,
-                    "written": len(detect.written_ids),
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
+        modeled = writer_agent.finalize_session(
+            cfg,
+            session_id=result.session_id,
+            event_daily_path=result.path,
+            just_written_entry_id=result.entry_id,
+        )
+        if modeled.completed:
+            logger.info("session %s: terminal model stages complete", result.session_id)
+        else:
             logger.warning(
-                "pattern_detector %s: crashed: %s", result.session_id, exc, exc_info=True
+                "session %s: terminal model stages incomplete (%s)",
+                result.session_id,
+                "; ".join(modeled.errors) or modeled.skipped_reason,
             )
-
-        # memory_delta consolidator (Memory-rebuild Phase 0, spec §4.1/§6.2):
-        # one shadow LLM read of the whole ended session → structured delta into
-        # the memory_deltas table. Gated on [memory_delta] enabled (default OFF);
-        # best-effort — a delta failure never affects the chain around it.
-        try:
-            from ..writer import memory_delta as memory_delta_mod
-
-            delta = memory_delta_mod.run_after_session(
-                cfg,
-                session_id=result.session_id,
-                start_time=result.start_time,
-                end_time=result.end_time,
-            )
-            if delta.written:
-                logger.info(
-                    "memory_delta %s: shadow row %d (%s)",
-                    result.session_id,
-                    delta.delta_id,
-                    ", ".join(f"{h}={n}" for h, n in delta.counts.items()),
-                )
-            elif delta.skipped_reason not in ("", "disabled"):
-                logger.info(
-                    "memory_delta %s: skipped (%s)", result.session_id, delta.skipped_reason
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("memory_delta %s: crashed: %s", result.session_id, exc)
-
-        # WorkThread tracker (spec 2026-06-12 §四): the ONLY mount point is this
-        # terminal-reduce callback (classifier 同款 — flush 路径不挂). The call
-        # enqueues the session summary and batch-runs the tracker when the
-        # aggregation window is due (max(60min, 5 summaries)). Best-effort —
-        # a tracker failure never affects the reduce/classify chain above.
-        try:
-            workthread_tracker.enqueue_session_summary(
-                cfg,
-                session_id=result.session_id,
-                summary=result.summary,
-                sub_tasks=result.sub_tasks,
-                start_time=result.start_time.isoformat() if result.start_time else "",
-                end_time=result.end_time.isoformat() if result.end_time else "",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("workthread tracker %s: crashed: %s", result.session_id, exc)
 
     return SessionManager(
         gap_minutes=cfg.session.gap_minutes,
@@ -277,6 +116,42 @@ def build_manager(cfg: Config) -> SessionManager:
         on_session_start=_on_start,
         on_session_end=_on_end,
     )
+
+
+async def run_reducer_retry_tick(cfg: Config) -> None:
+    """Retry due terminal reductions and finalize any completed session."""
+    if not cfg.reducer.enabled:
+        logger.info("reducer retry loop not started (reducer disabled)")
+        return
+    interval = 60
+    logger.info("reducer retry loop started (every %ds)", interval)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            results = await asyncio.to_thread(session_reducer.retry_due, cfg)
+            for reduced in results:
+                modeled = await asyncio.to_thread(
+                    writer_agent.finalize_session,
+                    cfg,
+                    session_id=reduced.session_id,
+                    event_daily_path=reduced.path,
+                    just_written_entry_id=reduced.entry_id,
+                )
+                if modeled.completed:
+                    logger.info(
+                        "session %s: retry completed terminal model stages",
+                        reduced.session_id,
+                    )
+                elif modeled.skipped_reason != "session not ready for modeling":
+                    logger.warning(
+                        "session %s: retry left model stages incomplete (%s)",
+                        reduced.session_id,
+                        "; ".join(modeled.errors) or modeled.skipped_reason,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("reducer retry tick failed: %s", exc, exc_info=True)
 
 
 async def run_check_cuts(cfg: Config, manager: SessionManager) -> None:
@@ -359,7 +234,6 @@ async def run_classifier_tick(cfg: Config, manager: SessionManager) -> None:
             if now - window_start < timedelta(seconds=interval):
                 continue
 
-            events_mod.publish("classifier", "stage_start", {"session_id": session_id})
             result = await asyncio.to_thread(
                 classifier_mod.classify_window,
                 cfg,
@@ -368,7 +242,6 @@ async def run_classifier_tick(cfg: Config, manager: SessionManager) -> None:
                 start=window_start,
                 end=now,
                 include_prior_day=window_start == session_start,
-                on_event=events_mod.make_on_event("classifier"),
             )
 
             if result.committed and result.written_ids:
@@ -389,16 +262,6 @@ async def run_classifier_tick(cfg: Config, manager: SessionManager) -> None:
                     "classifier tick %s: committed with no writes",
                     session_id,
                 )
-            events_mod.publish(
-                "classifier",
-                "stage_end",
-                {
-                    "session_id": session_id,
-                    "summary": result.summary or "",
-                    "written": len(result.written_ids),
-                },
-            )
-
             if result.committed or result.skipped_reason:
                 with fts.cursor() as conn:
                     session_store.set_classified_end(conn, session_id, now)
@@ -444,86 +307,6 @@ def _seconds_until_next_local(hour: int, minute: int) -> float:
     return (target - now).total_seconds()
 
 
-def expire_overdue_intents() -> tuple[int, int, int]:
-    """Blocking helper for the intent expiry harvest.
-
-    Returns ``(expired_open, expired_armed, stale_open)``:
-
-    - ``expired_open`` — the #546 面2 ``open``/``armed`` ``→expired`` harvest of
-      overdue GROUNDED intents by ``valid_until`` (#629 covers the armed leg);
-    - ``expired_armed`` — the #532 ``armed``→``expired`` TTL reap of dormant
-      event-based intents that never fired within their max age (a system/staleness
-      close, not a user rejection — the dormant row was never surfaced; §9 audit);
-    - ``stale_open`` — the #612 ``open``→``expired`` TTL reap of UNGROUNDED ``open``
-      rows (``valid_until`` NULL) older than their max age, the open-side twin of
-      the #532 armed reaper. These rows carry no deadline, so ``expire_overdue``
-      can never harvest them and ``is_expired`` reads them live forever — without
-      an age TTL they accumulate unbounded (66/70 ``open`` in the field).
-
-    Runs at two points: the 23:55 ``daily-safety-net`` tick, and once at daemon
-    startup as a catch-up (#628). All three legs are inherently idempotent — they
-    only touch rows still in ``open``/``armed`` whose ``valid_until``/age cutoff
-    has passed, so a row already harvested by a prior run is excluded by the
-    ``WHERE status = ... (IS NULL)`` guard; re-running never double-harvests.
-    """
-    now = datetime.now().isoformat(timespec="seconds")
-    with fts.cursor() as conn:
-        expired = intent_store.expire_overdue(conn, now=now)
-        expired_armed = intent_store.expire_stale_armed(conn, now=now)
-        stale_open = intent_store.expire_stale_open(conn, now=now)
-    # 识别即更新状态 (#intent-evidence-autoclose follow-up): make the daily/boot
-    # harvest flips LIVE on the SSE bus so the app drops a now-stale suggestion card
-    # the instant it's reaped, instead of waiting for the next reconcile poll. Best-
-    # effort per row (publish swallows its own errors); only the terminal new_status
-    # matters to the app's handleStatusChange (previous_status is informational).
-    for iid in expired:
-        intent_store.publish_intent_status_change(
-            iid, new_status="expired", previous_status=None, reason="harvest_overdue"
-        )
-    for iid in expired_armed:
-        intent_store.publish_intent_status_change(
-            iid, new_status="expired", previous_status="armed", reason="harvest_armed_ttl"
-        )
-    for iid in stale_open:
-        intent_store.publish_intent_status_change(
-            iid, new_status="expired", previous_status="open", reason="harvest_ungrounded_ttl"
-        )
-    return (len(expired), len(expired_armed), len(stale_open))
-
-
-def _workthread_daily_housekeeping() -> int:
-    """Blocking helper: stale harvest + 日终 threads 摘要进 event-daily 尾节.
-
-    Returns the number of threads harvested to ``stale``. The digest entry is
-    best-effort (its absence loses a convenience line, not state).
-    """
-    from ..store import entries as entries_mod
-
-    with fts.cursor() as conn:
-        harvested = workthread_executor.harvest_stale(conn)
-        open_lines = workthread_store.open_threads(conn)
-        if open_lines:
-            day = datetime.now().strftime("%Y-%m-%d")
-            lines = [
-                f"- [{t.status}] {t.title} — {t.total_active_minutes}min"
-                + ("≈" if t.approximate else "")
-                + (f"（{t.origin_actor} 交办）" if t.origin_actor else "")
-                for t in open_lines[:6]
-            ]
-            try:
-                entries_mod.append_entry(
-                    conn,
-                    name=f"event-{day}.md",
-                    content="**Work threads（日终）**\n" + "\n".join(lines),
-                    tags=["workthread", "daily-digest"],
-                )
-            except FileNotFoundError:
-                pass  # no event-daily file today (machine idle all day) — skip
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("workthread daily digest write failed: %s", exc)
-    return harvested
-
-
 def _reproject_entries_from_evomem() -> tuple[int, int]:
     """从 evo_nodes 重投影 entries/entry_metadata 检索层（reader↔重建保鲜，spec 2026-07-04）。
     直接调 ``entries._rebuild_from_evo_nodes``（rebuild-index 的 evomem 混合重建腿），不依赖
@@ -550,7 +333,7 @@ async def run_daily_safety_net(cfg: Config, manager: SessionManager) -> None:
                 # Give the just-force-ended session's async reducer thread a
                 # chance to finish before the catch-up pass would re-process it.
                 await asyncio.sleep(2)
-                await asyncio.to_thread(session_reducer.reduce_all_pending, cfg)
+                await asyncio.to_thread(writer_agent.run, cfg)
             # ② reader↔重建保鲜（apply_enabled=True，delta 铸点已上线，spec 2026-07-04 §reader-cutover）：
             # add_direct 只写 evo_nodes、不投影 entries（inversion 只投 choke-point 动词），classifier
             # 又已退役 → 检索读的 entries 会随新写陈旧。每日从 evo_nodes 全量重投影 entries/entry_metadata
@@ -562,42 +345,6 @@ async def run_daily_safety_net(cfg: Config, manager: SessionManager) -> None:
                     logger.info("daily 检索投影 evo_nodes→entries: %d 文件 / %d 条目", files, ents)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("daily 检索投影重建失败: %s", exc)
-            # Intent expiry harvest (#546 面2): flip stale open intents
-            # (valid_until passed) to ``expired`` so they stop polluting recall
-            # and the active layer. Side channel — never kills the tick.
-            try:
-                expired, dismissed_armed, stale_open = await asyncio.to_thread(
-                    expire_overdue_intents
-                )
-                if expired:
-                    logger.info("daily intent expiry harvest: %d open → expired", expired)
-                if dismissed_armed:
-                    logger.info(
-                        "daily armed TTL harvest: %d armed → dismissed (#532)", dismissed_armed
-                    )
-                if stale_open:
-                    logger.info(
-                        "daily ungrounded open TTL harvest: %d open → expired (#612)", stale_open
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("daily intent expiry harvest failed: %s", exc)
-            # WorkThread daily housekeeping (spec 2026-06-12 §三/§六-4): flush
-            # any half-full tracker window left in the queue (the day is over —
-            # the window is as full as it will get), harvest stale lines (30d
-            # without an attach, pinned exempt — inactivity is never completion,
-            # staleness is code's job), then fold a one-entry threads digest
-            # into today's event-daily file. All side channels.
-            if cfg.thread_tracker.enabled:
-                try:
-                    await asyncio.to_thread(workthread_tracker.maybe_run_window, cfg, force=True)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("daily workthread window flush failed: %s", exc)
-            try:
-                harvested = await asyncio.to_thread(_workthread_daily_housekeeping)
-                if harvested:
-                    logger.info("daily workthread stale harvest: %d open → stale", harvested)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("daily workthread housekeeping failed: %s", exc)
             # Semantic-contradiction self-check (memory-rebuild spec §4.4,
             # gated OFF by default — nightly LLM cost): pair same-file live
             # facts, LLM-judge a bounded batch, MARK contradictions
@@ -676,9 +423,8 @@ async def run_daily_safety_net(cfg: Config, manager: SessionManager) -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("daily wal_checkpoint failed: %s", exc)
-            # Retention for the per-call telemetry tables (#508): they record a
-            # row on every recall/recognition/parser tick and define a bounded
-            # `prune` that previously had no caller. Run it once per day so the
+            # Retention for parser-tick telemetry (#508): the table defines a
+            # bounded `prune` that previously had no caller. Run it once per day so the
             # advertised bound actually holds. Pure side channel — failures
             # alert in the log and never kill the tick.
             try:
@@ -690,8 +436,8 @@ async def run_daily_safety_net(cfg: Config, manager: SessionManager) -> None:
             # evomem survivability base (design §3.2/§3.3, PR-1): daily verified
             # VACUUM INTO snapshot + retention, then the chain-invariant
             # self-check on the live DB. Both are side channels — config off
-            # means this tick behaves exactly as before. Failures alert via
-            # the integrity_alert SSE event; neither ever kills the tick.
+            # means this tick behaves exactly as before. Failures emit
+            # structured error logs; neither ever kills the tick.
             if cfg.evomem.snapshot_enabled:
                 try:
                     await asyncio.to_thread(evo_backup.run_daily_backup, cfg)
@@ -724,45 +470,8 @@ async def run_daily_safety_net(cfg: Config, manager: SessionManager) -> None:
             await asyncio.sleep(60)
 
 
-async def run_dream_tick(cfg: Config) -> None:
-    """Once per local day at HH:MM, run the Dream slow-thinking stage."""
-    if not cfg.dream.enabled:
-        logger.info("dream tick loop not started (disabled)")
-        return
-    hour = cfg.dream.daily_tick_hour
-    minute = cfg.dream.daily_tick_minute
-    logger.info("dream tick loop started (fires at %02d:%02d local)", hour, minute)
-    while True:
-        try:
-            wait = _seconds_until_next_local(hour, minute)
-            await asyncio.sleep(wait)
-            logger.info("dream tick: enqueueing daily dream run via run-dispatcher")
-            # Phase 1b: delegate to the run-dispatcher so the dashboard shows
-            # a live queued→running→terminal card. Dedup: if a queued dream
-            # row already exists (e.g. the user just hit "run" from the app)
-            # enqueue_run folds into it and returns the existing id.
-            from ..runs.recorder import enqueue_run
-
-            run_id, _deduped = enqueue_run(
-                cfg, kind="dream", trigger="daily-tick", dispatch_source="dream-tick"
-            )
-            logger.info("dream tick: enqueued run_id=%s", run_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.error("dream tick failed: %s", exc, exc_info=True)
-            await asyncio.sleep(60)
-
-
 async def run_schema_tick(cfg: Config) -> None:
-    """Once per local day at HH:MM, run the D2 schema miner.
-
-    Clusters durable fact entries per file and induces predictive ``schema-*.md``
-    priors the intent recognizer reads back (``intent.schema_prior``). Scheduled
-    just after dream + the daily safety-net so it mines facts the dream pass just
-    归纳'd. The miner is sync (LLM + DB), so it runs on a worker thread; the loop
-    catches per-tick exceptions so a bad run never kills the daemon task.
-    """
+    """Once per local day, run the shared personal-model build service."""
     if not cfg.schema.enabled:
         logger.info("schema tick loop not started (disabled)")
         return
@@ -773,57 +482,28 @@ async def run_schema_tick(cfg: Config) -> None:
         try:
             wait = _seconds_until_next_local(hour, minute)
             await asyncio.sleep(wait)
-            logger.info("schema tick: mining D2 schemas from durable facts")
+            logger.info("schema tick: running shared personal-model build")
+            from ..model import ModelBuildBusy, run_model_build
 
-            def _mine() -> schema_miner_stage.SchemaRunResult:
-                with fts.cursor() as conn:
-                    run = schema_miner_stage.mine_schemas_for_user(cfg, conn)
-                    # Tail step: collide topic-far/behavior-near schemas into
-                    # higher-level ones (Hy-Memory sweeper). Same conn, same tick —
-                    # it consumes the schemas the miner just refreshed. Gated off by
-                    # default; a sweep failure is logged but never fails the tick.
-                    if cfg.schema.cross_domain_enabled:
-                        try:
-                            sweep = cross_domain_sweeper.sweep_cross_domain(
-                                cfg,
-                                conn,
-                                behavior_max_distance=cfg.schema.cross_domain_behavior_max_distance,
-                                min_confidence=cfg.schema.cross_domain_min_confidence,
-                            )
-                            logger.info(
-                                "cross-domain sweep: %d fused (considered=%d probed=%d)",
-                                sweep.written_count,
-                                sweep.pairs_considered,
-                                sweep.pairs_probed,
-                            )
-                        except Exception:  # noqa: BLE001 - sweep must not fail the tick
-                            logger.exception("cross-domain sweep failed")
-                    # Tail-of-tail: synthesize the level-3 root apex from the 体/面 the
-                    # miner+sweeper just refreshed (2026-07-04 spec). Same conn, same tick.
-                    # Default ON; fail-open — a bad synthesis keeps the prior root, never
-                    # fails the tick.
-                    if getattr(cfg.schema, "root_synthesis_enabled", True):
-                        try:
-                            rr = root_synthesis.run_root_synthesis(cfg, conn)
-                            logger.info("root synthesis: %s (%s)", rr.reason, rr.face_id or "-")
-                        except Exception:  # noqa: BLE001 - root synth must not fail the tick
-                            logger.exception("root synthesis failed")
-                    return run
-
-            result = await asyncio.to_thread(_mine)
-            if result.written:
-                logger.info(
-                    "schema tick: wrote %d schema(s) (small=%d empty=%d)",
-                    result.written_count,
-                    result.skipped_small,
-                    result.skipped_empty,
+            try:
+                result = await asyncio.to_thread(
+                    run_model_build,
+                    cfg,
+                    wait_seconds=0.0,
+                    trigger="daemon-schema-tick",
                 )
-            else:
-                logger.info(
-                    "schema tick: no schemas written (small=%d empty=%d)",
-                    result.skipped_small,
-                    result.skipped_empty,
-                )
+            except ModelBuildBusy:
+                logger.info("schema tick: model build already in progress; skipping")
+                continue
+            logger.info(
+                "schema tick: model build %s (points=%d lines=%d faces=%d volumes=%d roots=%d)",
+                result.status,
+                result.stats["points"],
+                result.stats["evolution_lines"] + result.stats["relation_lines"],
+                result.stats["faces"],
+                result.stats["volumes"],
+                result.stats["roots"],
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -831,43 +511,51 @@ async def run_schema_tick(cfg: Config) -> None:
             await asyncio.sleep(60)
 
 
-# Fires after dream (00:00) + safety-net (23:55) + schema (00:15), so it enriches off
-# facts those passes just landed.
-_EVOMEM_ENRICHMENT_HOUR = 0
-_EVOMEM_ENRICHMENT_MINUTE = 20
-
-
-def _run_evomem_enrichment_once(cfg: Config) -> None:
+def _run_evomem_enrichment_once(
+    cfg: Config,
+    *,
+    raise_on_error: bool = False,
+) -> dict[str, object]:
     """One enrichment pass: person-graph ingest (#1) + case extraction (#2).
 
     Both layers gate INTERNALLY on their own flags and no-op when off, so this is
     safe to call whenever the tick fires. Person-graph ingest is deterministic (no
     LLM); case extraction makes one LLM pass over the last 24h of timeline blocks.
     Extracted so the wiring is unit-testable without driving the daily loop. Each
-    layer is isolated in its own try so one failing never blocks the other.
+    layer is isolated in its own try so one failure never blocks the others.
+    Scheduled callers stay fail-open; the model build passes ``raise_on_error``
+    so its manifest cannot label a partially failed enrichment stage complete.
     """
     from ..evomem.engine import EvoMemory
-    from ..evomem.person_graph import IntentPersonNameSource, PersonGraph
+    from ..evomem.person_graph import PersonGraph
+    from ..model.entity_source import MemoryPersonNameSource
     from ..writer import case_extractor
+
+    report: dict[str, object] = {"person_updates": 0, "case_cards": 0, "relation_edges": 0}
+    errors: list[str] = []
 
     if getattr(cfg, "person_graph_enabled", False):
         try:
             touched = PersonGraph(
-                EvoMemory(), cfg=cfg, name_source=IntentPersonNameSource()
+                EvoMemory(), cfg=cfg, name_source=MemoryPersonNameSource()
             ).ingest()
+            report["person_updates"] = len(touched)
             logger.info("evomem enrichment: person graph ingested %d update(s)", len(touched))
         except Exception as exc:  # noqa: BLE001 — best-effort enrichment, never crash the tick
             logger.error("evomem enrichment: person graph failed: %s", exc, exc_info=True)
+            errors.append(f"person_graph: {type(exc).__name__}: {exc}")
 
     if getattr(cfg, "case_extraction_enabled", False):
         try:
             result = case_extractor.run_case_extraction(cfg)
+            report["case_cards"] = getattr(result, "written_count", 0)
             logger.info(
                 "evomem enrichment: case extraction wrote %d card(s)",
                 getattr(result, "written_count", 0),
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("evomem enrichment: case extraction failed: %s", exc, exc_info=True)
+            errors.append(f"case_extraction: {type(exc).__name__}: {exc}")
 
     # Graph-memory P0-2 (#428): relation-edge extraction → SHADOW. Gates internally on
     # relation_extraction_enabled (default off) + fully fail-open, like the two layers above.
@@ -876,6 +564,7 @@ def _run_evomem_enrichment_once(cfg: Config) -> None:
             from ..evomem import relation_extractor
 
             rel = relation_extractor.run_relation_extraction(cfg)
+            report["relation_edges"] = rel.written_count
             logger.info(
                 "evomem enrichment: relation extraction wrote %d shadow edge(s) (det=%d llm=%d)",
                 rel.written_count,
@@ -900,32 +589,9 @@ def _run_evomem_enrichment_once(cfg: Config) -> None:
                 logger.info("evomem enrichment: %d relation edge(s) promoted to ACTIVE", n_promoted)
         except Exception as exc:  # noqa: BLE001 — best-effort enrichment, never crash the tick
             logger.error("evomem enrichment: relation extraction failed: %s", exc, exc_info=True)
+            errors.append(f"relation_extraction: {type(exc).__name__}: {exc}")
 
-
-async def run_evomem_enrichment_tick(cfg: Config) -> None:
-    """Once per local day, run the evomem enrichment pass (person graph + case cards).
-
-    Only started when at least one layer is enabled (the TaskDefinition gate also
-    checks this). Sync work runs on a worker thread; per-tick exceptions are caught so
-    a bad run never kills the daemon task.
-    """
-    if not (
-        getattr(cfg, "person_graph_enabled", False)
-        or getattr(cfg, "case_extraction_enabled", False)
-        or getattr(cfg, "relation_extraction_enabled", False)
-    ):
-        logger.info("evomem enrichment tick not started (all layers disabled)")
-        return
-    hour = _EVOMEM_ENRICHMENT_HOUR
-    minute = _EVOMEM_ENRICHMENT_MINUTE
-    logger.info("evomem enrichment tick started (fires at %02d:%02d local)", hour, minute)
-    while True:
-        try:
-            await asyncio.sleep(_seconds_until_next_local(hour, minute))
-            logger.info("evomem enrichment: ingesting person graph + extracting case cards")
-            await asyncio.to_thread(_run_evomem_enrichment_once, cfg)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.error("evomem enrichment tick failed: %s", exc, exc_info=True)
-            await asyncio.sleep(60)
+    report["errors"] = errors
+    if errors and raise_on_error:
+        raise RuntimeError("; ".join(errors))
+    return report

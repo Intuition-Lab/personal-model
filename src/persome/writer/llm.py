@@ -1,7 +1,7 @@
 """Anthropic SDK wrapper with per-stage model resolution.
 
-All background stages (timeline / reducer / classifier / compact / dream /
-pattern_detector / active / consolidator / intent_recognizer) call the Anthropic
+All background stages (timeline / reducer / classifier / compact /
+pattern_detector / case_extractor / memory_delta) call the Anthropic
 Messages API directly through the official SDK — the same client path chat uses.
 litellm was removed: it serialized custom tools with a ``type:"custom"`` variant
 the DeepSeek ``/anthropic`` gateway rejects (``unknown variant 'custom'``), which
@@ -16,7 +16,6 @@ and every caller already consume — the Anthropic response is adapted back into
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import time
@@ -240,10 +239,12 @@ def call_llm(
     (529 fallback). ``cache_control`` on messages/tools/system passes through —
     the Anthropic protocol honors it natively (no stripping, no prefix tricks).
     ``extra`` merges raw request params into the call body (e.g.
-    ``{"thinking": {"type": "disabled"}}`` for the fast recognizer) — forwarded
+    ``{"thinking": {"type": "disabled"}}`` for a fast stage) — forwarded
     verbatim, so the relay passes them to the upstream gateway.
     """
-    if (os.environ.get("PERSOME_LLM_MOCK") or os.environ.get("MENS_CONTEXT_LLM_MOCK")) == "1":  # Mens is the legacy name
+    if (
+        os.environ.get("PERSOME_LLM_MOCK") or os.environ.get("MENS_CONTEXT_LLM_MOCK")
+    ) == "1":  # Mens is the legacy name
         return _mock_response(stage, messages, tools, json_mode)
 
     model_cfg = cfg.model_for(stage)
@@ -272,76 +273,6 @@ def call_llm(
     return resp
 
 
-def call_llm_streaming(
-    cfg: Config,
-    stage: str,
-    *,
-    messages: list[dict[str, Any]],
-    json_mode: bool = False,
-    on_delta: Any = None,
-    extra: dict[str, Any] | None = None,
-) -> str:
-    """Streaming variant of :func:`call_llm` — returns the FULL accumulated text and feeds
-    ``on_delta(accumulated_text)`` after each chunk so the caller can act on partial output
-    (the fast recognizer fires on its required fields before ``rationale``/``quote`` finish).
-
-    Robust through the Persome relay: it iterates the SDK's RAW event stream and pulls
-    ``content_block_delta.delta.text`` (the relay re-frames the SSE in a way that makes the SDK's
-    ``text_stream`` helper yield nothing, but the raw ``content_block_delta`` events arrive fine —
-    and DeepSeek's ``thinking`` events are simply ignored). **Fail-open**: a proxy that rejects
-    ``stream:true``, an empty stream, or any error falls back to the non-streaming :func:`call_llm`,
-    so behaviour degrades to "wait for the whole body" — never worse, never a recognition miss.
-    Mock-aware: ``PERSOME_LLM_MOCK=1`` delegates to :func:`call_llm` (so a test's monkeypatched
-    ``call_llm`` / ``fake_llm`` fixture is honored) and feeds the full text to ``on_delta`` once."""
-    if (os.environ.get("PERSOME_LLM_MOCK") or os.environ.get("MENS_CONTEXT_LLM_MOCK")) == "1":  # Mens is the legacy name
-        text = extract_text(call_llm(cfg, stage, messages=messages, json_mode=json_mode, extra=extra))
-        if on_delta:
-            with contextlib.suppress(Exception):  # a callback error must not break the call
-                on_delta(text)
-        return text
-
-    model_cfg = cfg.model_for(stage)
-    override = os.environ.get("_OC_FALLBACK_MODEL")
-    if override:
-        model_cfg = ModelConfig(**{**model_cfg.__dict__, "model": override})
-    system, amsgs = _to_anthropic_messages(messages)
-    kwargs: dict[str, Any] = {
-        "model": _bare_model(model_cfg.model),
-        "messages": amsgs,
-        "max_tokens": model_cfg.max_tokens or _DEFAULT_MAX_TOKENS,
-    }
-    if system is not None:
-        kwargs["system"] = system
-    if extra:
-        kwargs.update(extra)
-
-    try:
-        parts: list[str] = []
-        with _anthropic_client().messages.stream(**kwargs) as stream:
-            for event in stream:
-                if getattr(event, "type", "") != "content_block_delta":
-                    continue
-                delta = getattr(event, "delta", None)
-                piece = getattr(delta, "text", None) if delta is not None else None
-                if not piece:
-                    continue
-                parts.append(piece)
-                if on_delta:
-                    with contextlib.suppress(Exception):
-                        on_delta("".join(parts))
-        text = "".join(parts)
-        if not text.strip():
-            raise RuntimeError("empty stream (relay reframing?) — fall back")
-        return _unfence_json(text) if json_mode else text
-    except Exception as exc:  # noqa: BLE001 — fail-open to the blocking call
-        logger.warning("streaming call failed (%s); falling back to non-streaming", exc)
-        text = extract_text(call_llm(cfg, stage, messages=messages, json_mode=json_mode, extra=extra))
-        if on_delta:
-            with contextlib.suppress(Exception):
-                on_delta(text)
-        return text
-
-
 # Stage-specific default shapes so PERSOME_LLM_MOCK=1 works out of the box
 # for every stage instead of returning an obsolete v1-shape string.
 _MOCK_DEFAULTS: dict[str, str] = {
@@ -349,13 +280,14 @@ _MOCK_DEFAULTS: dict[str, str] = {
     "reducer": '{"summary": "Test session", "sub_tasks": ["[10:00-10:05, TestApp] test activity, involving —"]}',
     "classifier": "",  # no text → tool_calls empty → no action → commit not called
     "compact": '{"content": "Compacted text."}',
-    "thread_tracker": '{"ops": [{"op": "none"}]}',  # window judged idle — no state change
 }
 
 
 def _mock_response(stage: str, messages, tools, json_mode):  # type: ignore[no-untyped-def]
     """Minimal stub for offline tests. Customize via PERSOME_LLM_MOCK_JSON."""
-    override = (os.environ.get("PERSOME_LLM_MOCK_JSON") or os.environ.get("MENS_CONTEXT_LLM_MOCK_JSON"))  # Mens is the legacy name
+    override = os.environ.get("PERSOME_LLM_MOCK_JSON") or os.environ.get(
+        "MENS_CONTEXT_LLM_MOCK_JSON"
+    )  # Mens is the legacy name
     content = override if override else _MOCK_DEFAULTS.get(stage, "")
     return _build_response(content)
 
@@ -403,7 +335,9 @@ def ping_stage(cfg: Config, stage: str, *, timeout: float = 5.0) -> PingResult:
     informational callers must remain non-fatal.
     """
     model_cfg = cfg.model_for(stage)
-    if (os.environ.get("PERSOME_LLM_MOCK") or os.environ.get("MENS_CONTEXT_LLM_MOCK")) == "1":  # Mens is the legacy name
+    if (
+        os.environ.get("PERSOME_LLM_MOCK") or os.environ.get("MENS_CONTEXT_LLM_MOCK")
+    ) == "1":  # Mens is the legacy name
         return PingResult(
             stage=stage,
             model=model_cfg.model,
@@ -561,7 +495,9 @@ def count_tokens_api(cfg: Config, stage: str, messages: list[dict[str, Any]]) ->
     Returns None on any failure, when disabled, or when the gateway doesn't
     implement the endpoint — callers fall back to ``_estimate_tokens``.
     """
-    if (os.environ.get("PERSOME_LLM_MOCK") or os.environ.get("MENS_CONTEXT_LLM_MOCK")) == "1":  # Mens is the legacy name
+    if (
+        os.environ.get("PERSOME_LLM_MOCK") or os.environ.get("MENS_CONTEXT_LLM_MOCK")
+    ) == "1":  # Mens is the legacy name
         return None
     if not cfg.writer.use_token_count_api:
         return None

@@ -102,8 +102,8 @@ def _discover_external_skills(skills_dir: Path) -> list[SkillEntry]:
     return results
 
 
-def _discover_dream_skills() -> list[SkillEntry]:
-    """Scan ~/.persome/memory/skills/skill-*.md for dream-generated skills."""
+def _discover_memory_skills() -> list[SkillEntry]:
+    """Scan ~/.persome/memory/skills/skill-*.md for model-generated skills."""
     results: list[SkillEntry] = []
     memory_skills_dir = paths.memory_dir() / "skills"
     if not memory_skills_dir.is_dir():
@@ -200,7 +200,11 @@ class LoadedSkills:
     handlers: dict[str, Callable[[dict[str, Any]], Any]]
 
 
-def load_all_skills(builtin_names: set[str] | None = None) -> LoadedSkills:
+def load_all_skills(
+    builtin_names: set[str] | None = None,
+    *,
+    allow_executable_tools: bool = False,
+) -> LoadedSkills:
     """Discover and load all skills.
 
     Returns a LoadedSkills with:
@@ -210,8 +214,8 @@ def load_all_skills(builtin_names: set[str] | None = None) -> LoadedSkills:
     - entries: full registry keyed by skill name, for load_skill lookups
     """
     external = _discover_external_skills(paths.skills_dir())
-    dream = _discover_dream_skills()
-    all_skills = external + dream
+    memory_skills = _discover_memory_skills()
+    all_skills = external + memory_skills
 
     if not all_skills:
         return LoadedSkills(entries={}, index_prompt="", schemas=[], handlers={})
@@ -224,11 +228,13 @@ def load_all_skills(builtin_names: set[str] | None = None) -> LoadedSkills:
             continue
         entries[skill.name] = skill
 
-    # Load tool modules
-    seen_names: set[str] = set(builtin_names or ())
-    seen_names.add("load_skill")
-    for skill in entries.values():
-        _load_tools_py(skill, seen_names)
+    # A skill's Markdown is data; tools.py is executable local code. Loading it
+    # belongs behind Chat's explicit unsafe-tools opt-in.
+    if allow_executable_tools:
+        seen_names: set[str] = set(builtin_names or ())
+        seen_names.add("load_skill")
+        for skill in entries.values():
+            _load_tools_py(skill, seen_names)
 
     # Build index prompt
     lines: list[str] = [

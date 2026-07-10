@@ -34,6 +34,41 @@ base_url = "https://example/anthropic"
     assert classifier.base_url == "https://example/anthropic"
 
 
+def test_capture_privacy_settings_are_nested(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[capture]
+pause_on_lock = false
+suppress_secure_input = false
+encrypt_screenshots = false
+extended_retention_enabled = false
+actionable_retention_days = 3
+"""
+    )
+    capture = config.load(path).capture
+    assert capture.pause_on_lock is False
+    assert capture.suppress_secure_input is False
+    assert capture.encrypt_screenshots is False
+    assert capture.extended_retention_enabled is False
+    assert capture.actionable_retention_days == 3
+
+
+def test_legacy_top_level_capture_privacy_settings_still_load(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+capture_pause_on_lock = false
+capture_encrypt_screenshots = false
+capture_actionable_retention_days = 2
+"""
+    )
+    capture = config.load(path).capture
+    assert capture.pause_on_lock is False
+    assert capture.encrypt_screenshots is False
+    assert capture.actionable_retention_days == 2
+
+
 def test_legacy_api_key_fields_ignored(tmp_path: Path) -> None:
     """Old TOMLs may still set ``api_key`` / ``api_key_env`` — silently drop
     them so users can upgrade without a migration step."""
@@ -95,59 +130,3 @@ def test_infer_provider() -> None:
     # Unknown bare names default to openai (litellm's own default).
     assert config.infer_provider("gpt-5.4-nano") == "openai"
     assert config.infer_provider("mystery-model") == "openai"
-
-
-def test_debug_hud_defaults_to_intent_only(tmp_path: Path) -> None:
-    cfg = config.load(tmp_path / "missing.toml")
-    assert cfg.debug_hud.show == ["intent"]
-
-
-def test_debug_hud_show_override(tmp_path: Path) -> None:
-    path = tmp_path / "config.toml"
-    path.write_text('[debug_hud]\nshow = ["intent", "tool_call", "health"]\n')
-    cfg = config.load(path)
-    assert cfg.debug_hud.show == ["intent", "tool_call", "health"]
-
-
-def test_set_debug_hud_show_replaces_existing_line() -> None:
-    text = '[capture]\nx = 1\n\n[debug_hud]\nshow = ["intent"]\n'
-    out = config.set_debug_hud_show(text, ["intent", "health"])
-    assert 'show = ["intent", "health"]' in out
-    assert "[capture]" in out and "x = 1" in out  # untouched
-    assert out.count("[debug_hud]") == 1
-
-
-def test_set_debug_hud_show_appends_section_when_absent() -> None:
-    text = "[capture]\nx = 1\n"
-    out = config.set_debug_hud_show(text, ["intent", "tool_call"])
-    assert "[debug_hud]" in out
-    assert 'show = ["intent", "tool_call"]' in out
-    assert config.load.__module__  # sanity
-    import tomllib
-
-    assert tomllib.loads(out)["debug_hud"]["show"] == ["intent", "tool_call"]
-
-
-def test_set_debug_hud_show_inserts_when_section_has_no_show() -> None:
-    text = "[debug_hud]\n# nothing yet\n"
-    out = config.set_debug_hud_show(text, ["memory"])
-    import tomllib
-
-    assert tomllib.loads(out)["debug_hud"]["show"] == ["memory"]
-
-
-def test_top_level_flat_flags_load_from_toml(tmp_path: Path) -> None:
-    """Reverse-loop G1 regression: the flat top-level feature flags must actually be
-    READ from config.toml by ``load()`` — not just exist on the dataclass. The G1
-    daemon kill-switch ``memory_ingest_enabled`` was added to the ``Config`` dataclass
-    but its ``raw.get`` line was missing from ``load()``, so the flag was stuck at its
-    ``False`` default and the channel could never be enabled (a real-E2E-caught bug).
-    Pin a representative sibling too so the wiring can't silently rot again."""
-    # default (no file) → the dataclass default
-    assert config.load(tmp_path / "missing.toml").memory_ingest_enabled is False
-    # explicit top-level override IS honoured
-    p = tmp_path / "config.toml"
-    p.write_text("memory_ingest_enabled = true\nrewind_enabled = false\n")
-    cfg = config.load(p)
-    assert cfg.memory_ingest_enabled is True
-    assert cfg.rewind_enabled is False

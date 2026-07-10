@@ -1,11 +1,10 @@
-"""Pattern detector stage: detects repetitive user behavior patterns
-that could be scripted or automated. Runs after the classifier.
+"""Pattern detector stage: detects repeated, evidence-backed user behavior.
 
 Two-stage design:
 1. Structured filtering: SQL queries extract high-frequency candidate patterns
    from timeline_blocks, captures, and event-daily entries.
 2. LLM validation: LLM judges whether candidates are real habits vs coincidence,
-   then writes confirmed patterns to workflow-*.md via tool-call loop.
+   then writes confirmed behavioral memory to skills/skill-*.md.
 """
 
 from __future__ import annotations
@@ -19,8 +18,6 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ..config import Config
-from ..intent import store as intent_store
-from ..intent.ontology import Intent
 from ..logger import get
 from ..prompts import load as load_prompt
 from ..session import store as session_store
@@ -53,7 +50,7 @@ def detect_after_classify(
     session_start: datetime | None = None,
     session_end: datetime | None = None,
 ) -> DetectResult:
-    """Pattern detection entry point. Called after classifier commits."""
+    """Pattern detection entry point for terminal session finalization."""
     if not cfg.pattern_detector.enabled:
         return DetectResult(session_id=session_id, skipped_reason="pattern detector disabled")
 
@@ -121,11 +118,12 @@ def _collect_candidates(
 ) -> dict[str, Any]:
     """Query the database for high-frequency candidate patterns.
 
-    Returns a dict with four candidate categories:
+    Returns a dict with five candidate categories:
       - app_sequences: repeated app combos from timeline_blocks
       - repeated_titles: repeated window titles from captures_fts
       - repeated_urls: repeated URLs from captures_fts
       - time_clusters: sessions clustered by hour-of-day + dominant app
+      - event_memory: durable past activity entries with receipts
     """
     candidates: dict[str, Any] = {}
 
@@ -151,32 +149,43 @@ def _collect_candidates(
     if time_clusters:
         candidates["time_clusters"] = time_clusters
 
-    # 5. Recognized intents from the unified stream (meeting hints, scheduling,
-    #    chat-extracted facts). Behaviour mining no longer sees only passive
-    #    screen signals — what the user *intends* is a first-class candidate.
-    intents = _collect_recent_intents(conn, lookback_start, window_end)
-    if intents:
-        candidates["intents"] = intents
+    # 5. Durable past activity memory supplies the semantic repetition signal.
+    event_memory = _collect_event_memory(conn, lookback_start, window_end)
+    if event_memory:
+        candidates["event_memory"] = event_memory
 
     return candidates
 
 
-def _collect_recent_intents(
+def _collect_event_memory(
     conn: sqlite3.Connection, lookback_start: datetime, window_end: datetime
-) -> list[Intent]:
-    return intent_store.recent_intents(
-        conn, start=lookback_start.isoformat(), end=window_end.isoformat()
-    )
+) -> list[dict[str, str]]:
+    rows = conn.execute(
+        "SELECT id, path, timestamp, content FROM entries "
+        "WHERE prefix = 'event' AND superseded = 0 AND timestamp >= ? AND timestamp < ? "
+        "ORDER BY timestamp DESC LIMIT 20",
+        (lookback_start.isoformat(), window_end.isoformat()),
+    ).fetchall()
+    return [
+        {
+            "id": str(row["id"]),
+            "path": str(row["path"]),
+            "timestamp": str(row["timestamp"]),
+            "summary": str(row["content"] or "")[:300],
+            "receipt": f"⟨{row['id']}:{row['path']}⟩",
+        }
+        for row in rows
+        if str(row["content"] or "").strip()
+    ]
 
 
-def _render_intent_lines(intents: list[Intent]) -> list[str]:
-    """Render unified-stream intents as a candidate section (shared by both modes)."""
-    if not intents:
+def _render_event_memory_lines(events: list[dict[str, str]]) -> list[str]:
+    """Render durable activity memory as a candidate section shared by both modes."""
+    if not events:
         return []
-    lines = ["### Recognized intents (from the unified intent stream)"]
-    for it in intents[:20]:
-        text = str(it.payload.get("text") or it.rationale or "")[:100]
-        lines.append(f'- [{it.kind}] "{text}" (scope={it.scope}, conf={it.confidence:.2f})')
+    lines = ["### Durable event memory (past activity with receipts)"]
+    for event in events[:20]:
+        lines.append(f"- [{event['timestamp']}] {event['summary']} receipt={event['receipt']}")
     lines.append("")
     return lines
 
@@ -194,12 +203,8 @@ def _find_repeated_app_sequences(
     Mail+Slack+Cursor counts as one occurrence of the combo {Cursor, Mail,
     Slack}, regardless of switching order.
 
-    Related but DIFFERENT: ``dream._mine_app_sequences`` looks at
-    ``captures.app_name`` and detects *ordered contiguous* subsequences
-    (Cursor → Slack → Mail), collapsing consecutive duplicates. The two
-    answer different questions — co-occurrence vs transition — so they live
-    side-by-side intentionally. If you change one, decide whether the other
-    needs the same change.
+    This groups durable timeline co-occurrence rather than ordered raw-capture
+    transitions.
     """
     rows = conn.execute(
         """
@@ -251,10 +256,7 @@ def _find_repeated_captures_field(
     Detector only looks at the session-aligned slice between
     ``last_pattern_detected_end`` and ``session_end``.
 
-    Related: ``dream._find_repeated_captures_field`` does the same counting
-    but takes only ``start`` (open-ended forward over the full lookback) and
-    validates ``field`` against an allowlist. Keep their output shape
-    identical so the prompt rendering helpers can be shared.
+    The bounded window keeps pattern detection aligned with the session slice.
     """
     rows = conn.execute(
         f"""
@@ -366,11 +368,11 @@ def _assemble_raw_context(
         f"## Raw activity data (last {(window_end - lookback_start).days + 1} days)",
         "",
         "Your job is to scan this raw data and detect any repetitive behavior "
-        "patterns that could be scripted or automated. Look for:",
+        "evidence-backed behavior patterns. Look for:",
         "- App sequences that repeat across days",
         "- Window titles or URLs visited repeatedly",
         "- Sessions that consistently start at the same time",
-        "- Any other routine or habit worth automating",
+        "- Any other routine or habit repeated across independent sessions",
         "",
     ]
 
@@ -418,8 +420,8 @@ def _assemble_raw_context(
             parts.append(line)
         parts.append("")
 
-    intents = _collect_recent_intents(conn, lookback_start, window_end)
-    parts.extend(_render_intent_lines(intents))
+    events = _collect_event_memory(conn, lookback_start, window_end)
+    parts.extend(_render_event_memory_lines(events))
 
     parts.append(
         "If you need to check existing workflow files for dedup, "
@@ -445,7 +447,7 @@ def _assemble_context(
         "",
         "These are high-frequency signals detected by structured queries. "
         "Your job is to judge which ones represent real user habits worth "
-        "scripting, vs coincidence or noise.",
+        "recording as behavioral memory, vs coincidence or noise.",
         "",
     ]
 
@@ -478,8 +480,8 @@ def _assemble_context(
             )
         parts.append("")
 
-    if candidates.get("intents"):
-        parts.extend(_render_intent_lines(candidates["intents"]))
+    if candidates.get("event_memory"):
+        parts.extend(_render_event_memory_lines(candidates["event_memory"]))
 
     parts.append(
         "If you need to check existing workflow files for dedup, "

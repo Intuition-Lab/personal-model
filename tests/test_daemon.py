@@ -13,8 +13,8 @@ import pytest
 from persome.config import (
     CaptureConfig,
     Config,
-    DreamConfig,
     MCPConfig,
+    ReducerConfig,
     SchemaConfig,
     SearchConfig,
 )
@@ -40,15 +40,8 @@ async def _never() -> None:
 
 
 def _base_cfg() -> Config:
-    """Explicit baseline: dream/schema/ocr off, MCP on (streamable-http).
-
-    The evomem enrichment layers (person-graph / case-extraction) default ON, so the
-    minimal baseline turns them off explicitly to keep `evomem-enrichment-tick` out of
-    the asserted default set (the on-by-default behavior is covered by
-    `test_evomem_enrichment_tick`).
-    """
+    """Explicit baseline: schema/ocr off, MCP on (streamable-http)."""
     return Config(
-        dream=DreamConfig(enabled=False),
         schema=SchemaConfig(enabled=False),
         capture=CaptureConfig(enable_ocr_fallback=False),
         mcp=MCPConfig(auto_start=True, transport="streamable-http"),
@@ -63,11 +56,10 @@ class TestRegistryEnabledPredicates:
         assert _enabled_names(_base_cfg()) == {
             "capture",
             "session",
+            "reducer-retry",
             "daily-safety-net",
             "timeline",
             "flush",
-            "classifier-tick",
-            "run-dispatcher",
             "mcp",
         }
 
@@ -75,14 +67,10 @@ class TestRegistryEnabledPredicates:
         assert _enabled_names(_base_cfg(), capture_only=True) == {
             "capture",
             "session",
+            "reducer-retry",
             "daily-safety-net",
             "mcp",
         }
-
-    def test_dream_tick_requires_flag_and_full_mode(self) -> None:
-        cfg = Config(dream=DreamConfig(enabled=True))
-        assert "dream-tick" in _enabled_names(cfg)
-        assert "dream-tick" not in _enabled_names(cfg, capture_only=True)
 
     def test_schema_tick_requires_flag_and_full_mode(self) -> None:
         cfg = Config(schema=SchemaConfig(enabled=True))
@@ -98,13 +86,11 @@ class TestRegistryEnabledPredicates:
             Config(search=SearchConfig(hybrid_enabled=False))
         )
 
-    def test_intent_recognizer_rides_timeline_not_a_standalone_task(self) -> None:
-        # Recognition now fires on the timeline task's block-flush hook, so there
-        # is no separate "intent-recognizer-tick" task. The timeline task (which
-        # carries it) is on in full mode and off in capture-only mode.
-        assert "intent-recognizer-tick" not in _enabled_names(Config())
-        assert "timeline" in _enabled_names(Config())
-        assert "timeline" not in _enabled_names(Config(), capture_only=True)
+    def test_classifier_tick_only_runs_for_legacy_classifier_mode(self) -> None:
+        cfg = _base_cfg()
+        assert "classifier-tick" not in _enabled_names(cfg)
+        cfg.memory_delta.apply_enabled = False
+        assert "classifier-tick" in _enabled_names(cfg)
 
     def test_mcp_disabled_when_auto_start_false(self) -> None:
         assert "mcp" not in _enabled_names(Config(mcp=MCPConfig(auto_start=False)))
@@ -117,6 +103,12 @@ class TestRegistryEnabledPredicates:
 
     def test_mcp_not_gated_by_capture_only(self) -> None:
         assert "mcp" in _enabled_names(Config(), capture_only=True)
+
+    def test_reducer_retry_requires_reducer(self) -> None:
+        assert "reducer-retry" in _enabled_names(Config(), capture_only=True)
+        assert "reducer-retry" not in _enabled_names(
+            Config(reducer=ReducerConfig(enabled=False)), capture_only=True
+        )
 
 
 class TestCreateTasksFromRegistry:

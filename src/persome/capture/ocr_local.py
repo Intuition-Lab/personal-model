@@ -54,7 +54,7 @@ def runtime_available() -> bool:
     (only manylinux x86_64, win_amd64, and macos arm64), so ``pyproject.toml`` gates the paddle
     deps to ``platform_machine == 'arm64'`` and the PyInstaller spec skips collecting them off
     arm64. The x86_64 daemon slice therefore ships WITHOUT local OCR: AX-poor apps (WeChat /
-    Feishu) get no OCR text, but AX-based context / intent recognition and every other feature
+    Feishu) get no OCR text, but AX-based state formation and every other feature
     work normally. This is the intended graceful degrade, not a failure.
 
     Cheap + side-effect-free: uses ``importlib.util.find_spec`` (no import), so it never triggers
@@ -90,7 +90,9 @@ def _ocr_disabled() -> bool:
     for AX-poor apps" instead of crashing. ``warm()``/``recognize*`` all honor it, so
     paddle is never even imported when disabled. Truthy values: 1/true/yes/on.
     """
-    val = (os.environ.get("PERSOME_DISABLE_OCR") or os.environ.get("MENS_CONTEXT_DISABLE_OCR", ""))  # Mens is the legacy name
+    val = os.environ.get("PERSOME_DISABLE_OCR") or os.environ.get(
+        "MENS_CONTEXT_DISABLE_OCR", ""
+    )  # Mens is the legacy name
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -107,9 +109,13 @@ def _use_isolation() -> bool:
     - ``PERSOME_OCR_IN_PROCESS=1`` — debug opt-out to the legacy in-daemon path
       (crash-exposed); for local diagnosis only, never a shipped default.
     """
-    if (os.environ.get("PERSOME_OCR_WORKER") or os.environ.get("MENS_CONTEXT_OCR_WORKER")):  # Mens is the legacy name
+    if os.environ.get("PERSOME_OCR_WORKER") or os.environ.get(
+        "MENS_CONTEXT_OCR_WORKER"
+    ):  # Mens is the legacy name
         return False
-    val = (os.environ.get("PERSOME_OCR_IN_PROCESS") or os.environ.get("MENS_CONTEXT_OCR_IN_PROCESS", ""))  # Mens is the legacy name
+    val = os.environ.get("PERSOME_OCR_IN_PROCESS") or os.environ.get(
+        "MENS_CONTEXT_OCR_IN_PROCESS", ""
+    )  # Mens is the legacy name
     return val.strip().lower() not in {"1", "true", "yes", "on"}
 
 
@@ -117,13 +123,19 @@ def _models_root() -> Path | None:
     """Locate the directory holding ``PP-OCRv6_<tier>_<kind>`` weight folders.
 
     Resolution order: explicit env override → PyInstaller bundle (``sys._MEIPASS``)
-    → vendored repo dir → the paddlex download cache (dev convenience).
+    → installed package bundle → vendored repo dir → the paddlex download cache.
     """
-    env = (os.environ.get("PERSOME_OCR_MODELS_DIR") or os.environ.get("MENS_CONTEXT_OCR_MODELS_DIR"))  # Mens is the legacy name
+    env = os.environ.get("PERSOME_OCR_MODELS_DIR") or os.environ.get(
+        "MENS_CONTEXT_OCR_MODELS_DIR"
+    )  # Mens is the legacy name
     if env:
         return Path(env)
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / "ocr_models"  # type: ignore[attr-defined]
+    # Wheel install: persome/capture/ocr_local.py -> persome/_bundled/ocr_models.
+    packaged = Path(__file__).resolve().parents[1] / "_bundled" / "ocr_models"
+    if packaged.exists():
+        return packaged
     # src/persome/capture/ocr_local.py -> persome-core/ocr_models
     vendored = Path(__file__).resolve().parents[3] / "ocr_models"
     if vendored.exists():
@@ -286,22 +298,6 @@ def _recognize_detailed_inproc(
 
     texts, boxes, scores = _extract_detailed(results)
     return (texts, boxes, scores) if texts else None
-
-
-def _extract_texts(results: Any) -> list[str]:
-    """Pull ``rec_texts`` out of a PaddleOCR 3.x predict result (list of dict-like)."""
-    if not results:
-        return []
-    out: list[str] = []
-    for r in results:
-        texts = None
-        if hasattr(r, "get"):
-            texts = r.get("rec_texts")
-        if texts is None:
-            texts = getattr(r, "rec_texts", None)
-        if texts:
-            out.extend(str(t) for t in texts)
-    return out
 
 
 def recognize_detailed(
