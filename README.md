@@ -86,19 +86,21 @@ Bring your own key. No key ships with the code. Without a key, capture and BM25 
 ### From observation to a personal model
 
 Leave the daemon running while you work. It groups observations into one-minute
-timeline blocks and deterministic work sessions. When a session ends, the
-terminal finalizer reduces its activity, extracts an evidence-gated structured
-memory delta, and deterministically applies durable entities, assertions,
-events, and relations as Points and Lines. It also records repeated behavioral
-patterns as evidence-backed skill memory.
+timeline blocks and deterministic work sessions. Every five-minute active
+flush reduces the new window, extracts an evidence-gated structured memory
+delta, and deterministically applies durable entities, assertions, events, and
+relations as Points and Lines. Session end only catches the trailing window and
+records repeated behavioral patterns; stopping the daemon is never required to
+trigger modeling.
 
-At 00:15 local time by default, the daemon runs the same locked build as
-`persome model build`: pending session recovery, case extraction, schema mining,
-cross-domain synthesis, Root synthesis, and vector backfill. A new or
-sparse store is expected to be `degraded` until repeated evidence is sufficient
-for a Face, Volume, and Root. `persome model status` explains which geometry is
-missing; the viewer reflects the current store rather than filling gaps with
-synthetic data.
+When new Point/Line evidence exists, a debounced structural build runs every 30
+minutes by default; 00:15 remains the unconditional daily pass. Both use the
+same locked build as `persome model build`: pending recovery, case extraction,
+schema mining, cross-domain synthesis, Root synthesis, and vector backfill. A
+new or sparse store is expected to be `degraded` until repeated evidence is
+sufficient for a Face, Volume, and Root. `persome model status` explains which
+geometry is missing; the viewer reflects the current store rather than filling
+gaps with synthetic data.
 
 An LLM key is therefore optional for collection and BM25 access, but required
 for real semantic modeling. `PERSOME_LLM_MOCK=1` exists only for deterministic
@@ -152,8 +154,8 @@ Swift watcher / trusted ingest
   -> capture buffer
   -> 1-minute timeline blocks
   -> session segmentation (three deterministic rules)
-  -> reducer
-  -> terminal model finalizer
+  -> 5-minute reducer + incremental Point/Line modeling
+  -> terminal trailing-window finalizer
 
 +-----------------------+
 | Personal model        |

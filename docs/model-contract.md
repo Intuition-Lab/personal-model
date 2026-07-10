@@ -24,7 +24,9 @@ as success. `model status` uses the same completeness rule for its `ready` resul
 The contract exposes:
 
 - `points`: evomem nodes, including historical nodes needed to reconstruct evolution chains.
-- `lines`: vertical `supersedes` edges and currently active horizontal relation edges.
+- `lines`: vertical `supersedes` edges and currently active horizontal relation
+  edges. Directly observed `engaged_with` attention is active immediately;
+  inferred semantic edges remain hidden until repeated evidence promotes them.
 - `faces`: active level-1 schemas.
 - `volumes`: active level-2 cross-domain schemas.
 - `root`: zero or one active level-3 apex. More than one live root is a contract error.

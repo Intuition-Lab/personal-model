@@ -444,8 +444,10 @@ Next steps:
   4. Open the live personal-model viewer:
      http://127.0.0.1:8742/model
 
-The viewer shows your current Point / Line / Face / Volume / Root model. A new
-install starts sparse and fills higher layers only as repeated evidence builds.
+Event memory can appear during a session's five-minute flushes. Points and Lines
+are modeled from each successful flush while the daemon keeps running. Face,
+Volume, and Root need repeated evidence and refresh in the background. The
+viewer refreshes itself; stopping Persome is never a modeling step.
 
 Connect an agent (MCP):
   Point any MCP client at the daemon's memory server:

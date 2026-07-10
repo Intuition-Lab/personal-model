@@ -65,7 +65,9 @@ remove it if self-test reports OCR disabled.
 
 ## No event-daily entries appearing
 
-Entries land in `~/.persome/memory/event-YYYY-MM-DD.md` at session boundaries. Silence usually means one of three things.
+Entries begin landing in `~/.persome/memory/event-YYYY-MM-DD.md` during the
+five-minute active-session flush and are finalized at session boundaries.
+Silence usually means one of three things.
 
 ### 1. No sessions are closing
 
@@ -102,9 +104,9 @@ tail -50 ~/.persome/logs/writer.log
 
 Look for `reducer failed (retry N/5)` lines. After 5 failed attempts the reducer writes a heuristic entry tagged `heuristic` and marks the session `reduced` — you should *never* see a permanently-stuck session.
 
-The `reducer-retry` task checks due rows every minute using the persisted
-5/15/30/60/120 minute schedule. If it is absent from startup logs, confirm
-`[reducer] enabled = true` and restart.
+The `reducer-retry` task first catches up persisted ended sessions at boot, then
+checks due rows every minute using the 5/15/30/60/120 minute schedule. If it is
+absent from startup logs, confirm `[reducer] enabled = true` and restart.
 
 Force a catch-up pass:
 
@@ -116,17 +118,18 @@ This runs the same code path the daily 23:55 cron uses.
 
 ## Personal model has no Points or Lines
 
-The shipped terminal writer is `memory_delta`, not the classifier. First close
-a real session, then inspect:
+The shipped live writer is `memory_delta`, not the 30-minute classifier. A
+successful five-minute active-session flush creates its Point/Line window while
+the daemon keeps running. Inspect:
 
 ```bash
-persome writer run
 persome delta-report
 persome model status
 tail -80 ~/.persome/logs/writer.log
 ```
 
-Look for `memory_delta` skip/failure reasons. Unsupported quotes, unknown
+Look for `active Point/Line window modeled` and `memory_delta` skip/failure
+reasons. Unsupported quotes, unknown
 identity references, off-vocabulary predicates, and confidence below the floor
 are deliberately dropped. An LLM/store failure leaves `modeled_at` empty so
 recovery can retry. An `apply_status=failed` row is resumed without a second

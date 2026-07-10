@@ -324,13 +324,15 @@ def _upsert_shadow(
     source_kind: str | None = None,
     source_id: str | None = None,
     source_receipt: str | None = None,
+    status: str = "shadow",
 ) -> None:
-    """New evidence → add a shadow edge; existing open edge → ratchet its strength.
+    """New evidence adds an edge; existing open edge ratchets its strength.
 
     ``observations`` is the caller-computed count of distinct supporting evidence
     (idempotent MAX semantics — re-running over the same data changes nothing).
     Endpoint legality is enforced by ``add_edge`` (raises for an illegal pair) — the
-    caller treats a raise as "not a P0 relation" and drops it.
+    caller treats a raise as "not a P0 relation" and drops it. Extractors use the
+    default shadow status; deterministic observed floor edges may request active.
     """
     key = _edge_key(src, dst, predicate.value)
     eid = seen.get(key)
@@ -339,6 +341,11 @@ def _upsert_shadow(
             conn, edge_id=eid, observations=observations, confidence=confidence, additive=additive
         ):
             tally.reinforced += 1
+        if status == "active":
+            conn.execute(
+                "UPDATE relation_edges SET status='active' WHERE edge_id=? AND status='shadow'",
+                (eid,),
+            )
         return
     new_id = edges_store.add_edge(
         conn,
@@ -357,6 +364,7 @@ def _upsert_shadow(
         source_kind=source_kind,
         source_id=source_id,
         source_receipt=source_receipt,
+        status=status,
     )
     seen[key] = new_id
     tally.new += 1

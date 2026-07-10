@@ -1,15 +1,16 @@
 # State and personal-model writers
 
 Persome has narrow, auditable write stations rather than one unrestricted
-agent. Session reduction records what happened; terminal modeling creates
-Points and Lines; slower build stages create Faces, Volumes, and Root.
+agent. Session reduction records what happened; windowed modeling creates
+Points and Lines incrementally; slower build stages create Faces, Volumes, and
+Root.
 
 ## Ownership map
 
 | Writer | Input | Output |
 |---|---|---|
 | session reducer | timeline blocks | `event-YYYY-MM-DD.md` |
-| memory delta + apply | one reduced session | entities, assertions, events, relation Lines in evomem/FTS/Markdown projection |
+| memory delta + apply | one newly flushed session window | entities, assertions, events, relation Lines in evomem/FTS/Markdown projection |
 | pattern detector | repeated event evidence | `memory/skills/skill-*.md` |
 | case extractor | error followed by supported resolution | reusable L5 knowledge Points |
 | schema miner | repeated durable facts | level-1 Face candidates |
@@ -38,13 +39,13 @@ the deterministic heuristic writes one coarse subtask per observed app, tagged
 `heuristic`. Event files are reducer-owned; other writers may read but cannot
 write them.
 
-## Terminal memory delta
+## Windowed memory delta
 
 With shipped defaults (`memory_delta.enabled=true`, `apply_enabled=true`), the
-terminal Point/Line path is:
+live Point/Line path is:
 
 ```text
-session timeline + structured focus evidence
+new timeline window + structured focus evidence
   -> one memory_delta LLM extraction
   -> quote / roster / predicate / confidence gates
   -> append-only memory_deltas audit row
@@ -57,9 +58,18 @@ through the identity roster or appear explicitly in the session. Relations use
 a closed predicate set. Low-confidence or unsupported items are dropped and
 counted.
 
+The deterministic `self engaged_with <entity>` attention floor is direct
+observational evidence, so it becomes an active Line on the first applied
+window. LLM semantic relations remain shadow candidates. Repeated deterministic
+co-occurrence increments their independent observation count; the background
+structural build promotes only candidates meeting the evidence floor and
+per-identity fan-out cap.
+
 Persist-before-apply is deliberate. `apply_status` is `pending`, `applied`, or
-`failed`; a terminal retry reuses the stored payload and only resumes apply.
-This keeps cost and relation-observation counts idempotent.
+`failed`; a retry reuses the stored window payload and only resumes apply.
+`sessions.delta_end` advances only after success, keeping cost and
+relation-observation counts idempotent. Terminal finalization processes only
+the remaining tail.
 
 When `apply_enabled=false`, the delta remains an audit artifact and the legacy
 classifier regains the terminal durable-fact role. This is a compatibility and
@@ -84,8 +94,9 @@ propose scripts or execute automation.
 
 ## Higher-level build
 
-`persome model build` and the 00:15 daemon schedule share
-`model/ModelBuildCoordinator` and one `model-build.lock`.
+The dirty-gated 30-minute refresh, `persome model build`, and the unconditional
+00:15 daemon schedule share `model/ModelBuildCoordinator` and one
+`model-build.lock`.
 
 ### Reusable cases
 

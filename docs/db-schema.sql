@@ -101,6 +101,7 @@ CREATE TABLE sessions (
     flush_end TEXT,
     classified_end TEXT,
     pattern_detected_end TEXT,
+    delta_end TEXT,
     modeled_at TEXT
 );
 
@@ -221,7 +222,10 @@ CREATE TABLE memory_deltas (
     status TEXT NOT NULL DEFAULT 'shadow',
     payload TEXT NOT NULL DEFAULT '{}',  -- post-gate delta JSON
     dropped INTEGER NOT NULL DEFAULT 0,  -- items removed by the deterministic gates
-    apply_status TEXT NOT NULL DEFAULT 'unknown'
+    apply_status TEXT NOT NULL DEFAULT 'unknown',
+    window_start TEXT NOT NULL DEFAULT '',
+    window_end TEXT NOT NULL DEFAULT '',
+    is_final INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX idx_memory_deltas_created ON memory_deltas(created_at DESC);

@@ -47,6 +47,20 @@ def _prune_telemetry_tables() -> dict[str, int]:
         return {"parser_ticks": parser_ticks_store.prune(conn)}
 
 
+def recover_stranded_sessions(*, now: datetime | None = None) -> list[session_store.SessionRow]:
+    """Close active rows owned by a daemon process that is no longer running."""
+    recovered_at = now or datetime.now().astimezone()
+    with fts.cursor() as conn:
+        recovered = session_store.recover_active(conn, recovered_at=recovered_at)
+    if recovered:
+        logger.warning(
+            "boot recovery: closed %d stranded active session(s): %s",
+            len(recovered),
+            ", ".join(row.id for row in recovered),
+        )
+    return recovered
+
+
 def build_manager(cfg: Config) -> SessionManager:
     """Construct a SessionManager whose end-callback wires the reducer."""
 
@@ -119,12 +133,24 @@ def build_manager(cfg: Config) -> SessionManager:
 
 
 async def run_reducer_retry_tick(cfg: Config) -> None:
-    """Retry due terminal reductions and finalize any completed session."""
+    """Catch up persisted work at boot, then retry due terminal reductions."""
     if not cfg.reducer.enabled:
         logger.info("reducer retry loop not started (reducer disabled)")
         return
     interval = 60
     logger.info("reducer retry loop started (every %ds)", interval)
+    try:
+        startup = await asyncio.to_thread(writer_agent.run, cfg)
+        if startup.reduced or startup.modeled:
+            logger.info(
+                "boot recovery: reduced %d session(s), modeled %d session(s)",
+                startup.reduced,
+                startup.modeled,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.error("boot writer recovery failed: %s", exc, exc_info=True)
     while True:
         try:
             await asyncio.sleep(interval)
@@ -188,13 +214,27 @@ async def run_flush_tick(cfg: Config, manager: SessionManager) -> None:
             if snap is None:
                 continue
             session_id, session_start = snap
-            await asyncio.to_thread(
+            flushed = await asyncio.to_thread(
                 session_reducer.flush_active_session,
                 cfg,
                 session_id=session_id,
                 session_start=session_start,
                 now=datetime.now().astimezone(),
             )
+            if flushed is not None:
+                modeled = await asyncio.to_thread(
+                    writer_agent.model_active_session,
+                    cfg,
+                    session_id=session_id,
+                )
+                if modeled.completed:
+                    logger.info("session %s: active Point/Line window modeled", session_id)
+                elif modeled.errors:
+                    logger.warning(
+                        "session %s: active modeling incomplete (%s)",
+                        session_id,
+                        "; ".join(modeled.errors),
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -511,6 +551,67 @@ async def run_schema_tick(cfg: Config) -> None:
             await asyncio.sleep(60)
 
 
+async def run_model_refresh_tick(cfg: Config) -> None:
+    """Refresh Face/Volume/Root after new Point/Line evidence, at a bounded cadence."""
+    if not cfg.schema.enabled:
+        logger.info("model refresh loop not started (schema disabled)")
+        return
+    interval = max(300, int(cfg.schema.refresh_minutes) * 60)
+    logger.info("model refresh loop started (every %ds when structure is dirty)", interval)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            with fts.cursor() as conn:
+                dirty = session_store.get_system_state(
+                    conn,
+                    "model_structure_dirty",
+                    default="0",
+                )
+            if dirty == "0":
+                continue
+
+            from ..model import ModelBuildBusy, run_model_build
+
+            try:
+                result = await asyncio.to_thread(
+                    run_model_build,
+                    cfg,
+                    wait_seconds=0.0,
+                    trigger="daemon-model-refresh",
+                )
+            except ModelBuildBusy:
+                logger.info("model refresh: build already in progress; keeping dirty state")
+                continue
+
+            failed = any(stage.get("status") == "failed" for stage in result.stages.values())
+            cleared = False
+            if not failed:
+                with fts.cursor() as conn:
+                    cleared = session_store.compare_and_set_system_state(
+                        conn,
+                        "model_structure_dirty",
+                        expected=dirty,
+                        value="0",
+                    )
+                if not cleared:
+                    logger.info("model refresh: newer evidence arrived; keeping dirty state")
+            logger.info(
+                "model refresh: %s (points=%d lines=%d faces=%d volumes=%d roots=%d, dirty=%s)",
+                result.status,
+                result.stats["points"],
+                result.stats["evolution_lines"] + result.stats["relation_lines"],
+                result.stats["faces"],
+                result.stats["volumes"],
+                result.stats["roots"],
+                "cleared" if cleared else "kept",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("model refresh failed: %s", exc, exc_info=True)
+            await asyncio.sleep(60)
+
+
 def _run_evomem_enrichment_once(
     cfg: Config,
     *,
@@ -571,25 +672,28 @@ def _run_evomem_enrichment_once(
                 rel.deterministic_count,
                 rel.llm_count,
             )
-            # 边转正判据 (memory-rebuild §7-3, designed WITH the RRF pool weights):
-            # evidence floor + per-identity fan-out cap — promotion volume IS
-            # relation-pool dilution volume, so only each identity's strongest
-            # edges spread activation. Idempotent nightly; same flag, own risk
-            # profile is covered by relation_pool_weight ≤ 0.3 (sweep-verified
-            # zero regression). Runs in the same try — a promotion failure logs
-            # with the extraction leg, never crashes the tick.
-            from ..store import fts as fts_store
-            from ..store import relation_edges as edges_store
-
-            with fts_store.cursor() as conn:
-                n_promoted = edges_store.promote_edges(
-                    conn, max_per_identity=int(getattr(cfg, "edge_promote_fanout", 20))
-                )
-            if n_promoted:
-                logger.info("evomem enrichment: %d relation edge(s) promoted to ACTIVE", n_promoted)
         except Exception as exc:  # noqa: BLE001 — best-effort enrichment, never crash the tick
             logger.error("evomem enrichment: relation extraction failed: %s", exc, exc_info=True)
             errors.append(f"relation_extraction: {type(exc).__name__}: {exc}")
+
+    # Edge promotion also consumes default memory-delta evidence, so it must not
+    # live behind the optional legacy relation extractor flag. Deterministic
+    # engaged_with floor edges are active at write time; repeated co-occurrence
+    # knows edges promote here after the evidence floor and fan-out cap.
+    try:
+        from ..store import relation_edges as edges_store
+
+        with fts.cursor() as conn:
+            n_promoted = edges_store.promote_edges(
+                conn,
+                max_per_identity=int(getattr(cfg, "edge_promote_fanout", 20)),
+            )
+        report["relation_promoted"] = n_promoted
+        if n_promoted:
+            logger.info("evomem enrichment: %d relation edge(s) promoted to ACTIVE", n_promoted)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("evomem enrichment: relation promotion failed: %s", exc, exc_info=True)
+        errors.append(f"relation_promotion: {type(exc).__name__}: {exc}")
 
     report["errors"] = errors
     if errors and raise_on_error:

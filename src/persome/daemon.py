@@ -116,6 +116,15 @@ async def _mcp_loop(cfg: Config) -> None:
             delay = min(delay * 2, 60.0)
 
 
+def _hard_exit(session_manager: Any, code: int = 0) -> None:
+    """Persist the current session, remove the pidfile, and exit immediately."""
+    with suppress(Exception):
+        session_manager.force_end(reason="daemon-shutdown")
+    with suppress(FileNotFoundError):
+        paths.pid_file().unlink()
+    os._exit(code)
+
+
 def _build_task_registry() -> list[TaskDefinition]:
     """Return the complete set of daemon task definitions."""
     return [
@@ -168,6 +177,11 @@ def _build_task_registry() -> list[TaskDefinition]:
             name="schema-tick",
             enabled=lambda cfg, capture_only: not capture_only and cfg.schema.enabled,
             create=lambda cfg, sm: session_tick.run_schema_tick(cfg),
+        ),
+        TaskDefinition(
+            name="model-refresh",
+            enabled=lambda cfg, capture_only: not capture_only and cfg.schema.enabled,
+            create=lambda cfg, sm: session_tick.run_model_refresh_tick(cfg),
         ),
         TaskDefinition(
             name="mcp",
@@ -236,6 +250,11 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
 
     fts_hybrid.wire_read_path(cfg)
 
+    # A process crash cannot run SessionManager.force_end. Close any rows owned
+    # by the previous daemon before capture can create a new active session; the
+    # reducer-retry task below immediately catches them up through modeling.
+    session_tick.recover_stranded_sessions()
+
     # SessionManager observes every capture-worthy event and fires the
     # reducer via its on_session_end callback. Built even when
     # capture_only is true so session rows still land on disk.
@@ -259,12 +278,10 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
         # macOS records as a SIGSEGV crash report on *every* quit (the long-blamed
         # "teardown SIGSEGV"). _install_signal_handlers() re-claims the signals
         # after the OCR warmup so we get here at all; doing os._exit (not a signal)
-        # then exits without tripping glog. The pidfile is the one cheap durable
-        # bit; the SQLite WAL is crash-safe and the boot safety-net force-ends the
-        # session left open, so we accept losing the graceful force_end here.
-        with suppress(Exception):
-            paths.pid_file().unlink()
-        os._exit(0)
+        # then exits without tripping glog. ``_hard_exit`` performs only the two
+        # fast durable writes needed before that exit: end the active session and
+        # remove the pidfile.
+        _hard_exit(session_manager)
 
     loop = asyncio.get_running_loop()
     _on_signal = _hard_stop if hard_exit else _handle_stop
@@ -317,14 +334,11 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
         #
         # force_end + pidfile unlink are a fast DB write + a syscall; os._exit
         # then kills the abandoned tasks and their SSL worker threads with the
-        # process. SQLite WAL is crash-safe, the boot safety-net force-ends any
-        # session still open. This collapses the SSL-live window to ~one DB write.
-        with suppress(Exception):
-            session_manager.force_end(reason="daemon-shutdown")
-        with suppress(FileNotFoundError):
-            paths.pid_file().unlink()
+        # process. SQLite WAL is crash-safe, and the next boot immediately
+        # recovers any row this fast path could not close. This collapses the
+        # SSL-live window to about one DB write.
         logger.info("daemon stopped")
-        os._exit(0)
+        _hard_exit(session_manager)
 
     # Soft path (tests / embedded callers drive `_run` directly and expect it to
     # return): full graceful drain, no hard-exit.
@@ -333,7 +347,7 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
     # Flush the currently open session so its S2 reducer has a chance
     # to run. The daemon-thread reducer spawned by the callback will be
     # killed when the process exits, but a row with status='ended'
-    # survives and the next boot's safety-net picks it up.
+    # survives and the next boot's writer catch-up picks it up.
     with suppress(Exception):
         session_manager.force_end(reason="daemon-shutdown")
 
@@ -374,8 +388,8 @@ def run(cfg: Config, *, capture_only: bool = False) -> None:
         loop.run_until_complete(_run(cfg, capture_only=capture_only, hard_exit=True))
     except KeyboardInterrupt:
         # Foreground Ctrl+C when the loop signal handler wasn't installed; _run's
-        # graceful path may not have run, but the boot safety-net recovers the open
-        # session. Exit clean rather than dumping a traceback.
+        # graceful path may not have run, but boot recovery closes the open
+        # session on the next start. Exit clean rather than dumping a traceback.
         pass
     except BaseException:  # noqa: BLE001 — log, then hard-exit non-zero; never fall into the racy teardown
         logger.exception("daemon crashed")

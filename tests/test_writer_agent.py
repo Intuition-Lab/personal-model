@@ -11,6 +11,7 @@ from typing import Any
 from persome import config as config_mod
 from persome.session import store as session_store
 from persome.store import fts
+from persome.store import memory_deltas as deltas_store
 from persome.timeline import store as timeline_store
 from persome.writer import agent
 from persome.writer import llm as llm_mod
@@ -174,3 +175,139 @@ def test_terminal_finalizer_applies_default_person_model(
         ).fetchone()
     assert row is not None and row.modeled_at is not None
     assert delta is not None and delta["apply_status"] == "applied"
+
+
+def test_active_session_flush_mints_model_before_session_end(
+    ac_root: Path,
+    fake_llm,
+) -> None:
+    start = datetime(2026, 7, 10, 10, 0, tzinfo=_TZ)
+    end = start + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=["[Feishu] 和张三确认了评审结论"],
+                apps_used=["Feishu"],
+                capture_count=1,
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(id="sess_live", start_time=start, status="active"),
+        )
+        session_store.set_flush_end(conn, "sess_live", end)
+
+    fake_llm.set_default(
+        "memory_delta",
+        json.dumps(
+            {
+                "entities": [
+                    {
+                        "new_entity": "张三",
+                        "kind": "person",
+                        "quote": "和张三确认了评审结论",
+                        "confidence": 0.9,
+                    }
+                ],
+                "assertions": [],
+                "relations": [],
+                "events": [],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    cfg = config_mod.load(ac_root / "config.toml")
+    result = agent.model_active_session(cfg, session_id="sess_live")
+    again = agent.model_active_session(cfg, session_id="sess_live")
+
+    assert result.completed and result.delta.applied
+    assert again.completed and again.delta.skipped_reason == "no_window"
+    assert len(fake_llm.calls) == 1
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_live")
+        point_count = conn.execute(
+            "SELECT COUNT(*) FROM evo_nodes WHERE file_name='person-张三.md'"
+        ).fetchone()[0]
+        dirty = session_store.get_system_state(conn, "model_structure_dirty")
+    assert row is not None and row.status == "active"
+    assert row.delta_end == end and row.modeled_at is None
+    assert point_count == 1
+    assert dirty == "1"
+
+
+def test_active_model_resumes_failed_apply_before_new_tail(ac_root: Path, fake_llm) -> None:
+    start = datetime(2026, 7, 10, 11, 0, tzinfo=_TZ)
+    middle = start + timedelta(minutes=1)
+    end = middle + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        for block_start, text in (
+            (start, "[Feishu] 和张三确认了评审结论"),
+            (middle, "[Feishu] 和李四确认了发布结论"),
+        ):
+            timeline_store.insert(
+                conn,
+                timeline_store.TimelineBlock(
+                    start_time=block_start,
+                    end_time=block_start + timedelta(minutes=1),
+                    entries=[text],
+                    apps_used=["Feishu"],
+                    capture_count=1,
+                ),
+            )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(id="sess_resume", start_time=start, status="active"),
+        )
+        session_store.set_flush_end(conn, "sess_resume", end)
+        deltas_store.insert(
+            conn,
+            session_id="sess_resume",
+            payload={"entities": [], "assertions": [], "relations": [], "events": []},
+            apply_status="failed",
+            window_start=start,
+            window_end=middle,
+            is_final=False,
+        )
+
+    fake_llm.set_default(
+        "memory_delta",
+        json.dumps(
+            {
+                "entities": [
+                    {
+                        "new_entity": "李四",
+                        "kind": "person",
+                        "quote": "和李四确认了发布结论",
+                        "confidence": 0.9,
+                    }
+                ],
+                "assertions": [],
+                "relations": [],
+                "events": [],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    cfg = config_mod.load(ac_root / "config.toml")
+    result = agent.model_active_session(cfg, session_id="sess_resume")
+
+    assert result.completed
+    assert len(fake_llm.calls) == 1
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_resume")
+        windows = conn.execute(
+            "SELECT window_start, window_end, apply_status FROM memory_deltas"
+            " WHERE session_id=? ORDER BY id",
+            ("sess_resume",),
+        ).fetchall()
+    assert row is not None and row.delta_end == end
+    assert [(item["window_start"], item["window_end"]) for item in windows] == [
+        (start.isoformat(), middle.isoformat()),
+        (middle.isoformat(), end.isoformat()),
+    ]
+    assert all(item["apply_status"] == "applied" for item in windows)
