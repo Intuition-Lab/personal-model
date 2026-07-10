@@ -249,7 +249,7 @@ def start(
         # Hard-exit instead of returning — `daemon.run` has already done the clean
         # shutdown (cancelled tasks, force-ended the session, logged "daemon
         # stopped"), so all durable state is committed (SQLite WAL is crash-safe;
-        # the boot safety-net recovers any open session). Falling through to normal
+        # the next boot immediately recovers any open session). Falling through to normal
         # interpreter exit instead runs CPython finalization, which tears down the
         # OpenSSL state that a background LLM/embedding worker (`run_in_executor`)
         # may still be blocked inside (`_ssl__SSLSocket_read`) — freeing it under

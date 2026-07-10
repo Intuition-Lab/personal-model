@@ -247,6 +247,7 @@ def _apply_relations(
                     src_kind=src_kind,
                     dst_kind=dst_kind,
                     polarity=_norm_polarity(rel.get("polarity")),
+                    additive=bool(rel.get("cooccurrence")),
                 )
             except ValueError:
                 # 非法端点/谓词组合 → 非 P0 关系，丢弃（add_edge 内建矩阵闸）
@@ -337,6 +338,7 @@ def _apply_floor(
                 src_kind=EntityKind.SELF.value,
                 dst_kind=_endpoint_kind(canonical, kinds),
                 additive=True,  # ① 地板 = 跨会话累加（=会话数=attention 权重）,非 MAX-of-1
+                status="active",  # direct observed attention, not an inferred semantic claim
             )
         except ValueError:
             continue  # 理论上 engaged_with 端点全合法；防御性

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     flush_end TEXT,
     classified_end TEXT,
     pattern_detected_end TEXT,
+    delta_end TEXT,
     modeled_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
@@ -52,6 +53,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN classified_end TEXT")
     if "pattern_detected_end" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN pattern_detected_end TEXT")
+    if "delta_end" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN delta_end TEXT")
     if "modeled_at" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN modeled_at TEXT")
         # Existing reduced sessions were finalized by the pre-column callback.
@@ -76,6 +79,7 @@ class SessionRow:
     flush_end: datetime | None = None
     classified_end: datetime | None = None
     pattern_detected_end: datetime | None = None
+    delta_end: datetime | None = None
     modeled_at: datetime | None = None
 
 
@@ -116,6 +120,36 @@ def mark_ended(conn: sqlite3.Connection, session_id: str, end_time: datetime) ->
         """,
         (end_time.isoformat(), datetime.now().astimezone().isoformat(), session_id),
     )
+
+
+def recover_active(conn: sqlite3.Connection, *, recovered_at: datetime) -> list[SessionRow]:
+    """Close sessions left active by a previous daemon process.
+
+    A later session start is the safest boundary for an older stranded row. The
+    newest row closes at daemon boot. The status guard in ``mark_ended`` keeps
+    this recovery idempotent across repeated starts.
+    """
+    rows = conn.execute("SELECT * FROM sessions ORDER BY start_time ASC, created_at ASC").fetchall()
+    sessions = [_to_row(row) for row in rows]
+    recovered: list[SessionRow] = []
+    for index, row in enumerate(sessions):
+        if row.status != "active":
+            continue
+        next_start = next(
+            (
+                candidate.start_time
+                for candidate in sessions[index + 1 :]
+                if candidate.start_time > row.start_time
+            ),
+            None,
+        )
+        end_time = min(recovered_at, next_start) if next_start else recovered_at
+        end_time = max(row.start_time, end_time)
+        mark_ended(conn, row.id, end_time)
+        row.end_time = end_time
+        row.status = "ended"
+        recovered.append(row)
+    return recovered
 
 
 def mark_reduced(conn: sqlite3.Connection, session_id: str) -> None:
@@ -201,6 +235,18 @@ def set_pattern_detected_end(
     )
 
 
+def set_delta_end(conn: sqlite3.Connection, session_id: str, delta_end: datetime) -> None:
+    """Advance the successfully applied Point/Line modeling watermark."""
+    conn.execute(
+        "UPDATE sessions SET delta_end=?, updated_at=? WHERE id=?",
+        (
+            delta_end.isoformat(),
+            datetime.now().astimezone().isoformat(),
+            session_id,
+        ),
+    )
+
+
 def mark_modeled(conn: sqlite3.Connection, session_id: str, modeled_at: datetime) -> None:
     """Mark terminal classifier/pattern/delta processing complete."""
     conn.execute(
@@ -276,6 +322,32 @@ def set_system_state(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def increment_system_state(conn: sqlite3.Connection, key: str) -> None:
+    """Atomically increment an integer-valued state generation."""
+    conn.execute(
+        """
+        INSERT INTO system_state(key, value) VALUES(?, '1')
+        ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER) + 1
+        """,
+        (key,),
+    )
+
+
+def compare_and_set_system_state(
+    conn: sqlite3.Connection,
+    key: str,
+    *,
+    expected: str,
+    value: str,
+) -> bool:
+    """Update state only if no concurrent writer changed its generation."""
+    cur = conn.execute(
+        "UPDATE system_state SET value=? WHERE key=? AND value=?",
+        (value, key, expected),
+    )
+    return cur.rowcount == 1
+
+
 def _to_row(r: sqlite3.Row) -> SessionRow:
     def _dt(v: str | None) -> datetime | None:
         if not v:
@@ -302,6 +374,11 @@ def _to_row(r: sqlite3.Row) -> SessionRow:
         pattern_detected_end = _dt(r["pattern_detected_end"])
     except (IndexError, KeyError):
         pattern_detected_end = None
+    delta_end: datetime | None = None
+    try:
+        delta_end = _dt(r["delta_end"])
+    except (IndexError, KeyError):
+        delta_end = None
     modeled_at: datetime | None = None
     try:
         modeled_at = _dt(r["modeled_at"])
@@ -320,5 +397,6 @@ def _to_row(r: sqlite3.Row) -> SessionRow:
         flush_end=flush_end,
         classified_end=classified_end,
         pattern_detected_end=pattern_detected_end,
+        delta_end=delta_end,
         modeled_at=modeled_at,
     )

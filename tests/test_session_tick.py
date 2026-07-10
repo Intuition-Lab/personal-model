@@ -118,6 +118,49 @@ def test_prune_telemetry_calls_parser_store(ac_root: Path, monkeypatch) -> None:
     assert session_tick._prune_telemetry_tables() == {"parser_ticks": 7}
 
 
+def test_model_dirty_generation_does_not_clear_newer_evidence(ac_root: Path) -> None:
+    with fts.cursor() as conn:
+        session_store.set_system_state(conn, "model_structure_dirty", "1")
+        session_store.increment_system_state(conn, "model_structure_dirty")
+        assert not session_store.compare_and_set_system_state(
+            conn,
+            "model_structure_dirty",
+            expected="1",
+            value="0",
+        )
+        assert session_store.get_system_state(conn, "model_structure_dirty") == "2"
+        assert session_store.compare_and_set_system_state(
+            conn,
+            "model_structure_dirty",
+            expected="2",
+            value="0",
+        )
+
+
+def test_boot_recovery_closes_stranded_active_sessions(ac_root: Path) -> None:
+    first = datetime(2026, 7, 10, 9, 0, tzinfo=_TZ)
+    second = first + timedelta(hours=1)
+    boot = second + timedelta(hours=1)
+    with fts.cursor() as conn:
+        session_store.insert(
+            conn,
+            session_store.SessionRow(id="sess_old", start_time=first, status="active"),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(id="sess_new", start_time=second, status="active"),
+        )
+
+    recovered = session_tick.recover_stranded_sessions(now=boot)
+    assert [row.id for row in recovered] == ["sess_old", "sess_new"]
+    assert [row.end_time for row in recovered] == [second, boot]
+
+    with fts.cursor() as conn:
+        assert session_store.get_by_id(conn, "sess_old").status == "ended"
+        assert session_store.get_by_id(conn, "sess_new").status == "ended"
+    assert session_tick.recover_stranded_sessions(now=boot) == []
+
+
 @pytest.mark.parametrize("llm_succeeded", [True, False])
 def test_terminal_callback_finalizes_no_write_and_heuristic_results(
     ac_root: Path,
@@ -199,3 +242,53 @@ async def test_reducer_retry_tick_finalizes_due_results(ac_root: Path, monkeypat
             "just_written_entry_id": "entry-1",
         }
     ]
+
+
+async def test_reducer_retry_runs_writer_catch_up_before_sleep(ac_root: Path, monkeypatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(
+        session_tick.writer_agent,
+        "run",
+        lambda cfg: seen.append("writer") or type("Result", (), {"reduced": 0, "modeled": 0})(),
+    )
+
+    async def cancel_on_sleep(seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(session_tick.asyncio, "sleep", cancel_on_sleep)
+    cfg = config_mod.load(ac_root / "config.toml")
+    with pytest.raises(asyncio.CancelledError):
+        await session_tick.run_reducer_retry_tick(cfg)
+    assert seen == ["writer"]
+
+
+async def test_flush_tick_models_successful_active_window(ac_root: Path, monkeypatch) -> None:
+    start = datetime(2026, 7, 10, 12, 0, tzinfo=_TZ)
+    manager = type("Manager", (), {"current_snapshot": lambda self: ("sess_live", start)})()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        session_tick.session_reducer,
+        "flush_active_session",
+        lambda cfg, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        session_tick.writer_agent,
+        "model_active_session",
+        lambda cfg, **kwargs: (
+            calls.append(kwargs["session_id"])
+            or type("Result", (), {"completed": True, "errors": []})()
+        ),
+    )
+    sleeps = 0
+
+    async def run_once(seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(session_tick.asyncio, "sleep", run_once)
+    cfg = config_mod.load(ac_root / "config.toml")
+    with pytest.raises(asyncio.CancelledError):
+        await session_tick.run_flush_tick(cfg, manager)
+    assert calls == ["sess_live"]

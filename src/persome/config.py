@@ -179,7 +179,7 @@ class PatternDetectorConfig:
 
 @dataclass
 class MemoryDeltaConfig:
-    # One LLM reading of the just-ended session emits a structured
+    # One LLM reading of each newly flushed session window emits a structured
     # ``memory_delta {entities, assertions, relations, events}`` persisted to
     # the ``memory_deltas`` table before deterministic application mints or
     # reinforces evomem Points and relation Lines.
@@ -250,9 +250,10 @@ class SkillCheckConfig:
 
 @dataclass
 class SchemaConfig:
-    # The daily tick invokes the same full model build used by the CLI. This
-    # section controls its schedule and schema/Root stages.
+    # New Point/Line evidence triggers a debounced structural refresh; the daily
+    # tick remains the unconditional safety pass.
     enabled: bool = True
+    refresh_minutes: int = 30
     daily_tick_hour: int = 0
     daily_tick_minute: int = 15
     # After the per-file miner runs, collide
@@ -782,7 +783,7 @@ lookback_days = 7          # scan this many days of event-daily for patterns
 min_occurrences = 2        # minimum repetitions to flag as a candidate
 
 [memory_delta]
-enabled = true             # one evidence-gated structured extraction per ended session
+enabled = true             # one evidence-gated structured extraction per newly flushed session window
 max_blocks = 120
 roster_max = 60
 min_confidence = 0.5
@@ -846,7 +847,8 @@ enabled = true                    # detect skill matches inside the per-minute t
 
 
 [schema]
-enabled = true                    # D2 schema miner daily tick: induce predictive schema-*.md priors from durable facts
+enabled = true                    # induce predictive schema-*.md priors from durable facts
+refresh_minutes = 30             # after new Point/Line evidence, refresh Face/Volume/Root at this cadence (min 5)
 daily_tick_hour = 0               # local-time hour for the daily schema tick (after safety-net 23:55)
 daily_tick_minute = 15            # local-time minute for the daily schema tick
 cross_domain_enabled = true       # Hy-Memory cross-domain sweeper: collide topic-far/behavior-near schemas (no embedding); low-quality fusions stay forming, only stable ones enter active model reads

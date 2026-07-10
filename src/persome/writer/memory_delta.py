@@ -1,9 +1,9 @@
-"""Session-end structured modeling: observations to auditable Points and Lines.
+"""Windowed structured modeling: observations to auditable Points and Lines.
 
-One LLM reading of the just-ended session, multiple structured heads —
+One LLM reading of each newly flushed session window, multiple structured heads —
 ``memory_delta {entities, assertions, relations, events}``. The gated delta is
 persisted first, then ``delta_apply`` deterministically mints or reinforces
-evomem Points and relation Lines. Persist-before-apply makes the terminal path
+evomem Points and relation Lines. Persist-before-apply makes the windowed path
 auditable and retryable.
 
 §4.1 discipline — judgment belongs to the LLM (this one call), identity and
@@ -19,8 +19,8 @@ gating to code:
 - **Confidence floor**: items below ``memory_delta.min_confidence`` drop.
 
 Everything here is fail-open: an LLM error, malformed JSON, or a store error
-logs a warning and returns ``written=False``. The terminal finalizer leaves the
-session unmodeled so recovery can retry it.
+logs a warning and returns ``written=False``. The active watermark or terminal
+marker remains unchanged so recovery can retry it.
 """
 
 from __future__ import annotations
@@ -337,8 +337,9 @@ def run_after_session(
     start_time: datetime | None,
     end_time: datetime | None,
     llm_call: LlmCallFn | None = None,
+    is_final: bool = True,
 ) -> DeltaResult:
-    """Consolidate one ended session into a shadow memory_delta row."""
+    """Consolidate one bounded session window into a shadow memory_delta row."""
     result = DeltaResult(session_id=session_id)
     if not getattr(cfg.memory_delta, "enabled", False):
         result.skipped_reason = "disabled"
@@ -350,12 +351,12 @@ def run_after_session(
     max_blocks = int(getattr(cfg.memory_delta, "max_blocks", 120))
     try:
         with fts.cursor() as conn:
-            # newest-first + limit → the session's most recent max_blocks;
+            # newest-first + limit gives the window's most recent max_blocks;
             # reversed back to chronological order for the event log.
             blocks = list(
                 reversed(tl_store.query_range(conn, start_time, end_time, limit=max_blocks))
             )
-    except Exception:  # noqa: BLE001 — fail-open, never disturb the session-end chain
+    except Exception:  # noqa: BLE001 — fail-open, never disturb the writer chain
         logger.warning("memory_delta %s: block read failed", session_id, exc_info=True)
         result.skipped_reason = "block_read_failed"
         return result
@@ -423,6 +424,9 @@ def run_after_session(
                     if getattr(cfg.memory_delta, "apply_enabled", False)
                     else "not_requested"
                 ),
+                window_start=start_time,
+                window_end=end_time,
+                is_final=is_final,
             )
     except Exception:  # noqa: BLE001
         logger.warning("memory_delta %s: persist failed", session_id, exc_info=True)
@@ -477,13 +481,66 @@ def ensure_after_session(
     end_time: datetime | None,
     llm_call: LlmCallFn | None = None,
 ) -> DeltaResult:
-    """Run one session delta once, retrying only a previously failed apply.
+    """Run one terminal delta window once, with legacy-row compatibility."""
+    return _ensure_window(
+        cfg,
+        session_id=session_id,
+        start_time=start_time,
+        end_time=end_time,
+        llm_call=llm_call,
+        is_final=True,
+        allow_legacy=True,
+    )
 
-    Terminal session finalization is retryable. A retry must not spend another
+
+def ensure_active_window(
+    cfg: Any,
+    *,
+    session_id: str,
+    start_time: datetime | None,
+    end_time: datetime | None,
+    llm_call: LlmCallFn | None = None,
+) -> DeltaResult:
+    """Apply one active-session window exactly once."""
+    return _ensure_window(
+        cfg,
+        session_id=session_id,
+        start_time=start_time,
+        end_time=end_time,
+        llm_call=llm_call,
+        is_final=False,
+        allow_legacy=False,
+    )
+
+
+def _ensure_window(
+    cfg: Any,
+    *,
+    session_id: str,
+    start_time: datetime | None,
+    end_time: datetime | None,
+    llm_call: LlmCallFn | None,
+    is_final: bool,
+    allow_legacy: bool,
+) -> DeltaResult:
+    """Run one delta window once, retrying only a previously failed apply.
+
+    Active and terminal modeling are retryable. A retry must not spend another
     LLM call or reinforce relation observations twice after a successful run.
     """
+    if start_time is None or end_time is None or start_time >= end_time:
+        return DeltaResult(session_id=session_id, skipped_reason="no_window")
     with fts.cursor() as conn:
-        existing = deltas_store.latest_for_session(conn, session_id)
+        existing = deltas_store.latest_for_window(
+            conn,
+            session_id,
+            window_start=start_time,
+            window_end=end_time,
+        )
+        if existing is None and allow_legacy:
+            legacy = deltas_store.latest_for_session(conn, session_id)
+            if legacy is not None and not str(legacy["window_end"] or ""):
+                existing = legacy
     if existing is None:
         return run_after_session(
             cfg,
@@ -491,6 +548,7 @@ def ensure_after_session(
             start_time=start_time,
             end_time=end_time,
             llm_call=llm_call,
+            is_final=is_final,
         )
 
     result = DeltaResult(
@@ -499,6 +557,11 @@ def ensure_after_session(
         skipped_reason="already_processed",
     )
     status = str(existing["apply_status"] or "unknown")
+    try:
+        payload = json.loads(existing["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    result.counts = {head: len(payload.get(head) or []) for head in _HEADS}
     result.applied = status in {"applied", "unknown"}
     if not getattr(cfg.memory_delta, "apply_enabled", False) or status not in {
         "pending",
@@ -508,7 +571,6 @@ def ensure_after_session(
         return result
 
     try:
-        payload = json.loads(existing["payload"] or "{}")
         from . import delta_apply
 
         with fts.cursor() as conn:

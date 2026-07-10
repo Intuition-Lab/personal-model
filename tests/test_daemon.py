@@ -23,6 +23,7 @@ from persome.daemon import (
     TaskDefinition,
     _build_task_registry,
     _create_tasks_from_registry,
+    _hard_exit,
     _mcp_loop,
     _on_task_done,
     _run,
@@ -75,8 +76,11 @@ class TestRegistryEnabledPredicates:
     def test_schema_tick_requires_flag_and_full_mode(self) -> None:
         cfg = Config(schema=SchemaConfig(enabled=True))
         assert "schema-tick" in _enabled_names(cfg)
+        assert "model-refresh" in _enabled_names(cfg)
         assert "schema-tick" not in _enabled_names(cfg, capture_only=True)
+        assert "model-refresh" not in _enabled_names(cfg, capture_only=True)
         assert "schema-tick" not in _enabled_names(Config(schema=SchemaConfig(enabled=False)))
+        assert "model-refresh" not in _enabled_names(Config(schema=SchemaConfig(enabled=False)))
 
     def test_vector_embed_tick_requires_flag_and_full_mode(self) -> None:
         cfg = Config(search=SearchConfig(hybrid_enabled=True))
@@ -383,3 +387,20 @@ class TestRunLifecycle:
 def test_shutdown_timeout_constant_is_sane() -> None:
     # Guard against an accidental 0/negative that would make shutdown not wait.
     assert _SHUTDOWN_TIMEOUT_SECONDS > 0
+
+
+def test_hard_exit_persists_session_before_process_exit(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from persome import paths
+
+    manager = MagicMock()
+    paths.pid_file().write_text("123")
+    exit_mock = MagicMock()
+    monkeypatch.setattr("persome.daemon.os._exit", exit_mock)
+
+    _hard_exit(manager)
+
+    manager.force_end.assert_called_once_with(reason="daemon-shutdown")
+    assert not paths.pid_file().exists()
+    exit_mock.assert_called_once_with(0)

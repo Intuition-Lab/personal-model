@@ -1,4 +1,4 @@
-"""Shared terminal session finalizer and manual writer recovery entry point.
+"""Shared active/terminal model writer and manual recovery entry point.
 
 The writer is driven by session boundaries. ``SessionManager.on_session_end``
 spawns the reducer asynchronously (see ``session/tick.py``), then this module
@@ -20,6 +20,7 @@ from ..config import Config
 from ..logger import get
 from ..session import store as session_store
 from ..store import fts
+from ..store import memory_deltas as deltas_store
 from . import classifier as classifier_mod
 from . import memory_delta as memory_delta_mod
 from . import pattern_detector as pattern_detector_mod
@@ -50,6 +51,113 @@ class SessionModelResult:
 
 def _event_path(row: session_store.SessionRow) -> str:
     return f"event-{row.start_time.date().isoformat()}.md"
+
+
+def _delta_completed(cfg: Config, delta: Any) -> bool:
+    benign = {"disabled", "no_blocks", "no_window", "already_processed", "resumed_apply"}
+    complete = bool(delta.written or delta.skipped_reason in benign)
+    if getattr(cfg.memory_delta, "apply_enabled", False):
+        complete = complete and bool(
+            delta.applied or delta.skipped_reason in {"no_blocks", "no_window"}
+        )
+    return complete
+
+
+def _advance_delta_watermark(
+    session_id: str,
+    window_end: datetime,
+    delta: Any,
+) -> None:
+    with fts.cursor() as conn:
+        session_store.set_delta_end(conn, session_id, window_end)
+        if sum(delta.counts.values()) > 0:
+            session_store.increment_system_state(conn, "model_structure_dirty")
+
+
+def _model_delta_range(
+    cfg: Config,
+    *,
+    session_id: str,
+    window_start: datetime,
+    window_end: datetime,
+    terminal: bool,
+) -> tuple[Any, str]:
+    """Resume persisted windows first, then model only the unprocessed tail."""
+    if window_start >= window_end:
+        return memory_delta_mod.DeltaResult(
+            session_id=session_id,
+            skipped_reason="no_window",
+        ), ""
+
+    cursor = window_start
+    last_delta: Any = None
+    while cursor < window_end:
+        with fts.cursor() as conn:
+            persisted = deltas_store.next_for_session_start(
+                conn,
+                session_id,
+                window_start=cursor,
+                through=window_end,
+            )
+        persisted_end = None
+        persisted_final = False
+        if persisted is not None:
+            try:
+                persisted_end = datetime.fromisoformat(str(persisted["window_end"]))
+                persisted_final = bool(persisted["is_final"])
+            except (TypeError, ValueError):
+                persisted_end = None
+        target = persisted_end or window_end
+        use_terminal = persisted_final or (terminal and target == window_end)
+        ensure = (
+            memory_delta_mod.ensure_after_session
+            if use_terminal
+            else memory_delta_mod.ensure_active_window
+        )
+        last_delta = ensure(
+            cfg,
+            session_id=session_id,
+            start_time=cursor,
+            end_time=target,
+        )
+        if not _delta_completed(cfg, last_delta):
+            return last_delta, f"memory_delta: {last_delta.skipped_reason or 'not applied'}"
+        _advance_delta_watermark(session_id, target, last_delta)
+        cursor = target
+
+    return last_delta, ""
+
+
+def model_active_session(cfg: Config, *, session_id: str) -> SessionModelResult:
+    """Turn the latest flushed active-session window into Points and Lines."""
+    result = SessionModelResult(session_id=session_id)
+    lock_path = paths.session_model_lock()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock:
+        lock_path.chmod(0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with fts.cursor() as conn:
+                row = session_store.get_by_id(conn, session_id)
+            if row is None or row.status != "active" or row.flush_end is None:
+                result.skipped_reason = "session not ready for active modeling"
+                return result
+            window_start = row.delta_end or row.start_time
+            window_end = row.flush_end
+            result.delta, error = _model_delta_range(
+                cfg,
+                session_id=session_id,
+                window_start=window_start,
+                window_end=window_end,
+                terminal=False,
+            )
+            if error:
+                result.errors.append(error)
+                return result
+            result.completed = True
+            return result
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def finalize_session(
@@ -123,28 +231,15 @@ def finalize_session(
                 logger.warning("pattern_detector %s crashed: %s", session_id, exc, exc_info=True)
 
             try:
-                result.delta = memory_delta_mod.ensure_after_session(
+                result.delta, error = _model_delta_range(
                     cfg,
                     session_id=session_id,
-                    start_time=row.start_time,
-                    end_time=row.end_time,
+                    window_start=row.delta_end or row.start_time,
+                    window_end=row.end_time,
+                    terminal=True,
                 )
-                benign = {
-                    "disabled",
-                    "no_blocks",
-                    "no_window",
-                    "already_processed",
-                    "resumed_apply",
-                }
-                delta_ok = result.delta.written or result.delta.skipped_reason in benign
-                if getattr(cfg.memory_delta, "apply_enabled", False):
-                    delta_ok = delta_ok and (
-                        result.delta.applied or result.delta.skipped_reason == "no_blocks"
-                    )
-                if not delta_ok:
-                    result.errors.append(
-                        f"memory_delta: {result.delta.skipped_reason or 'not applied'}"
-                    )
+                if error:
+                    result.errors.append(error)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(f"memory_delta: {type(exc).__name__}: {exc}")
                 logger.warning("memory_delta %s crashed: %s", session_id, exc, exc_info=True)

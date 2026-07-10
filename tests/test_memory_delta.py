@@ -227,6 +227,47 @@ def test_stats_aggregates_latest_per_session(ac_root, fake_llm) -> None:
     assert agg["heads"]["entities"] == 1
 
 
+def test_active_windows_are_incremental_and_idempotent(ac_root, fake_llm) -> None:
+    start, end = _seed_session_blocks([SESSION_ENTRY, SESSION_ENTRY])
+    middle = start + timedelta(minutes=1)
+    fake_llm.set_default(delta_mod.STAGE, _payload())
+    cfg = _cfg()
+
+    first = delta_mod.ensure_active_window(
+        cfg,
+        session_id="s-live",
+        start_time=start,
+        end_time=middle,
+    )
+    duplicate = delta_mod.ensure_active_window(
+        cfg,
+        session_id="s-live",
+        start_time=start,
+        end_time=middle,
+    )
+    second = delta_mod.ensure_active_window(
+        cfg,
+        session_id="s-live",
+        start_time=middle,
+        end_time=end,
+    )
+
+    assert first.written and first.applied
+    assert duplicate.skipped_reason == "already_processed"
+    assert second.written and second.applied
+    assert len(fake_llm.calls) == 2
+    with fts.cursor() as conn:
+        rows = conn.execute(
+            "SELECT window_start, window_end, is_final FROM memory_deltas"
+            " WHERE session_id=? ORDER BY id",
+            ("s-live",),
+        ).fetchall()
+    assert [(row["window_start"], row["window_end"], row["is_final"]) for row in rows] == [
+        (start.isoformat(), middle.isoformat(), 0),
+        (middle.isoformat(), end.isoformat(), 0),
+    ]
+
+
 def test_gate_canonicalizes_honorific_ref_through_the_funnel(ac_root) -> None:
     """§4.3 the ONE funnel at work inside the gate: a "张总" ref resolves to the
     roster canonical and is REWRITTEN in the stored payload — downstream reads

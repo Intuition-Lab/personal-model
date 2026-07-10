@@ -45,12 +45,14 @@ flowchart LR
    aligned one-minute blocks.
 4. `session/manager.py` cuts work using idle-gap, single-app soft-cut, and
    maximum-duration rules.
-5. `writer/session_reducer.py` periodically flushes long sessions and writes a
-   terminal event record when a session ends.
+5. `writer/session_reducer.py` flushes active sessions every five minutes;
+   `writer.agent.model_active_session` turns each new window into Points/Lines.
+   Session end writes and models only the trailing range.
 
-### Terminal modeling
+### Incremental and terminal modeling
 
-Every reduced session enters `writer.agent.finalize_session`, regardless of
+Every successful active flush enters the windowed memory-delta path. Every
+reduced session then enters `writer.agent.finalize_session`, regardless of
 whether the terminal reducer wrote a new entry. This matters when prior flushes
 already covered the whole session or when the reducer exhausted its LLM retries
 and wrote a heuristic fallback.
@@ -59,20 +61,22 @@ The finalizer runs:
 
 1. classifier compatibility/incremental catch-up;
 2. repeated-pattern detection into `skills/skill-*.md`;
-3. one structured `memory_delta` extraction over the session;
+3. one structured `memory_delta` extraction over the unmodeled tail;
 4. deterministic gates for quoted evidence, identity, predicate vocabulary,
    and confidence;
 5. deterministic apply into current/historical Points and relation Lines.
 
-The memory-delta row is persisted before apply. `apply_status` allows a crashed
-apply to resume without another LLM call or duplicate relation reinforcement.
-The session receives `modeled_at` only after all enabled terminal stages finish.
-A kernel `session-model.lock` coordinates daemon, retry, CLI, and model-build
-callers.
+Each memory-delta window is persisted before apply. `apply_status` allows a
+crashed apply to resume without another LLM call or duplicate relation
+reinforcement. `delta_end` advances after successful active apply; the session
+receives `modeled_at` only after all terminal stages finish. A kernel
+`session-model.lock` coordinates daemon, retry, CLI, and model-build callers.
 
 ### Higher geometry
 
-`persome model build` and the scheduled 00:15 build call one locked coordinator:
+New Point/Line evidence triggers a debounced build every 30 minutes by default;
+`persome model build` and the unconditional 00:15 build call the same locked
+coordinator:
 
 1. recover pending reductions and terminal modeling;
 2. initialize the evomem baseline when needed;
@@ -98,9 +102,10 @@ The registry in `src/persome/daemon.py` is the authoritative task list.
 | `reducer-retry` | Every 60 seconds; consumes `next_retry_at`, then sends reduced or heuristic terminal results through the shared finalizer. |
 | `daily-safety-net` | At 23:55 by default; force-ends the open session, catches all stranded reduction/modeling work, reprojects, checkpoints, snapshots, prunes telemetry, and runs enabled maintenance. |
 | `timeline` | Every 60 seconds; materializes closed timeline windows and applies capture retention. |
-| `flush` | Every `session.flush_minutes`; incrementally reduces an active session. |
-| `classifier-tick` | Every `classifier.interval_minutes`; extracts durable facts from long active sessions. With default memory-delta apply, terminal Point production remains owned by memory delta. |
+| `flush` | Every `session.flush_minutes`; reduces and models the new active-session window as Points/Lines. |
+| `classifier-tick` | Legacy-only: every `classifier.interval_minutes` when delta apply is disabled. |
 | `vector-embed-tick` | Every 60 seconds when hybrid retrieval is enabled; drains the embedding queue. It is a no-op without credentials. |
+| `model-refresh` | Every `schema.refresh_minutes` when new Point/Line evidence exists; refreshes Face/Volume/Root. |
 | `schema-tick` | At 00:15 by default; invokes the shared personal-model build. |
 | `mcp` | Hosts streamable HTTP MCP, REST, Chat routes, and `/model`; restarts with backoff after a crash. |
 
@@ -148,6 +153,7 @@ audio, or benchmark scorer.
 - OCR worker crash: the worker is restarted/fails open; the daemon survives.
 - Reducer failure: persisted exponential retry; final exhaustion writes an
   auditable heuristic event, then still runs terminal modeling.
+- Active model failure: `delta_end` does not advance, so the next flush retries a larger window.
 - Terminal model failure: `modeled_at` remains null and retry/recovery can resume.
 - Model build overlap: `model-build.lock` waits or reports busy.
 - Integrity/snapshot failure: structured error logs and optional write freeze;

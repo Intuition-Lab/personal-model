@@ -22,7 +22,9 @@ import pytest
 
 from persome.config import Config, SchemaConfig
 from persome.daemon import _build_task_registry
+from persome.session import store as session_store
 from persome.session import tick as session_tick
+from persome.store import fts
 
 
 def _enabled_names(cfg: Config, capture_only: bool = False) -> set[str]:
@@ -35,12 +37,15 @@ def _enabled_names(cfg: Config, capture_only: bool = False) -> set[str]:
 def test_schema_tick_requires_flag_and_full_mode() -> None:
     cfg = Config(schema=SchemaConfig(enabled=True))
     assert "schema-tick" in _enabled_names(cfg)
+    assert "model-refresh" in _enabled_names(cfg)
     assert "schema-tick" not in _enabled_names(cfg, capture_only=True)
+    assert "model-refresh" not in _enabled_names(cfg, capture_only=True)
 
 
 def test_schema_tick_absent_when_disabled() -> None:
     cfg = Config(schema=SchemaConfig(enabled=False))
     assert "schema-tick" not in _enabled_names(cfg)
+    assert "model-refresh" not in _enabled_names(cfg)
 
 
 def test_schema_config_defaults_on_just_after_midnight() -> None:
@@ -48,6 +53,7 @@ def test_schema_config_defaults_on_just_after_midnight() -> None:
     # net so it consumes freshly classified facts.
     sc = SchemaConfig()
     assert sc.enabled is True
+    assert sc.refresh_minutes == 30
     assert sc.daily_tick_hour == 0
     assert sc.daily_tick_minute == 15
 
@@ -112,3 +118,48 @@ async def test_run_schema_tick_invokes_shared_model_build(ac_root, monkeypatch) 
         await asyncio.wait_for(session_tick.run_schema_tick(cfg), timeout=2.0)
 
     assert calls == [(0.0, "daemon-schema-tick")]
+
+
+async def test_model_refresh_builds_only_when_dirty(ac_root, monkeypatch) -> None:
+    cfg = Config(schema=SchemaConfig(enabled=True, refresh_minutes=5))
+    with fts.cursor() as conn:
+        session_store.set_system_state(conn, "model_structure_dirty", "1")
+
+    calls: list[str] = []
+
+    def _fake_build(_cfg, *, wait_seconds, trigger):
+        from types import SimpleNamespace
+
+        calls.append(trigger)
+        return SimpleNamespace(
+            status="degraded",
+            stages={"schema_miner": {"status": "complete"}},
+            stats={
+                "points": 1,
+                "evolution_lines": 0,
+                "relation_lines": 1,
+                "faces": 0,
+                "volumes": 0,
+                "roots": 0,
+            },
+        )
+
+    import persome.model as model_mod
+
+    monkeypatch.setattr(model_mod, "run_model_build", _fake_build)
+    sleeps = 0
+
+    async def run_once(seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(session_tick.asyncio, "sleep", run_once)
+    with pytest.raises(asyncio.CancelledError):
+        await session_tick.run_model_refresh_tick(cfg)
+
+    with fts.cursor() as conn:
+        dirty = session_store.get_system_state(conn, "model_structure_dirty")
+    assert calls == ["daemon-model-refresh"]
+    assert dirty == "0"

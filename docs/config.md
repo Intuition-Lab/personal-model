@@ -122,15 +122,16 @@ interval_minutes = 30
 ```
 
 Timeline windows are wall-clock aligned and idempotent. `flush_minutes` and
-`classifier.interval_minutes` have a five-minute effective floor. Terminal
+`classifier.interval_minutes` have a five-minute effective floor. A successful
+flush also models its new Point/Line window under default delta apply. Terminal
 reducer failures use persisted `5/15/30/60/120` minute backoff; a daemon task
 checks the queue every minute and the daily safety net ignores backoff to catch
 anything stranded.
 
 Disabling the reducer preserves capture/session rows but prevents event and
-terminal personal-model writes.
+incremental personal-model writes.
 
-## Terminal personal modeling
+## Incremental personal modeling
 
 ```toml
 [memory_delta]
@@ -149,11 +150,13 @@ lookback_days = 7
 min_occurrences = 2
 ```
 
-With the shipped defaults, `memory_delta` is the terminal Point/Line producer.
-It persists one gated session payload before deterministic apply. Disabling
-`apply_enabled` keeps the audit row but stops it from changing the model and
-reactivates the classifier's legacy terminal write role. This switch is for
-diagnosis/migration, not a second normal operating mode.
+With the shipped defaults, `memory_delta` is the Point/Line producer. It
+persists one gated payload per newly flushed active-session window before
+deterministic apply and advances `sessions.delta_end`; terminal finalization
+only catches the remaining tail. Disabling `apply_enabled` keeps the audit row
+but stops it from changing the model and reactivates the classifier's legacy
+terminal write role. This switch is for diagnosis/migration, not a second
+normal operating mode.
 
 The pattern detector requires repeated evidence and writes observed behavioral
 memory under `memory/skills/skill-*.md`. It does not propose or execute
@@ -177,6 +180,7 @@ memory-delta relation path is already active.
 ```toml
 [schema]
 enabled = true
+refresh_minutes = 30
 daily_tick_hour = 0
 daily_tick_minute = 15
 cross_domain_enabled = true
@@ -186,11 +190,12 @@ root_synthesis_enabled = true
 root_token_budget = 1500
 ```
 
-The scheduled task calls the same `ModelBuildCoordinator` as `persome model
-build`. It runs pending state formation, enrichment, Face mining, Volume
-synthesis, Root synthesis, vectors, and layout. Forming schemas are excluded
-from active snapshots. Missing repeated evidence yields a truthful degraded
-build.
+After new Point/Line evidence, the Runtime calls the same
+`ModelBuildCoordinator` as `persome model build` at the bounded
+`refresh_minutes` cadence. The 00:15 tick remains an unconditional daily pass.
+Both run pending state formation, enrichment, Face mining, Volume synthesis,
+Root synthesis, vectors, and layout. Forming schemas are excluded from active
+snapshots. Missing repeated evidence yields a truthful degraded build.
 
 ## Writer and maintenance
 

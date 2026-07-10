@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from persome.evomem.engine import EvoMemory
 from persome.store import fts
+from persome.store import relation_edges as edges_store
 from persome.writer import delta_apply
 
 
@@ -258,13 +259,13 @@ def test_floor_edge_connects_every_entity_no_orphan(ac_root):
     with fts.cursor() as conn:
         conn.row_factory = None
         connected = {
-            row[0]
+            (row[0], row[1])
             for row in conn.execute(
-                "SELECT dst_identity FROM relation_edges WHERE src_identity='self'"
+                "SELECT dst_identity, status FROM relation_edges WHERE src_identity='self'"
                 " AND predicate='engaged_with'"
             )
         }
-    assert connected == {"腾讯校招", "某工具"}  # 都连 USER，无孤儿
+    assert connected == {("腾讯校招", "active"), ("某工具", "active")}  # observed Lines
 
 
 def test_floor_obs_accumulates_across_sessions(ac_root):
@@ -285,6 +286,39 @@ def test_floor_obs_accumulates_across_sessions(ac_root):
             " AND dst_identity='张三' AND valid_to IS NULL"
         ).fetchone()
     assert row is not None and row[0] == 3  # 修前会永远是 1
+
+
+def test_cooccurrence_relation_accumulates_then_promotes(ac_root):
+    clean = {
+        "entities": [
+            {"ref": "张三", "kind": "person", "ended": False, "quote": "张三和李四"},
+            {"ref": "李四", "kind": "person", "ended": False, "quote": "张三和李四"},
+        ],
+        "relations": [
+            {
+                "src": {"ref": "张三"},
+                "dst": {"ref": "李四"},
+                "predicate": "knows",
+                "quote": "",
+                "confidence": 0.6,
+                "cooccurrence": True,
+            }
+        ],
+        "events": [],
+        "assertions": [],
+    }
+    for _ in range(3):
+        _apply(clean)
+    with fts.cursor() as conn:
+        row = conn.execute(
+            "SELECT observations, status FROM relation_edges WHERE predicate='knows'"
+        ).fetchone()
+        promoted = edges_store.promote_edges(conn)
+        status = conn.execute(
+            "SELECT status FROM relation_edges WHERE predicate='knows'"
+        ).fetchone()[0]
+    assert tuple(row) == (3, "shadow")
+    assert promoted == 1 and status == "active"
 
 
 def test_org_nesting_part_of(ac_root):

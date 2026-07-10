@@ -109,8 +109,10 @@ Update matching docs in the same change as behavior. Research notes under
   names; secrets belong in `<PERSOME_ROOT>/env`, never `config.toml`.
 - `install.sh` generates and preserves `PERSOME_SCREENSHOT_KEY`. If encrypted
   screenshot persistence lacks a valid key, omit pixels; never write plaintext.
-- Default terminal Point/Line production is `memory_delta` followed by
-  deterministic `delta_apply`; do not silently reintroduce parallel writers.
+- Default Point/Line production is the windowed `memory_delta` followed by
+  deterministic `delta_apply`: active flushes advance `sessions.delta_end` and
+  terminal finalization only catches the trailing window. Do not silently
+  reintroduce parallel writers.
 - Every modeled object preserves evidence receipts and bitemporal history.
 - At most one live Root exists. Missing geometry is `degraded`, never fabricated.
 - Chat skill Markdown is safe to load. Executable `skills/*/tools.py`, shell,
