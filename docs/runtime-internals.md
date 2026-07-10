@@ -11,10 +11,13 @@ ANTHROPIC_API_KEY
 ANTHROPIC_BASE_URL
 OPENAI_API_KEY
 OPENAI_BASE_URL
+PERSOME_SCREENSHOT_KEY
 ```
 
 `config.toml` contains behavior and model names, never API keys. `PERSOME_ROOT`
 redirects the entire runtime for tests or isolated profiles.
+`install.sh` generates the machine-local screenshot key automatically and
+preserves it across reinstalls; it is not a provider credential.
 
 ## Daemon lifecycle
 
@@ -49,7 +52,7 @@ belong in core.
 
 | Path | Purpose |
 |---|---|
-| `env` | provider secrets |
+| `env` | provider secrets plus the generated screenshot-encryption key |
 | `config.toml` | runtime configuration |
 | `.pid` | direct-daemon PID |
 | `capture-buffer/` | bounded AX/OCR records |

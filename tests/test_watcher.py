@@ -63,7 +63,9 @@ def _propagate_capture_logs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(logging.getLogger("persome.capture"), "propagate", True)
 
 
-def _read_events_from_lines(proc: AXWatcherProcess, lines: list[str]) -> None:
+def _read_events_from_lines(
+    proc: AXWatcherProcess, lines: list[str], *, return_code: int = 0
+) -> int | None:
     """Drive ``_read_events`` over a real pipe carrying the given JSONL lines."""
     r_fd, w_fd = os.pipe()
     with os.fdopen(w_fd, "w") as w:
@@ -71,8 +73,10 @@ def _read_events_from_lines(proc: AXWatcherProcess, lines: list[str]) -> None:
             w.write(line + "\n")
     reader = os.fdopen(r_fd, "r")
     try:
-        proc._process = SimpleNamespace(stdout=reader, poll=lambda: 0, wait=lambda: 0)
-        proc._read_events()
+        proc._process = SimpleNamespace(
+            stdout=reader, poll=lambda: return_code, wait=lambda: return_code
+        )
+        return proc._read_events()
     finally:
         proc._process = None
         reader.close()
@@ -147,6 +151,55 @@ def test_electron_ax_activated_missing_details_does_not_raise(
 
     assert received == []
     assert any("Electron AX activated" in r.getMessage() for r in caplog.records)
+
+
+def test_permission_denial_is_returned_without_stopping_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(watcher, "_resolve_watcher_path", lambda: None)
+    proc = AXWatcherProcess()
+
+    rc = _read_events_from_lines(proc, [], return_code=2)
+
+    assert rc == 2
+    assert not proc._stop_event.is_set()
+
+
+def test_wait_for_accessibility_recovers_after_grant(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(watcher, "_resolve_watcher_path", lambda: None)
+    proc = AXWatcherProcess(permission_poll_seconds=0.01)
+    probes = iter([False, False, True])
+    monkeypatch.setattr(watcher.ax_capture, "ax_trusted", lambda: next(probes))
+
+    assert proc._wait_for_accessibility() is True
+
+
+def test_run_loop_restarts_immediately_after_permission_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(watcher, "_resolve_watcher_path", lambda: None)
+    proc = AXWatcherProcess()
+    starts = 0
+    results = iter([2, 0])
+
+    def fake_start() -> None:
+        nonlocal starts
+        starts += 1
+        proc._process = SimpleNamespace()
+
+    def fake_read() -> int:
+        result = next(results)
+        if result == 0:
+            proc._stop_event.set()
+        return result
+
+    monkeypatch.setattr(proc, "_start_process", fake_start)
+    monkeypatch.setattr(proc, "_read_events", fake_read)
+    monkeypatch.setattr(proc, "_wait_for_accessibility", lambda: True)
+
+    proc._run_loop()
+
+    assert starts == 2
 
 
 @pytest.mark.macos

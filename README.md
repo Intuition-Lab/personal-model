@@ -55,6 +55,11 @@ ANTHROPIC_API_KEY=your-anthropic-key
 EOF
 ```
 
+`install.sh` also generates a machine-local `PERSOME_SCREENSHOT_KEY` automatically
+and stores it in the same owner-only env file. This AES-256 key protects optional
+screenshots at rest; it is not a provider credential and users never type it.
+Re-running the installer preserves the existing key.
+
 Self-check, then start:
 
 ```bash
@@ -181,6 +186,9 @@ Swift watcher / trusted ingest
 - There is no telemetry.
 - OCR is optional, subprocess-isolated, and fully local.
 - Secrets live in a 0600 env file at `~/.persome/env`.
+- The installer generates the screenshot-encryption key automatically; if an
+  encrypted-screenshot deployment lacks a valid key, pixels are omitted rather
+  than written in plaintext.
 - The capture buffer has a tiered retention policy.
 - The runtime does not include computer-use actuation, meeting audio capture, or filesystem profiling.
 

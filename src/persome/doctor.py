@@ -115,6 +115,21 @@ def check_api_key() -> Check:
     )
 
 
+def check_screenshot_key() -> Check:
+    """Machine-local AES-256 screenshot key, without ever printing its value."""
+    raw = os.environ.get(env_file_mod.SCREENSHOT_KEY_ENV) or os.environ.get(
+        env_file_mod.LEGACY_SCREENSHOT_KEY_ENV
+    )
+    if env_file_mod.is_valid_screenshot_key(raw):
+        return Check(env_file_mod.SCREENSHOT_KEY_ENV, "ok", "set (32-byte local key)")
+    return Check(
+        env_file_mod.SCREENSHOT_KEY_ENV,
+        "warn",
+        "missing or invalid — encrypted screenshot persistence will be omitted; "
+        "rerun install.sh to provision it",
+    )
+
+
 def check_base_url() -> Check:
     """HEAD the configured (or default) Anthropic base URL. Reachability is a
     warning-only signal: any HTTP response counts as reachable; a network error
@@ -252,6 +267,7 @@ def run_checks(host: str, port: int) -> list[Check]:
     checks: list[Check] = [
         check_env_file(),
         check_api_key(),
+        check_screenshot_key(),
         check_base_url(),
         *check_helpers(),
         check_ax_trust(),

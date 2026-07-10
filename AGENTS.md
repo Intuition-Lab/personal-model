@@ -107,6 +107,8 @@ Update matching docs in the same change as behavior. Research notes under
 - Use `with fts.cursor() as conn:` for SQLite. The store runs in WAL mode.
 - All stage LLM calls go through `writer/llm.py`. Model names are bare gateway
   names; secrets belong in `<PERSOME_ROOT>/env`, never `config.toml`.
+- `install.sh` generates and preserves `PERSOME_SCREENSHOT_KEY`. If encrypted
+  screenshot persistence lacks a valid key, omit pixels; never write plaintext.
 - Default terminal Point/Line production is `memory_delta` followed by
   deterministic `delta_apply`; do not silently reintroduce parallel writers.
 - Every modeled object preserves evidence receipts and bitemporal history.

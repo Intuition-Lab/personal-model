@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from ..logger import get
+from . import ax_capture
 from .ax_capture import _maybe_compile
 
 logger = get("persome.capture")
@@ -82,12 +83,14 @@ class AXWatcherProcess:
     # complete silence while the process is alive almost certainly means the
     # Swift binary is frozen — restart is harmless and restores event flow.
     _DEFAULT_STALE_TIMEOUT = 300.0
+    _DEFAULT_PERMISSION_POLL = 2.0
 
     def __init__(
         self,
         *,
         max_reconnect_delay: float = 60.0,
         stale_timeout_seconds: float = _DEFAULT_STALE_TIMEOUT,
+        permission_poll_seconds: float = _DEFAULT_PERMISSION_POLL,
     ) -> None:
         self._watcher_path = _resolve_watcher_path()
         self._callback: Callable[[dict[str, Any]], None] | None = None
@@ -96,6 +99,7 @@ class AXWatcherProcess:
         self._stop_event = threading.Event()
         self._max_reconnect_delay = max_reconnect_delay
         self._stale_timeout = stale_timeout_seconds
+        self._permission_poll = max(0.01, permission_poll_seconds)
 
     @property
     def available(self) -> bool:
@@ -150,20 +154,40 @@ class AXWatcherProcess:
     def _run_loop(self) -> None:
         delay = 1.0
         while not self._stop_event.is_set():
+            return_code: int | None = None
             try:
                 self._start_process()
                 if self._process is None:
                     break
-                self._read_events()
+                return_code = self._read_events()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("AX watcher error: %s", exc)
 
             if self._stop_event.is_set():
                 break
 
+            if return_code == 2:
+                delay = 1.0
+                if self._wait_for_accessibility():
+                    logger.info("Accessibility permission granted — restarting AX watcher")
+                    continue
+                break
+
             logger.info("AX watcher exited, reconnecting in %.0fs", delay)
             self._stop_event.wait(delay)
             delay = min(delay * 2, self._max_reconnect_delay)
+
+    def _wait_for_accessibility(self) -> bool:
+        """Poll the daemon's TCC trust without showing repeated permission dialogs."""
+        logger.warning(
+            "Accessibility permission not granted — waiting for approval (polling every %.0fs)",
+            self._permission_poll,
+        )
+        while not self._stop_event.is_set():
+            if ax_capture.ax_trusted():
+                return True
+            self._stop_event.wait(self._permission_poll)
+        return False
 
     def _start_process(self) -> None:
         if not self._watcher_path:
@@ -187,10 +211,10 @@ class AXWatcherProcess:
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=wait_timeout)
 
-    def _read_events(self) -> None:
-        """Returns when the process exits, is stopped, or is killed due to inactivity."""
+    def _read_events(self) -> int | None:
+        """Read until exit/stop/staleness and return the subprocess exit code."""
         if not self._process or not self._process.stdout:
-            return
+            return None
 
         stdout = self._process.stdout
         last_activity = time.monotonic()
@@ -209,7 +233,7 @@ class AXWatcherProcess:
                     proc = self._process
                     if proc and proc.poll() is None:
                         self._force_kill(proc)
-                    return  # _run_loop will reconnect
+                    return proc.wait() if proc is not None else None
                 continue
 
             if self._stop_event.is_set():
@@ -255,8 +279,7 @@ class AXWatcherProcess:
 
         if self._process:
             rc = self._process.wait()
-            if rc == 2:
-                logger.error("Accessibility permission not granted — watcher won't restart")
-                self._stop_event.set()
-            elif rc != 0:
+            if rc != 0 and rc != 2:
                 logger.warning("AX watcher exited with code %d", rc)
+            return rc
+        return None
