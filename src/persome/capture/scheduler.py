@@ -168,8 +168,9 @@ def _attach_screenshot(
     Shared by the daemon grab path and the ingest path: Swift sends plaintext
     base64 and the at-rest encryption — when configured (spec E5 / TODO #6) —
     happens HERE, so the "screenshots are encrypted on disk" invariant holds
-    regardless of who captured the pixels. Fail-open: flag on but no key in
-    ``PERSOME_SCREENSHOT_KEY`` ⇒ warn + store plaintext, never drop the screenshot.
+    regardless of who captured the pixels. Fail-closed: when encryption is
+    required but no valid key is available, omit the persisted screenshot while
+    preserving the capture's AX text and metadata.
     """
     screenshot_enc = False
     if cfg.encrypt_screenshots:
@@ -178,10 +179,11 @@ def _attach_screenshot(
             image_base64 = screenshot_crypto.encrypt(image_base64, key)
             screenshot_enc = True
         else:
-            logger.warning(
-                "encrypt_screenshots is on but %s is unavailable; writing plaintext screenshot",
+            logger.error(
+                "encrypt_screenshots is on but %s is unavailable; omitting screenshot",
                 screenshot_crypto.KEY_ENV,
             )
+            return
     out["screenshot"] = {
         "image_base64": image_base64,
         "mime_type": mime_type,

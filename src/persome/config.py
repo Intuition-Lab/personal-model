@@ -745,7 +745,7 @@ ocr_structured = true              # geometry-structure raw OCR (zero LLM, on-de
 cmux_source_enabled = true
 pause_on_lock = true
 suppress_secure_input = true
-encrypt_screenshots = true       # requires PERSOME_SCREENSHOT_KEY; no key -> warned plaintext fallback
+encrypt_screenshots = true       # install.sh provisions PERSOME_SCREENSHOT_KEY; no key -> pixels omitted
 extended_retention_enabled = true
 actionable_retention_days = 7
 

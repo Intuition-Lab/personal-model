@@ -202,13 +202,10 @@ def test_write_flag_on_with_key_is_ciphertext(monkeypatch: pytest.MonkeyPatch) -
     assert screenshot_crypto.read_screenshot(out) == _IMAGE_BYTES
 
 
-def test_write_flag_on_without_key_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clear_key(monkeypatch)  # flag on but no key → plaintext, no crash
+def test_write_flag_on_without_key_omits_screenshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_key(monkeypatch)  # fail-closed: AX capture survives, pixels do not persist
     out = _build_with_screenshot(monkeypatch, encrypt_flag=True)
-    assert out["screenshot"]["image_base64"] == _IMAGE_B64
-    assert not screenshot_crypto.is_encrypted(out["screenshot"]["image_base64"])
-    assert "screenshot_enc" not in out["screenshot"]
-    assert screenshot_crypto.read_screenshot(out) == _IMAGE_BYTES
+    assert "screenshot" not in out
 
 
 # ── mcp/captures _format_response round-trip ─────────────────────────────────

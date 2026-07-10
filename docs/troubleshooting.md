@@ -43,7 +43,12 @@ persome capture-once
 cat ~/.persome/capture-buffer/*.json | jq '.ax_tree | length' | head
 ```
 
-If the tree is `{}` or tiny across the board, open System Settings → Privacy & Security → Accessibility and enable your terminal (Terminal, iTerm2, Warp, VS Code…) plus `persome` itself if it appears. Restart the daemon.
+If the tree is `{}` or tiny across the board, open System Settings → Privacy & Security → Accessibility and enable your terminal (Terminal, iTerm2, Warp, VS Code…) plus `persome` itself if it appears.
+
+The daemon watcher waits after an initial denial and polls the non-prompting TCC
+status. Granting Accessibility while the daemon is still running should restart
+event capture automatically within about two seconds. A restart remains a valid
+fallback for old installs or a changed TCC principal.
 
 Second most common cause: **`ax_depth` too shallow for Electron apps.** See [capture.md](capture.md#ax-depth-the-1-footgun).
 

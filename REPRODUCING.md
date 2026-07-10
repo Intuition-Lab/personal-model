@@ -85,6 +85,10 @@ persome model export
 open http://127.0.0.1:8742/model
 ```
 
+The installer generates `PERSOME_SCREENSHOT_KEY` automatically; reproduction
+does not require inventing or copying this machine-local key. If Accessibility
+is granted after daemon startup, the watcher resumes automatically.
+
 Exports default to `<PERSOME_ROOT>/exports/`, are redacted, and use mode
 `0600`. `--raw` is an explicit sensitive-data opt-out from redaction.
 

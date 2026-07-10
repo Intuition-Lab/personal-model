@@ -23,7 +23,12 @@ from persome import doctor, paths
 
 @pytest.fixture
 def clean_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "PERSOME_SCREENSHOT_KEY",
+        "MENS_SCREENSHOT_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -80,6 +85,19 @@ def test_api_key_set_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_api_key_missing_fails(ac_root: Path, clean_llm_env: None) -> None:
     assert doctor.check_api_key().status == "fail"
+
+
+def test_screenshot_key_set_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PERSOME_SCREENSHOT_KEY", "ab" * 32)
+    c = doctor.check_screenshot_key()
+    assert c.status == "ok"
+    assert "ab" * 32 not in c.detail
+
+
+def test_screenshot_key_missing_warns(clean_llm_env: None) -> None:
+    c = doctor.check_screenshot_key()
+    assert c.status == "warn"
+    assert "rerun install.sh" in c.detail
 
 
 # ── base URL (warn-only) ──────────────────────────────────────────────────────
@@ -303,6 +321,7 @@ def test_run_checks_merges_env_file_first(
     by_name = {c.name: c for c in checks}
     assert by_name["env file"].status == "ok"
     assert by_name["ANTHROPIC_API_KEY"].status == "ok"
+    assert by_name["PERSOME_SCREENSHOT_KEY"].status == "warn"
 
 
 def test_has_failure_ignores_warnings() -> None:

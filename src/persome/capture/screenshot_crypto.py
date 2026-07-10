@@ -1,16 +1,15 @@
 """AES-256-GCM at-rest encryption for capture-buffer screenshots (spec E5 / TODO #6).
 
-Capture screenshots land in ``~/.persome/chronicle/capture-buffer/<ts>.json`` as a
+Capture screenshots land in ``~/.persome/capture-buffer/<ts>.json`` as a
 base64 string under ``screenshot.image_base64`` and are stripped after 24h. This
 module lets the scheduler encrypt that base64 payload at rest with an AES-256-GCM
 envelope whose key comes **only from the environment** (``PERSOME_SCREENSHOT_KEY``,
 64 hex chars = 32 bytes).
 
-The key deliberately never lands in the data dir — the Swift app stores it in the
-Keychain and hands it to the daemon over the env file, the same channel the JWT
-uses (the AirJelly trap was shipping the key in the data dir alongside the
-ciphertext). This module is the Python consumer only; it never reads or writes the
-key anywhere but ``os.environ``.
+The standalone installer generates the key into the owner-only Runtime env file;
+an embedding product may instead mirror it from its secure store. This module is
+the Python consumer only: it never reads a Keychain or writes the key itself and
+only consumes ``os.environ``.
 
 Envelope layout (string, JSON-safe so it drops straight into ``image_base64``):
 
@@ -36,8 +35,8 @@ from ..logger import get
 
 logger = get("persome.capture")
 
-#: Key env var — 64 hex chars (32 raw bytes, AES-256). Set by the Swift app's env
-#: file; absent on dev boxes (then encryption is a silent no-op, see scheduler).
+#: Key env var — 64 hex chars (32 raw bytes, AES-256). The standalone installer
+#: provisions it; embedding products may inject it from their own secure store.
 KEY_ENV = "PERSOME_SCREENSHOT_KEY"
 
 #: Pre-rename key env var, still honoured on upgraded machines.

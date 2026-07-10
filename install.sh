@@ -392,6 +392,37 @@ write_default_if_missing()
   echo ""
   echo "OCR for AX-poor apps (WeChat/Feishu) runs fully on-device (bundled"
   echo "PP-OCRv6) — no key, no upload, no network."
+  echo "A machine-local screenshot encryption key is generated automatically;"
+  echo "you never need to enter or manage it manually."
+}
+
+ensure_screenshot_key() {
+  local env_path="${INSTALL_HOME}/env"
+  local status
+  status="$("${VENV_DIR}/bin/python" - "${env_path}" <<'PY'
+import sys
+from pathlib import Path
+
+from persome.env_file import ensure_screenshot_key
+
+print(ensure_screenshot_key(Path(sys.argv[1])))
+PY
+)" || die "failed to provision PERSOME_SCREENSHOT_KEY"
+
+  case "${status}" in
+    existing)
+      log "screenshot encryption key already configured"
+      ;;
+    migrated)
+      log "migrated legacy screenshot encryption key to PERSOME_SCREENSHOT_KEY"
+      ;;
+    generated)
+      log "generated machine-local screenshot encryption key in ${env_path}"
+      ;;
+    *)
+      die "unexpected screenshot-key provisioning result: ${status}"
+      ;;
+  esac
 }
 
 print_summary() {
@@ -444,6 +475,7 @@ main() {
   verify_install
   inject_detected_clients
   maybe_configure_api_key
+  ensure_screenshot_key
   print_summary
 }
 

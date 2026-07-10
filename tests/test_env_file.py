@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from persome import env_file
 from persome.env_file import load_env_file
 
 
@@ -68,3 +69,57 @@ def test_invalid_key_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert os.environ["OK_KEY"] == "ok"
     assert "bad-key" not in os.environ
     assert n >= 1
+
+
+def test_ensure_screenshot_key_generates_owner_only_file(tmp_path: Path) -> None:
+    path = tmp_path / "env"
+    path.write_text("ANTHROPIC_API_KEY=synthetic\n")
+
+    status = env_file.ensure_screenshot_key(path)
+
+    assert status == "generated"
+    assert path.stat().st_mode & 0o777 == 0o600
+    lines = path.read_text().splitlines()
+    assert "ANTHROPIC_API_KEY=synthetic" in lines
+    generated = next(
+        line.partition("=")[2]
+        for line in lines
+        if line.startswith(f"{env_file.SCREENSHOT_KEY_ENV}=")
+    )
+    assert env_file.is_valid_screenshot_key(generated)
+
+
+def test_ensure_screenshot_key_is_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "env"
+    original = "ab" * 32
+    path.write_text(f"{env_file.SCREENSHOT_KEY_ENV}={original}\n")
+
+    assert env_file.ensure_screenshot_key(path) == "existing"
+    assert env_file.ensure_screenshot_key(path) == "existing"
+    assert path.read_text().count(f"{env_file.SCREENSHOT_KEY_ENV}=") == 1
+    assert f"{env_file.SCREENSHOT_KEY_ENV}={original}" in path.read_text()
+
+
+def test_ensure_screenshot_key_migrates_legacy_value(tmp_path: Path) -> None:
+    path = tmp_path / "env"
+    legacy = "cd" * 32
+    path.write_text(f"{env_file.LEGACY_SCREENSHOT_KEY_ENV}={legacy}\n")
+
+    assert env_file.ensure_screenshot_key(path) == "migrated"
+    assert f"{env_file.SCREENSHOT_KEY_ENV}={legacy}" in path.read_text()
+
+
+def test_ensure_screenshot_key_replaces_invalid_duplicates(tmp_path: Path) -> None:
+    path = tmp_path / "env"
+    path.write_text(
+        f"{env_file.SCREENSHOT_KEY_ENV}=invalid\n{env_file.SCREENSHOT_KEY_ENV}=also-invalid\n"
+    )
+
+    assert env_file.ensure_screenshot_key(path) == "generated"
+    canonical = [
+        line.partition("=")[2]
+        for line in path.read_text().splitlines()
+        if line.startswith(f"{env_file.SCREENSHOT_KEY_ENV}=")
+    ]
+    assert len(canonical) == 1
+    assert env_file.is_valid_screenshot_key(canonical[0])

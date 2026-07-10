@@ -18,7 +18,16 @@ Semantics:
 from __future__ import annotations
 
 import os
+import secrets
+import tempfile
 from pathlib import Path
+from typing import Literal
+
+SCREENSHOT_KEY_ENV = "PERSOME_SCREENSHOT_KEY"
+LEGACY_SCREENSHOT_KEY_ENV = "MENS_SCREENSHOT_KEY"
+_SCREENSHOT_KEY_HEX_LENGTH = 64
+
+ScreenshotKeyStatus = Literal["existing", "migrated", "generated"]
 
 
 def _parse_line(line: str) -> tuple[str, str] | None:
@@ -61,3 +70,72 @@ def load_env_file(path: Path) -> int:
         os.environ[key] = value
         added += 1
     return added
+
+
+def is_valid_screenshot_key(value: str | None) -> bool:
+    if value is None or len(value) != _SCREENSHOT_KEY_HEX_LENGTH:
+        return False
+    try:
+        return len(bytes.fromhex(value)) == 32
+    except ValueError:
+        return False
+
+
+def ensure_screenshot_key(path: Path) -> ScreenshotKeyStatus:
+    """Ensure ``path`` contains one valid machine-local screenshot key.
+
+    The installer calls this after creating its virtualenv. Existing canonical
+    keys are preserved; a valid legacy Mens key is migrated verbatim so old
+    encrypted captures remain readable. Missing or malformed values are
+    replaced with a freshly generated 256-bit key. The key is never returned or
+    logged, and the dotenv file is atomically rewritten with mode ``0600``.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+
+    lines = text.splitlines()
+    canonical: str | None = None
+    legacy: str | None = None
+    kept: list[str] = []
+    for line in lines:
+        parsed = _parse_line(line)
+        if parsed is None:
+            kept.append(line)
+            continue
+        key, value = parsed
+        if key == SCREENSHOT_KEY_ENV:
+            if canonical is None and is_valid_screenshot_key(value):
+                canonical = value
+            continue
+        if key == LEGACY_SCREENSHOT_KEY_ENV and legacy is None and is_valid_screenshot_key(value):
+            legacy = value
+        kept.append(line)
+
+    if canonical is not None:
+        value = canonical
+        status: ScreenshotKeyStatus = "existing"
+    elif legacy is not None:
+        value = legacy
+        status = "migrated"
+    else:
+        value = secrets.token_hex(32)
+        status = "generated"
+
+    kept.append(f"{SCREENSHOT_KEY_ENV}={value}")
+    payload = "\n".join(kept).rstrip("\n") + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        path.chmod(0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return status

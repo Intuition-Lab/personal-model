@@ -23,11 +23,11 @@ actionable captures covered by extended retention. OCR is disabled by default;
 when enabled, inference is local, subprocess-isolated, and uses bundled
 PP-OCRv6 weights.
 
-`encrypt_screenshots=true` encrypts pixels only when
-`PERSOME_SCREENSHOT_KEY` is available. The current missing-key behavior is a
-warning plus plaintext fallback, so operators requiring encrypted-at-rest
-pixels must provision the key or set `include_screenshot=false`. OCR can still
-use an ephemeral screenshot when persistent screenshot storage is off.
+`install.sh` generates a machine-local `PERSOME_SCREENSHOT_KEY` and preserves it
+across reinstalls. When `encrypt_screenshots=true`, a missing or malformed key
+fails closed: the Runtime keeps AX text and metadata but omits persistent pixels
+instead of writing a plaintext screenshot. OCR can still use an ephemeral
+screenshot when persistent screenshot storage is off.
 
 ## Network egress
 

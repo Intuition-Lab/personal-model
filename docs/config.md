@@ -331,6 +331,10 @@ extended_retention_enabled = true
 actionable_retention_days = 7
 ```
 
+`install.sh` provisions `PERSOME_SCREENSHOT_KEY` automatically. When screenshot
+encryption is enabled but that key is unavailable, the capture remains usable
+for AX/text modeling but its screenshot is not persisted.
+
 Old top-level `capture_*` names are read as compatibility fallbacks, but new
 configuration should use the nested names.
 

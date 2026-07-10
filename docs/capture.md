@@ -142,9 +142,11 @@ Ported from Einsia-Partner's `s1_collector`. These are what downstream LLM stage
 Persisted screenshots are **not** passed to timeline, reducer, memory-delta, or
 schema prompts. They support optional local provenance drill-down and debugging.
 When `encrypt_screenshots=true`, `PERSOME_SCREENSHOT_KEY` seals them with
-AES-256-GCM; if the key is absent, the current fail-open behavior warns and
-stores plaintext. Set `include_screenshot=false` for the strictest paper run;
-OCR can still take an ephemeral focused screenshot when enabled.
+AES-256-GCM. `install.sh` generates this machine-local key automatically and
+preserves it across reinstalls. If the key is absent or malformed, persistence
+fails closed by omitting pixels while retaining AX text and metadata. Set
+`include_screenshot=false` for the strictest paper run; OCR can still take an
+ephemeral focused screenshot when enabled.
 
 ## Buffer hygiene — tiered retention
 
