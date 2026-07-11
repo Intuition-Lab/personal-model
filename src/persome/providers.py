@@ -14,13 +14,18 @@ from typing import Any, Literal
 
 LLMProtocol = Literal["anthropic", "openai"]
 
+LLM_API_KEY_ENV = "PERSOME_LLM_API_KEY"
+LLM_BASE_URL_ENV = "PERSOME_LLM_BASE_URL"
+_LEGACY_ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_LEGACY_ANTHROPIC_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
+
 
 @dataclass(frozen=True)
 class ProviderSpec:
     id: str
     label: str
     protocol: LLMProtocol
-    api_key_env: str
+    discovery_api_key_env: str
     base_url: str
     default_model: str
     description: str
@@ -33,8 +38,8 @@ class ProviderSpec:
     def resolved_base_url_env(self) -> str:
         if self.base_url_env:
             return self.base_url_env
-        if self.api_key_env.endswith("_API_KEY"):
-            return f"{self.api_key_env[:-8]}_BASE_URL"
+        if self.discovery_api_key_env.endswith("_API_KEY"):
+            return f"{self.discovery_api_key_env[:-8]}_BASE_URL"
         return ""
 
 
@@ -279,6 +284,7 @@ class ResolvedLLMProfile:
     api_key: str | None = field(default=None, repr=False)
     key_required: bool = True
     legacy: bool = False
+    credential_source_env: str = field(default="", repr=False)
 
     @property
     def wire_model(self) -> str:
@@ -295,6 +301,14 @@ class ResolvedLLMProfile:
     @property
     def credential_ready(self) -> bool:
         return bool(self.api_key) or not self.key_required
+
+    @property
+    def credential_migration_required(self) -> bool:
+        return bool(
+            self.api_key
+            and self.credential_source_env
+            and self.credential_source_env != LLM_API_KEY_ENV
+        )
 
     def client_api_key(self) -> str:
         """Return an SDK-safe key or raise before any hosted network call."""
@@ -333,8 +347,14 @@ def infer_provider(model: str) -> str:
 
 
 def provider_api_key(provider: str) -> str | None:
+    """Return a provider-specific key for auxiliary provider integrations.
+
+    The active Runtime profile uses ``PERSOME_LLM_API_KEY``. This helper stays
+    provider-specific because dense retrieval may use OpenAI independently of
+    the selected Runtime provider.
+    """
     spec = provider_spec(provider)
-    return os.environ.get(spec.api_key_env) if spec else None
+    return os.environ.get(spec.discovery_api_key_env) if spec else None
 
 
 def provider_base_url(provider: str) -> str | None:
@@ -356,24 +376,30 @@ def _legacy_anthropic_profile(model_cfg: Any) -> ResolvedLLMProfile | None:
     explicit = any(str(getattr(model_cfg, name, "") or "") for name in ("provider", "protocol"))
     if explicit:
         return None
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = os.environ.get(LLM_API_KEY_ENV)
+    credential_source_env = LLM_API_KEY_ENV if key else ""
+    if not key:
+        key = os.environ.get(_LEGACY_ANTHROPIC_API_KEY_ENV)
+        credential_source_env = _LEGACY_ANTHROPIC_API_KEY_ENV if key else ""
     model = str(getattr(model_cfg, "model", "") or "")
     provider = infer_provider(model)
     spec = provider_spec(provider)
     base_url = str(getattr(model_cfg, "base_url", "") or "")
-    base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL", "")
+    base_url = base_url or os.environ.get(LLM_BASE_URL_ENV, "")
+    base_url = base_url or os.environ.get(_LEGACY_ANTHROPIC_BASE_URL_ENV, "")
     if not base_url:
         base_url = _BY_ID["anthropic"].base_url
     return ResolvedLLMProfile(
         provider=provider,
-        provider_label=f"{spec.label if spec else provider} (legacy Anthropic route)",
+        provider_label=f"{spec.label if spec else provider} (legacy route)",
         protocol="anthropic",
         model=model,
         base_url=base_url,
-        api_key_env="ANTHROPIC_API_KEY",
+        api_key_env=LLM_API_KEY_ENV,
         api_key=key,
         key_required=True,
         legacy=True,
+        credential_source_env=credential_source_env,
     )
 
 
@@ -390,7 +416,17 @@ def resolve_profile(model_cfg: Any) -> ResolvedLLMProfile:
         spec = _BY_ID["custom-openai"]
     protocol_raw = str(getattr(model_cfg, "protocol", "") or "") or spec.protocol
     protocol: LLMProtocol = "anthropic" if protocol_raw == "anthropic" else "openai"
-    api_key_env = str(getattr(model_cfg, "api_key_env", "") or "") or spec.api_key_env
+    configured_key_env = str(getattr(model_cfg, "api_key_env", "") or "")
+    if configured_key_env == LLM_API_KEY_ENV:
+        credential_candidates = (LLM_API_KEY_ENV,)
+    elif configured_key_env:
+        credential_candidates = (configured_key_env, LLM_API_KEY_ENV)
+    else:
+        credential_candidates = (LLM_API_KEY_ENV, spec.discovery_api_key_env)
+    credential_source_env = next(
+        (name for name in dict.fromkeys(credential_candidates) if os.environ.get(name)),
+        "",
+    )
     base_url = str(getattr(model_cfg, "base_url", "") or "")
     if not base_url and spec.resolved_base_url_env:
         base_url = os.environ.get(spec.resolved_base_url_env, "")
@@ -401,9 +437,10 @@ def resolve_profile(model_cfg: Any) -> ResolvedLLMProfile:
         protocol=protocol,
         model=model or spec.default_model,
         base_url=base_url,
-        api_key_env=api_key_env,
-        api_key=os.environ.get(api_key_env),
+        api_key_env=LLM_API_KEY_ENV,
+        api_key=os.environ.get(credential_source_env) if credential_source_env else None,
         key_required=spec.key_required,
+        credential_source_env=credential_source_env,
     )
 
 
@@ -436,4 +473,10 @@ def detected_providers() -> list[ProviderSpec]:
     Region/protocol variants intentionally remain separate even when they use
     the same key variable; guessing the wrong endpoint is worse than prompting.
     """
-    return [spec for spec in PROVIDERS if not spec.local and os.environ.get(spec.api_key_env)]
+    return [
+        spec
+        for spec in PROVIDERS
+        if not spec.local
+        and spec.discovery_api_key_env != LLM_API_KEY_ENV
+        and os.environ.get(spec.discovery_api_key_env)
+    ]

@@ -68,21 +68,21 @@ def test_status_loads_env_file_before_probe(ac_root: Path, monkeypatch: pytest.M
     """status sources ~/.persome/env before the per-stage model probe.
 
     Regression: the probe used to run in the `status` process without loading the
-    env file, so ping_stage built the Anthropic client with no ANTHROPIC_API_KEY
+    env file, so ping_stage built the client with no PERSOME_LLM_API_KEY
     and every stage falsely reported "Could not resolve authentication method" —
     even when the daemon (which loads env in start()) was healthy.
     """
     monkeypatch.delenv("PERSOME_LLM_MOCK", raising=False)
     # load_env_file does not overwrite an already-set var, so clear it first.
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("PERSOME_LLM_API_KEY", raising=False)
     env_path = paths.env_file()
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("ANTHROPIC_API_KEY=sk-test-from-env-file\n")
+    env_path.write_text("PERSOME_LLM_API_KEY=sk-test-from-env-file\n")
 
     seen: dict[str, str | None] = {}
 
     def capture_ping(cfg, stage, *, timeout=5.0):  # noqa: ARG001
-        seen[stage] = os.environ.get("ANTHROPIC_API_KEY")
+        seen[stage] = os.environ.get("PERSOME_LLM_API_KEY")
         return llm_mod.PingResult(
             stage=stage,
             model=cfg.model_for(stage).model,

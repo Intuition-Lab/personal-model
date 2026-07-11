@@ -80,7 +80,7 @@ api_key_env = "OPENAI_API_KEY"
 api_key = "sk-old"
 
 [chat]
-api_key_env = "ANTHROPIC_API_KEY"
+api_key_env = "LEGACY_CHAT_API_KEY"
 api_key = "sk-old"
 base_url = "https://api.example/anthropic"
 """
@@ -108,20 +108,18 @@ def test_write_default_creates_file(tmp_path: Path) -> None:
     text = p.read_text()
     assert "[models.default]" in text
     assert "persome llm setup" in text
-    assert "api_key_env" in text
+    assert "PERSOME_LLM_API_KEY" in text
     # idempotent
     assert not config.write_default_if_missing(p)
 
 
 def test_provider_helpers_read_env(monkeypatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k-ant")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ant")
     monkeypatch.setenv("OPENAI_API_KEY", "k-oai")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openai.example/v1")
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
-    assert config.provider_api_key("anthropic") == "k-ant"
-    assert config.provider_base_url("anthropic") == "https://ant"
     assert config.provider_api_key("openai") == "k-oai"
+    assert config.provider_base_url("openai") == "https://openai.example/v1"
     assert config.provider_api_key("deepseek") is None
     assert config.provider_api_key("unknown") is None
 
@@ -146,7 +144,7 @@ provider = "openrouter"
 protocol = "openai"
 model = "anthropic/claude-sonnet-4"
 base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
+api_key_env = "PERSOME_LLM_API_KEY"
 
 [chat]
 thinking_budget = 0
@@ -156,4 +154,4 @@ thinking_budget = 0
     assert cfg.chat.provider == "openrouter"
     assert cfg.chat.protocol == "openai"
     assert cfg.chat.model == "anthropic/claude-sonnet-4"
-    assert cfg.chat.api_key_env == "OPENROUTER_API_KEY"
+    assert cfg.chat.api_key_env == "PERSOME_LLM_API_KEY"

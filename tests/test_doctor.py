@@ -21,19 +21,19 @@ import pytest
 from persome import doctor, paths
 from persome.capture import ocr_health, ocr_local, screen_recording
 from persome.config import CaptureConfig
-from persome.providers import PROVIDERS
+from persome.providers import LLM_API_KEY_ENV, LLM_BASE_URL_ENV, PROVIDERS
 
 
 @pytest.fixture
 def clean_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     variables = {
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_BASE_URL",
+        LLM_API_KEY_ENV,
+        LLM_BASE_URL_ENV,
         "PERSOME_SCREENSHOT_KEY",
         "PERSOME_LOCAL_API_TOKEN",
     }
     for spec in PROVIDERS:
-        variables.add(spec.api_key_env)
+        variables.add(spec.discovery_api_key_env)
         if spec.resolved_base_url_env:
             variables.add(spec.resolved_base_url_env)
     for var in variables:
@@ -52,21 +52,21 @@ def test_env_file_missing_fails(ac_root: Path, clean_llm_env: None) -> None:
 def test_env_file_missing_but_shell_key_warns(
     ac_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-synthetic")
+    monkeypatch.setenv(LLM_API_KEY_ENV, "sk-test-synthetic")
     c = doctor.check_env_file()
     assert c.status == "warn"
 
 
 def test_env_file_0600_ok(ac_root: Path) -> None:
     p = paths.env_file()
-    p.write_text("ANTHROPIC_API_KEY=sk-test-synthetic\n")
+    p.write_text(f"{LLM_API_KEY_ENV}=sk-test-synthetic\n")
     p.chmod(0o600)
     assert doctor.check_env_file().status == "ok"
 
 
 def test_env_file_loose_perms_fail(ac_root: Path) -> None:
     p = paths.env_file()
-    p.write_text("ANTHROPIC_API_KEY=sk-test-synthetic\n")
+    p.write_text(f"{LLM_API_KEY_ENV}=sk-test-synthetic\n")
     p.chmod(0o644)
     c = doctor.check_env_file()
     assert c.status == "fail"
@@ -75,7 +75,7 @@ def test_env_file_loose_perms_fail(ac_root: Path) -> None:
 
 def test_env_file_owner_only_stricter_than_0600_ok(ac_root: Path) -> None:
     p = paths.env_file()
-    p.write_text("ANTHROPIC_API_KEY=sk-test-synthetic\n")
+    p.write_text(f"{LLM_API_KEY_ENV}=sk-test-synthetic\n")
     p.chmod(0o400)
     assert doctor.check_env_file().status == "ok"
 
@@ -84,7 +84,7 @@ def test_env_file_owner_only_stricter_than_0600_ok(ac_root: Path) -> None:
 
 
 def test_api_key_set_ok(ac_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-synthetic")
+    monkeypatch.setenv(LLM_API_KEY_ENV, "sk-test-synthetic")
     c = doctor.check_api_key()
     assert c.status == "ok"
     # never leak the key value
@@ -149,7 +149,7 @@ def test_base_url_reachable_ok(
     monkeypatch.setattr(httpx, "head", fake_head)
     c = doctor.check_base_url()
     assert c.status == "ok"
-    assert "legacy Anthropic route" in c.detail
+    assert "legacy route" in c.detail
 
 
 def test_base_url_unreachable_warns_never_fails(
@@ -157,7 +157,7 @@ def test_base_url_unreachable_warns_never_fails(
 ) -> None:
     import httpx
 
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.invalid/anthropic")
+    monkeypatch.setenv(LLM_BASE_URL_ENV, "https://gateway.invalid/anthropic")
 
     def fake_head(url: str, **kw: object) -> object:
         raise httpx.ConnectError("boom")
@@ -426,7 +426,7 @@ def test_run_checks_merges_env_file_first(
 
     p = paths.env_file()
     p.write_text(
-        "ANTHROPIC_API_KEY=sk-test-synthetic\n"
+        f"{LLM_API_KEY_ENV}=sk-test-synthetic\n"
         "PERSOME_LOCAL_API_TOKEN=local-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
     )
     p.chmod(0o600)
@@ -454,10 +454,10 @@ provider = "openai"
 protocol = "openai"
 model = "gpt-4.1-mini"
 base_url = "https://gateway.example/v1"
-api_key_env = "OPENAI_API_KEY"
+api_key_env = "PERSOME_LLM_API_KEY"
 """
     )
-    monkeypatch.setenv("OPENAI_API_KEY", "synthetic")
+    monkeypatch.setenv(LLM_API_KEY_ENV, "synthetic")
     seen: list[str] = []
     monkeypatch.setattr(httpx, "head", lambda url, **kw: seen.append(url) or object())
 

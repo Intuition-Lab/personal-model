@@ -87,14 +87,14 @@ def test_write_env_values_upserts_atomically(
 
 def test_ensure_screenshot_key_generates_owner_only_file(tmp_path: Path) -> None:
     path = tmp_path / "env"
-    path.write_text("ANTHROPIC_API_KEY=synthetic\n")
+    path.write_text("PERSOME_LLM_API_KEY=synthetic\n")
 
     status = env_file.ensure_screenshot_key(path)
 
     assert status == "generated"
     assert path.stat().st_mode & 0o777 == 0o600
     lines = path.read_text().splitlines()
-    assert "ANTHROPIC_API_KEY=synthetic" in lines
+    assert "PERSOME_LLM_API_KEY=synthetic" in lines
     generated = next(
         line.partition("=")[2]
         for line in lines

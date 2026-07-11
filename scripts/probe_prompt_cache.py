@@ -6,7 +6,7 @@ breakpoint, then reports usage.cache_creation_input_tokens and cache_read_input_
 Usage:
 
     uv run python scripts/probe_prompt_cache.py
-    uv run python scripts/probe_prompt_cache.py --base-url https://api.anthropic.com --model claude-haiku-4-5 --api-key-env ANTHROPIC_API_KEY
+    uv run python scripts/probe_prompt_cache.py --base-url https://api.anthropic.com --model claude-haiku-4-5
 
 Exit code is 0 iff the second call shows cache_read_input_tokens > 0. The output
 is a markdown table suitable for pasting into a PR description.
@@ -51,8 +51,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--base-url",
-        default=os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
-        help="Anthropic-compatible base URL (default: ANTHROPIC_BASE_URL or official API).",
+        default=os.environ.get("PERSOME_LLM_BASE_URL", "https://api.anthropic.com"),
+        help="Anthropic-compatible base URL (default: PERSOME_LLM_BASE_URL or official API).",
     )
     p.add_argument(
         "--model",
@@ -61,8 +61,8 @@ def main() -> int:
     )
     p.add_argument(
         "--api-key-env",
-        default="ANTHROPIC_API_KEY",
-        help="Environment variable holding the API key (default: ANTHROPIC_API_KEY).",
+        default="PERSOME_LLM_API_KEY",
+        help="Environment variable holding the API key (default: PERSOME_LLM_API_KEY).",
     )
     args = p.parse_args()
 

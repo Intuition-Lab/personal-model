@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 from persome import config, paths
 from persome.cli import app
 from persome.llm_setup import ProbeResult, probe_profile, save_profile
-from persome.providers import make_profile
+from persome.providers import LLM_API_KEY_ENV, make_profile
 
 
 def _profile(api_key: str = "synthetic-secret"):  # type: ignore[no-untyped-def]
@@ -18,7 +18,7 @@ def _profile(api_key: str = "synthetic-secret"):  # type: ignore[no-untyped-def]
         "openai",
         model="gpt-4.1-mini",
         base_url="https://gateway.example/v1",
-        api_key_env="OPENAI_API_KEY",
+        api_key_env=LLM_API_KEY_ENV,
         api_key=api_key,
         protocol="openai",
     )
@@ -35,7 +35,8 @@ def test_save_profile_keeps_secret_out_of_toml(tmp_path: Path) -> None:
     assert "synthetic-secret" not in text
     assert 'provider = "openai"' in text
     assert "interval_minutes = 3" in text
-    assert env_path.read_text() == "OPENAI_API_KEY=synthetic-secret\n"
+    assert f'api_key_env = "{LLM_API_KEY_ENV}"' in text
+    assert env_path.read_text() == f"{LLM_API_KEY_ENV}=synthetic-secret\n"
     assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
     loaded = config.load(config_path).model_for("default")
     assert loaded.protocol == "openai"
@@ -125,11 +126,47 @@ def test_setup_cli_uses_provider_defaults_and_persists_profile(ac_root: Path, mo
     assert selected.provider == "openai"
     assert selected.model == "gpt-4.1-mini"
     assert selected.base_url == "https://api.openai.com/v1"
-    assert paths.env_file().read_text().count("OPENAI_API_KEY=") == 1
+    env_text = paths.env_file().read_text()
+    assert env_text.count(f"{LLM_API_KEY_ENV}=") == 1
+    assert "OPENAI_API_KEY=" not in env_text
+    assert selected.api_key_env == LLM_API_KEY_ENV
+
+
+def test_setup_migrates_existing_provider_specific_key(ac_root: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    paths.config_file().write_text(
+        """
+[models.default]
+provider = "anthropic"
+protocol = "anthropic"
+model = "claude-sonnet-4-5"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+"""
+    )
+    paths.env_file().write_text("ANTHROPIC_API_KEY=legacy-secret\n")
+    paths.env_file().chmod(0o600)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv(LLM_API_KEY_ENV, raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        ["llm", "setup", "--yes", "--skip-check"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "legacy-secret" not in result.output
+    selected = config.load().model_for("default")
+    assert selected.api_key_env == LLM_API_KEY_ENV
+    assert f"{LLM_API_KEY_ENV}=legacy-secret" in paths.env_file().read_text()
+    status = CliRunner().invoke(app, ["llm", "status"])
+    assert status.exit_code == 0
+    assert LLM_API_KEY_ENV in status.output
+    assert "ANTHROPIC_API_KEY" not in status.output
 
 
 def test_interactive_preset_setup_only_asks_for_provider_key(ac_root: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv(LLM_API_KEY_ENV, raising=False)
     monkeypatch.setattr("persome.cli._interactive_terminal", lambda: True)
 
     result = CliRunner().invoke(
@@ -146,7 +183,7 @@ def test_interactive_preset_setup_only_asks_for_provider_key(ac_root: Path, monk
     selected = config.load().model_for("default")
     assert selected.model == "gpt-4.1-mini"
     assert selected.base_url == "https://api.openai.com/v1"
-    assert paths.env_file().read_text() == "OPENAI_API_KEY=synthetic-secret\n"
+    assert paths.env_file().read_text() == f"{LLM_API_KEY_ENV}=synthetic-secret\n"
 
 
 def test_interactive_custom_setup_is_explicitly_advanced(ac_root: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -216,6 +253,8 @@ def test_provider_list_hides_routing_details_by_default(ac_root: Path) -> None:
     assert detailed.exit_code == 0
     assert "Endpoint:" in detailed.output
     assert "Default model:" in detailed.output
+    assert f"Runtime credential: {LLM_API_KEY_ENV}" in detailed.output
+    assert "ANTHROPIC_API_KEY" not in detailed.output
 
 
 def test_setup_cli_does_not_save_failed_probe(ac_root: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

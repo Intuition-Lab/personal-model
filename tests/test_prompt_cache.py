@@ -260,7 +260,7 @@ def test_run_turn_tools_are_sorted_and_last_has_cache_control(monkeypatch) -> No
         async def close(self) -> None:
             pass
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    monkeypatch.setenv("PERSOME_LLM_API_KEY", "synthetic")
     cfg = ChatConfig(model="deepseek-chat")
     agent = ChatAgent(cfg, schemas, handlers)
     agent.client = _FakeClient()  # type: ignore[assignment]

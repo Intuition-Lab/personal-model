@@ -27,7 +27,7 @@ def _patch_anthropic(monkeypatch: pytest.MonkeyPatch, create: Callable[..., Any]
     Returns a list capturing each ``messages.create`` kwargs dict."""
     import anthropic
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    monkeypatch.setenv("PERSOME_LLM_API_KEY", "synthetic")
     calls: list[dict] = []
 
     class _FakeMessages:
@@ -180,14 +180,14 @@ def test_ping_stage_openai_compatible_uses_selected_endpoint(
 
 def test_ping_stage_reports_missing_selected_credential(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PERSOME_LLM_MOCK", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("PERSOME_LLM_API_KEY", raising=False)
     cfg = Config(
         models={
             "default": ModelConfig(
                 provider="openai",
                 protocol="openai",
                 model="gpt-4.1-mini",
-                api_key_env="OPENAI_API_KEY",
+                api_key_env="PERSOME_LLM_API_KEY",
             )
         }
     )
@@ -196,4 +196,4 @@ def test_ping_stage_reports_missing_selected_credential(monkeypatch: pytest.Monk
 
     assert result.ok is False
     assert result.error is not None
-    assert "OPENAI_API_KEY" in result.error
+    assert "PERSOME_LLM_API_KEY" in result.error

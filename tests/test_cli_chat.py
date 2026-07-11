@@ -15,18 +15,18 @@ from persome import cli, paths
 def test_chat_loads_runtime_env_before_building_agent(
     ac_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("PERSOME_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("PERSOME_LLM_BASE_URL", raising=False)
     paths.env_file().write_text(
-        "ANTHROPIC_API_KEY=sk-test-from-env-file\n"
-        "ANTHROPIC_BASE_URL=https://gateway.example/anthropic\n"
+        "PERSOME_LLM_API_KEY=sk-test-from-env-file\n"
+        "PERSOME_LLM_BASE_URL=https://gateway.example/anthropic\n"
     )
 
     seen: dict[str, str | None] = {}
 
     def capture_env(_cfg: object) -> None:
-        seen["api_key"] = os.environ.get("ANTHROPIC_API_KEY")
-        seen["base_url"] = os.environ.get("ANTHROPIC_BASE_URL")
+        seen["api_key"] = os.environ.get("PERSOME_LLM_API_KEY")
+        seen["base_url"] = os.environ.get("PERSOME_LLM_BASE_URL")
 
     monkeypatch.setattr(chat_mod, "run_chat_sync", capture_env)
 

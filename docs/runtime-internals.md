@@ -7,7 +7,7 @@ mode `0600`. `persome start` loads this file before daemonization. Business
 code reads the resulting environment variables:
 
 ```text
-<api_key_env selected by models.default>
+PERSOME_LLM_API_KEY (active Runtime provider)
 OPENAI_API_KEY / OPENAI_BASE_URL (optional dense retrieval)
 PERSOME_SCREENSHOT_KEY
 PERSOME_LOCAL_API_TOKEN

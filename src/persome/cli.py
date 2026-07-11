@@ -1225,7 +1225,7 @@ def _interactive_terminal() -> bool:
 def _llm_credential_summary(spec: ProviderSpec) -> str:
     if not spec.key_required:
         return "[dim]local, no key[/dim]"
-    if os.environ.get(spec.api_key_env):
+    if os.environ.get(spec.discovery_api_key_env):
         return "[green]key found[/green]"
     return "[dim]API key required[/dim]"
 
@@ -1248,11 +1248,11 @@ def llm_providers(
     details: bool = typer.Option(
         False,
         "--details",
-        help="Show protocol, default model, endpoint, and credential variable.",
+        help="Show protocol, default model, endpoint, and credential storage.",
     ),
 ) -> None:
     """List supported presets and mark credentials already found locally."""
-    from .providers import PROVIDERS
+    from .providers import LLM_API_KEY_ENV, PROVIDERS
 
     env_file_mod.load_env_file(paths.env_file())
     for spec in PROVIDERS:
@@ -1261,12 +1261,12 @@ def llm_providers(
             flags.append("[yellow]advanced[/yellow]")
         console.print(f"[bold]{spec.label}[/bold] [dim]({spec.id})[/dim]  {' | '.join(flags)}")
         if details:
-            credential = "none" if not spec.key_required else spec.api_key_env
+            credential = "none" if not spec.key_required else LLM_API_KEY_ENV
             console.print(
                 f"  Protocol: {spec.protocol}\n"
                 f"  Default model: {spec.default_model}\n"
                 f"  Endpoint: {spec.base_url or 'configured during advanced setup'}\n"
-                f"  Credential variable: {credential}\n"
+                f"  Runtime credential: {credential}\n"
                 f"  [dim]{spec.description}[/dim]\n"
             )
     if not details:
@@ -1299,6 +1299,8 @@ def llm_status(
         credential = "[green]not required[/green] (local endpoint)"
     elif profile.credential_ready:
         credential = f"[green]set[/green] via {profile.api_key_env}"
+        if profile.credential_migration_required:
+            credential = f"[green]set[/green] (ready to migrate to {profile.api_key_env})"
     else:
         credential = f"[red]missing[/red] ({profile.api_key_env})"
     table.add_row("Credential", credential)
@@ -1306,8 +1308,13 @@ def llm_status(
     console.print(table)
     if profile.legacy:
         console.print(
-            "[yellow]This installation still uses the pre-provider Anthropic-compatible route. "
+            "[yellow]This installation still uses the pre-provider compatibility route. "
             "Run `persome llm setup` to verify and migrate it explicitly.[/yellow]"
+        )
+    elif profile.credential_migration_required:
+        console.print(
+            "[yellow]The key is being read through a provider-specific compatibility fallback. "
+            "Run `persome llm setup` to store it as PERSOME_LLM_API_KEY.[/yellow]"
         )
     if check:
         if not profile.credential_ready:
@@ -1338,7 +1345,7 @@ def llm_setup(
     model: str = typer.Option("", "--model", help="Advanced: override the preset model."),
     base_url: str = typer.Option("", "--base-url", help="Advanced: override the endpoint."),
     api_key_env: str = typer.Option(
-        "", "--api-key-env", help="Advanced: environment variable holding the key."
+        "", "--api-key-env", help="Advanced: import the key from this environment variable."
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Accept detected/default values."),
     allow_no_tools: bool = typer.Option(
@@ -1355,6 +1362,7 @@ def llm_setup(
     """Choose a provider, enter its key, verify it, and save the Runtime profile."""
     from .llm_setup import probe_profile, save_profile
     from .providers import (
+        LLM_API_KEY_ENV,
         PROVIDERS,
         detected_providers,
         make_profile,
@@ -1406,13 +1414,14 @@ def llm_setup(
             console.print("Choose the LLM provider Persome should use:")
             selected = _choose_llm_provider(PROVIDERS)
 
+    chosen_key_env = LLM_API_KEY_ENV
+    source_key_env = api_key_env
     if keep_current:
         provider_id = current.provider
         protocol = current.protocol
         chosen_model = model or current.model
         chosen_base_url = base_url or current.base_url
-        chosen_key_env = api_key_env or current.api_key_env
-        api_key = os.environ.get(chosen_key_env) or current.api_key
+        api_key = os.environ.get(source_key_env) if source_key_env else current.api_key
     else:
         assert selected is not None
         provider_id = selected.id
@@ -1420,8 +1429,11 @@ def llm_setup(
         chosen_model = model or selected.default_model
         chosen_base_url = base_url or os.environ.get(selected.resolved_base_url_env, "")
         chosen_base_url = chosen_base_url or selected.base_url
-        chosen_key_env = api_key_env or selected.api_key_env
-        api_key = os.environ.get(chosen_key_env)
+        if source_key_env:
+            api_key = os.environ.get(source_key_env)
+        else:
+            api_key = os.environ.get(selected.discovery_api_key_env)
+            api_key = api_key or os.environ.get(LLM_API_KEY_ENV)
 
     selected_spec = selected or provider_spec(provider_id)
     provider_label = selected_spec.label if selected_spec is not None else current.provider_label
@@ -1433,7 +1445,7 @@ def llm_setup(
             "[yellow]Advanced setup:[/yellow] this provider needs deployment-specific "
             "routing details."
         )
-        api_key = os.environ.get(chosen_key_env) or api_key
+        api_key = (os.environ.get(source_key_env) if source_key_env else None) or api_key
         if not base_url:
             chosen_base_url = typer.prompt("API endpoint", default=chosen_base_url or "")
         if not model:
@@ -1448,7 +1460,7 @@ def llm_setup(
     if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.netloc:
         console.print("[red]The API endpoint must be an absolute http(s) URL.[/red]")
         raise typer.Exit(2)
-    if not chosen_key_env.isascii() or not chosen_key_env.isidentifier():
+    if source_key_env and (not source_key_env.isascii() or not source_key_env.isidentifier()):
         console.print("[red]The API key environment variable name is invalid.[/red]")
         raise typer.Exit(2)
 
@@ -1456,7 +1468,8 @@ def llm_setup(
     if key_required and not api_key:
         if not interactive:
             console.print(
-                f"[red]{chosen_key_env} is not set. Export it or run setup interactively.[/red]"
+                f"[red]No API key was found. Set {LLM_API_KEY_ENV} or run setup "
+                "interactively.[/red]"
             )
             raise typer.Exit(2)
         api_key = typer.prompt(

@@ -14,8 +14,8 @@ from . import providers as provider_mod
 @dataclass
 class ModelConfig:
     model: str = "deepseek-v4-flash"
-    # Provider routing is explicit after ``persome llm setup``. Empty values
-    # preserve old configs and are inferred from the model/environment.
+    # Provider routing is explicit after ``persome llm setup``. ``api_key_env``
+    # is retained for old TOMLs; new profiles always use PERSOME_LLM_API_KEY.
     provider: str = ""
     protocol: str = ""
     api_key_env: str = ""
@@ -626,8 +626,8 @@ DEFAULT_CONFIG_TEMPLATE = """# Persome configuration
 # calling before writing the fields below. Every stage inherits [models.default]
 # unless its own section overrides a field.
 #
-# API keys never belong in this file. `api_key_env` stores only the variable
-# name; the secret itself lives in ~/.persome/env (mode 0600). Endpoints are not
+# API keys never belong in this file. The active secret is always named
+# PERSOME_LLM_API_KEY and lives in ~/.persome/env (mode 0600). Endpoints are not
 # secrets and are stored here so Chat and daemon subprocesses use the same route.
 # `persome llm providers` lists hosted/local presets. Azure and custom compatible
 # gateways use the clearly separated advanced setup path.
@@ -646,7 +646,8 @@ edge_promote_fanout = 20
 # name = "Alice"
 
 [models.default]
-# `persome llm setup` writes provider, protocol, model, base_url, and api_key_env.
+# `persome llm setup` writes provider, protocol, model, base_url, and the
+# PERSOME_LLM_API_KEY credential reference.
 # Until then, these legacy defaults retain compatibility with pre-provider installs.
 model = "deepseek-v4-flash"
 
@@ -783,8 +784,9 @@ port = 8742
 
 [chat]
 # Chat inherits the complete [models.default] provider profile. Override model,
-# provider, protocol, base_url, or api_key_env here only when Chat intentionally
-# uses another endpoint. thinking_budget applies only to Anthropic models.
+# provider, protocol, or base_url here only when Chat intentionally uses another
+# endpoint. The active credential remains PERSOME_LLM_API_KEY.
+# thinking_budget applies only to Anthropic models.
 # thinking_budget = 0
 unsafe_local_tools_enabled = false # opt in to shell, arbitrary filesystem, and web tools
 mcp_connect_daemon = true         # auto-connect to the daemon's own MCP server

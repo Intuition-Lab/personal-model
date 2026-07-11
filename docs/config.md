@@ -34,9 +34,11 @@ cannot call tools requires an explicit degraded-mode confirmation.
 
 Azure deployments and `custom-openai` / `custom-anthropic` are explicitly
 advanced because their endpoint and model or deployment name are user-specific.
-Automation can also override a preset with `--base-url`, `--model`, and
-`--api-key-env`. Run `persome llm providers --details` to inspect those routing
-defaults; they are not part of regular onboarding.
+Automation can also override a preset with `--base-url` and `--model`, or import
+a key from an existing variable with `--api-key-env`. Imported keys are still
+stored under Persome's provider-neutral `PERSOME_LLM_API_KEY` name. Run
+`persome llm providers --details` to inspect routing defaults; they are not part
+of regular onboarding.
 
 The resulting non-secret configuration has this shape:
 
@@ -46,7 +48,7 @@ provider = "openrouter"
 protocol = "openai"
 model = "anthropic/claude-sonnet-4"
 base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
+api_key_env = "PERSOME_LLM_API_KEY"
 # max_tokens = 4096
 
 [models.timeline]
@@ -59,10 +61,11 @@ api_key_env = "OPENROUTER_API_KEY"
 [models.schema_miner]
 ```
 
-Only the value named by `api_key_env` is stored in `<PERSOME_ROOT>/env`:
+The active provider key is stored in `<PERSOME_ROOT>/env` under one stable,
+provider-neutral name:
 
 ```dotenv
-OPENROUTER_API_KEY=...
+PERSOME_LLM_API_KEY=...
 
 # Optional dense retrieval:
 OPENAI_API_KEY=...
@@ -84,10 +87,14 @@ Ollama, LM Studio, and vLLM. Presets describe endpoint defaults, not a blanket
 capability guarantee for every model. Use `custom-openai` or
 `custom-anthropic` for another compatible gateway.
 
-For migration, a config without `provider` and `protocol` retains the former
-`ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` route exactly, even if an older file
-contains an ignored `api_key_env`. Running `persome llm setup` tests and
-converts that route to explicit fields.
+During onboarding, Persome can discover common provider-specific variables such
+as keys exported by provider CLIs or existing shell profiles. They are import
+sources only; the saved Runtime profile always references `PERSOME_LLM_API_KEY`.
+
+For migration, existing provider-specific `api_key_env` values and the former
+pre-provider route remain readable as compatibility fallbacks. Running
+`persome llm setup` tests the current route, copies the selected key to
+`PERSOME_LLM_API_KEY`, and writes an explicit provider profile.
 
 ## Capture
 

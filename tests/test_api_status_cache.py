@@ -60,7 +60,7 @@ def test_status_provider_ping_refreshes_after_ttl(monkeypatch) -> None:
 
 def test_status_cache_key_never_contains_provider_secret(monkeypatch) -> None:
     routes._model_ping_cache.clear()
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "secret-value-must-not-be-retained")
+    monkeypatch.setenv("PERSOME_LLM_API_KEY", "secret-value-must-not-be-retained")
     monkeypatch.setattr(llm_mod, "ping_stage", _ok_ping)
 
     routes._status_model_pings(Config())

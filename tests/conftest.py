@@ -12,6 +12,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
+@pytest.fixture(autouse=True)
+def isolate_runtime_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep developer credentials and cross-test writes out of unit tests."""
+    monkeypatch.delenv("PERSOME_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("PERSOME_LLM_BASE_URL", raising=False)
+
+
 @pytest.fixture
 def ac_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "persome"

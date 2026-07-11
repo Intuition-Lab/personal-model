@@ -111,8 +111,9 @@ modeling. During installation, the provider wizard asks you to choose a service
 and enter its API key. Persome supplies that provider's endpoint and default
 model, tests completion and tool calling, and only then saves the route. Existing
 keys are detected automatically. API keys go to the owner-only
-`~/.persome/env` file; the non-secret route goes to `~/.persome/config.toml`.
-Nothing ships with a key.
+`~/.persome/env` file under the provider-neutral `PERSOME_LLM_API_KEY` name;
+provider-specific environment variables are import sources only. The non-secret
+route goes to `~/.persome/config.toml`. Nothing ships with a key.
 
 ```bash
 # If provider setup was skipped during installation:

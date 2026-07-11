@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import env_file, paths
-from .providers import ResolvedLLMProfile
+from .providers import LLM_API_KEY_ENV, ResolvedLLMProfile
 
 _PROBE_TOOL_NAME = "persome_setup_check"
 _PROBE_TOOL_DESCRIPTION = "Confirm that this model can call Persome memory tools."
@@ -173,13 +173,13 @@ def save_profile(
     default["protocol"] = profile.protocol
     default["model"] = profile.model
     default["base_url"] = profile.base_url
-    default["api_key_env"] = profile.api_key_env
+    default["api_key_env"] = LLM_API_KEY_ENV
 
     if config_path.is_symlink():
         raise RuntimeError(f"config file must not be a symlink: {config_path}")
-    paths.atomic_write_private_text(config_path, tomlkit.dumps(document))
     if profile.api_key:
-        env_file.write_env_values(env_path, {profile.api_key_env: profile.api_key})
+        env_file.write_env_values(env_path, {LLM_API_KEY_ENV: profile.api_key})
+    paths.atomic_write_private_text(config_path, tomlkit.dumps(document))
 
 
 def profile_dict(profile: ResolvedLLMProfile) -> dict[str, Any]:

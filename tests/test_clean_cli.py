@@ -101,7 +101,7 @@ def test_clean_all_keeps_only_install_configuration_and_custom_skills(ac_root) -
     _seed_capture()
     _seed_model()
     paths.config_file().write_text("[capture]\n")
-    paths.env_file().write_text("ANTHROPIC_API_KEY=synthetic\n")
+    paths.env_file().write_text("PERSOME_LLM_API_KEY=synthetic\n")
     (paths.root() / "venv").mkdir()
     paths.skills_dir().mkdir()
     (paths.skills_dir() / "custom.md").write_text("Synthetic skill.")
