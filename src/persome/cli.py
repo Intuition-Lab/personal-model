@@ -333,9 +333,11 @@ def status() -> None:
     cfg = _init()
     # Source the env file before resolving/probing the selected provider.
     env_file_mod.load_env_file(paths.env_file())
+    from .capture.ocr_health import inspect as inspect_ocr
     from .providers import resolve_profile
 
     default_profile = resolve_profile(cfg.model_for("default"))
+    ocr_health = inspect_ocr(cfg.capture)
     pid = _read_pid()
     paused = paths.paused_flag().exists()
 
@@ -350,6 +352,22 @@ def status() -> None:
     table.add_row("Uptime", uptime)
     table.add_row("Health", f"[{health_style}]{health_label}[/{health_style}]")
     table.add_row("Capture", "[yellow]paused[/yellow]" if paused else "active")
+    ocr_style = "green" if ocr_health.ready else "yellow" if not ocr_health.enabled else "red"
+    table.add_row(
+        "OCR",
+        f"[{ocr_style}]{ocr_health.state}[/{ocr_style}] ({ocr_health.tier})",
+    )
+    permission_style = (
+        "green"
+        if ocr_health.screen_recording == "granted"
+        else "yellow"
+        if ocr_health.screen_recording == "not_applicable"
+        else "red"
+    )
+    table.add_row(
+        "Screen Recording",
+        f"[{permission_style}]{ocr_health.screen_recording}[/{permission_style}]",
+    )
 
     if last_ts:
         try:
@@ -448,8 +466,9 @@ def doctor() -> None:
     Prints one ✓/✗/⚠ line per prerequisite — env file present + private (0600),
     local API bearer token present, selected provider credential configured,
     endpoint reachable (HEAD, warn-only), Swift capture helpers compiled, macOS
-    Accessibility trust, data root writable, daemon port available. Exits 1 if
-    any check FAILS; warnings never fail.
+    Accessibility and Screen Recording trust, local OCR readiness, data root
+    writable, daemon port available. Exits 1 if any check FAILS; warnings never
+    fail.
     """
     from . import doctor as doctor_mod
 
@@ -541,6 +560,128 @@ def mcp() -> None:
     from .mcp import server as mcp_server
 
     mcp_server.run_stdio()
+
+
+ocr_app = typer.Typer(help="Configure and inspect on-device OCR for AX-poor apps.")
+app.add_typer(ocr_app, name="ocr")
+
+
+def _open_screen_recording_settings() -> None:
+    if sys.platform != "darwin":
+        return
+    subprocess.run(
+        [
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        ],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+@ocr_app.command("setup")
+def ocr_setup(
+    tier: str = typer.Option("tiny", "--tier", help="OCR tier: tiny | small | medium."),
+    open_settings: bool = typer.Option(
+        True,
+        "--open-settings/--no-open-settings",
+        help="Open Screen Recording settings when permission is not granted.",
+    ),
+) -> None:
+    """Enable local OCR, request Screen Recording, and verify the worker."""
+    from .capture import ocr_local, screen_recording
+    from .ocr_setup import VALID_TIERS, save_ocr_config
+
+    _init()
+    env_file_mod.load_env_file(paths.env_file())
+    if tier not in VALID_TIERS:
+        console.print(f"[red]Unsupported OCR tier {tier!r}: choose {', '.join(VALID_TIERS)}.[/red]")
+        raise typer.Exit(2)
+    if ocr_local.disabled_by_environment():
+        console.print(
+            "[red]OCR is disabled by PERSOME_DISABLE_OCR. Remove that variable and retry.[/red]"
+        )
+        raise typer.Exit(1)
+    if not ocr_local.runtime_available():
+        console.print(
+            "[red]The local Paddle OCR runtime is unavailable on this architecture.[/red] "
+            "AX capture remains available."
+        )
+        raise typer.Exit(1)
+    if not ocr_local.models_available(tier):
+        console.print(f"[red]Bundled PP-OCRv6 {tier} model weights are missing.[/red]")
+        raise typer.Exit(1)
+
+    console.print("Requesting macOS Screen Recording permission for local OCR...")
+    screen_recording.request_screen_recording()
+    with console.status("Starting the isolated local OCR worker..."):
+        engine_ready = ocr_local.warm(tier)
+    if not engine_ready:
+        console.print("[red]The local OCR worker could not initialize. Nothing was enabled.[/red]")
+        raise typer.Exit(1)
+
+    save_ocr_config(enabled=True, tier=tier, config_path=paths.config_file())
+    permission_ready = screen_recording.has_screen_recording()
+    if not permission_ready:
+        if open_settings:
+            _open_screen_recording_settings()
+        console.print(
+            "[yellow]OCR is enabled, but Screen Recording is not granted yet.[/yellow]\n"
+            "Enable the terminal or Persome runtime entry shown in System Settings -> "
+            "Privacy & Security -> Screen Recording, then restart the daemon."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓ Local OCR enabled and ready[/green] ({tier}, isolated worker)")
+    if _read_pid() is not None:
+        console.print("Restart the daemon to load the updated OCR configuration.")
+
+
+@ocr_app.command("status")
+def ocr_status(
+    check: bool = typer.Option(False, "--check", help="Start the worker and verify its engine."),
+) -> None:
+    """Show OCR configuration, runtime, models, and permission state."""
+    from .capture import ocr_health, ocr_local
+
+    cfg = _init()
+    env_file_mod.load_env_file(paths.env_file())
+    health = ocr_health.inspect(cfg.capture)
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_row("State", health.state)
+    table.add_row("Enabled", "yes" if health.enabled else "no")
+    table.add_row("Tier", health.tier)
+    table.add_row("Runtime", "available" if health.runtime_available else "unavailable")
+    table.add_row("Models", "available" if health.models_available else "missing")
+    table.add_row("Screen Recording", health.screen_recording)
+    table.add_row("Detail", health.detail)
+    console.print(table)
+    if check:
+        if not health.enabled or health.disabled_by_environment:
+            raise typer.Exit(1)
+        with console.status("Checking the isolated local OCR worker..."):
+            ready = ocr_local.warm(health.tier)
+        if not ready:
+            console.print("[red]✗ OCR worker check failed[/red]")
+            raise typer.Exit(1)
+        console.print("[green]✓ OCR worker is ready[/green]")
+    if health.enabled and not health.ready:
+        raise typer.Exit(1)
+
+
+@ocr_app.command("disable")
+def ocr_disable() -> None:
+    """Disable OCR fallback without changing screenshot retention."""
+    from .ocr_setup import save_ocr_config
+
+    cfg = _init()
+    save_ocr_config(
+        enabled=False,
+        tier=cfg.capture.ocr_tier,
+        config_path=paths.config_file(),
+    )
+    console.print("[yellow]Local OCR disabled. Restart the daemon to apply.[/yellow]")
 
 
 @app.command("ocr-selftest")

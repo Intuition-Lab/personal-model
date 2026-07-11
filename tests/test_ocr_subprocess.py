@@ -144,14 +144,14 @@ class TestCrashContainment:
 
         client = ocr_subprocess.OCRWorkerClient(spawn=_boom, timeout=1)
         assert client.recognize_detailed(_JPEG, "tiny") is None
-        assert client.warm("tiny") is None  # warm also fails open, never raises
+        assert client.warm("tiny") is False  # warm also fails open, never raises
 
 
 class TestWarm:
     def test_warm_spawns_worker(self) -> None:
         client = ocr_subprocess.OCRWorkerClient(spawn=_spawner(_ECHO), timeout=10)
         try:
-            client.warm("tiny")
+            assert client.warm("tiny") is True
             assert client._proc is not None and client._proc.poll() is None
         finally:
             client.shutdown()

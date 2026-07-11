@@ -18,10 +18,10 @@ runtime schema.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Liveness probe. |
+| GET | `/health` | Liveness plus compact OCR readiness (`ok` or `degraded`). |
 | POST | `/auth/browser-bootstrap` | Exchange the bearer for a 60-second, one-use viewer URL. |
-| GET | `/permissions` | macOS Accessibility state. |
-| GET | `/status` | Daemon, capture, session, memory, and provider status. |
+| GET | `/permissions` | macOS Accessibility and Screen Recording state. |
+| GET | `/status` | Daemon, capture, OCR, session, memory, and provider status. |
 | POST | `/captures/ingest` | Ingest one bearer-authenticated capture from a trusted local producer. |
 | GET | `/model` | Open the offline Point/Line/Face/Volume/Root explorer. |
 | GET | `/model/graph` | Read the canonical versioned model snapshot. |
@@ -36,6 +36,9 @@ intentionally omitted from OpenAPI.
 endpoint, key variable name, credential presence, and legacy-migration state.
 It never returns the credential value. Provider network probes run only for
 the explicit `GET /status?check_models=true` request and are cached briefly.
+`/status.data.ocr` reports the configured tier, Runtime and model availability,
+kill switch, Screen Recording, and effective readiness. `/health` exposes only
+the compact OCR state because it is the unauthenticated liveness route.
 
 ## Chat routes
 

@@ -31,6 +31,7 @@ uv run python scripts/sample_demo.py
 ```bash
 bash install.sh
 persome llm status --check
+persome ocr status --check
 persome doctor
 persome start
 persome model open

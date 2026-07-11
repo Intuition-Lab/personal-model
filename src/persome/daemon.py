@@ -304,7 +304,8 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
 
         def _warm_ocr() -> None:
             try:
-                ocr_local.warm(cfg.capture.ocr_tier)
+                if not ocr_local.warm(cfg.capture.ocr_tier):
+                    logger.warning("boot: OCR warmup did not produce a ready engine")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("boot: OCR warmup failed: %s", exc)
             finally:

@@ -78,6 +78,7 @@ After installing the Swift helpers and granting Accessibility permission:
 ```bash
 bash install.sh
 persome llm status --check
+persome ocr status --check
 persome doctor
 persome start
 
@@ -124,8 +125,10 @@ PERSOME_ROOT=/tmp/persome-wheel-root \
   /tmp/persome-wheel-venv/bin/persome llm providers
 ```
 
-`persome ocr-selftest <image>` performs a full bundled OCR inference check on
-Apple Silicon.
+`install.sh` runs `persome ocr setup`, which requests Screen Recording and
+performs a full bundled worker initialization on Apple Silicon.
+`persome ocr-selftest <image>` remains available for a known-image inference
+check.
 
 For a GitHub Release produced by the current workflow (older releases are not
 retroactively attested), also download `SHA256SUMS`, verify it from the

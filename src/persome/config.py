@@ -692,7 +692,7 @@ ax_depth = 100                # Electron apps (Claude Desktop, VS Code, Slack) h
 ax_timeout_seconds = 3
 # OCR fallback for apps that block Accessibility API (WeChat, Feishu, NetEase Music, etc.)
 # On-device PP-OCRv6 — the focused-window screenshot is OCR'd locally; nothing leaves the machine.
-enable_ocr_fallback = false   # local inference; no network, no API token
+enable_ocr_fallback = false   # install.sh verifies the worker, then writes true on supported Macs
 # Inference runs in an isolated local worker, so a native Paddle crash does not
 # kill the daemon. PERSOME_DISABLE_OCR=1 is the deployment kill switch.
 ocr_tier = "tiny"             # tiny (default) | small | medium — local PP-OCRv6 weights

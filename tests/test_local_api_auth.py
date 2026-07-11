@@ -92,7 +92,8 @@ def test_health_is_public_but_missing_token_closes_protected_rest(
     protected = client.get("/openapi.json")
 
     assert health.status_code == 200
-    assert health.json() == {"success": True, "data": {"status": "ok"}}
+    assert health.json()["data"]["status"] == "ok"
+    assert "ocr" in health.json()["data"]
     assert protected.status_code == 503
     assert protected.headers["connection"] == "close"
     assert protected.json() == {

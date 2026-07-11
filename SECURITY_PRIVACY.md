@@ -25,9 +25,10 @@ artifacts are private from creation.
 
 Default capture retention is seven days. Screenshot payloads are stripped
 earlier by the configured screenshot retention window, except explicitly
-actionable captures covered by extended retention. OCR is disabled by default;
-when enabled, inference is local, subprocess-isolated, and uses bundled
-PP-OCRv6 weights.
+actionable captures covered by extended retention. On supported Apple Silicon
+installs, `install.sh` enables OCR after requesting Screen Recording and proving
+the isolated worker can load bundled PP-OCRv6 weights. Inference remains local;
+`persome ocr disable` is the explicit opt-out.
 
 Lock-screen detection is privacy-conservative: when both macOS probes are
 unavailable or error, capture pauses until a probe can establish that the

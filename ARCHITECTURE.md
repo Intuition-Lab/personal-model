@@ -33,8 +33,9 @@ tests can run on Linux with macOS-marked tests deselected.
 
 ## State formation
 
-1. `capture/` receives Accessibility events. AX-poor apps can opt into bundled,
-   subprocess-isolated PP-OCRv6; the default is AX-only.
+1. `capture/` receives Accessibility events. Supported installs enable bundled,
+   subprocess-isolated PP-OCRv6 as a fallback when an app exposes no usable AX
+   text; AX remains the primary signal.
 2. `parsers/` normalizes app-specific structures into capture records.
 3. `timeline/` groups records into one-minute blocks and preserves authored
    evidence.

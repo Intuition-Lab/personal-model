@@ -48,8 +48,7 @@ def serve() -> int:
         result: ocr_protocol.Detailed | None
         if not image:
             # Warm request: build the engine now so the first real capture is fast.
-            ocr_local.warm(tier)
-            result = ([], [], [])
+            result = ([], [], []) if ocr_local.warm(tier) else None
         else:
             # A native fault inside here takes down ONLY this process (by design).
             try:

@@ -4,7 +4,8 @@ Capture is the only layer that touches the outside world. It produces one JSON f
 
 Live capture requires macOS Accessibility permission for the process that runs
 Persome. Screen Recording is additionally required when screenshots or OCR are
-enabled. OCR is bundled but **disabled by default**.
+enabled. `install.sh` enables and verifies bundled OCR on supported Apple
+Silicon Macs, then requests Screen Recording from the same Runtime identity.
 
 ## Two signal sources
 
@@ -26,11 +27,13 @@ The filename is ISO-8601 with `:` → `-` and `+` → `p` / `-` → `m` for the 
 
 The same capture scheduler also invokes `SessionManager.on_event` (wired as a `pre_capture_hook` in `daemon.py`), so the session cutter sees every written, non-duplicate observation without a separate subscription path.
 
-## Optional local OCR
+## Local OCR fallback
 
-Set `enable_ocr_fallback = true` only when AX-poor applications matter. The
+The installer runs `persome ocr setup`, which checks the native Runtime and
+bundled weights, requests Screen Recording, starts the isolated worker, and
+writes `enable_ocr_fallback = true` only after the worker initializes. The
 focused screenshot is used locally and is never placed in an LLM prompt. The
-default OCR path is:
+OCR path is:
 
 ```text
 focused screenshot bytes
@@ -45,6 +48,13 @@ The subprocess is the native-crash boundary: a Paddle fault fails the OCR call
 without killing the daemon. `PERSOME_DISABLE_OCR=1` prevents Paddle from being
 loaded at all. `PERSOME_OCR_IN_PROCESS=1` exists only for debugging and removes
 that isolation.
+
+```bash
+persome ocr setup          # enable, request permission, verify worker
+persome ocr status         # quick config/runtime/model/TCC state
+persome ocr status --check # also start and verify the worker engine
+persome ocr disable        # explicit opt-out; restart to apply
+```
 
 ## Debounce / dedup / gap
 

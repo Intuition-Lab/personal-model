@@ -56,16 +56,25 @@ fallback for old installs or a changed TCC principal.
 
 Second most common cause: **`ax_depth` too shallow for Electron apps.** See [capture.md](capture.md#ax-depth-the-1-footgun).
 
-For an AX-poor app, enable local OCR explicitly and grant Screen Recording:
+The installer normally enables local OCR and requests Screen Recording. Check
+the complete state first:
 
-```toml
-[capture]
-enable_ocr_fallback = true
+```bash
+persome ocr status --check
 ```
 
-Then restart and run `persome ocr-selftest <image>`. OCR worker failures should
-leave the daemon alive. `PERSOME_DISABLE_OCR=1` disables inference entirely;
-remove it if self-test reports OCR disabled.
+If it reports disabled, missing permission, or an incomplete worker setup, run:
+
+```bash
+persome ocr setup
+persome stop
+persome start
+persome doctor
+```
+
+The setup command opens Screen Recording settings when needed. OCR worker
+failures leave the daemon alive. `PERSOME_DISABLE_OCR=1` disables inference
+entirely; remove it if health reports `disabled_by_environment`.
 
 ## No event-daily entries appearing
 

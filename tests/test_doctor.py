@@ -19,6 +19,8 @@ from pathlib import Path
 import pytest
 
 from persome import doctor, paths
+from persome.capture import ocr_health, ocr_local, screen_recording
+from persome.config import CaptureConfig
 from persome.providers import PROVIDERS
 
 
@@ -282,6 +284,69 @@ def test_ax_trust_non_macos_warns_unknown(monkeypatch: pytest.MonkeyPatch) -> No
     assert "unknown" in c.detail
 
 
+# ── Screen Recording + local OCR ─────────────────────────────────────────────
+
+
+def test_screen_recording_granted_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: True)
+
+    check = doctor.check_screen_recording(CaptureConfig(enable_ocr_fallback=True))
+
+    assert check.status == "ok"
+
+
+def test_screen_recording_denied_fails_when_ocr_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: False)
+
+    check = doctor.check_screen_recording(CaptureConfig(enable_ocr_fallback=True))
+
+    assert check.status == "fail"
+    assert "Screen Recording" in check.detail
+
+
+def test_ocr_ready_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ocr_health.sys, "platform", "darwin")
+    monkeypatch.setattr(ocr_local, "runtime_available", lambda: True)
+    monkeypatch.setattr(ocr_local, "models_available", lambda tier: True)
+    monkeypatch.setattr(ocr_local, "disabled_by_environment", lambda: False)
+    monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: True)
+
+    check = doctor.check_ocr(CaptureConfig(enable_ocr_fallback=True))
+
+    assert check.status == "ok"
+    assert "isolated worker" in check.detail
+
+
+def test_ocr_permission_block_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ocr_health.sys, "platform", "darwin")
+    monkeypatch.setattr(ocr_local, "runtime_available", lambda: True)
+    monkeypatch.setattr(ocr_local, "models_available", lambda tier: True)
+    monkeypatch.setattr(ocr_local, "disabled_by_environment", lambda: False)
+    monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: False)
+
+    check = doctor.check_ocr(CaptureConfig(enable_ocr_fallback=True))
+
+    assert check.status == "fail"
+    assert "permission_required" in check.detail
+
+
+def test_ocr_disabled_is_visible_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ocr_health.sys, "platform", "darwin")
+    monkeypatch.setattr(ocr_local, "runtime_available", lambda: True)
+    monkeypatch.setattr(ocr_local, "models_available", lambda tier: True)
+    monkeypatch.setattr(ocr_local, "disabled_by_environment", lambda: False)
+    monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: True)
+
+    check = doctor.check_ocr(CaptureConfig(enable_ocr_fallback=False))
+
+    assert check.status == "warn"
+    assert "persome ocr setup" in check.detail
+
+
 # ── data root ─────────────────────────────────────────────────────────────────
 
 
@@ -373,6 +438,8 @@ def test_run_checks_merges_env_file_first(
     assert by_name["PERSOME_LOCAL_API_TOKEN"].status == "ok"
     assert by_name["SQLite secure FTS"].status == "ok"
     assert by_name["PERSOME_SCREENSHOT_KEY"].status == "warn"
+    assert "Screen Recording" in by_name
+    assert by_name["local OCR"].status == "warn"
 
 
 def test_openai_profile_uses_selected_credential_and_endpoint(

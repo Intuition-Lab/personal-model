@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .. import __version__, paths
-from ..capture import ax_capture, scheduler
+from ..capture import ax_capture, ocr_health, scheduler, screen_recording
 from ..capture.timestamps import newest_capture_path
 from ..config import Config
 from ..config import load as load_config
@@ -206,8 +206,10 @@ router = APIRouter()
 
 @router.get("/health", response_model=ApiResponse, tags=["system"])
 def health() -> ApiResponse:
-    """Return the service liveness status."""
-    return ApiResponse(data={"status": "ok"})
+    """Return liveness plus the configured local-OCR readiness state."""
+    current = ocr_health.inspect(_get_cfg().capture)
+    status = "degraded" if current.enabled and not current.ready else "ok"
+    return ApiResponse(data={"status": status, "ocr": current.state})
 
 
 @router.post(BROWSER_BOOTSTRAP_PATH, response_model=ApiResponse, tags=["system"])
@@ -257,12 +259,18 @@ def consume_browser_bootstrap(
 def permissions() -> ApiResponse:
     """Return the daemon's current macOS permission state.
 
-    Accessibility belongs to the daemon process because it launches the AX
-    helpers that read the tree. A GUI onboarding flow should poll this endpoint
-    instead of creating a second TCC identity. ``accessibility`` is ``granted``
-    or ``denied`` and is always ``denied`` on non-macOS hosts.
+    Accessibility and Screen Recording belong to the daemon process. A GUI
+    onboarding flow should poll this endpoint instead of creating another TCC
+    identity. Each field is ``granted`` or ``denied``.
     """
-    return ApiResponse(data={"accessibility": "granted" if ax_capture.ax_trusted() else "denied"})
+    return ApiResponse(
+        data={
+            "accessibility": "granted" if ax_capture.ax_trusted() else "denied",
+            "screen_recording": (
+                "granted" if screen_recording.has_screen_recording() else "denied"
+            ),
+        }
+    )
 
 
 @router.get("/status", response_model=ApiResponse, tags=["system"])
@@ -282,6 +290,7 @@ def status(check_models: bool = False) -> ApiResponse:
         "uptime": uptime,
         "health": health_label,
         "capture": "paused" if paused else "active",
+        "ocr": ocr_health.inspect(cfg.capture).as_dict(),
     }
 
     if last_ts:

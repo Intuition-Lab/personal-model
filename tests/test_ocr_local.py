@@ -66,6 +66,8 @@ class TestModelResolution:
         rec = ocr_local._model_dir("tiny", "rec")
         assert det is not None and det.endswith("PP-OCRv6_tiny_det")
         assert rec is not None and rec.endswith("PP-OCRv6_tiny_rec")
+        assert ocr_local.models_available("tiny") is True
+        assert ocr_local.models_available("invalid") is False
 
     def test_env_override(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         monkeypatch.setenv("PERSOME_OCR_MODELS_DIR", str(tmp_path))
@@ -175,7 +177,7 @@ class TestDisableKillSwitch:
             raise AssertionError("warm must not build the engine when OCR is disabled")
 
         monkeypatch.setattr(ocr_local, "_build_engine", _boom)
-        ocr_local.warm("tiny")  # must not raise
+        assert ocr_local.warm("tiny") is False
 
     def test_enabled_recognize_still_runs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Guard against the kill-switch accidentally disabling OCR when unset/off.

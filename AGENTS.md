@@ -126,8 +126,9 @@ Update matching docs in the same change as behavior.
   layer; treat local endpoint access as access to personal data.
 - Prompt edits follow `docs/prompt-engineering.md`: define an eval criterion,
   then change and verify the smallest prompt surface.
-- Live capture uses compiled Swift helpers bundled into the wheel. OCR is off
-  by default and runs in an isolated worker when enabled.
+- Live capture uses compiled Swift helpers bundled into the wheel. On supported
+  Apple Silicon installs, onboarding enables bundled OCR and requests Screen
+  Recording; inference runs in an isolated worker.
 - `--capture-only` disables timeline and model-processing tasks, but keeps
   capture, session tracking, reducer recovery/safety net, and configured MCP.
 

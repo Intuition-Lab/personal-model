@@ -78,9 +78,9 @@ class OCRWorkerClient:
             return None
         return self._request(tier, image_bytes)
 
-    def warm(self, tier: str) -> None:
-        """Pre-spawn the worker and pre-build its engine (empty image = warm request)."""
-        self._request(tier, b"")
+    def warm(self, tier: str) -> bool:
+        """Pre-build the worker engine and report whether it became ready."""
+        return self._request(tier, b"") is not None
 
     def shutdown(self) -> None:
         """Terminate the worker (best-effort). The worker also exits on stdin EOF."""

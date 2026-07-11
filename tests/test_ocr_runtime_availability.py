@@ -61,4 +61,4 @@ def test_ocr_entrypoints_degrade_cleanly_without_runtime(monkeypatch: pytest.Mon
 
     assert ocr_local.recognize(b"\xff\xd8\xff-not-a-real-jpeg") is None
     assert ocr_local.recognize_detailed(b"\xff\xd8\xff-not-a-real-jpeg") is None
-    ocr_local.warm()  # clean no-op, no exception
+    assert ocr_local.warm() is False
