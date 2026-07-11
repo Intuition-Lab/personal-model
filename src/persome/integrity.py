@@ -170,14 +170,19 @@ def _try_rebuild_captures_fts(db_path: Path) -> bool | None:
 
         conn.execute("BEGIN IMMEDIATE")
         fts.rebuild_captures_fts(conn)
+        conn.commit()
+        # Older macOS SQLite builds can retain the malformed virtual-table
+        # constructor in this connection after DROP/CREATE. Validate from a
+        # fresh connection so that cache cannot turn a successful rebuild into
+        # a rollback.
+        conn.close()
+        conn = sqlite3.connect(db_path, timeout=5.0)
         repaired = [
             str(row[0])
             for row in conn.execute(f"PRAGMA integrity_check({_INTEGRITY_CHECK_LIMIT})").fetchall()
         ]
         if repaired != ["ok"]:
-            conn.rollback()
-            return False
-        conn.commit()
+            return None if _is_captures_fts_only_damage(repaired) else False
         return True
     except (RuntimeError, sqlite3.DatabaseError) as exc:
         if conn is not None and conn.in_transaction:
