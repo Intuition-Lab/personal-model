@@ -169,11 +169,20 @@ def save_profile(
         default = tomlkit.table()
         models["default"] = default
 
-    default["provider"] = profile.provider
-    default["protocol"] = profile.protocol
-    default["model"] = profile.model
-    default["base_url"] = profile.base_url
-    default["api_key_env"] = LLM_API_KEY_ENV
+    managed_values = {
+        "provider": profile.provider,
+        "protocol": profile.protocol,
+        "model": profile.model,
+        "base_url": profile.base_url,
+        "api_key_env": LLM_API_KEY_ENV,
+    }
+    for key, value in managed_values.items():
+        default[key] = value
+        # These fields are owned by onboarding. Drop stale provider-specific
+        # inline comments retained by tomlkit when an existing value is replaced.
+        item = default.item(key)
+        item.trivia.comment_ws = ""
+        item.trivia.comment = ""
 
     if config_path.is_symlink():
         raise RuntimeError(f"config file must not be a symlink: {config_path}")

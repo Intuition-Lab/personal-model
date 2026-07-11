@@ -139,8 +139,8 @@ def test_setup_migrates_existing_provider_specific_key(ac_root: Path, monkeypatc
 provider = "anthropic"
 protocol = "anthropic"
 model = "claude-sonnet-4-5"
-base_url = "https://api.anthropic.com"
-api_key_env = "ANTHROPIC_API_KEY"
+base_url = "https://api.anthropic.com" # legacy provider endpoint
+api_key_env = "ANTHROPIC_API_KEY" # legacy credential name
 """
     )
     paths.env_file().write_text("ANTHROPIC_API_KEY=legacy-secret\n")
@@ -157,6 +157,8 @@ api_key_env = "ANTHROPIC_API_KEY"
     assert "legacy-secret" not in result.output
     selected = config.load().model_for("default")
     assert selected.api_key_env == LLM_API_KEY_ENV
+    assert "legacy provider endpoint" not in paths.config_file().read_text()
+    assert "legacy credential name" not in paths.config_file().read_text()
     assert f"{LLM_API_KEY_ENV}=legacy-secret" in paths.env_file().read_text()
     status = CliRunner().invoke(app, ["llm", "status"])
     assert status.exit_code == 0
