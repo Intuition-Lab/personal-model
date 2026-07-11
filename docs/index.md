@@ -30,6 +30,7 @@ uv run python scripts/sample_demo.py
 
 ```bash
 bash install.sh
+persome llm status --check
 persome doctor
 persome start
 open http://127.0.0.1:8742/model
@@ -43,6 +44,7 @@ optional on-device OCR, and serves streamable HTTP MCP at
 
 - [Product experience and Quick Start](https://github.com/Persome-ai/persome-core#readme)
 - [Architecture](architecture.md)
+- [LLM provider configuration](config.md#providers-and-stage-models)
 - [MCP clients](mcp-clients.md)
 - [Operations and data control](operations.md)
 - [Benchmark scope](benchmarks.md)

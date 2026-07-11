@@ -73,6 +73,7 @@ After installing the Swift helpers and granting Accessibility permission:
 
 ```bash
 bash install.sh
+persome llm status --check
 persome doctor
 persome start
 
@@ -91,8 +92,9 @@ The installer generates `PERSOME_SCREENSHOT_KEY` automatically. Exports
 default to `<PERSOME_ROOT>/exports/`, are redacted, and use mode `0600`.
 `--raw` is an explicit sensitive-data opt-out from redaction.
 
-Without an LLM key, capture and BM25 retrieval continue while semantic modeling
-reports degradation. A sparse model may correctly remain degraded until it has
+Without a configured hosted credential or keyless local endpoint, capture and
+BM25 retrieval continue while semantic modeling reports degradation. A sparse
+model may correctly remain degraded until it has
 enough repeated evidence for higher geometry.
 
 ## 6. Verify the release artifact
@@ -109,6 +111,8 @@ uv pip install --python /tmp/persome-wheel-venv/bin/python dist/persome_core-*.w
 cd /tmp
 PERSOME_ROOT=/tmp/persome-wheel-root \
   /tmp/persome-wheel-venv/bin/persome doctor
+PERSOME_ROOT=/tmp/persome-wheel-root \
+  /tmp/persome-wheel-venv/bin/persome llm providers
 ```
 
 `persome ocr-selftest <image>` performs a full bundled OCR inference check on
@@ -135,7 +139,8 @@ PERSOME_ROOT=/tmp/persome-soak uv run python scripts/soak_healthcheck.py
 ```
 
 The soak check rebuilds the retrieval projection in the copied root. It should
-not be pointed at a live store. Provider maintainers can verify prompt-cache
-support separately with `scripts/probe_prompt_cache.py`; it uses
-`ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` by default and performs two real
+not be pointed at a live store. Verify the active Runtime profile with
+`persome llm status --check`; it tests completion and tool calling. Anthropic
+endpoint maintainers can additionally inspect prompt-cache behavior with
+`scripts/probe_prompt_cache.py`; that protocol-specific probe performs two real
 LLM calls.

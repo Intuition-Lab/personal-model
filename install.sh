@@ -324,11 +324,9 @@ inject_detected_clients() {
   fi
 }
 
-maybe_configure_api_key() {
+maybe_configure_llm() {
   local config_path="${INSTALL_HOME}/config.toml"
-  local env_path="${INSTALL_HOME}/env"
 
-  # Create default config if missing
   if [[ ! -f "${config_path}" ]]; then
     log "creating default config at ${config_path}"
     "${VENV_DIR}/bin/python" -c "
@@ -339,56 +337,31 @@ write_default_if_missing()
 " || warn "failed to create default config; you can create it manually later"
   fi
 
-  # Secrets live in the 0600 env file next to config.toml (never in config.toml).
-  # Skip if a key is already provided (env file or the current shell).
-  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    log "ANTHROPIC_API_KEY detected in environment"
-    return 0
-  fi
-  if [[ -f "${env_path}" ]] && grep -qE '^ANTHROPIC_API_KEY=.' "${env_path}" 2>/dev/null; then
-    log "ANTHROPIC_API_KEY already set in ${env_path}"
-    return 0
-  fi
-
-  # Skip in non-interactive mode
   if [[ ! -t 0 ]]; then
+    log "non-interactive install: run 'persome llm setup' to configure a provider"
     return 0
   fi
 
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  LLM API Key Setup (bring your own key)"
+  echo "  LLM Provider Setup (bring your own key or local model)"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
-  echo "The daemon calls an LLM (Anthropic Messages API) for timeline"
-  echo "normalisation, session reduction, and durable-memory writing."
-  echo "It uses YOUR key — nothing is sent anywhere else."
+  echo "Persome can discover existing provider credentials or configure an"
+  echo "Anthropic Messages / OpenAI-compatible endpoint. It verifies both"
+  echo "completion and tool calling before saving anything."
   echo ""
-  echo "The key is written to ${env_path} (chmod 600). To use a compatible"
-  echo "gateway instead of api.anthropic.com (e.g. DeepSeek's /anthropic"
-  echo "endpoint), you can also set a base URL below."
-  echo ""
-
-  local api_key base_url
-  read -r -s -p "Enter ANTHROPIC_API_KEY (or press Enter to skip): " api_key
-  printf '\n'
-  if [[ -z "${api_key}" ]]; then
-    echo "Skipped. Set it later:  echo 'ANTHROPIC_API_KEY=sk-...' >> ${env_path}"
+  if ! prompt_yes_no "Configure and test the Runtime LLM now?"; then
+    echo "Skipped. Run 'persome llm setup' at any time."
     return 0
   fi
-  read -r -p "Base URL for a gateway (or Enter for api.anthropic.com): " base_url
-
-  umask 177  # 0600 for the secrets file
-  {
-    printf 'ANTHROPIC_API_KEY=%s\n' "${api_key}"
-    [[ -n "${base_url}" ]] && printf 'ANTHROPIC_BASE_URL=%s\n' "${base_url}"
-  } >>"${env_path}" || warn "failed to write ${env_path}"
-  chmod 600 "${env_path}" 2>/dev/null || true
-  log "API key saved to ${env_path} (chmod 600)"
+  if ! "${INSTALL_BIN_DIR}/persome" llm setup; then
+    warn "LLM setup was not completed; rerun it later with 'persome llm setup'"
+  fi
 
   echo ""
   echo "Optional: for semantic (paraphrase-robust) memory search, also set"
-  echo "OPENAI_* embedding credentials in ${env_path}. Without them the"
+  echo "OPENAI_* embedding credentials in ${INSTALL_HOME}/env. Without them the"
   echo "daemon runs keyword (BM25) search only — no degraded behaviour."
   echo ""
   echo "OCR for AX-poor apps (WeChat/Feishu) runs fully on-device (bundled"
@@ -458,6 +431,10 @@ Connect an agent (MCP):
 
 Run a health check any time:
   persome doctor
+
+Change or verify the LLM provider:
+  persome llm setup
+  persome llm status --check
 EOF
 
   case ":${PATH}:" in
@@ -483,7 +460,7 @@ main() {
   install_shim
   verify_install
   inject_detected_clients
-  maybe_configure_api_key
+  maybe_configure_llm
   ensure_screenshot_key
   print_summary
 }

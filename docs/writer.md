@@ -155,7 +155,10 @@ selected projections and preserve receipts/history.
 
 ## LLM and failure rules
 
-- Stage calls use `writer/llm.py`; keys come from `<PERSOME_ROOT>/env`.
+- Stage calls use `writer/llm.py` with the profile selected by
+  `persome llm setup`. Anthropic Messages and OpenAI-compatible Chat
+  Completions share one response/tool-loop contract; keys come from
+  `<PERSOME_ROOT>/env`.
 - Terminal finalization sets `sessions.modeled_at` only after every enabled
   stage completes or reports a deliberate benign skip.
 - Semantic-stage errors degrade the model and remain retryable; they do not

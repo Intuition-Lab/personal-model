@@ -2,7 +2,9 @@
 
 Work from symptoms to cause. Each section links to the relevant log file under `~/.persome/logs/`.
 
-Start with the install self-check — it covers the most common bring-your-own-key setup mistakes (env file missing / wrong perms, no `ANTHROPIC_API_KEY`, uncompiled Swift helpers, missing Accessibility grant, occupied port) in one offline pass:
+Start with the install self-check. It covers an absent/private env file, a
+missing selected-provider credential, endpoint reachability, uncompiled Swift
+helpers, Accessibility, and the daemon port in one offline pass:
 
 ```bash
 persome doctor   # ✓/✗/⚠ per prerequisite; exits 1 if anything FAILS; zero LLM calls
@@ -30,8 +32,10 @@ persome start --foreground
 Read the console output. Common culprits:
 
 - `OSError: [Errno 48] Address already in use` → another process holds port 8742. `lsof -i :8742` to find it.
-- Missing `ANTHROPIC_API_KEY` does not prevent capture startup; it degrades LLM
-  stages. Put provider secrets in `~/.persome/env`, never `config.toml`.
+- A missing selected-provider credential does not prevent capture startup; it
+  degrades LLM stages. Run `persome llm setup`, then verify with
+  `persome llm status --check`. Key values belong in `~/.persome/env`, never
+  `config.toml`.
 - `mac-ax-helper` / `mac-ax-watcher` binary missing → run `bash install.sh`.
 
 ## Captures are empty / tree has no content

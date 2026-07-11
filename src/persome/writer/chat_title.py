@@ -1,8 +1,8 @@
 """Generate a short sidebar title for a chat session.
 
 Called once per session, after the first user/assistant exchange. Uses the
-same Anthropic SDK path the chat agent uses (``chat.agent.complete_sync``
-+ ``[chat] model`` + ``ANTHROPIC_*`` env), so any user who can chat at all
+same resolved provider path as the chat agent (``chat.agent.complete_sync``),
+so any user who can chat at all
 has a working title generator without configuring a separate ``[models.*]``
 stage — title generation rides the same already-validated provider as their
 chat replies.
@@ -107,15 +107,8 @@ def generate_title(cfg: Config, messages: list[dict[str, Any]]) -> str | None:
     body += "\n\nTitle:"
 
     try:
-        # max_tokens budget must cover a reasoning-model "thinking" block AND
-        # the actual title text. DeepSeek's /anthropic gateway routes
-        # `deepseek-v4-flash` (and v4-pro) as reasoning models that emit a
-        # thinking block before the text block — a tight budget (e.g. 64)
-        # gets consumed entirely by thinking, the response stops with
-        # `stop_reason: max_tokens` and no text block at all, and
-        # ``complete_sync`` returns "". 1024 is comfortably above observed
-        # thinking-block sizes for this prompt; the actual title is ≤24
-        # chars so the cost is bounded by the thinking length, not by us.
+        # Leave enough output room for providers that emit reasoning before the
+        # title. A tight budget can end before any text block is returned.
         raw = complete_sync(
             cfg.chat,
             [{"role": "user", "content": _PROMPT_PREFIX + body}],

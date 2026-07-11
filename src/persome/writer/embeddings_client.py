@@ -61,7 +61,7 @@ def _resolve_endpoint() -> tuple[str, str] | None:
     - **Azure OpenAI / full URL**: a base that already names the route
       (``…/openai/deployments/<dep>/embeddings?api-version=…``, or any URL ending in
       ``/embeddings`` / carrying ``api-version=``) is used VERBATIM, with the key in ``api-key``
-      (Azure's header). Lets a bring-your-own-key user point straight at Azure te3-large.
+      (Azure's header). Lets a user point dense retrieval straight at Azure te3-large.
     """
     base = provider_base_url("openai")
     if not base:

@@ -225,7 +225,7 @@ def run_case_extraction(
     ``cfg.case_extraction_enabled`` is truthy.
 
     ``llm_call`` / ``memory`` are injectable seams for testing; the live defaults
-    use ``llm_mod.call_llm`` (Anthropic) and a fresh ``EvoMemory`` (its
+    use provider-aware ``llm_mod.call_llm`` and a fresh ``EvoMemory`` (its
     deterministic ``add_direct`` write entrance — no reconciler/LLM needed).
     """
 

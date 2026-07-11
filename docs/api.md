@@ -31,6 +31,10 @@ Face, Volume, and Root hierarchy from their declared `members`. It loads its
 pinned Three.js modules from `/model/assets/*`; those package resources are
 intentionally omitted from OpenAPI.
 
+`/status.data.llm_profile` reports the effective provider, protocol, model,
+endpoint, key variable name, credential presence, and legacy-migration state.
+It never returns the credential value.
+
 ## Chat routes
 
 | Method | Path | Purpose |

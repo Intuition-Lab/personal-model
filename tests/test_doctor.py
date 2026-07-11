@@ -1,4 +1,4 @@
-"""`persome doctor` — the BYO-key install self-check (src/persome/doctor.py).
+"""`persome doctor` — the BYO-provider install self-check.
 
 Every branch is exercised offline via monkeypatch: no network, no LLM, no real
 TCC probe. Contract pinned here:
@@ -19,15 +19,17 @@ from pathlib import Path
 import pytest
 
 from persome import doctor, paths
+from persome.providers import PROVIDERS
 
 
 @pytest.fixture
 def clean_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in (
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_BASE_URL",
-        "PERSOME_SCREENSHOT_KEY",
-    ):
+    variables = {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "PERSOME_SCREENSHOT_KEY"}
+    for spec in PROVIDERS:
+        variables.add(spec.api_key_env)
+        if spec.resolved_base_url_env:
+            variables.add(spec.resolved_base_url_env)
+    for var in variables:
         monkeypatch.delenv(var, raising=False)
 
 
@@ -112,7 +114,7 @@ def test_base_url_reachable_ok(monkeypatch: pytest.MonkeyPatch, clean_llm_env: N
     monkeypatch.setattr(httpx, "head", fake_head)
     c = doctor.check_base_url()
     assert c.status == "ok"
-    assert "(default)" in c.detail
+    assert "legacy Anthropic route" in c.detail
 
 
 def test_base_url_unreachable_warns_never_fails(
@@ -319,8 +321,32 @@ def test_run_checks_merges_env_file_first(
     checks = doctor.run_checks("127.0.0.1", 0)
     by_name = {c.name: c for c in checks}
     assert by_name["env file"].status == "ok"
-    assert by_name["ANTHROPIC_API_KEY"].status == "ok"
+    assert by_name["LLM credential"].status == "ok"
     assert by_name["PERSOME_SCREENSHOT_KEY"].status == "warn"
+
+
+def test_openai_profile_uses_selected_credential_and_endpoint(
+    ac_root: Path, clean_llm_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    paths.config_file().write_text(
+        """
+[models.default]
+provider = "openai"
+protocol = "openai"
+model = "gpt-4.1-mini"
+base_url = "https://gateway.example/v1"
+api_key_env = "OPENAI_API_KEY"
+"""
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic")
+    seen: list[str] = []
+    monkeypatch.setattr(httpx, "head", lambda url, **kw: seen.append(url) or object())
+
+    assert doctor.check_api_key().status == "ok"
+    assert doctor.check_base_url().status == "ok"
+    assert seen == ["https://gateway.example/v1"]
 
 
 def test_has_failure_ignores_warnings() -> None:

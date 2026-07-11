@@ -39,6 +39,8 @@ uv run python scripts/pii_scan.py
 uv run python scripts/language_scan.py
 
 persome doctor
+persome llm setup
+persome llm status --check
 persome start
 persome status
 persome stop
@@ -105,8 +107,10 @@ Update matching docs in the same change as behavior.
 - Use `src/persome/paths.py` for every runtime path. Tests use `ac_root` and
   must never touch the real data root.
 - Use `with fts.cursor() as conn:` for SQLite. The store runs in WAL mode.
-- All stage LLM calls go through `writer/llm.py`. Model names are bare gateway
-  names; secrets belong in `<PERSOME_ROOT>/env`, never `config.toml`.
+- All stage LLM calls go through `writer/llm.py`. The selected profile uses
+  Anthropic Messages or OpenAI-compatible Chat Completions. Provider, protocol,
+  model, endpoint, and key variable name live in `config.toml`; key values
+  belong in `<PERSOME_ROOT>/env`, never TOML.
 - `install.sh` generates and preserves `PERSOME_SCREENSHOT_KEY`. If encrypted
   screenshot persistence lacks a valid key, omit pixels; never write plaintext.
 - Default Point/Line production is the windowed `memory_delta` followed by

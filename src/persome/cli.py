@@ -19,8 +19,10 @@ import signal
 import subprocess
 import sys
 import threading
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import typer
 from rich.console import Console
@@ -30,6 +32,7 @@ from . import __version__, integrity, paths
 from . import config as config_mod
 from . import env_file as env_file_mod
 from . import logger as logger_mod
+from .providers import ProviderSpec
 from .store import entries as entries_mod
 from .store import fts, index_md
 
@@ -319,13 +322,11 @@ def resume() -> None:
 def status() -> None:
     """Show daemon status + memory stats."""
     cfg = _init()
-    # Source the env file (LLM secrets SoT) before the per-stage model-health
-    # probe below. ping_stage builds the Anthropic client with
-    # provider_api_key("anthropic") == os.environ["ANTHROPIC_API_KEY"]; without
-    # this load the `status` process has no creds, so every stage falsely reports
-    # an auth error ("Could not resolve authentication method") even when the
-    # daemon — which loads env before forking in start() — is perfectly healthy.
+    # Source the env file before resolving/probing the selected provider.
     env_file_mod.load_env_file(paths.env_file())
+    from .providers import resolve_profile
+
+    default_profile = resolve_profile(cfg.model_for("default"))
     pid = _read_pid()
     paused = paths.paused_flag().exists()
 
@@ -373,6 +374,12 @@ def status() -> None:
         table.add_row("Captures (1h)", f"{cap_count}  {gap_str}")
 
     table.add_row("Install", _install_source())
+    credential = "ready" if default_profile.credential_ready else "credential missing"
+    table.add_row(
+        "LLM",
+        f"{default_profile.provider_label} / {default_profile.protocol} / "
+        f"{default_profile.model} ({credential})",
+    )
 
     buf = paths.capture_buffer_dir()
     if buf.exists():
@@ -409,18 +416,22 @@ def status() -> None:
     ping_results = _ping_stages(cfg, stages)
     for stage in stages:
         m = cfg.model_for(stage)
+        profile = resolve_profile(m)
         ping = _format_ping(ping_results.get(stage))
-        table.add_row(f"Model ({stage})", f"{m.model}   {ping}")
+        table.add_row(
+            f"Model ({stage})",
+            f"{profile.provider}/{profile.model} [{profile.protocol}]   {ping}",
+        )
 
     console.print(table)
 
 
 @app.command()
 def doctor() -> None:
-    """Self-check a bring-your-own-key install (offline; zero LLM calls).
+    """Self-check a bring-your-own-provider install (offline; zero LLM calls).
 
     Prints one ✓/✗/⚠ line per prerequisite — env file present + private (0600),
-    ANTHROPIC_API_KEY configured, base URL reachable (HEAD, warn-only), Swift
+    selected provider credential configured, endpoint reachable (HEAD, warn-only), Swift
     capture helpers compiled, macOS Accessibility trust, data root writable,
     daemon port available. Exits 1 if any check FAILS; warnings never fail.
     """
@@ -448,17 +459,16 @@ def _ping_stages(cfg: config_mod.Config, stages: tuple[str, ...]) -> dict:
     from concurrent.futures import ThreadPoolExecutor
     from dataclasses import replace
 
+    from .providers import resolve_profile
     from .writer.llm import PingResult, ping_stage
 
-    # Dedup by (model, resolved base_url, resolved api key) — common case is
+    # Dedup by effective profile — common case is
     # one model for all four stages, which should hit the network once.
-    dedup: dict[tuple[str, str, str], list[str]] = {}
+    dedup: dict[tuple[str, str, str, str], list[str]] = {}
     for stage in stages:
         m = cfg.model_for(stage)
-        provider = config_mod.infer_provider(m.model)
-        base_url = m.base_url or (config_mod.provider_base_url(provider) or "")
-        api_key = config_mod.provider_api_key(provider) or ""
-        key = (m.model, base_url, api_key)
+        profile = resolve_profile(m)
+        key = (profile.protocol, profile.model, profile.base_url, profile.api_key or "")
         dedup.setdefault(key, []).append(stage)
 
     results: dict = {}
@@ -1040,6 +1050,302 @@ launchagent_app = typer.Typer(
     help="Manage the macOS LaunchAgent so launchd owns the daemon lifecycle."
 )
 app.add_typer(launchagent_app, name="launchagent")
+
+llm_app = typer.Typer(help="Discover, verify, and configure the Runtime's LLM provider.")
+app.add_typer(llm_app, name="llm")
+
+
+def _choose_llm_provider(specs: Sequence[ProviderSpec]) -> ProviderSpec:
+    for index, spec in enumerate(specs, start=1):
+        credential = "none (local)" if not spec.key_required else spec.api_key_env
+        endpoint = spec.base_url or "enter during setup"
+        console.print(f"  [bold cyan]{index:>2}[/bold cyan]. {spec.label} [dim]({spec.id})[/dim]")
+        console.print(
+            f"      {spec.protocol} | {credential} | {endpoint}\n"
+            f"      [dim]{spec.description}[/dim]"
+        )
+    while True:
+        choice = typer.prompt("Choose a provider", type=int)
+        if 1 <= choice <= len(specs):
+            return specs[choice - 1]
+        console.print(f"[red]Enter a number from 1 to {len(specs)}.[/red]")
+
+
+@llm_app.command("providers")
+def llm_providers() -> None:
+    """List supported presets and mark credentials already found locally."""
+    from .providers import PROVIDERS
+
+    env_file_mod.load_env_file(paths.env_file())
+    for spec in PROVIDERS:
+        credential = "none (local)" if not spec.key_required else spec.api_key_env
+        detected = (
+            "[green]keyless[/green]"
+            if not spec.key_required
+            else "[green]yes[/green]"
+            if os.environ.get(spec.api_key_env)
+            else ""
+        )
+        suffix = f"  {detected}" if detected else ""
+        console.print(f"[bold]{spec.label}[/bold] [dim]({spec.id})[/dim]{suffix}")
+        console.print(
+            f"  Protocol: {spec.protocol}\n"
+            f"  Credential: {credential}\n"
+            f"  Endpoint: {spec.base_url or 'enter during setup'}\n"
+            f"  [dim]{spec.description}[/dim]\n"
+        )
+    console.print(
+        "[dim]Presets use Anthropic Messages or OpenAI-compatible Chat Completions. "
+        "Use custom-openai/custom-anthropic for another compatible endpoint.[/dim]"
+    )
+
+
+@llm_app.command("status")
+def llm_status(
+    check: bool = typer.Option(False, "--check", help="Run a live completion and tool-call probe."),
+) -> None:
+    """Show the effective provider profile without revealing its key."""
+    from .llm_setup import probe_profile
+    from .providers import resolve_profile
+
+    env_file_mod.load_env_file(paths.env_file())
+    cfg = config_mod.load()
+    profile = resolve_profile(cfg.model_for("default"))
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_row("Provider", f"{profile.provider_label} ({profile.provider})")
+    table.add_row("Protocol", profile.protocol)
+    table.add_row("Model", profile.model)
+    table.add_row("Endpoint", profile.base_url or "provider default")
+    if not profile.key_required:
+        credential = "[green]not required[/green] (local endpoint)"
+    elif profile.credential_ready:
+        credential = f"[green]set[/green] via {profile.api_key_env}"
+    else:
+        credential = f"[red]missing[/red] ({profile.api_key_env})"
+    table.add_row("Credential", credential)
+    table.add_row("Configuration", "legacy compatibility" if profile.legacy else "explicit profile")
+    console.print(table)
+    if profile.legacy:
+        console.print(
+            "[yellow]This installation still uses the pre-provider Anthropic-compatible route. "
+            "Run `persome llm setup` to verify and migrate it explicitly.[/yellow]"
+        )
+    if check:
+        if not profile.credential_ready:
+            console.print(
+                f"[red]✗ {profile.api_key_env} is missing. Run `persome llm setup`.[/red]"
+            )
+            raise typer.Exit(1)
+        with console.status("Testing completion and tool calling..."):
+            result = probe_profile(profile)
+        if not result.completion_ok:
+            console.print(f"[red]✗ Probe failed:[/red] {result.error}")
+            raise typer.Exit(1)
+        console.print(f"[green]✓ Completion works[/green] ({result.latency_ms} ms)")
+        if result.tool_call_ok:
+            console.print("[green]✓ Tool calling works[/green]")
+        else:
+            console.print("[yellow]⚠ Tool calling was not confirmed for this model.[/yellow]")
+
+
+@llm_app.command("setup")
+def llm_setup(
+    provider: str = typer.Option(
+        "", "--provider", help="Provider id from `persome llm providers`."
+    ),
+    model: str = typer.Option("", "--model", help="Model id sent to the provider."),
+    base_url: str = typer.Option("", "--base-url", help="Override the provider endpoint."),
+    api_key_env: str = typer.Option(
+        "", "--api-key-env", help="Environment variable holding the key."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Accept detected/default values."),
+    allow_no_tools: bool = typer.Option(
+        False,
+        "--allow-no-tools",
+        help="Save even when tool calling cannot be confirmed (modeling/Chat may degrade).",
+    ),
+    skip_check: bool = typer.Option(
+        False,
+        "--skip-check",
+        help="Save without a live probe (not recommended).",
+    ),
+) -> None:
+    """Detect credentials, verify a provider, then save one Runtime-wide profile."""
+    from .llm_setup import probe_profile, save_profile
+    from .providers import (
+        PROVIDERS,
+        detected_providers,
+        make_profile,
+        provider_spec,
+        resolve_profile,
+    )
+
+    paths.ensure_dirs()
+    config_mod.write_default_if_missing()
+    env_file_mod.load_env_file(paths.env_file())
+    cfg = config_mod.load()
+    current = resolve_profile(cfg.model_for("default"))
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not yes
+
+    selected = None
+    keep_current = False
+    if provider:
+        selected = provider_spec(provider)
+        if selected is None:
+            console.print(f"[red]Unknown provider {provider!r}. Run `persome llm providers`.[/red]")
+            raise typer.Exit(2)
+    elif current.credential_ready:
+        if interactive:
+            console.print(
+                f"Detected current route: [bold]{current.provider_label}[/bold] / "
+                f"{current.model} at {current.base_url or 'provider default'}"
+            )
+            keep_current = typer.confirm("Keep and verify this route?", default=True)
+        else:
+            keep_current = True
+
+    if selected is None and not keep_current:
+        detected = detected_providers()
+        if len(detected) == 1:
+            selected = detected[0]
+            console.print(
+                f"[green]Detected {selected.api_key_env}; selected {selected.label}.[/green]"
+            )
+        elif len(detected) > 1:
+            if not interactive:
+                names = ", ".join(spec.id for spec in detected)
+                console.print(
+                    f"[red]Multiple credentials detected ({names}); pass --provider.[/red]"
+                )
+                raise typer.Exit(2)
+            console.print("Multiple provider credentials were found:")
+            selected = _choose_llm_provider(tuple(detected))
+        elif not interactive:
+            console.print(
+                "[red]No configured LLM credential found; pass --provider and export its key.[/red]"
+            )
+            raise typer.Exit(2)
+        else:
+            console.print("Choose the LLM provider Persome should use:")
+            selected = _choose_llm_provider(PROVIDERS)
+
+    if keep_current:
+        provider_id = current.provider
+        protocol = current.protocol
+        chosen_model = model or current.model
+        chosen_base_url = base_url or current.base_url
+        chosen_key_env = api_key_env or current.api_key_env
+        api_key = os.environ.get(chosen_key_env) or current.api_key
+    else:
+        assert selected is not None
+        provider_id = selected.id
+        protocol = selected.protocol
+        chosen_model = model or selected.default_model
+        chosen_base_url = base_url or os.environ.get(selected.resolved_base_url_env, "")
+        chosen_base_url = chosen_base_url or selected.base_url
+        chosen_key_env = api_key_env or selected.api_key_env
+        api_key = os.environ.get(chosen_key_env)
+
+    if interactive:
+        if selected is not None and selected.id.startswith("custom-"):
+            chosen_key_env = typer.prompt("API key environment variable", default=chosen_key_env)
+            api_key = os.environ.get(chosen_key_env) or api_key
+        chosen_base_url = typer.prompt("API endpoint", default=chosen_base_url or "")
+        chosen_model = typer.prompt("Model id", default=chosen_model)
+    if not chosen_base_url:
+        console.print("[red]An API endpoint is required.[/red]")
+        raise typer.Exit(2)
+    if not chosen_model:
+        console.print("[red]A model id is required.[/red]")
+        raise typer.Exit(2)
+    parsed_endpoint = urlparse(chosen_base_url)
+    if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.netloc:
+        console.print("[red]The API endpoint must be an absolute http(s) URL.[/red]")
+        raise typer.Exit(2)
+    if not chosen_key_env.isascii() or not chosen_key_env.isidentifier():
+        console.print("[red]The API key environment variable name is invalid.[/red]")
+        raise typer.Exit(2)
+
+    key_required = selected.key_required if selected is not None else current.key_required
+    if key_required and not api_key:
+        if not interactive:
+            console.print(
+                f"[red]{chosen_key_env} is not set. Export it or run setup interactively.[/red]"
+            )
+            raise typer.Exit(2)
+        api_key = typer.prompt(
+            f"API key ({chosen_key_env})",
+            hide_input=True,
+            confirmation_prompt=True,
+        )
+
+    profile = make_profile(
+        provider_id,
+        model=chosen_model,
+        base_url=chosen_base_url,
+        api_key_env=chosen_key_env,
+        api_key=api_key,
+        protocol=protocol,
+    )
+
+    while not skip_check:
+        with console.status("Testing completion and tool calling before saving..."):
+            result = probe_profile(profile)
+        if not result.completion_ok:
+            console.print(f"[red]✗ Provider check failed. Nothing was saved.[/red] {result.error}")
+            if not interactive or not typer.confirm("Edit settings and retry?", default=True):
+                raise typer.Exit(1)
+            chosen_base_url = typer.prompt("API endpoint", default=profile.base_url)
+            chosen_model = typer.prompt("Model id", default=profile.model)
+            replacement = typer.prompt(
+                "New API key (Enter to keep the current key)",
+                default="",
+                show_default=False,
+                hide_input=True,
+            )
+            api_key = replacement or profile.api_key
+            profile = make_profile(
+                provider_id,
+                model=chosen_model,
+                base_url=chosen_base_url,
+                api_key_env=chosen_key_env,
+                api_key=api_key,
+                protocol=protocol,
+            )
+            continue
+        console.print(f"[green]✓ Completion works[/green] ({result.latency_ms} ms)")
+        if result.tool_call_ok:
+            console.print("[green]✓ Tool calling works[/green]")
+            break
+        console.print(
+            "[yellow]The endpoint completed a prompt, but this model did not call the test "
+            "tool. Persome modeling and Chat rely on tool calling.[/yellow]"
+        )
+        if result.error:
+            console.print(f"[dim]{result.error}[/dim]")
+        if allow_no_tools or (
+            interactive and typer.confirm("Save this limited model anyway?", default=False)
+        ):
+            break
+        if not interactive or not typer.confirm("Choose another model and retry?", default=True):
+            console.print("[red]Nothing was saved.[/red]")
+            raise typer.Exit(1)
+        chosen_model = typer.prompt("Model id", default=profile.model)
+        profile = make_profile(
+            provider_id,
+            model=chosen_model,
+            base_url=chosen_base_url,
+            api_key_env=chosen_key_env,
+            api_key=api_key,
+            protocol=protocol,
+        )
+
+    save_profile(profile, config_path=paths.config_file(), env_path=paths.env_file())
+    console.print(f"[green]✓ Saved {profile.provider_label} as the Runtime LLM profile.[/green]")
+    console.print(f"  Config: {paths.config_file()}")
+    if profile.api_key:
+        console.print(f"  Secret: {paths.env_file()} ({profile.api_key_env}, mode 0600)")
+    console.print("  Next: persome llm status --check")
 
 
 def _default_daemon_binary() -> str:

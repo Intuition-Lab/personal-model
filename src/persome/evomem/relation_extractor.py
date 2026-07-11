@@ -628,7 +628,7 @@ def run_relation_extraction(
     """Run both passes over the consolidated PAST layer, writing shadow edges. No-op disabled.
 
     ``memory`` / ``llm_call`` / ``conn_factory`` are injectable seams for tests; live defaults
-    use a fresh ``EvoMemory``, ``llm.call_llm`` (Anthropic, mock-aware), and ``fts.cursor``.
+    use a fresh ``EvoMemory``, provider-aware ``llm.call_llm``, and ``fts.cursor``.
     """
     if not getattr(cfg, "relation_extraction_enabled", False):
         return ExtractionResult()

@@ -135,3 +135,43 @@ def test_ping_stage_truncates_long_error_message(monkeypatch: pytest.MonkeyPatch
     assert res.ok is False
     assert res.error is not None
     assert len(res.error) <= 80
+
+
+def test_ping_stage_openai_compatible_uses_selected_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PERSOME_LLM_MOCK", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic")
+    import openai
+
+    captured_client: dict[str, Any] = {}
+    captured_call: dict[str, Any] = {}
+
+    class _FakeCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            captured_call.update(kwargs)
+            return SimpleNamespace(choices=[])
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_client.update(kwargs)
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+    monkeypatch.setattr(openai, "OpenAI", _FakeClient)
+    cfg = Config(
+        models={
+            "default": ModelConfig(
+                provider="openai",
+                protocol="openai",
+                model="gpt-4.1-mini",
+                base_url="https://gateway.example/v1",
+                api_key_env="OPENAI_API_KEY",
+            )
+        }
+    )
+
+    result = llm_mod.ping_stage(cfg, "timeline")
+
+    assert result.ok is True
+    assert captured_client["base_url"] == "https://gateway.example/v1"
+    assert captured_call["model"] == "gpt-4.1-mini"

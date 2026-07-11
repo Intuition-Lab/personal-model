@@ -2,7 +2,7 @@
 #
 # Use a spec because several dependencies dynamically import modules that a
 # static scan cannot see. collect_all and collect_submodules include them
-# explicitly. LLM traffic uses the Anthropic SDK over httpx.
+# explicitly. LLM traffic uses the Anthropic or OpenAI SDK over httpx.
 #
 # Invocation used by build_python_bundle.sh:
 #   pyinstaller --noconfirm \
@@ -43,6 +43,9 @@ datas, binaries, hiddenimports = _merge(
     collect_all("mcp"),
     collect_all("typer"),
     collect_all("rich"),
+    collect_all("anthropic"),
+    collect_all("openai"),
+    collect_all("tomlkit"),
     # PaddleOCR for on-device OCR (PP-OCRv6 tiny tier) — arm64 macOS only;
     # paddle has no x86_64 macOS wheel, so these are no-ops on x86_64 builds.
     _safe_collect("paddleocr"),
@@ -87,7 +90,7 @@ for _mod in ("imagesize", "pyclipper", "bidi", "einops", "ftfy",
     except Exception:
         pass
 
-# HTTP stack: the Anthropic SDK uses httpx; OCR and optional web paths use
+# HTTP stack: both LLM SDKs use httpx; OCR and optional web paths use
 # requests. requests/urllib3 contrib modules are dynamic and must be collected
 # so gzip, zstandard, and brotli responses can be decompressed.
 hiddenimports += collect_submodules("httpx")

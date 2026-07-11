@@ -7,14 +7,14 @@ mode `0600`. `persome start` loads this file before daemonization. Business
 code reads the resulting environment variables:
 
 ```text
-ANTHROPIC_API_KEY
-ANTHROPIC_BASE_URL
-OPENAI_API_KEY
-OPENAI_BASE_URL
+<api_key_env selected by models.default>
+OPENAI_API_KEY / OPENAI_BASE_URL (optional dense retrieval)
 PERSOME_SCREENSHOT_KEY
 ```
 
-`config.toml` contains behavior and model names, never API keys. `PERSOME_ROOT`
+`config.toml` contains behavior plus the provider id, protocol, model, endpoint,
+and key variable name, never the key value. `persome llm setup` writes that
+profile only after a live check. `PERSOME_ROOT`
 redirects the entire runtime for tests or isolated profiles.
 `install.sh` generates the machine-local screenshot key automatically and
 preserves it across reinstalls; it is not a provider credential.

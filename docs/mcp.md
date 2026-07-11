@@ -74,7 +74,7 @@ port = 8742
   only connect trusted clients.
 - The MCP server does not forward results to a model provider by itself. A
   connected agent may do so, and Persome Chat sends invoked tool results to its
-  configured `ANTHROPIC_BASE_URL`.
+  configured Runtime LLM endpoint.
 - Screenshots are excluded unless a tool call explicitly requests one.
 - `get_model_snapshot` redacts detectable secrets and local paths by default.
 - Write tools are explicit and auditable; the removed computer-use tools are

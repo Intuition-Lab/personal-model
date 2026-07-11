@@ -195,16 +195,17 @@ def status() -> ApiResponse:
     try:
         from concurrent.futures import ThreadPoolExecutor
 
-        from ..config import infer_provider, provider_api_key, provider_base_url
+        from ..llm_setup import profile_dict
+        from ..providers import resolve_profile
         from ..writer.llm import ping_stage
 
-        dedup: dict[tuple[str, str, str], list[str]] = {}
+        data["llm_profile"] = profile_dict(resolve_profile(cfg.model_for("default")))
+
+        dedup: dict[tuple[str, str, str, str], list[str]] = {}
         for stage in stages:
             m = cfg.model_for(stage)
-            provider = infer_provider(m.model)
-            base_url = m.base_url or (provider_base_url(provider) or "")
-            api_key = provider_api_key(provider) or ""
-            key = (m.model, base_url, api_key)
+            profile = resolve_profile(m)
+            key = (profile.protocol, profile.model, profile.base_url, profile.api_key or "")
             dedup.setdefault(key, []).append(stage)
 
         if dedup:

@@ -34,7 +34,9 @@ screenshot when persistent screenshot storage is off.
 There is no telemetry or update phone-home. Runtime egress occurs only through
 configured capabilities:
 
-1. `ANTHROPIC_BASE_URL` receives prompts for enabled LLM stages and Chat. Stage
+1. The endpoint selected under `[models.default]` receives prompts for enabled
+   LLM stages and Chat over Anthropic Messages or OpenAI-compatible Chat
+   Completions. Stage
    prompts can contain derived personal context. When Chat invokes a memory or
    capture tool, the next model request also contains that tool result, which
    can include raw memory text, screen text, window titles, URLs, focused-field
@@ -61,7 +63,7 @@ model stages report degradation rather than silently claiming success.
   endpoint.
 - MCP tool execution itself has no provider egress, but a connected agent may
   send returned personal data to its own model provider. Persome Chat sends
-  tool results to the configured `ANTHROPIC_BASE_URL` as described above.
+  tool results to the configured Runtime LLM endpoint as described above.
 - `/model/graph` is a raw owner-local inspection surface. Default CLI/MCP model
   export is redacted; the browser viewer is not a safe publication artifact.
 - Exposing the server through a tunnel changes the privacy boundary and is not

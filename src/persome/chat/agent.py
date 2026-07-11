@@ -1,4 +1,4 @@
-"""Anthropic SDK-based agent loop for interactive chat."""
+"""Provider-aware agent loops for interactive chat."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from .. import config as config_mod
 from ..logger import get as _get_logger
+from ..providers import ResolvedLLMProfile, resolve_profile
 from ..trace import get_trace_id
 from .tools import to_anthropic_tools
 
@@ -38,29 +39,45 @@ def complete_sync(
     *,
     max_tokens: int = 2048,
 ) -> str:
-    """One-shot synchronous Anthropic call. Returns the first text block.
+    """One-shot synchronous provider call. Returns the first text response.
 
     Shared by all auxiliary LLM callers (compression, away summary,
     memory extraction) so provider config is resolved in one place.
     """
-    client = anthropic.Anthropic(
-        api_key=config_mod.provider_api_key("anthropic"),
-        base_url=config_mod.provider_base_url("anthropic"),
-    )
+    profile = resolve_profile(chat_cfg)
     extra: dict[str, str] = {}
     tid = get_trace_id()
     if tid:
         extra["X-Trace-Id"] = tid
-    msg = client.messages.create(
-        model=chat_cfg.model,
-        messages=messages,  # type: ignore[arg-type]
+    if profile.protocol == "anthropic":
+        client = anthropic.Anthropic(
+            api_key=profile.api_key,
+            base_url=profile.base_url or None,
+        )
+        msg = client.messages.create(
+            model=profile.wire_model,
+            messages=messages,  # type: ignore[arg-type]
+            max_tokens=max_tokens,
+            extra_headers=extra or None,
+        )
+        for block in msg.content:
+            if hasattr(block, "text"):
+                return block.text
+        return ""
+
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=profile.api_key or "local-no-key",
+        base_url=profile.base_url,
+    )
+    response = client.chat.completions.create(
+        model=profile.wire_model,
+        messages=_to_openai_messages(messages),  # type: ignore[arg-type]
         max_tokens=max_tokens,
         extra_headers=extra or None,
     )
-    for block in msg.content:
-        if hasattr(block, "text"):
-            return block.text
-    return ""
+    return response.choices[0].message.content or ""
 
 
 @dataclass
@@ -102,6 +119,77 @@ def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
             out.append({"role": role, "content": content})
     if out:
         out[-1] = _with_terminal_cache_breakpoint(out[-1])
+    return out
+
+
+def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize persisted Anthropic/OpenAI history for Chat Completions."""
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role == "system":
+            if isinstance(content, str) and content:
+                out.append({"role": "system", "content": content})
+            continue
+        if role == "tool":
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": message.get("tool_call_id"),
+                    "content": str(content or ""),
+                }
+            )
+            continue
+        if role not in {"user", "assistant"}:
+            continue
+
+        if isinstance(content, str):
+            normalized: dict[str, Any] = {"role": role, "content": content}
+            if role == "assistant" and message.get("tool_calls"):
+                normalized["tool_calls"] = message["tool_calls"]
+            out.append(normalized)
+            continue
+        if not isinstance(content, list):
+            continue
+
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text" and block.get("text"):
+                text_parts.append(str(block["text"]))
+            elif block_type == "tool_use" and role == "assistant":
+                tool_calls.append(
+                    {
+                        "id": block.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                        },
+                    }
+                )
+            elif block_type == "tool_result" and role == "user":
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id"),
+                        "content": str(block.get("content") or ""),
+                    }
+                )
+        if role == "assistant":
+            normalized = {"role": "assistant", "content": "\n".join(text_parts) or None}
+            if tool_calls:
+                normalized["tool_calls"] = tool_calls
+            if normalized["content"] or tool_calls:
+                out.append(normalized)
+        elif text_parts:
+            out.append({"role": "user", "content": "\n".join(text_parts)})
+        out.extend(tool_results)
     return out
 
 
@@ -235,12 +323,10 @@ def _accumulate_usage(msg_usage: Any, usage: dict[str, int]) -> None:
 
 
 class ChatAgent:
-    """Agentic chat loop backed by the Anthropic Python SDK tool_runner.
+    """Agentic chat loop backed by the configured provider protocol.
 
-    Each call to ``run_turn`` uses ``client.beta.messages.tool_runner(stream=True)``
-    which handles the multi-round tool-call loop internally. Per-token streaming
-    is preserved — each round yields a ``BetaAsyncMessageStream`` that we iterate
-    for token events.
+    Anthropic uses its SDK tool runner and prompt caching. OpenAI-compatible
+    providers use a small explicit streaming tool loop over Chat Completions.
 
     Tools included per turn:
       - Built-in handlers (sync, wrapped via ``_make_async_sdk_tool``)
@@ -256,12 +342,22 @@ class ChatAgent:
         *,
         daemon_mcp_url: str = "",
     ) -> None:
-        self.client = AsyncAnthropic(
-            api_key=config_mod.provider_api_key("anthropic"),
-            base_url=config_mod.provider_base_url("anthropic"),
-        )
-        self.model = cfg.model
+        self._profile: ResolvedLLMProfile = resolve_profile(cfg)
+        if self._profile.protocol == "anthropic":
+            self.client = AsyncAnthropic(
+                api_key=self._profile.api_key,
+                base_url=self._profile.base_url or None,
+            )
+        else:
+            from openai import AsyncOpenAI
+
+            self.client = AsyncOpenAI(
+                api_key=self._profile.api_key or "local-no-key",
+                base_url=self._profile.base_url,
+            )
+        self.model = self._profile.wire_model
         self._cfg = cfg
+        self._openai_schemas = [dict(schema) for schema in all_schemas]
         self._sdk_schemas = to_anthropic_tools(all_schemas)
         self._handlers = all_handlers
         self._daemon_mcp_url = daemon_mcp_url
@@ -342,6 +438,35 @@ class ChatAgent:
         await self.client.close()
 
     async def run_turn(
+        self,
+        messages: list[dict[str, Any]],
+        system: str,
+        *,
+        on_token: _OnTokenT | None = None,
+        on_thinking: _OnTokenT | None = None,
+        on_tool_call: _OnToolCallT | None = None,
+        max_tokens: int = 8192,
+        thinking_budget: int = 0,
+    ) -> AgentTurnResult:
+        if self._profile.protocol == "openai":
+            return await self._run_openai_turn(
+                messages,
+                system,
+                on_token=on_token,
+                on_tool_call=on_tool_call,
+                max_tokens=max_tokens,
+            )
+        return await self._run_anthropic_turn(
+            messages,
+            system,
+            on_token=on_token,
+            on_thinking=on_thinking,
+            on_tool_call=on_tool_call,
+            max_tokens=max_tokens,
+            thinking_budget=thinking_budget,
+        )
+
+    async def _run_anthropic_turn(
         self,
         messages: list[dict[str, Any]],
         system: str,
@@ -536,6 +661,220 @@ class ChatAgent:
             )
 
         except Exception as exc:
+            _logger.exception("turn error: %s", exc)
+            return AgentTurnResult(
+                messages=messages,
+                assistant_message=final_text,
+                tool_calls_executed=tool_calls_executed,
+                usage=usage,
+                error=str(exc),
+                ttft_ms=ttft_ms,
+            )
+
+        return AgentTurnResult(
+            messages=messages,
+            assistant_message=final_text,
+            tool_calls_executed=tool_calls_executed,
+            usage=usage,
+            ttft_ms=ttft_ms,
+        )
+
+    async def _run_openai_turn(
+        self,
+        messages: list[dict[str, Any]],
+        system: str,
+        *,
+        on_token: _OnTokenT | None,
+        on_tool_call: _OnToolCallT | None,
+        max_tokens: int,
+    ) -> AgentTurnResult:
+        """Run a streaming OpenAI-compatible tool loop."""
+        tool_calls_executed: list[dict[str, Any]] = []
+        usage: dict[str, int] = {}
+        final_text = ""
+        turn_start = time.perf_counter()
+        ttft_ms: float | None = None
+
+        tools: list[dict[str, Any]] = []
+        executors: dict[str, tuple[str, Any]] = {}
+        for schema in sorted(self._openai_schemas, key=lambda item: item["function"]["name"]):
+            function = schema.get("function") or {}
+            name = str(function.get("name") or "")
+            if name and name in self._handlers and name not in executors:
+                tools.append({"type": "function", "function": dict(function)})
+                executors[name] = ("static", self._handlers[name])
+
+        for spec, session in sorted(self._mcp_tool_specs, key=lambda item: item[0].name):
+            name = spec.name
+            if name in executors:
+                _logger.warning("dropping duplicate MCP tool name %r", name)
+                continue
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": spec.description or "",
+                        "parameters": (
+                            dict(spec.inputSchema)
+                            if spec.inputSchema
+                            else {"type": "object", "properties": {}}
+                        ),
+                    },
+                }
+            )
+            executors[name] = ("mcp", session)
+
+        async def execute_tool(name: str, arguments: dict[str, Any]) -> str:
+            started = time.monotonic()
+            target = executors.get(name)
+            try:
+                if target is None:
+                    result: Any = {"error": f"Unknown tool: {name}"}
+                elif target[0] == "static":
+                    result = await asyncio.to_thread(target[1], arguments)
+                else:
+                    call_result = await target[1].call_tool(name=name, arguments=arguments)
+                    if call_result.isError:
+                        result = {"error": str(call_result.content)}
+                    else:
+                        parts = [item.text for item in call_result.content if hasattr(item, "text")]
+                        result = "\n".join(parts)
+            except Exception as exc:  # noqa: BLE001
+                result = {"error": f"{type(exc).__name__}: {exc}"}
+            result_str = (
+                result
+                if isinstance(result, str)
+                else json.dumps(result, ensure_ascii=False, default=str)
+            )
+            if len(result_str) > _MAX_TOOL_RESULT_BYTES:
+                truncated = len(result_str) - _MAX_TOOL_RESULT_BYTES
+                result_str = (
+                    result_str[:_MAX_TOOL_RESULT_BYTES] + f"\n...(truncated {truncated} bytes)"
+                )
+            elapsed = (time.monotonic() - started) * 1000
+            tool_calls_executed.append({"name": name, "arguments": arguments})
+            _logger.info("tool %s elapsed=%.0fms size=%d", name, elapsed, len(result_str))
+            if on_tool_call:
+                await on_tool_call(name, arguments, result_str, elapsed)
+            return result_str
+
+        wire_messages = [
+            {"role": "system", "content": system},
+            *(m for m in _to_openai_messages(messages) if m.get("role") != "system"),
+        ]
+        tid = get_trace_id()
+
+        try:
+            _logger.info("turn start messages=%d protocol=openai", len(messages))
+            for round_index in range(8):
+                request: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": wire_messages,
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                    "extra_headers": {"X-Trace-Id": tid} if tid else None,
+                }
+                if tools:
+                    request["tools"] = tools
+                stream = await self.client.chat.completions.create(**request)
+
+                round_text = ""
+                fragments: dict[int, dict[str, str]] = {}
+                async for chunk in stream:
+                    chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage:
+                        for source, target in (
+                            ("prompt_tokens", "input_tokens"),
+                            ("completion_tokens", "output_tokens"),
+                        ):
+                            value = getattr(chunk_usage, source, None)
+                            if value is not None:
+                                usage[target] = usage.get(target, 0) + int(value)
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = choices[0].delta
+                    content = getattr(delta, "content", None)
+                    if content:
+                        if ttft_ms is None:
+                            ttft_ms = (time.perf_counter() - turn_start) * 1000
+                        round_text += content
+                        final_text += content
+                        if on_token:
+                            await on_token(content)
+                    for position, tool_delta in enumerate(getattr(delta, "tool_calls", None) or []):
+                        index = getattr(tool_delta, "index", None)
+                        index = position if index is None else int(index)
+                        fragment = fragments.setdefault(
+                            index, {"id": "", "name": "", "arguments": ""}
+                        )
+                        if getattr(tool_delta, "id", None):
+                            fragment["id"] += tool_delta.id
+                        function = getattr(tool_delta, "function", None)
+                        if function is not None:
+                            if getattr(function, "name", None):
+                                fragment["name"] += function.name
+                            if getattr(function, "arguments", None):
+                                fragment["arguments"] += function.arguments
+
+                round_tool_calls: list[dict[str, Any]] = []
+                for index in sorted(fragments):
+                    fragment = fragments[index]
+                    call_id = fragment["id"] or f"call_{round_index}_{index}"
+                    round_tool_calls.append(
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": fragment["name"],
+                                "arguments": fragment["arguments"] or "{}",
+                            },
+                        }
+                    )
+
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": round_text or None,
+                }
+                if round_tool_calls:
+                    assistant_message["tool_calls"] = round_tool_calls
+                wire_messages.append(assistant_message)
+                messages.append(dict(assistant_message))
+
+                if not round_tool_calls:
+                    break
+
+                for tool_call in round_tool_calls:
+                    raw_arguments = tool_call["function"]["arguments"]
+                    try:
+                        arguments = json.loads(raw_arguments)
+                        if not isinstance(arguments, dict):
+                            raise TypeError("tool arguments must be an object")
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        result_str = json.dumps(
+                            {"error": f"Invalid tool arguments: {exc}"}, ensure_ascii=False
+                        )
+                    else:
+                        result_str = await execute_tool(tool_call["function"]["name"], arguments)
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": result_str,
+                    }
+                    wire_messages.append(tool_message)
+                    messages.append(dict(tool_message))
+            else:
+                raise RuntimeError("OpenAI-compatible tool loop exceeded 8 rounds")
+
+            _logger.info(
+                "turn end tools=%d usage=%s ttft_ms=%s protocol=openai",
+                len(tool_calls_executed),
+                usage,
+                f"{ttft_ms:.0f}" if ttft_ms is not None else "n/a",
+                extra={"ttft_ms": round(ttft_ms, 1)} if ttft_ms is not None else {},
+            )
+        except Exception as exc:  # noqa: BLE001
             _logger.exception("turn error: %s", exc)
             return AgentTurnResult(
                 messages=messages,

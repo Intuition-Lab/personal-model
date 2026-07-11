@@ -152,7 +152,8 @@ audio, or evaluation runner.
 
 ## Failure semantics
 
-- No provider key: capture and BM25 remain available; semantic stages report
+- No selected provider credential (unless using a keyless local endpoint):
+  capture and BM25 remain available; semantic stages report
   skips/failures and model status stays degraded.
 - OCR worker crash: the worker is restarted/fails open; the daemon survives.
 - Reducer failure: persisted exponential retry; final exhaustion writes an

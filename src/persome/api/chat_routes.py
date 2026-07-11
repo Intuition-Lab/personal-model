@@ -149,8 +149,8 @@ def _first_user_preview(messages: list[dict[str, Any]]) -> str | None:
     """Build a sidebar preview string from the first user turn.
 
     Walks ``messages`` in order, picks the first ``role=="user"`` entry,
-    normalizes its content to a plain string (collapsing Anthropic SDK
-    block lists via :func:`_content_to_text`), strips whitespace, and
+    normalizes its content to a plain string (collapsing provider block lists
+    via :func:`_content_to_text`), strips whitespace, and
     truncates with an ellipsis if it exceeds ``_PREVIEW_MAX_CHARS``.
     Returns ``None`` when there is no user message or the content is
     effectively empty — callers should treat ``None`` as "fall back to
@@ -175,12 +175,9 @@ def _first_user_preview(messages: list[dict[str, Any]]) -> str | None:
 def _content_to_text(content: Any) -> str | None:
     """Normalize a stored message ``content`` field to a plain string.
 
-    Sessions persist assistant turns in the Anthropic SDK shape — content is
-    a list of blocks like ``[{"type": "text", "text": "..."}, {"type":
-    "tool_use", ...}]``. The HTTP contract advertises ``content: str | None``,
-    so we collapse text blocks into one string here and drop non-text blocks
-    (tool_use / thinking are surfaced via the SSE stream, not the history
-    endpoint).
+    Anthropic turns use a list of content blocks; OpenAI-compatible turns use a
+    string plus optional ``tool_calls``. This helper collapses the former while
+    plain strings pass through unchanged.
     """
     if content is None or isinstance(content, str):
         return content
@@ -208,7 +205,7 @@ def _is_real_user(content: Any) -> bool:
 
 
 def _projected_block(b: dict[str, Any]) -> dict[str, Any] | None:
-    """Project a stored Anthropic content block to the wire-shape block.
+    """Project a stored provider content block to the wire-shape block.
 
     Stored blocks may carry extra fields (cache markers, signatures, other
     internal SDK keys); the wire shape only keeps what clients render.
@@ -278,8 +275,35 @@ def _projected_blocks(content: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _openai_tool_use_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project OpenAI ``tool_calls`` into the public tool-use block shape."""
+    out: list[dict[str, Any]] = []
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        arguments = function.get("arguments") or "{}"
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed = {}
+        else:
+            parsed = arguments
+        out.append(
+            {
+                "type": "tool_use",
+                "name": function.get("name") or "",
+                "input": parsed if isinstance(parsed, dict) else {},
+            }
+        )
+    return out
+
+
 def _fold_agent_loop(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse Anthropic agent-loop iterations into one assistant turn.
+    """Collapse provider agent-loop iterations into one assistant turn.
 
     Storage keeps each loop iteration faithful (assistant text+tool_use →
     user tool_result → assistant text+tool_use → ... → final assistant
@@ -333,6 +357,16 @@ def _fold_agent_loop(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
             pending_blocks.extend(_projected_blocks(content))
         elif role == "assistant":
             pending_blocks.extend(_projected_blocks(content))
+            pending_blocks.extend(_openai_tool_use_blocks(m))
+        elif role == "tool":
+            pending_blocks.append(
+                {
+                    "type": "tool_result",
+                    "name": m.get("name"),
+                    "content": str(content or ""),
+                    "tool_use_id": m.get("tool_call_id"),
+                }
+            )
     _flush_assistant()
     return out
 

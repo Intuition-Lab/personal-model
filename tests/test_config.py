@@ -69,9 +69,8 @@ capture_actionable_retention_days = 2
     assert capture.actionable_retention_days == 2
 
 
-def test_legacy_api_key_fields_ignored(tmp_path: Path) -> None:
-    """Old TOMLs may still set ``api_key`` / ``api_key_env`` — silently drop
-    them so users can upgrade without a migration step."""
+def test_inline_api_key_is_ignored_but_route_fields_load(tmp_path: Path) -> None:
+    """Secrets in TOML are ignored; non-secret route fields are supported."""
     path = tmp_path / "config.toml"
     path.write_text(
         """
@@ -88,12 +87,11 @@ base_url = "https://api.example/anthropic"
     )
     cfg = config.load(path)
     default = cfg.model_for("default")
-    # No AttributeError, no leakage into the dataclass.
     assert not hasattr(default, "api_key")
-    assert not hasattr(default, "api_key_env")
+    assert default.api_key_env == "OPENAI_API_KEY"
     assert not hasattr(cfg.chat, "api_key")
-    assert not hasattr(cfg.chat, "api_key_env")
-    assert not hasattr(cfg.chat, "base_url")
+    assert cfg.chat.api_key_env == "ANTHROPIC_API_KEY"
+    assert cfg.chat.base_url == "https://api.example/anthropic"
 
 
 def test_write_default_creates_file(tmp_path: Path) -> None:
@@ -102,8 +100,8 @@ def test_write_default_creates_file(tmp_path: Path) -> None:
     assert p.exists()
     text = p.read_text()
     assert "[models.default]" in text
-    # Template no longer mentions key/env fields.
-    assert "api_key_env" not in text
+    assert "persome llm setup" in text
+    assert "api_key_env" in text
     # idempotent
     assert not config.write_default_if_missing(p)
 
@@ -130,3 +128,25 @@ def test_infer_provider() -> None:
     # Unknown bare names default to openai (litellm's own default).
     assert config.infer_provider("gpt-5.4-nano") == "openai"
     assert config.infer_provider("mystery-model") == "openai"
+
+
+def test_chat_inherits_default_provider_profile(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[models.default]
+provider = "openrouter"
+protocol = "openai"
+model = "anthropic/claude-sonnet-4"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[chat]
+thinking_budget = 0
+"""
+    )
+    cfg = config.load(path)
+    assert cfg.chat.provider == "openrouter"
+    assert cfg.chat.protocol == "openai"
+    assert cfg.chat.model == "anthropic/claude-sonnet-4"
+    assert cfg.chat.api_key_env == "OPENROUTER_API_KEY"

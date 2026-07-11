@@ -52,6 +52,7 @@ data, not harmless metadata.
 ## Lifecycle and first recall
 
 ```bash
+persome llm status --check
 persome doctor
 persome start
 persome status
@@ -63,8 +64,9 @@ persome stop
 The default active-session flush is five minutes. Timeline closure and model
 processing add bounded local work, so the operational target for first useful
 recall is at most ten minutes after valid AX capture and provider availability.
-No-key mode still supports capture and BM25 recall; semantic modeling reports a
-degraded state until a provider is configured.
+Without a hosted credential or keyless local endpoint, capture and BM25 recall
+still work; semantic modeling reports a degraded state. Run
+`persome llm setup` to change the active route, then restart the daemon.
 
 Use these checks when memory does not appear:
 

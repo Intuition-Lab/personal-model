@@ -35,7 +35,7 @@ def _patch_client(monkeypatch, count_tokens) -> list[dict]:
             return count_tokens(**kwargs)
 
     monkeypatch.setattr(
-        llm_mod, "_anthropic_client", lambda: SimpleNamespace(messages=_FakeMessages())
+        llm_mod, "_anthropic_client", lambda _profile: SimpleNamespace(messages=_FakeMessages())
     )
     return calls
 

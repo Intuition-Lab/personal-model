@@ -7,19 +7,38 @@ file is created on first initialization.
 ```bash
 persome config   # print the path and current file
 persome doctor   # offline prerequisites; no LLM call
+persome llm status --check  # live completion and tool-call check
 ```
 
 The daemon loads configuration once. Restart it after editing.
 
 ## Providers and stage models
 
-All semantic stages use the Anthropic Messages API through the official SDK in
-`writer/llm.py`. `model` is the bare name accepted by the configured endpoint.
+One profile powers semantic stages and Chat. Persome supports native Anthropic
+Messages and OpenAI-compatible Chat Completions. Use the guided path instead of
+editing secrets by hand:
+
+```bash
+persome llm providers       # presets and locally detected key names
+persome llm setup           # select, edit, probe, then save
+persome llm status --check  # inspect the effective route and retest it
+```
+
+`setup` checks the current profile first, auto-selects when exactly one known
+credential is found, prompts when several are available, and accepts keyless
+local endpoints. It makes a small completion call and a forced tool call before
+saving. A failed connectivity/authentication probe writes nothing. A model that
+completes but cannot call tools requires an explicit degraded-mode confirmation.
+
+The resulting non-secret configuration has this shape:
 
 ```toml
 [models.default]
-model = "deepseek-v4-flash"
-# base_url = ""       # rare per-stage override; prefer env
+provider = "openrouter"
+protocol = "openai"
+model = "anthropic/claude-sonnet-4"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
 # max_tokens = 4096
 
 [models.timeline]
@@ -32,11 +51,10 @@ model = "deepseek-v4-flash"
 [models.schema_miner]
 ```
 
-Credentials in `<PERSOME_ROOT>/env`:
+Only the value named by `api_key_env` is stored in `<PERSOME_ROOT>/env`:
 
 ```dotenv
-ANTHROPIC_API_KEY=...
-# ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+OPENROUTER_API_KEY=...
 
 # Optional dense retrieval:
 OPENAI_API_KEY=...
@@ -46,9 +64,21 @@ OPENAI_API_KEY=...
 Common model stages are `timeline`, `reducer`, `classifier`, `memory_delta`,
 `pattern_detector`, `case_extractor`, `compact`, `schema_miner`,
 `cross_domain_sweeper`, `root_synthesis`, `contradiction_check`, and
-`memory_decay`. The classifier and pattern detector require correct Anthropic
-tool-use support. JSON stages require reliable structured output. No-key mode
-still captures and serves BM25, but semantic model stages remain degraded.
+`memory_decay`. Tool-loop stages require function/tool calling; JSON stages
+require reliable structured output. Without a hosted credential or keyless
+local endpoint, Persome still captures and serves BM25, but semantic model
+stages remain degraded.
+
+Hosted presets currently include Anthropic, OpenAI, DeepSeek, OpenRouter,
+Gemini, Groq, Mistral, xAI, Qwen, Moonshot/Kimi, Zhipu GLM, SiliconFlow,
+Together, Fireworks, Cerebras, and Azure OpenAI. Keyless local presets cover
+Ollama, LM Studio, and vLLM. Presets describe endpoint defaults, not a blanket
+capability guarantee for every model. Use `custom-openai` or
+`custom-anthropic` for another compatible gateway.
+
+For migration, a config without `provider`, `protocol`, and `api_key_env`
+retains the former `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` route exactly.
+Running `persome llm setup` tests and converts that route to explicit fields.
 
 ## Capture
 
@@ -297,7 +327,7 @@ read_receipt_enabled = true
 entity_graph_enabled = true
 
 [chat]
-model = "deepseek-v4-flash"
+# The complete models.default profile is inherited unless overridden here.
 thinking_budget = 0
 unsafe_local_tools_enabled = false
 mcp_connect_daemon = true
@@ -316,6 +346,10 @@ Chat always loads skill Markdown as model guidance. Executable
 `unsafe_local_tools_enabled=true`. Configured external MCP servers are another
 explicit trust expansion and can have their own network behavior. The Runtime
 ships a terminal client (`persome chat`), not a browser Chat page.
+
+Anthropic profiles retain prompt caching and optional extended thinking.
+OpenAI-compatible profiles use streamed Chat Completions and the same built-in
+and MCP tools; `thinking_budget` is ignored on that protocol.
 
 ## Privacy and API flags
 

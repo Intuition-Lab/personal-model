@@ -1,17 +1,8 @@
-"""Anthropic SDK wrapper with per-stage model resolution.
+"""Provider-aware LLM wrapper with per-stage model resolution.
 
-All background stages (timeline / reducer / classifier / compact /
-pattern_detector / case_extractor / memory_delta) call the Anthropic
-Messages API directly through the official SDK — the same client path chat uses.
-litellm was removed: it serialized custom tools with a ``type:"custom"`` variant
-the DeepSeek ``/anthropic`` gateway rejects (``unknown variant 'custom'``), which
-broke every tool-calling stage. The backend talks only the Anthropic protocol
-(official endpoint or a compatible gateway like DeepSeek's ``/anthropic``).
-
-To keep the blast radius minimal, ``call_llm`` still returns the OpenAI-shaped
-``_Resp([_Choice(_Msg(content, tool_calls))])`` object the rest of this module
-(``run_tool_loop`` / ``extract_text`` / ``extract_tool_calls`` / ``extract_usage``)
-and every caller already consume — the Anthropic response is adapted back into it.
+Background stages use either Anthropic Messages or OpenAI-compatible Chat
+Completions. Both paths return the same small OpenAI-shaped response contract so
+the reducer/classifier/modeling tool loops remain provider-independent.
 """
 
 from __future__ import annotations
@@ -25,8 +16,9 @@ from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any, cast
 
-from ..config import Config, ModelConfig, provider_api_key, provider_base_url
+from ..config import Config, ModelConfig
 from ..logger import get
+from ..providers import ResolvedLLMProfile, resolve_profile
 
 logger = get("persome.writer")
 
@@ -60,21 +52,8 @@ class _RetryCtx:
     overloaded_count: int = 0
 
 
-# litellm routing prefixes — stripped to a bare model name for the Anthropic SDK,
-# which (like the chat agent) sends the bare name verbatim to the gateway.
-_ROUTING_PREFIXES = ("anthropic/", "deepseek/", "openai/", "openrouter/", "gemini/")
-
 # Default output cap when a stage's ModelConfig sets none (Anthropic requires max_tokens).
 _DEFAULT_MAX_TOKENS = 8192
-
-
-def _bare_model(model: str) -> str:
-    """Strip a routing prefix → bare model name (e.g. ``anthropic/deepseek-v4-flash``
-    → ``deepseek-v4-flash``). Back-compat for existing ``anthropic/...`` configs."""
-    for p in _ROUTING_PREFIXES:
-        if model.startswith(p):
-            return model[len(p) :]
-    return model
 
 
 def _unfence_json(text: str) -> str:
@@ -160,6 +139,63 @@ def _to_anthropic_messages(
     return system, out
 
 
+def _text_content(content: Any) -> str | None:
+    """Flatten text-only provider content while dropping protocol extensions."""
+    if content is None or isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+    return "\n".join(part for part in parts if part) or None
+
+
+def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize shared messages for OpenAI-compatible Chat Completions."""
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role not in {"system", "user", "assistant", "tool"}:
+            continue
+        normalized: dict[str, Any] = {
+            "role": role,
+            "content": _text_content(message.get("content")),
+        }
+        if role == "assistant" and message.get("tool_calls"):
+            normalized["tool_calls"] = message["tool_calls"]
+        if role == "tool":
+            normalized["tool_call_id"] = message.get("tool_call_id")
+            if message.get("name"):
+                normalized["name"] = message["name"]
+        out.append(normalized)
+    return out
+
+
+def _to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove Anthropic-only cache metadata from OpenAI function tools."""
+    out: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            out.append({"type": "function", "function": dict(tool["function"])})
+        elif "name" in tool and "input_schema" in tool:
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema")
+                        or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+    return out
+
+
 def _adapt(msg: Any) -> Any:
     """Adapt an Anthropic ``Message`` into the OpenAI-shaped ``_Resp`` the rest of
     the module consumes (text + tool_calls + finish_reason + usage)."""
@@ -204,7 +240,7 @@ def _adapt(msg: Any) -> Any:
     return _Resp([_Choice(_Msg("".join(text_parts) or None, tool_calls or None), finish)], usage)
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=16)
 def _make_anthropic_client(api_key: str | None, base_url: str | None) -> Any:
     """Build (and memoize) an Anthropic client per (key, base_url). Cached so the underlying httpx
     connection pool — and its keep-alive TLS connections to the relay — are REUSED across calls
@@ -217,9 +253,20 @@ def _make_anthropic_client(api_key: str | None, base_url: str | None) -> Any:
     return anthropic.Anthropic(api_key=api_key, base_url=base_url)
 
 
-def _anthropic_client() -> Any:
-    """Cached Anthropic client from the canonical ANTHROPIC_* env (same as chat)."""
-    return _make_anthropic_client(provider_api_key("anthropic"), provider_base_url("anthropic"))
+@lru_cache(maxsize=16)
+def _make_openai_client(api_key: str, base_url: str) -> Any:
+    """Build and memoize an OpenAI-compatible client per credential/endpoint."""
+    from openai import OpenAI
+
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _anthropic_client(profile: ResolvedLLMProfile) -> Any:
+    return _make_anthropic_client(profile.api_key, profile.base_url or None)
+
+
+def _openai_client(profile: ResolvedLLMProfile) -> Any:
+    return _make_openai_client(profile.api_key or "local-no-key", profile.base_url)
 
 
 def call_llm(
@@ -231,16 +278,13 @@ def call_llm(
     json_mode: bool = False,
     extra: dict[str, Any] | None = None,
 ) -> Any:
-    """Invoke the Anthropic Messages API for the given stage.
+    """Invoke the configured provider for one background stage.
 
-    Returns the OpenAI-shaped ``_Resp`` adapter (see module docstring), so
-    ``run_tool_loop`` / ``extract_*`` and every caller stay unchanged.
+    Anthropic responses are adapted to the shared response shape. OpenAI SDK
+    responses already expose that shape and pass through directly.
     Respects ``PERSOME_LLM_MOCK=1`` (test stub) and ``PERSOME_FALLBACK_MODEL``
-    (529 fallback). ``cache_control`` on messages/tools/system passes through —
-    the Anthropic protocol honors it natively (no stripping, no prefix tricks).
-    ``extra`` merges raw request params into the call body (e.g.
-    ``{"thinking": {"type": "disabled"}}`` for a fast stage) — forwarded
-    verbatim, so the relay passes them to the upstream gateway.
+    (529 fallback). Anthropic cache-control metadata passes through only on the
+    Anthropic path; it is removed for OpenAI-compatible endpoints.
     """
     if os.environ.get("PERSOME_LLM_MOCK") == "1":
         return _mock_response(stage, messages, tools, json_mode)
@@ -249,23 +293,40 @@ def call_llm(
     override = os.environ.get("PERSOME_FALLBACK_MODEL")
     if override:
         model_cfg = ModelConfig(**{**model_cfg.__dict__, "model": override})
+    profile = resolve_profile(model_cfg)
 
-    system, amsgs = _to_anthropic_messages(messages)
-    kwargs: dict[str, Any] = {
-        "model": _bare_model(model_cfg.model),
-        "messages": amsgs,
-        "max_tokens": model_cfg.max_tokens or _DEFAULT_MAX_TOKENS,
-    }
-    if system is not None:
-        kwargs["system"] = system
-    if tools:
-        kwargs["tools"] = _to_anthropic_tools(tools)
-    if extra:
-        kwargs.update(extra)
-
-    logger.debug("llm call stage=%s model=%s", stage, model_cfg.model)
-    msg = _anthropic_client().messages.create(**kwargs)
-    resp = _adapt(msg)
+    logger.debug(
+        "llm call stage=%s provider=%s protocol=%s model=%s",
+        stage,
+        profile.provider,
+        profile.protocol,
+        profile.model,
+    )
+    if profile.protocol == "anthropic":
+        system, provider_messages = _to_anthropic_messages(messages)
+        kwargs: dict[str, Any] = {
+            "model": profile.wire_model,
+            "messages": provider_messages,
+            "max_tokens": model_cfg.max_tokens or _DEFAULT_MAX_TOKENS,
+        }
+        if system is not None:
+            kwargs["system"] = system
+        if tools:
+            kwargs["tools"] = _to_anthropic_tools(tools)
+        if extra:
+            kwargs.update(extra)
+        resp = _adapt(_anthropic_client(profile).messages.create(**kwargs))
+    else:
+        openai_kwargs: dict[str, Any] = {
+            "model": profile.wire_model,
+            "messages": _to_openai_messages(messages),
+            "max_tokens": model_cfg.max_tokens or _DEFAULT_MAX_TOKENS,
+        }
+        if tools:
+            openai_kwargs["tools"] = _to_openai_tools(tools)
+        # ``extra`` contains Anthropic-specific controls in existing callers.
+        # Do not leak those unsupported fields into compatible gateways.
+        resp = _openai_client(profile).chat.completions.create(**openai_kwargs)
     if json_mode and resp.choices and resp.choices[0].message.content:
         resp.choices[0].message.content = _unfence_json(resp.choices[0].message.content)
     return resp
@@ -331,6 +392,7 @@ def ping_stage(cfg: Config, stage: str, *, timeout: float = 5.0) -> PingResult:
     informational callers must remain non-fatal.
     """
     model_cfg = cfg.model_for(stage)
+    profile = resolve_profile(model_cfg)
     if os.environ.get("PERSOME_LLM_MOCK") == "1":
         return PingResult(
             stage=stage,
@@ -341,29 +403,34 @@ def ping_stage(cfg: Config, stage: str, *, timeout: float = 5.0) -> PingResult:
             mocked=True,
         )
 
-    try:
-        import anthropic  # lazy import — keeps CLI startup fast
-    except ImportError as exc:
-        return PingResult(
-            stage=stage,
-            model=model_cfg.model,
-            ok=False,
-            latency_ms=None,
-            error=f"ImportError: {exc}",
-        )
-
     start = time.monotonic()
     try:
-        client = anthropic.Anthropic(
-            api_key=provider_api_key("anthropic"),
-            base_url=provider_base_url("anthropic"),
-            timeout=timeout,
-        )
-        client.messages.create(
-            model=_bare_model(model_cfg.model),
-            messages=[{"role": "user", "content": "Reply with 'ok'."}],
-            max_tokens=4,
-        )
+        if profile.protocol == "anthropic":
+            import anthropic
+
+            client = anthropic.Anthropic(
+                api_key=profile.api_key,
+                base_url=profile.base_url or None,
+                timeout=timeout,
+            )
+            client.messages.create(
+                model=profile.wire_model,
+                messages=[{"role": "user", "content": "Reply with 'ok'."}],
+                max_tokens=4,
+            )
+        else:
+            from openai import OpenAI
+
+            client = OpenAI(
+                api_key=profile.api_key or "local-no-key",
+                base_url=profile.base_url,
+                timeout=timeout,
+            )
+            client.chat.completions.create(
+                model=profile.wire_model,
+                messages=[{"role": "user", "content": "Reply with 'ok'."}],
+                max_tokens=4,
+            )
     except Exception as exc:  # noqa: BLE001
         label = type(exc).__name__
         msg = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
@@ -494,14 +561,17 @@ def count_tokens_api(cfg: Config, stage: str, messages: list[dict[str, Any]]) ->
     if not cfg.writer.use_token_count_api:
         return None
     model_cfg = cfg.model_for(stage)
+    profile = resolve_profile(model_cfg)
+    if profile.protocol != "anthropic":
+        return None
     try:
         import anthropic  # noqa: F401
 
         system, amsgs = _to_anthropic_messages(messages)
-        kwargs: dict[str, Any] = {"model": _bare_model(model_cfg.model), "messages": amsgs}
+        kwargs: dict[str, Any] = {"model": profile.wire_model, "messages": amsgs}
         if system is not None:
             kwargs["system"] = system
-        result = _anthropic_client().messages.count_tokens(**kwargs)
+        result = _anthropic_client(profile).messages.count_tokens(**kwargs)
         return int(getattr(result, "input_tokens", 0)) or None
     except Exception:  # noqa: BLE001
         return None

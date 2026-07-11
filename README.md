@@ -91,18 +91,30 @@ required to read focused AX text and structure. Grant **Screen Recording** only
 when enabling OCR fallback or screenshot retention; it supplies pixels to the
 local OCR worker. Persome does not require Full Disk Access.
 
-An LLM key is optional for collection and BM25 recall, but required for real
-semantic modeling. `install.sh` can save an Anthropic key or an
-Anthropic-compatible gateway key to the owner-only `~/.persome/env` file.
-Nothing ships with a key.
+An LLM is optional for collection and BM25 recall, but required for semantic
+modeling. During installation, the provider wizard discovers existing keys,
+lets you edit the endpoint and model, tests completion and tool calling, and
+only then saves the route. API keys go to the owner-only `~/.persome/env` file;
+the non-secret route goes to `~/.persome/config.toml`. Nothing ships with a key.
 
 ```bash
-# If the installer was run without a key:
-printf 'ANTHROPIC_API_KEY=%s\n' 'your-provider-key' >> ~/.persome/env
-chmod 600 ~/.persome/env
+# If provider setup was skipped during installation:
+persome llm providers
+persome llm setup
+persome llm status --check
+
+# Restart after changing the active provider:
 persome stop || true
 persome start
 ```
+
+Persome speaks two wire protocols: native Anthropic Messages and
+OpenAI-compatible Chat Completions. Presets cover Anthropic, OpenAI, DeepSeek,
+OpenRouter, Gemini, Groq, Mistral, xAI, Qwen, Moonshot/Kimi, Zhipu GLM,
+SiliconFlow, Together, Fireworks, Cerebras, Azure OpenAI, Ollama, LM Studio, and
+vLLM. `custom-openai` and `custom-anthropic` accept another compatible endpoint.
+A preset means the route is configured, not that every model has the necessary
+capabilities; Persome warns when the selected model cannot call tools.
 
 Active work is reduced every five minutes by default. A first useful recall is
 therefore expected within ten minutes of valid capture plus a working semantic

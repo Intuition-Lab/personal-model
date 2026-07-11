@@ -3,7 +3,6 @@
 Since the migration off litellm, the background stages call the Anthropic
 Messages API directly. ``call_llm`` converts the OpenAI-shaped messages/tools
 into Anthropic shape and adapts the response back. Covers:
-- ``_bare_model`` — routing-prefix stripping
 - ``_to_anthropic_tools`` — OpenAI function → Anthropic ``input_schema`` (+ cache_control)
 - ``_to_anthropic_messages`` — system extraction, tool_result folding, tool_use, cache_control pass-through
 - ``call_llm`` forwards a bare model + converted tools/system to the SDK, preserving cache_control
@@ -19,23 +18,11 @@ from typing import Any
 import pytest
 
 from persome.writer.llm import (
-    _bare_model,
     _to_anthropic_messages,
     _to_anthropic_tools,
 )
 
 _EPHEMERAL = {"type": "ephemeral"}
-
-
-# ─── _bare_model ─────────────────────────────────────────────────────────────
-
-
-def test_bare_model_strips_routing_prefixes() -> None:
-    assert _bare_model("anthropic/deepseek-v4-flash") == "deepseek-v4-flash"
-    assert _bare_model("deepseek/deepseek-v4-flash") == "deepseek-v4-flash"
-    assert _bare_model("openai/gpt-4o") == "gpt-4o"
-    assert _bare_model("deepseek-v4-flash") == "deepseek-v4-flash"  # already bare
-    assert _bare_model("claude-haiku-4-5") == "claude-haiku-4-5"
 
 
 # ─── tool conversion ─────────────────────────────────────────────────────────
@@ -123,7 +110,7 @@ def test_call_llm_forwards_bare_model_and_converted_tools(monkeypatch) -> None:
             )
 
     monkeypatch.setattr(
-        llm_mod, "_anthropic_client", lambda: SimpleNamespace(messages=_FakeMessages())
+        llm_mod, "_anthropic_client", lambda _profile: SimpleNamespace(messages=_FakeMessages())
     )
 
     cfg = config_mod.Config()
@@ -152,6 +139,67 @@ def test_call_llm_forwards_bare_model_and_converted_tools(monkeypatch) -> None:
     # response adapted back into OpenAI shape
     assert llm_mod.extract_text(resp) == "ok"
     assert llm_mod.extract_usage(resp)["prompt_tokens"] == 3
+
+
+def test_call_llm_openai_compatible_strips_anthropic_extensions(monkeypatch) -> None:
+    monkeypatch.delenv("PERSOME_LLM_MOCK", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic")
+    from persome import config as config_mod
+    from persome.writer import llm as llm_mod
+
+    captured: dict[str, Any] = {}
+
+    class _FakeCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=4, completion_tokens=1, total_tokens=5),
+            )
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+    monkeypatch.setattr(llm_mod, "_openai_client", lambda _profile: fake_client)
+
+    cfg = config_mod.Config(
+        models={
+            "default": config_mod.ModelConfig(
+                provider="openrouter",
+                protocol="openai",
+                model="anthropic/claude-sonnet-4",
+                base_url="https://openrouter.ai/api/v1",
+                api_key_env="OPENROUTER_API_KEY",
+            )
+        }
+    )
+    response = llm_mod.call_llm(
+        cfg,
+        "default",
+        messages=[
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "sys", "cache_control": _EPHEMERAL}],
+            },
+            {"role": "user", "content": "hi"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+                "cache_control": _EPHEMERAL,
+            }
+        ],
+    )
+
+    assert captured["model"] == "anthropic/claude-sonnet-4"
+    assert captured["messages"][0] == {"role": "system", "content": "sys"}
+    assert "cache_control" not in captured["tools"][0]
+    assert llm_mod.extract_text(response) == "ok"
+    assert llm_mod.extract_usage(response)["total_tokens"] == 5
 
 
 # ─── system prompt templates carry no format placeholders ───────────────────

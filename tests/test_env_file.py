@@ -71,6 +71,20 @@ def test_invalid_key_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert n >= 1
 
 
+def test_write_env_values_upserts_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "env"
+    path.write_text("KEEP=yes\nOPENAI_API_KEY=old\nOPENAI_API_KEY=duplicate\n")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    env_file.write_env_values(path, {"OPENAI_API_KEY": "new"})
+
+    assert path.read_text() == "KEEP=yes\nOPENAI_API_KEY=new\n"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert os.environ["OPENAI_API_KEY"] == "new"
+
+
 def test_ensure_screenshot_key_generates_owner_only_file(tmp_path: Path) -> None:
     path = tmp_path / "env"
     path.write_text("ANTHROPIC_API_KEY=synthetic\n")

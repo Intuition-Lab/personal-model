@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
-import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from . import paths
+from . import providers as provider_mod
 
 
 @dataclass
 class ModelConfig:
     model: str = "deepseek-v4-flash"
-    # Optional override; when empty, ``provider_base_url(model)`` falls back to
-    # the canonical ``{PROVIDER}_BASE_URL`` environment variable.
+    # Provider routing is explicit after ``persome llm setup``. Empty values
+    # preserve old configs and are inferred from the model/environment.
+    provider: str = ""
+    protocol: str = ""
+    api_key_env: str = ""
+    # Endpoints are not secrets and may be stored in TOML. The matching
+    # provider BASE_URL environment variable remains a supported fallback.
     base_url: str = ""
     max_tokens: int | None = None
 
@@ -422,23 +427,13 @@ class MCPServerSpec:
 
 @dataclass
 class ChatConfig:
-    # Chat uses the Anthropic SDK directly for prompt caching, extended thinking,
-    # and tool use. Configured under [chat] in config.toml.
-    #
-    # API key and base URL are NOT in TOML — they come from the env vars
-    # ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_BASE_URL``, loaded from the runtime
-    # env file or the user's shell.
-    #
-    # NO routing prefix here. The chat agent calls the Anthropic SDK
-    # directly (``anthropic.AsyncAnthropic`` in ``chat/agent.py``); whatever
-    # string sits in ``model`` is sent verbatim in the request body and
-    # validated by the gateway. DeepSeek's ``/anthropic`` endpoint only
-    # accepts bare names (``deepseek-v4-flash`` / ``deepseek-v4-pro``); a
-    # routing-style ``anthropic/...`` prefix would be rejected as an unknown
-    # model. Prompt caching for the chat agent is enabled via the
-    # ``cache_control`` field on message content (see ``chat/agent.py``),
-    # independent of the model name.
+    # Chat inherits the default model profile unless one of these values is
+    # explicitly overridden under [chat].
     model: str = "deepseek-v4-flash"
+    provider: str = ""
+    protocol: str = ""
+    api_key_env: str = ""
+    base_url: str = ""
     # Extended thinking (Anthropic "thinking" block). 0 disables (default —
     # safe for non-reasoning models like deepseek-v4-flash). Set to >=1024
     # to enable; requires a reasoning-capable model (Claude Opus/Sonnet 4.5+,
@@ -491,44 +486,17 @@ class Config:
         return self.models.get(stage) or self.models.get("default") or ModelConfig()
 
 
-# Provider name -> canonical environment-variable prefix.
-_PROVIDER_ENV_PREFIX: dict[str, str] = {
-    "anthropic": "ANTHROPIC",
-    "openai": "OPENAI",
-    "deepseek": "DEEPSEEK",
-}
-
-
 def infer_provider(model: str) -> str:
-    """Best-effort provider name from an optional ``provider/model`` string.
-
-    Recognises explicit ``provider/model`` prefixes first; falls back to a few
-    well-known bare-name heuristics. Returns ``"openai"`` when unknown — the
-    compatibility default so legacy ``gpt-*`` configs keep working.
-    """
-    head = model.split("/", 1)[0].lower() if "/" in model else ""
-    if head in _PROVIDER_ENV_PREFIX:
-        return head
-    lower = model.lower()
-    if lower.startswith("claude"):
-        return "anthropic"
-    if lower.startswith("deepseek"):
-        return "deepseek"
-    return "openai"
+    """Compatibility wrapper for callers that import provider helpers here."""
+    return provider_mod.infer_provider(model)
 
 
 def provider_api_key(provider: str) -> str | None:
-    prefix = _PROVIDER_ENV_PREFIX.get(provider)
-    if not prefix:
-        return None
-    return os.environ.get(f"{prefix}_API_KEY")
+    return provider_mod.provider_api_key(provider)
 
 
 def provider_base_url(provider: str) -> str | None:
-    prefix = _PROVIDER_ENV_PREFIX.get(provider)
-    if not prefix:
-        return None
-    return os.environ.get(f"{prefix}_BASE_URL")
+    return provider_mod.provider_base_url(provider)
 
 
 def _as_dict(section: Any) -> dict:
@@ -557,13 +525,20 @@ def _build_dataclass(cls, raw: dict):  # type: ignore[no-untyped-def]
     return cls(**allowed)
 
 
-def _build_chat(raw: dict) -> ChatConfig:
-    # Secrets/base URLs are env-only. TOML scalars cover model,
-    # thinking_budget, and mcp_connect_daemon.
+def _build_chat(raw: dict, default_model: ModelConfig) -> ChatConfig:
+    # The LLM route inherits from [models.default]. Chat-only controls remain
+    # independent. Explicit [chat] values override only their matching fields.
+    inherited = {
+        "model": default_model.model,
+        "provider": default_model.provider,
+        "protocol": default_model.protocol,
+        "api_key_env": default_model.api_key_env,
+        "base_url": default_model.base_url,
+    }
     scalar_fields = {
         k: v for k, v in raw.items() if k in ChatConfig.__dataclass_fields__ and k != "mcp_servers"
     }
-    cfg = ChatConfig(**scalar_fields)
+    cfg = ChatConfig(**{**inherited, **scalar_fields})
     # Parse [[chat.mcp_servers]] array-of-tables
     raw_servers = raw.get("mcp_servers", [])
     if isinstance(raw_servers, list):
@@ -599,8 +574,9 @@ def load(path: Path | None = None) -> Config:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
 
+    models = _build_models(_as_dict(raw.get("models")))
     return Config(
-        models=_build_models(_as_dict(raw.get("models"))),
+        models=models,
         capture=_build_capture(raw),
         timeline=_build_dataclass(TimelineConfig, _as_dict(raw.get("timeline"))),
         session=_build_dataclass(SessionConfig, _as_dict(raw.get("session"))),
@@ -619,7 +595,7 @@ def load(path: Path | None = None) -> Config:
         skill_check=_build_dataclass(SkillCheckConfig, _as_dict(raw.get("skill_check"))),
         schema=_build_dataclass(SchemaConfig, _as_dict(raw.get("schema"))),
         user=_build_dataclass(UserConfig, _as_dict(raw.get("user"))),
-        chat=_build_chat(_as_dict(raw.get("chat"))),
+        chat=_build_chat(_as_dict(raw.get("chat")), models["default"]),
         # Competitive-enhancement flat toggles (spec 2026-06-23): top-level TOML
         # scalars so config.toml can override the safe defaults.
         api_require_local_origin=bool(raw.get("api_require_local_origin", True)),
@@ -631,26 +607,17 @@ def load(path: Path | None = None) -> Config:
 
 
 DEFAULT_CONFIG_TEMPLATE = """# Persome configuration
-# All LLM stages call the Anthropic Messages API via the official SDK (same path
-# as chat). The backend speaks only the Anthropic protocol — the official
-# endpoint or a compatible gateway (e.g. DeepSeek's /anthropic). ``model`` is a
-# BARE name (no routing prefix) sent verbatim to ANTHROPIC_BASE_URL; legacy
-# ``anthropic/...`` prefixes are tolerated (stripped). Each stage inherits from
-# [models.default]. Prompt caching is automatic (cache_control passes through);
-# no model-name prefix is needed.
+# One verified profile powers timeline reduction, personal modeling, and Chat.
+# Persome supports Anthropic Messages and OpenAI-compatible Chat Completions.
+# Run `persome llm setup` to detect an existing key, choose/edit the endpoint and
+# model, test completion + tool calling, and write the fields below. Every stage
+# inherits [models.default] unless its own section overrides a field.
 #
-# Secrets (API keys, base URLs) are NOT in this file. They live in
-# ``~/.persome/env`` (dotenv format). Canonical env var names: {PROVIDER}_API_KEY and
-# {PROVIDER}_BASE_URL where {PROVIDER} ∈ {ANTHROPIC, OPENAI, DEEPSEEK}.
-# For CLI debugging you may export the same vars in your shell.
-#
-# Bring-your-own-key model naming:
-# - Official Anthropic endpoint: leave ANTHROPIC_BASE_URL unset and use a bare
-#   claude model name, e.g. model = "claude-haiku-4-5".
-# - Anthropic-compatible gateways (e.g. DeepSeek): set
-#   ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic and use the bare name
-#   the gateway serves, e.g. model = "deepseek-v4-flash" (the shipped default).
-# Verify your setup any time with `persome doctor` (offline, zero LLM calls).
+# API keys never belong in this file. `api_key_env` stores only the variable
+# name; the secret itself lives in ~/.persome/env (mode 0600). Endpoints are not
+# secrets and are stored here so Chat and daemon subprocesses use the same route.
+# `persome llm providers` lists hosted/local presets. Custom compatible gateways
+# use provider="custom-openai" or provider="custom-anthropic".
 
 # Cross-cutting runtime/model switches.
 api_require_local_origin = true
@@ -666,7 +633,9 @@ edge_promote_fanout = 20
 # name = "Alice"
 
 [models.default]
-model = "deepseek-v4-flash"   # bare name, sent verbatim to ANTHROPIC_BASE_URL gateway
+# `persome llm setup` writes provider, protocol, model, base_url, and api_key_env.
+# Until then, these legacy defaults retain compatibility with pre-provider installs.
+model = "deepseek-v4-flash"
 
 [models.compact]
 # Accuracy-sensitive — match or exceed the default.
@@ -680,7 +649,7 @@ model = "deepseek-v4-flash"   # bare name, sent verbatim to ANTHROPIC_BASE_URL g
 # runs on every 1-min window — slow LLM calls here cause the pipeline to
 # lag behind real time and delay all downstream memory updates.
 # Example override (uncomment): a faster model just for this hot path.
-# model = "deepseek-v4-flash"   # bare name; routed to ANTHROPIC_BASE_URL
+# model = "a-faster-model-id"
 
 [models.reducer]
 # Session-level S2 reduce-from-blocks. Prompt is short (blocks are already
@@ -800,10 +769,9 @@ host = "127.0.0.1"                # bind address; keep localhost-only by default
 port = 8742
 
 [chat]
-# Anthropic SDK-based chat assistant. Set ANTHROPIC_API_KEY (and optionally
-# ANTHROPIC_BASE_URL to point at e.g. DeepSeek's /anthropic gateway) via
-# the env file next to config.toml, or export them in your shell for CLI debugging.
-# model = "deepseek-v4-flash"      # bare name sent through the Anthropic SDK
+# Chat inherits the complete [models.default] provider profile. Override model,
+# provider, protocol, base_url, or api_key_env here only when Chat intentionally
+# uses another endpoint. thinking_budget applies only to Anthropic models.
 # thinking_budget = 0
 unsafe_local_tools_enabled = false # opt in to shell, arbitrary filesystem, and web tools
 mcp_connect_daemon = true         # auto-connect to the daemon's own MCP server

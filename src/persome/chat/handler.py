@@ -76,9 +76,8 @@ def _load_compress_prompt() -> str:
 def _get_context_window(model: str) -> int:
     """Return the context window size for the given model string.
 
-    Takes a bare model identifier so the same heuristic works whether the
-    string came from ``cfg.chat.model`` or a ``[models.*]`` stage — both
-    now go through the Anthropic SDK.
+    Takes the endpoint model identifier from ``cfg.chat`` or ``[models.*]``;
+    the estimate is provider-independent.
     """
     if "[1m]" in model or "1m" in model.lower():
         return 1_000_000
@@ -592,7 +591,7 @@ async def _run_turn(
 
 
 async def run_chat(cfg: config_mod.Config) -> None:
-    """Interactive chat loop driven by the Anthropic SDK ChatAgent."""
+    """Interactive chat loop driven by the configured provider ChatAgent."""
     console.print(f"[bold]Chat with {cfg.chat.model}[/bold] (type 'exit' or Ctrl+C to quit)")
     console.print("[dim]Commands: 'new' = new conversation, 'exit' = quit[/dim]\n")
 

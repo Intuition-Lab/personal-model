@@ -1,4 +1,4 @@
-"""``persome doctor`` — offline self-check for a bring-your-own-key install.
+"""``persome doctor`` — offline self-check for a bring-your-own-provider install.
 
 Each check returns a :class:`Check` with a three-state status:
 
@@ -10,7 +10,7 @@ Each check returns a :class:`Check` with a three-state status:
 Design constraints (BYO-key onboarding):
 
 * **Zero LLM calls.** The only network I/O is a single HTTP ``HEAD`` against the
-  configured ``ANTHROPIC_BASE_URL`` (3s timeout), and even that failing is a
+  configured provider endpoint (3s timeout), and even that failing is a
   warning only — a firewalled machine must still be able to get a green doctor.
 * **No side effects** beyond creating the data root when probing writability.
   Doctor never compiles helpers, never touches the DB, never writes config.
@@ -28,16 +28,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from . import config as config_mod
 from . import env_file as env_file_mod
 from . import paths
+from .providers import ResolvedLLMProfile, resolve_profile
 
 Status = Literal["ok", "fail", "warn"]
 
 # HEAD probe budget for the base-URL reachability check (seconds).
 _HEAD_TIMEOUT = 3.0
-
-# Default official endpoint when ANTHROPIC_BASE_URL is unset.
-_DEFAULT_BASE_URL = "https://api.anthropic.com"
 
 # Swift helper binaries the capture pipeline shells out to, with their
 # path-override env vars (mirrors capture/ax_capture.py + capture/watcher.py).
@@ -74,21 +73,34 @@ def _helper_candidates(name: str) -> list[Path]:
     return candidates
 
 
-def check_env_file() -> Check:
+def _llm_profile() -> ResolvedLLMProfile:
+    return resolve_profile(config_mod.load().model_for("default"))
+
+
+def check_env_file(profile: ResolvedLLMProfile | None = None) -> Check:
     """The dotenv secret store exists and is private (0600 — no group/other bits)."""
+    profile = profile or _llm_profile()
     p = paths.env_file()
     if not p.exists():
-        if os.environ.get("ANTHROPIC_API_KEY"):
+        if profile.credential_ready:
+            if not profile.key_required:
+                return Check(
+                    "env file",
+                    "warn",
+                    f"{p} missing (the local LLM needs no key; rerun install.sh "
+                    "to provision screenshot encryption)",
+                )
             return Check(
                 "env file",
                 "warn",
-                f"{p} missing (ANTHROPIC_API_KEY is exported in this shell; "
+                f"{p} missing ({profile.api_key_env} is available in this shell; "
                 "writing it to the env file survives restarts)",
             )
         return Check(
             "env file",
             "fail",
-            f"{p} missing — create it with ANTHROPIC_API_KEY=sk-... then chmod 600",
+            f"{p} missing — run `persome llm setup`, then rerun install.sh "
+            "to provision the screenshot key",
         )
     try:
         mode = stat.S_IMODE(p.stat().st_mode)
@@ -103,15 +115,18 @@ def check_env_file() -> Check:
     return Check("env file", "ok", str(p))
 
 
-def check_api_key() -> Check:
-    """``ANTHROPIC_API_KEY`` resolvable (env file already merged by run_checks)."""
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return Check("ANTHROPIC_API_KEY", "ok", "set")
+def check_api_key(profile: ResolvedLLMProfile | None = None) -> Check:
+    """The selected provider credential is resolvable without exposing it."""
+    profile = profile or _llm_profile()
+    if profile.credential_ready:
+        detail = (
+            "not required (local endpoint)" if not profile.key_required else profile.api_key_env
+        )
+        return Check("LLM credential", "ok", detail)
     return Check(
-        "ANTHROPIC_API_KEY",
+        "LLM credential",
         "fail",
-        f"not set — add ANTHROPIC_API_KEY=... to {paths.env_file()} "
-        "(official Anthropic key, or a compatible gateway's key with ANTHROPIC_BASE_URL)",
+        f"{profile.api_key_env} is not set for {profile.provider_label} — run `persome llm setup`",
     )
 
 
@@ -128,20 +143,22 @@ def check_screenshot_key() -> Check:
     )
 
 
-def check_base_url() -> Check:
-    """HEAD the configured (or default) Anthropic base URL. Reachability is a
+def check_base_url(profile: ResolvedLLMProfile | None = None) -> Check:
+    """HEAD the configured provider endpoint. Reachability is a
     warning-only signal: any HTTP response counts as reachable; a network error
     warns but never fails (offline machines still get a usable doctor)."""
-    base = os.environ.get("ANTHROPIC_BASE_URL") or ""
-    url = base or _DEFAULT_BASE_URL
-    label = url if base else f"{url} (default)"
+    profile = profile or _llm_profile()
+    url = profile.base_url
+    if not url:
+        return Check("LLM endpoint", "fail", "missing — run `persome llm setup`")
+    label = f"{profile.provider_label}: {url}"
     try:
         import httpx
 
         httpx.head(url, timeout=_HEAD_TIMEOUT, follow_redirects=True)
     except Exception as exc:  # noqa: BLE001 — reachability is advisory only
-        return Check("base URL", "warn", f"{label}: unreachable ({exc.__class__.__name__})")
-    return Check("base URL", "ok", label)
+        return Check("LLM endpoint", "warn", f"{label}: unreachable ({exc.__class__.__name__})")
+    return Check("LLM endpoint", "ok", label)
 
 
 def check_helpers() -> list[Check]:
@@ -262,11 +279,12 @@ def run_checks(host: str, port: int) -> list[Check]:
     """Run every check in display order. Merges the env file into ``os.environ``
     first (same semantics as ``persome start``: pre-set shell vars win)."""
     env_file_mod.load_env_file(paths.env_file())
+    profile = _llm_profile()
     checks: list[Check] = [
-        check_env_file(),
-        check_api_key(),
+        check_env_file(profile),
+        check_api_key(profile),
         check_screenshot_key(),
-        check_base_url(),
+        check_base_url(profile),
         *check_helpers(),
         check_ax_trust(),
         check_root_writable(),

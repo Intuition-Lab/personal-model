@@ -1,8 +1,7 @@
 """Tests for the agent-loop folding in GET /chat/sessions/{id}/messages.
 
-The chat agent persists Anthropic agent-loop iterations faithfully —
-``assistant text+tool_use`` rows interleaved with ``user tool_result`` rows
-— but the HTTP messages endpoint is a presentation projection that folds
+The chat agent persists provider-native agent-loop iterations faithfully, but
+the HTTP messages endpoint is a presentation projection that folds
 each agent-loop span into ONE assistant turn carrying:
 
   - ``content``: plain-text join of every text block (fallback for older
@@ -170,6 +169,44 @@ def test_fold_string_content_assistant_kept() -> None:
     out = _fold_agent_loop(raw)
     assert out[1]["content"] == "plain string answer"
     assert out[1]["blocks"] == [{"type": "text", "text": "plain string answer"}]
+
+
+def test_fold_openai_tool_calls_and_results() -> None:
+    raw = [
+        {"role": "user", "content": "search my memory"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_memory",
+                        "arguments": '{"query":"project"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "memory result",
+        },
+        {"role": "assistant", "content": "I found the project."},
+    ]
+
+    out = _fold_agent_loop(raw)
+
+    assert len(out) == 2
+    assert out[1]["content"] == "I found the project."
+    assert _types(out[1]) == ["tool_use", "tool_result", "text"]
+    assert out[1]["blocks"][0] == {
+        "type": "tool_use",
+        "name": "search_memory",
+        "input": {"query": "project"},
+    }
+    assert out[1]["blocks"][1]["tool_use_id"] == "call_1"
 
 
 def test_fold_multiple_turns() -> None:

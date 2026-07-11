@@ -1,4 +1,4 @@
-"""Integration tests using real DeepSeek API (deepseek/deepseek-v4-flash).
+"""Integration tests using DeepSeek's OpenAI-compatible API.
 
 Run with:
     DEEPSEEK_API_KEY=sk-... uv run pytest tests/test_integration_deepseek.py -v -s
@@ -45,14 +45,21 @@ pytestmark = [
     ),
 ]
 
-MODEL = "deepseek/deepseek-v4-flash"
+MODEL = "deepseek-chat"
 
 
 def _make_cfg(max_tokens: int = 64):
     from persome.config import Config, ModelConfig, WriterConfig
 
     cfg = Config(writer=WriterConfig(llm_retry_attempts=2))
-    cfg.models["default"] = ModelConfig(model=MODEL, max_tokens=max_tokens)
+    cfg.models["default"] = ModelConfig(
+        provider="deepseek",
+        protocol="openai",
+        model=MODEL,
+        base_url="https://api.deepseek.com/v1",
+        api_key_env="DEEPSEEK_API_KEY",
+        max_tokens=max_tokens,
+    )
     return cfg
 
 

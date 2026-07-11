@@ -10,8 +10,9 @@ from pydantic import BaseModel, Field
 
 
 class ChatMessageBlock(BaseModel):
-    """One block in an assistant/user turn — preserves the Anthropic content-list
-    structure so clients can render text + tool calls in their original order.
+    """One block in a provider-folded turn.
+
+    Preserves text and tool calls in their original order.
 
     Each block carries the subset of fields relevant to its ``type``; other
     fields are ``None`` (omitted from the wire form because of

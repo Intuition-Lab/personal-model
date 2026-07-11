@@ -110,4 +110,6 @@ legacy completed activity can be read through a neutral adapter.
 - A model export is redacted by default and written with mode `0600`.
 - SQLite access uses `with fts.cursor() as conn:` so readers and the writer
   coexist under WAL mode.
-- LLM calls flow through `writer/llm.py`; secrets stay out of `config.toml`.
+- LLM calls flow through `writer/llm.py` over Anthropic Messages or
+  OpenAI-compatible Chat Completions. Route metadata lives in `config.toml`;
+  key values stay in the owner-only `env` file.

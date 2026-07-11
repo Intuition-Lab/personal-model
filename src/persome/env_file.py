@@ -50,7 +50,7 @@ def load_env_file(path: Path) -> int:
 
     Pre-existing env vars are NOT overwritten. Unreadable / missing files are
     silently ignored (returns 0) — the daemon will surface a clearer error
-    later when a specific ``ANTHROPIC_API_KEY`` etc. lookup comes back empty.
+    later when the selected provider credential lookup comes back empty.
     """
     if not path.exists():
         return 0
@@ -69,6 +69,49 @@ def load_env_file(path: Path) -> int:
         os.environ[key] = value
         added += 1
     return added
+
+
+def write_env_values(path: Path, updates: dict[str, str]) -> None:
+    """Atomically upsert dotenv values while preserving unrelated entries.
+
+    Used by guided onboarding so credentials are durable across daemon restarts.
+    Updated keys are emitted once at the end of the owner-only file.
+    """
+    invalid = [key for key in updates if not key or not key.replace("_", "").isalnum()]
+    if invalid:
+        raise ValueError(f"invalid environment variable name: {invalid[0]}")
+    if any("\n" in value or "\r" in value for value in updates.values()):
+        raise ValueError("environment variable values must be single-line")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+
+    kept: list[str] = []
+    for line in lines:
+        parsed = _parse_line(line)
+        if parsed is not None and parsed[0] in updates:
+            continue
+        kept.append(line)
+    kept.extend(f"{key}={value}" for key, value in updates.items())
+    payload = "\n".join(kept).rstrip("\n") + "\n"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        path.chmod(0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    for key, value in updates.items():
+        os.environ[key] = value
 
 
 def is_valid_screenshot_key(value: str | None) -> bool:
