@@ -2,20 +2,48 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from persome import __version__
-from persome.api import build_api_app
+from persome.api import build_api_app, routes
 
 
-def test_health_returns_ok() -> None:
+def test_health_returns_ok(monkeypatch) -> None:
     """GET /health must return the documented envelope immediately."""
+    monkeypatch.setattr(
+        routes.ocr_health,
+        "inspect",
+        lambda capture: SimpleNamespace(enabled=True, ready=True, state="ready"),
+    )
     client = TestClient(build_api_app(auth_enabled=False))
     response = client.get("/health")
 
     assert response.status_code == 200
     body = response.json()
-    assert body == {"success": True, "data": {"status": "ok"}}
+    assert body == {"success": True, "data": {"status": "ok", "ocr": "ready"}}
+
+
+def test_health_reports_enabled_ocr_degradation(monkeypatch) -> None:
+    monkeypatch.setattr(
+        routes.ocr_health,
+        "inspect",
+        lambda capture: SimpleNamespace(
+            enabled=True,
+            ready=False,
+            state="permission_required",
+        ),
+    )
+    client = TestClient(build_api_app(auth_enabled=False))
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "status": "degraded",
+        "ocr": "permission_required",
+    }
 
 
 def test_openapi_reports_runtime_version() -> None:

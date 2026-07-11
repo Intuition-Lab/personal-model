@@ -112,7 +112,7 @@ screenshot_jpeg_quality = 80
 ax_depth = 100
 ax_timeout_seconds = 3
 
-enable_ocr_fallback = false
+enable_ocr_fallback = true
 ocr_tier = "tiny"                 # tiny | small | medium
 ocr_min_gap_seconds = 15.0
 ocr_structured = true
@@ -123,12 +123,13 @@ cmux_source_enabled = true
   from the trusted bearer-authenticated `/captures/ingest` producer and starts
   no OS watcher. The producer must obtain `PERSOME_LOCAL_API_TOKEN` through an
   owner-approved local secret channel and must never put it in a URL.
-- Accessibility permission is required for daemon AX capture. Screen Recording
-  is required for screenshot/OCR use.
-- OCR is off by default. When enabled, Paddle inference runs in a local worker
-  subprocess so a native crash does not kill the daemon. OCR text is backfilled
-  into capture search and consumed by timeline/modeling; pixels are not sent to
-  an LLM stage.
+- Accessibility permission is required for daemon AX capture. `install.sh`
+  requests Screen Recording and enables OCR after its worker initializes.
+- Paddle inference runs in a local worker subprocess so a native crash does not
+  kill the daemon. OCR text is backfilled into capture search and consumed by
+  timeline/modeling; pixels are not sent to an LLM stage. The source-level
+  config default remains off for unsupported/direct-library environments;
+  supported macOS installation writes the enabled state shown above.
 - `PERSOME_DISABLE_OCR=1` is the deployment kill switch.
 - `PERSOME_OCR_IN_PROCESS=1` is a debugging escape hatch that gives up crash
   isolation and should not be used for normal operation.

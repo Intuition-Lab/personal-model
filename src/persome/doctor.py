@@ -274,6 +274,48 @@ def check_ax_trust() -> Check:
     )
 
 
+def check_screen_recording(capture: config_mod.CaptureConfig) -> Check:
+    """Check the TCC permission required by OCR and screenshot capture."""
+    if platform.system() != "Darwin":
+        return Check("Screen Recording", "warn", "unknown (not macOS)")
+    required = capture.enable_ocr_fallback or capture.include_screenshot
+    if not required:
+        return Check("Screen Recording", "ok", "not required by current capture settings")
+    try:
+        from .capture.screen_recording import has_screen_recording
+
+        granted = has_screen_recording()
+    except Exception as exc:  # noqa: BLE001 - TCC probes must not crash doctor
+        return Check(
+            "Screen Recording",
+            "warn",
+            f"unknown (probe failed: {exc.__class__.__name__})",
+        )
+    if granted:
+        return Check("Screen Recording", "ok", "granted to the Persome runtime")
+    status: Status = "fail" if capture.enable_ocr_fallback else "warn"
+    return Check(
+        "Screen Recording",
+        status,
+        "not granted — System Settings → Privacy & Security → Screen Recording; "
+        "required for local OCR and screenshots",
+    )
+
+
+def check_ocr(capture: config_mod.CaptureConfig) -> Check:
+    """Check OCR configuration, kill switch, runtime, models, and permission."""
+    from .capture.ocr_health import inspect
+
+    health = inspect(capture)
+    if health.ready:
+        return Check("local OCR", "ok", health.detail)
+    if health.state == "disabled":
+        return Check("local OCR", "warn", health.detail)
+    if health.state == "runtime_unavailable" and platform.machine() != "arm64":
+        return Check("local OCR", "warn", f"{health.detail}; AX capture remains available")
+    return Check("local OCR", "fail", f"{health.state}: {health.detail}")
+
+
 def check_root_writable() -> Check:
     """The data root exists (created on demand) and accepts writes."""
     root = paths.root()
@@ -323,7 +365,8 @@ def run_checks(host: str, port: int) -> list[Check]:
     """Run every check in display order. Merges the env file into ``os.environ``
     first (same semantics as ``persome start``: pre-set shell vars win)."""
     env_file_mod.load_env_file(paths.env_file())
-    profile = _llm_profile()
+    cfg = config_mod.load()
+    profile = resolve_profile(cfg.model_for("default"))
     checks: list[Check] = [
         check_env_file(profile),
         check_local_api_token(),
@@ -333,6 +376,8 @@ def run_checks(host: str, port: int) -> list[Check]:
         check_base_url(profile),
         *check_helpers(),
         check_ax_trust(),
+        check_screen_recording(cfg.capture),
+        check_ocr(cfg.capture),
         check_root_writable(),
         check_port(host, port),
     ]

@@ -238,7 +238,7 @@ def test_last_capture_handles_corrupted_json(ac_root: Path) -> None:
 
 
 def test_status_renders_new_fields(ac_root: Path) -> None:
-    """Status output includes Version, Uptime, Health, and Last Capture."""
+    """Status output includes runtime, capture, permission, and OCR health."""
     runner = CliRunner()
     result = runner.invoke(cli.app, ["status"])
     assert result.exit_code == 0, result.output
@@ -246,6 +246,8 @@ def test_status_renders_new_fields(ac_root: Path) -> None:
     assert "Uptime" in result.output
     assert "Health" in result.output
     assert "Last Capture" in result.output
+    assert "OCR" in result.output
+    assert "Screen Recording" in result.output
 
 
 def test_status_shows_version(ac_root: Path) -> None:

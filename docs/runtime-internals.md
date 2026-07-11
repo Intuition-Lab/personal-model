@@ -70,10 +70,12 @@ belong in core.
 | `backup/` | optional SQLite snapshots |
 | `logs/` | component logs |
 
-OCR is off by default. When enabled it uses a child worker process managed by
-`capture/ocr_subprocess.py`; a native Paddle crash does not take down the daemon.
-The parent OCR submission thread only coordinates local inference and SQLite
-backfill.
+Supported installs enable OCR through `persome ocr setup`. It uses a child
+worker process managed by `capture/ocr_subprocess.py`; a native Paddle crash
+does not take down the daemon. The parent OCR submission thread only coordinates
+local inference and SQLite backfill. Quick health checks inspect configuration,
+Runtime, weights, kill switch, and Screen Recording without loading Paddle;
+`persome ocr status --check` verifies the worker engine.
 
 New code must use `paths.py`; tests use a temporary `PERSOME_ROOT` and must
 never inspect the real store.

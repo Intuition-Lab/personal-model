@@ -1,9 +1,9 @@
-"""Tests for the GET /permissions endpoint and the ax_trusted() probe.
+"""Tests for the GET /permissions endpoint and macOS TCC probes.
 
 The daemon is the process that reads the AX tree (via mac-ax-helper /
-mac-ax-watcher), so /permissions reports the daemon's own Accessibility trust —
-the authoritative signal the app's onboarding reflects instead of self-checking
-in the GUI process (which would create a redundant second TCC principal).
+mac-ax-watcher and captures focused-window pixels, so /permissions reports the
+daemon's own Accessibility and Screen Recording trust. This is the authoritative
+signal for onboarding instead of probing from a second GUI TCC principal.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import platform
 from fastapi.testclient import TestClient
 
 from persome.api import build_api_app
-from persome.capture import ax_capture
+from persome.capture import ax_capture, screen_recording
 
 
 def _make_client() -> TestClient:
@@ -22,18 +22,22 @@ def _make_client() -> TestClient:
 
 def test_permissions_reports_granted(monkeypatch) -> None:
     monkeypatch.setattr(ax_capture, "ax_trusted", lambda: True)
+    monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: True)
     resp = _make_client().get("/permissions")
     assert resp.status_code == 200
     body = resp.json()
     assert body["success"] is True
     assert body["data"]["accessibility"] == "granted"
+    assert body["data"]["screen_recording"] == "granted"
 
 
 def test_permissions_reports_denied(monkeypatch) -> None:
     monkeypatch.setattr(ax_capture, "ax_trusted", lambda: False)
+    monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: False)
     resp = _make_client().get("/permissions")
     assert resp.status_code == 200
     assert resp.json()["data"]["accessibility"] == "denied"
+    assert resp.json()["data"]["screen_recording"] == "denied"
 
 
 def test_ax_trusted_false_off_darwin() -> None:

@@ -20,13 +20,17 @@ compile the Swift AX helpers.
 | Permission | Required | Purpose | Effect when disabled |
 |---|---|---|---|
 | Accessibility | yes for live collection | reads the focused AX tree, application, window, selected control, and visible text | daemon remains healthy but produces no useful live captures |
-| Screen Recording | only for OCR or retained screenshots | supplies focused-window pixels to the local OCR worker or encrypted screenshot retention | AX collection continues; OCR-poor surfaces remain sparse and no screenshot can be retained |
+| Screen Recording | yes in the standard install | supplies focused-window pixels to the enabled local OCR worker and encrypted screenshot retention | AX collection continues, but health reports OCR degraded and AX-poor surfaces remain sparse |
 | Full Disk Access | no | not used | no effect |
 | Automation / Apple Events | no | not used by the Runtime | no effect |
 
 Grant permissions to the executable that launches Persome. If a terminal starts
 the daemon, grant that terminal. If launchd later owns the daemon, rerun
 `persome doctor` after the handoff and confirm live capture.
+
+`install.sh` requests Screen Recording during OCR onboarding. Verify the whole
+local path with `persome ocr status --check`; use `persome ocr disable` for an
+explicit opt-out.
 
 ## Local paths
 
@@ -55,6 +59,7 @@ upgrade, and gives its LaunchAgent umask `0077`.
 
 ```bash
 persome llm status --check
+persome ocr status --check
 persome doctor
 persome start
 persome status

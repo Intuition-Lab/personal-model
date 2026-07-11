@@ -73,8 +73,9 @@ This sample path is deliberately separate from the real-data path below.
 Requirements: macOS 13 or newer, Xcode Command Line Tools, and a Python build
 with SQLite 3.42+ (the installer verifies the secure FTS capability). The installer
 finds or installs `uv`, provisions Python 3.11-3.13, compiles the Swift AX
-helpers, generates the local screenshot-encryption key, and offers to register
-detected MCP clients. Its fallback `uv` download is version-pinned and checked
+helpers, generates the local screenshot-encryption key, enables and verifies
+local OCR, requests Screen Recording, and offers to register detected MCP
+clients. Its fallback `uv` download is version-pinned and checked
 against repository-pinned SHA-256 digests; the Runtime environment is installed
 from the committed `uv.lock`, and the complete build-backend closure is
 hash-constrained rather than resolved afresh.
@@ -85,15 +86,25 @@ cd persome-core
 bash install.sh
 
 persome doctor
+persome ocr status --check
 persome start
 persome model open
 ```
 
 Grant **Accessibility** to the terminal or app that launches Persome in
 **System Settings -> Privacy & Security -> Accessibility**. This permission is
-required to read focused AX text and structure. Grant **Screen Recording** only
-when enabling OCR fallback or screenshot retention; it supplies pixels to the
-local OCR worker. Persome does not require Full Disk Access.
+required to read focused AX text and structure. The installer enables bundled
+local OCR, requests **Screen Recording**, verifies the isolated OCR worker, and
+opens the correct settings pane when permission remains denied. OCR supplies
+text for AX-poor apps such as WeChat and Feishu; pixels never enter an LLM
+prompt. Persome does not require Full Disk Access.
+
+```bash
+# Recheck or repair OCR onboarding; disable is always explicit and reversible.
+persome ocr setup
+persome ocr status --check
+persome ocr disable
+```
 
 An LLM is optional for collection and BM25 recall, but required for semantic
 modeling. During installation, the provider wizard asks you to choose a service

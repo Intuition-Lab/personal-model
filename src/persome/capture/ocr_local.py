@@ -94,6 +94,11 @@ def _ocr_disabled() -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def disabled_by_environment() -> bool:
+    """Public, side-effect-free view of the emergency OCR kill switch."""
+    return _ocr_disabled()
+
+
 def _use_isolation() -> bool:
     """Whether OCR inference runs in the isolated crash-domain subprocess (default: yes).
 
@@ -143,6 +148,13 @@ def _model_dir(tier: str, kind: str) -> str | None:
         return None
     d = root / f"PP-OCRv6_{tier}_{kind}"
     return str(d) if (d / "inference.json").exists() else None
+
+
+def models_available(tier: str = DEFAULT_TIER) -> bool:
+    """Whether both bundled model graphs required by ``tier`` are present."""
+    if tier not in _VALID_TIERS:
+        return False
+    return _model_dir(tier, "det") is not None and _model_dir(tier, "rec") is not None
 
 
 def _build_engine(tier: str) -> Any | None:
@@ -209,7 +221,7 @@ def _get_engine(tier: str) -> Any | None:
     return engine
 
 
-def warm(tier: str = DEFAULT_TIER) -> None:
+def warm(tier: str = DEFAULT_TIER) -> bool:
     """Pre-build the engine so the first real capture doesn't pay graph-load latency.
 
     No-op when OCR is disabled (``PERSOME_DISABLE_OCR``): paddle is never imported.
@@ -218,20 +230,19 @@ def warm(tier: str = DEFAULT_TIER) -> None:
     """
     if _ocr_disabled():
         logger.info("local OCR disabled via PERSOME_DISABLE_OCR; skipping warm")
-        return
+        return False
     if not runtime_available():
         logger.info(
             "local OCR runtime unavailable in this build (no paddlepaddle wheel for this arch, "
             "e.g. x86_64 macOS); AX-poor apps run without OCR text — see #226. Skipping warm"
         )
-        return
+        return False
     if _use_isolation():
         from . import ocr_subprocess
 
-        ocr_subprocess.get_client().warm(tier)
-        return
+        return ocr_subprocess.get_client().warm(tier)
     with _lock:
-        _get_engine(tier)
+        return _get_engine(tier) is not None
 
 
 def recognize(image_bytes: bytes, tier: str = DEFAULT_TIER) -> str | None:

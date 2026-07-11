@@ -90,6 +90,7 @@ def test_polled_status_does_not_ping_without_explicit_check(ac_root, monkeypatch
     assert ordinary.status_code == 200
     assert ordinary.json()["data"]["models_checked"] is False
     assert ordinary.json()["data"]["models"] == {}
+    assert ordinary.json()["data"]["ocr"]["state"] == "disabled"
     assert calls_after_ordinary == []
     assert calls == ["timeline"]
     assert explicit.status_code == 200

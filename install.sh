@@ -515,10 +515,23 @@ PY
   echo "OPENAI_* embedding credentials in ${INSTALL_HOME}/env. Without them the"
   echo "daemon runs keyword (BM25) search only — no degraded behaviour."
   echo ""
-  echo "OCR for AX-poor apps (WeChat/Feishu) runs fully on-device (bundled"
-  echo "PP-OCRv6) — no key, no upload, no network."
   echo "A machine-local screenshot encryption key is generated automatically;"
   echo "you never need to enter or manage it manually."
+}
+
+configure_ocr() {
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Local OCR Setup"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  echo "Persome enables bundled PP-OCRv6 for AX-poor apps such as WeChat and"
+  echo "Feishu. Recognition runs in an isolated local process with no API key,"
+  echo "upload, or network model download. macOS will request Screen Recording."
+  echo ""
+  if ! PERSOME_ROOT="${INSTALL_HOME}" "${INSTALL_BIN_DIR}/persome" ocr setup --tier tiny; then
+    warn "OCR is not ready; grant Screen Recording and rerun 'persome ocr setup'"
+  fi
 }
 
 ensure_screenshot_key() {
@@ -583,11 +596,12 @@ Virtualenv   : ${VENV_DIR}
 CLI shim     : ${INSTALL_BIN_DIR}/persome
 
 Next steps:
-  1. Grant Accessibility permission to your terminal so Persome can read the
-     focused app's AX text and structure:
+  1. Grant Accessibility so Persome can read focused AX text and structure:
      System Settings -> Privacy & Security -> Accessibility
-     Screen Recording is optional. Grant it only for local OCR fallback or
-     encrypted screenshot retention; AX collection continues without it.
+     The installer requested Screen Recording for on-device OCR and encrypted
+     screenshot capture. If it is still denied, enable the terminal or Persome
+     runtime entry shown by macOS under:
+     System Settings -> Privacy & Security -> Screen Recording
      Persome does not require Full Disk Access or Automation permission.
   2. Start the daemon:
      persome start
@@ -610,6 +624,7 @@ Connect an agent (MCP):
 
 Run a health check any time:
   persome doctor
+  persome ocr status --check
 
 Change or verify the LLM provider:
   persome llm setup
@@ -643,6 +658,7 @@ main() {
   install_shim
   inject_detected_clients
   maybe_configure_llm
+  configure_ocr
   print_summary
 }
 

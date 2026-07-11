@@ -12,7 +12,7 @@
           "system"
         ],
         "summary": "Health",
-        "description": "Return the service liveness status.",
+        "description": "Return liveness plus the configured local-OCR readiness state.",
         "operationId": "health_health_get",
         "responses": {
           "200": {
@@ -57,7 +57,7 @@
           "system"
         ],
         "summary": "Permissions",
-        "description": "Return the daemon's current macOS permission state.\n\nAccessibility belongs to the daemon process because it launches the AX\nhelpers that read the tree. A GUI onboarding flow should poll this endpoint\ninstead of creating a second TCC identity. ``accessibility`` is ``granted``\nor ``denied`` and is always ``denied`` on non-macOS hosts.",
+        "description": "Return the daemon's current macOS permission state.\n\nAccessibility and Screen Recording belong to the daemon process. A GUI\nonboarding flow should poll this endpoint instead of creating another TCC\nidentity. Each field is ``granted`` or ``denied``.",
         "operationId": "permissions_permissions_get",
         "responses": {
           "200": {

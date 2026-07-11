@@ -82,7 +82,8 @@ def test_health_allowed_despite_malicious_origin() -> None:
         headers={"origin": "https://evil.com", "host": "attacker.com"},
     )
     assert response.status_code == 200
-    assert response.json() == {"success": True, "data": {"status": "ok"}}
+    assert response.json()["data"]["status"] == "ok"
+    assert "ocr" in response.json()["data"]
 
 
 def test_disabled_guard_does_not_block() -> None:
