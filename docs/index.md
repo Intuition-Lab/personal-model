@@ -15,6 +15,9 @@ and MCP clients.
 The image is a real Runtime screenshot generated from synthetic fixtures. The
 same viewer is available at `http://127.0.0.1:8742/model` after installation.
 
+**[Star Persome on GitHub](https://github.com/Persome-ai/persome-core)** to
+follow releases and help prioritize the next MCP integrations.
+
 ## Try the synthetic model
 
 ```bash

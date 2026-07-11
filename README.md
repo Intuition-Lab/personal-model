@@ -10,6 +10,9 @@ person, and serves that model to Chat and MCP agents.
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black)](#platform-support)
 [![MCP](https://img.shields.io/badge/interface-MCP-0b7285)](MCP.md)
 
+**[Star Persome on GitHub](https://github.com/Persome-ai/persome-core)** to
+follow the Runtime and help prioritize the next MCP integrations.
+
 ![Persome's local personal-model viewer showing synthetic Points, Lines, Faces, a Volume, and Root](docs/assets/persome-model-hero.png)
 
 _Actual `/model` screenshot produced by `scripts/sample_demo.py`: 4 synthetic
@@ -364,8 +367,12 @@ the right channel. Every commit requires DCO sign-off, and CI blocks known
 secrets, personal data, non-English source text, contract drift, lint failures,
 and offline regressions.
 
-If an inspectable, user-owned personal model is useful to your agents, star the
-repository and share the MCP client or workflow you want Persome to support.
+### Support Persome
+
+If an inspectable, user-owned personal model is useful to your agents,
+**[star Persome on GitHub](https://github.com/Persome-ai/persome-core)** and
+share the MCP client or workflow you want supported in
+[Discussions](https://github.com/Persome-ai/persome-core/discussions).
 
 ## License
 
