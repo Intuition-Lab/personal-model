@@ -36,6 +36,8 @@ _log = get("persome.daemon")
 # Cap the integrity_check work so a huge DB can't blow the <500ms startup
 # budget. The first N problems are enough to decide "corrupt".
 _INTEGRITY_CHECK_LIMIT = 100
+_CAPTURES_FTS_INTEGRITY_ERROR = "malformed inverted index for FTS5 table main.captures_fts"
+_CAPTURES_FTS_VTABLE_ERROR = "vtable constructor failed: captures_fts"
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,113 @@ def _db_corruption_reason(db_path: Path) -> str | None:
             conn.close()
 
 
+def _is_captures_fts_only_damage(results: list[str]) -> bool:
+    """Return whether every integrity failure belongs to the derived capture FTS."""
+    return bool(results) and all(
+        result.strip() == _CAPTURES_FTS_INTEGRITY_ERROR for result in results
+    )
+
+
+def _is_captures_fts_vtable_failure(error: sqlite3.DatabaseError) -> bool:
+    """Return whether SQLite could not construct only the derived capture FTS."""
+    return _CAPTURES_FTS_VTABLE_ERROR in str(error)
+
+
+def _rebuild_captures_fts_via_schema_reset(db_path: Path) -> None:
+    """Recover a derived capture FTS that an older SQLite cannot drop normally."""
+    from .store import fts
+
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fts.reset_corrupt_captures_fts_schema(conn)
+        conn.commit()
+        # Schema reset makes the old FTS shadow pages unreachable. VACUUM is
+        # required before integrity_check will accept the rebuilt database.
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fts.rebuild_captures_fts(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _try_rebuild_captures_fts(db_path: Path) -> bool | None:
+    """Repair a malformed derived capture FTS index without touching user data.
+
+    The raw ``captures`` table is authoritative; ``captures_fts`` is an
+    external-content FTS5 index that can be recreated from it. ``None`` means
+    the data is intact but the rebuild must be retried (for example, another
+    local reader owns the database); ``False`` means the failure was not
+    limited to this derived index.
+    """
+    conn: sqlite3.Connection | None = None
+    captures_fts_only = False
+    requires_schema_reset = False
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            results = [
+                str(row[0])
+                for row in conn.execute(
+                    f"PRAGMA integrity_check({_INTEGRITY_CHECK_LIMIT})"
+                ).fetchall()
+            ]
+        except sqlite3.DatabaseError as exc:
+            if not _is_captures_fts_vtable_failure(exc):
+                raise
+            # Some bundled SQLite versions reject PRAGMA integrity_check before
+            # returning the equivalent malformed-index row. The table name in
+            # this error is still narrow enough to rebuild the derived index.
+            captures_fts_only = True
+            requires_schema_reset = True
+        else:
+            captures_fts_only = _is_captures_fts_only_damage(results)
+        if not captures_fts_only:
+            return False
+
+        from .store import fts
+
+        if requires_schema_reset:
+            conn.close()
+            conn = None
+            _rebuild_captures_fts_via_schema_reset(db_path)
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+            fts.rebuild_captures_fts(conn)
+            conn.commit()
+        # Older macOS SQLite builds can retain the malformed virtual-table
+        # constructor in this connection after DROP/CREATE. Validate from a
+        # fresh connection so that cache cannot turn a successful rebuild into
+        # a rollback.
+        if conn is not None:
+            conn.close()
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        repaired = [
+            str(row[0])
+            for row in conn.execute(f"PRAGMA integrity_check({_INTEGRITY_CHECK_LIMIT})").fetchall()
+        ]
+        if repaired != ["ok"]:
+            return None if _is_captures_fts_only_damage(repaired) else False
+        return True
+    except (RuntimeError, sqlite3.DatabaseError) as exc:
+        if conn is not None and conn.in_transaction:
+            conn.rollback()
+        _log.warning(
+            "integrity: derived captures FTS repair failed",
+            extra={"path": str(db_path), "error": str(exc)},
+        )
+        return None if captures_fts_only else False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _config_corruption_reason(config_path: Path) -> str | None:
     """Return a reason string if the config is unparseable, else ``None``.
 
@@ -169,6 +278,8 @@ def check_and_recover() -> list[QuarantinedFile]:
 
     db_path = paths.index_db()
     config_path = paths.config_file()
+    rebuilt_captures_fts = False
+    deferred_captures_fts_repair = False
 
     try:
         db_reason = _db_corruption_reason(db_path)
@@ -176,20 +287,34 @@ def check_and_recover() -> list[QuarantinedFile]:
         db_reason = None
         _log.warning("integrity: DB check errored, assuming healthy", extra={"error": str(e)})
     if db_reason is not None:
-        dest = _quarantine(db_path)
-        quarantined.append(
-            QuarantinedFile(
-                kind="database",
-                original_path=str(db_path),
-                quarantine_path=str(dest),
-                reason=db_reason,
+        capture_fts_repair = _try_rebuild_captures_fts(db_path)
+        if capture_fts_repair is True:
+            rebuilt_captures_fts = True
+            _log.warning(
+                "integrity: rebuilt derived captures FTS index",
+                extra={"path": str(db_path), "reason": db_reason},
             )
-        )
-        _log.warning(
-            "integrity: quarantined corrupt database",
-            extra={"path": str(db_path), "moved_to": str(dest), "reason": db_reason},
-        )
-        # The DB is recreated lazily on the next fts.connect(); nothing to do.
+        elif capture_fts_repair is None:
+            deferred_captures_fts_repair = True
+            _log.warning(
+                "integrity: deferred derived captures FTS repair",
+                extra={"path": str(db_path), "reason": db_reason},
+            )
+        else:
+            dest = _quarantine(db_path)
+            quarantined.append(
+                QuarantinedFile(
+                    kind="database",
+                    original_path=str(db_path),
+                    quarantine_path=str(dest),
+                    reason=db_reason,
+                )
+            )
+            _log.warning(
+                "integrity: quarantined corrupt database",
+                extra={"path": str(db_path), "moved_to": str(dest), "reason": db_reason},
+            )
+            # The DB is recreated lazily on the next fts.connect(); nothing to do.
 
     try:
         config_reason = _config_corruption_reason(config_path)
@@ -221,7 +346,17 @@ def check_and_recover() -> list[QuarantinedFile]:
         extra={
             "elapsed_ms": round(elapsed_ms, 1),
             "recovered": len(quarantined),
-            "status": "recovered" if quarantined else "ok",
+            "derived_repaired": int(rebuilt_captures_fts),
+            "derived_repair_deferred": int(deferred_captures_fts_repair),
+            "status": (
+                "recovered"
+                if quarantined
+                else "repaired_derived"
+                if rebuilt_captures_fts
+                else "degraded_derived"
+                if deferred_captures_fts_repair
+                else "ok"
+            ),
         },
     )
     return quarantined
