@@ -2012,6 +2012,7 @@ def config() -> None:
 @app.command()
 def chat() -> None:
     """Interactive chat with memory-aware tool calling."""
+    env_file_mod.load_env_file(paths.env_file())
     cfg = _init()
     from .chat import run_chat_sync
 
