@@ -81,6 +81,21 @@ class TestViewPage:
         assert layout.media_type == "text/javascript"
         assert css.media_type == "text/css"
 
+    def test_viewer_interaction_contract_prefers_labels_over_lines(self, ac_root):
+        page = routes.model_view().body.decode()
+        viewer = routes.model_asset("viewer.js").body.decode()
+        css = routes.model_asset("viewer.css").body.decode()
+
+        assert 'id="canvas" aria-hidden="true"' not in page
+        assert 'document.createElement("button")' in viewer
+        assert 'element.setAttribute("aria-controls", "detail")' in viewer
+        assert 'element.setAttribute("aria-expanded", "false")' in viewer
+        assert 'event.key === "Escape"' in viewer
+        assert "raycaster.params.Line" not in viewer
+        assert "pickables.push(line)" not in viewer
+        assert "pointer-events: auto" in css
+        assert '.model-label[aria-expanded="true"]' in css
+
 
 class TestNodeReceipts:
     def test_snapshot_point_returns_its_exact_receipt(self, ac_root):

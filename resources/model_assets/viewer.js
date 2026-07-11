@@ -39,6 +39,7 @@ const renderer = new THREE.WebGLRenderer({
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.domElement.setAttribute("aria-hidden", "true");
 canvasHost.appendChild(renderer.domElement);
 
 const labelRenderer = new CSS2DRenderer();
@@ -69,10 +70,13 @@ let minTime = new Date();
 let maxTime = new Date();
 let playTimer = null;
 let pointerDown = null;
+let hoverPointer = null;
+let hoverDirty = false;
 let selected = null;
 let portraitMode = null;
 let labels = [];
 let pickables = [];
+let selectionTargets = new Map();
 let positions = new Map();
 let items = new Map();
 let layerObjects = freshLayerObjects();
@@ -80,8 +84,8 @@ let currentLayout = null;
 let layoutRadius = 6;
 let framedRadius = 0;
 const layerVisible = { points: true, lines: true, faces: true, volumes: true, root: true };
+const kindLayers = { point: "points", context: "points", face: "faces", volume: "volumes", root: "root" };
 const raycaster = new THREE.Raycaster();
-raycaster.params.Line.threshold = 0.12;
 const pointer = new THREE.Vector2();
 
 function freshLayerObjects() {
@@ -128,40 +132,58 @@ function register(object, layer) {
   return object;
 }
 
+function selectionKey(kind, id) {
+  return `${kind}:${id}`;
+}
+
+function registerSelectionTarget(kind, id, target) {
+  const key = selectionKey(kind, id);
+  target.userData.ref = { kind, id };
+  const targets = selectionTargets.get(key) || [];
+  targets.push(target);
+  selectionTargets.set(key, targets);
+}
+
 function registerPickable(object, layer, kind, item) {
-  object.userData.ref = { kind, id: item.id };
+  registerSelectionTarget(kind, item.id, object);
   register(object, layer);
   pickables.push(object);
-  items.set(`${kind}:${item.id}`, item);
+  items.set(selectionKey(kind, item.id), item);
   return object;
 }
 
-function addLabel(text, position, layer, priority, context = false) {
-  const element = document.createElement("div");
+function addLabel(text, position, layer, priority, kind, item, context = false) {
+  const element = document.createElement("button");
+  element.type = "button";
   element.className = `model-label${context ? " context" : ""}`;
   element.textContent = shortLabel(text);
   element.title = String(text || "");
+  element.dataset.kind = kind;
+  element.setAttribute("aria-label", `Open ${kind} details: ${shortLabel(text, 80)}`);
+  element.setAttribute("aria-controls", "detail");
+  element.setAttribute("aria-expanded", "false");
   const label = new CSS2DObject(element);
   label.position.copy(position);
   label.userData.priority = priority;
+  registerSelectionTarget(kind, item.id, label);
+  element.addEventListener("pointerdown", (event) => event.stopPropagation());
+  element.addEventListener("click", (event) => {
+    event.stopPropagation();
+    showDetails(kind, item);
+  });
   register(label, layer);
   labels.push(label);
   return label;
 }
 
-function addLine(start, end, color, opacity, dashed, item, layer = "lines") {
+function addLine(start, end, color, opacity, dashed, layer = "lines") {
   const geometry = new THREE.BufferGeometry().setFromPoints([start, end]);
   const material = dashed
     ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize: 0.12, gapSize: 0.09 })
     : new THREE.LineBasicMaterial({ color, transparent: true, opacity });
   const line = new THREE.Line(geometry, material);
   if (dashed) line.computeLineDistances();
-  if (item) {
-    line.userData.ref = { kind: "line", id: item.id };
-    items.set(`line:${item.id}`, item);
-  }
   register(line, layer);
-  if (item) pickables.push(line);
   return line;
 }
 
@@ -177,6 +199,7 @@ function disposeGraph() {
   scene.add(graph);
   labels = [];
   pickables = [];
+  selectionTargets = new Map();
   positions = new Map();
   items = new Map();
   layerObjects = freshLayerObjects();
@@ -198,7 +221,14 @@ function addPoint(point, position, baseRadius, showLabel, promoted) {
   const mesh = registerPickable(new THREE.Mesh(geometry, material), "points", "point", point);
   mesh.position.copy(position);
   if (showLabel) {
-    addLabel(point.content, position.clone().add(new THREE.Vector3(0, radius + 0.16, 0)), "points", active ? 55 : 25);
+    addLabel(
+      point.content,
+      position.clone().add(new THREE.Vector3(0, radius + 0.16, 0)),
+      "points",
+      active ? 55 : 25,
+      "point",
+      point
+    );
   }
 }
 
@@ -217,7 +247,15 @@ function addContextNode(id) {
   );
   mesh.position.copy(position);
   if (id === "self" || hash(id) < 0.16) {
-    addLabel(item.content, position.clone().add(new THREE.Vector3(0, 0.24, 0)), "points", 30, true);
+    addLabel(
+      item.content,
+      position.clone().add(new THREE.Vector3(0, 0.24, 0)),
+      "points",
+      30,
+      "context",
+      item,
+      true
+    );
   }
 }
 
@@ -263,8 +301,17 @@ function addFace(face, showLabel) {
     face
   );
   node.position.copy(position);
-  if (showLabel) addLabel(face.signature, position.clone().add(new THREE.Vector3(0, 0.4, 0)), "faces", 75);
-  memberPositions.forEach((member) => addLine(member, position, COLORS.hierarchy, 0.1, true, null));
+  if (showLabel) {
+    addLabel(
+      face.signature,
+      position.clone().add(new THREE.Vector3(0, 0.4, 0)),
+      "faces",
+      75,
+      "face",
+      face
+    );
+  }
+  memberPositions.forEach((member) => addLine(member, position, COLORS.hierarchy, 0.1, true));
 }
 
 function addVolume(volume, showLabel) {
@@ -287,10 +334,19 @@ function addVolume(volume, showLabel) {
     volume
   );
   mesh.position.copy(position);
-  if (showLabel) addLabel(volume.signature, position.clone().add(new THREE.Vector3(0, 0.55, 0)), "volumes", 90);
+  if (showLabel) {
+    addLabel(
+      volume.signature,
+      position.clone().add(new THREE.Vector3(0, 0.55, 0)),
+      "volumes",
+      90,
+      "volume",
+      volume
+    );
+  }
   const memberIds = currentLayout?.volumeFaceIds.get(volume.id) || [];
   memberIds.map((id) => positions.get(id)).filter(Boolean)
-    .forEach((member) => addLine(member, position, COLORS.volumes, 0.22, false, null));
+    .forEach((member) => addLine(member, position, COLORS.volumes, 0.22, false));
 }
 
 function addRoot(root) {
@@ -311,10 +367,17 @@ function addRoot(root) {
     root
   );
   mesh.position.copy(position);
-  addLabel(root.signature, position.clone().add(new THREE.Vector3(0, 0.66, 0)), "root", 120);
+  addLabel(
+    root.signature,
+    position.clone().add(new THREE.Vector3(0, 0.66, 0)),
+    "root",
+    120,
+    "root",
+    root
+  );
   const parentIds = currentLayout?.rootVolumeIds || [];
   parentIds.map((id) => positions.get(id)).filter(Boolean)
-    .forEach((member) => addLine(member, position, COLORS.root, 0.32, false, null));
+    .forEach((member) => addLine(member, position, COLORS.root, 0.32, false));
 }
 
 function addModelLine(line) {
@@ -327,7 +390,7 @@ function addModelLine(line) {
   const targetCluster = currentLayout?.pointClusterById.get(line.target);
   const sameCluster = sourceCluster && sourceCluster === targetCluster;
   const opacity = evolution ? (sameCluster ? 0.34 : 0.08) : 0.34;
-  addLine(start, end, evolution ? COLORS.lines : 0x6ebf8e, opacity, !evolution, line);
+  addLine(start, end, evolution ? COLORS.lines : 0x6ebf8e, opacity, !evolution);
 }
 
 function addGround() {
@@ -433,6 +496,38 @@ function renderStatus() {
   if (model.build?.status) statusEl.append(`  ·  Build ${model.build.status}`);
 }
 
+function pauseAutoRotate() {
+  if (!controls.autoRotate) return;
+  controls.autoRotate = false;
+  document.getElementById("rotate").setAttribute("aria-pressed", "false");
+}
+
+function syncSelectionState() {
+  const activeKey = selected ? selectionKey(selected.kind, selected.id) : null;
+  selectionTargets.forEach((targets, key) => {
+    const active = key === activeKey;
+    targets.forEach((target) => {
+      if (target.element) {
+        target.element.setAttribute("aria-expanded", String(active));
+      } else if (target.isMesh) {
+        target.scale.setScalar(active ? 1.32 : 1);
+      }
+    });
+  });
+  window.__persomeInteractionState = {
+    linePickables: pickables.filter((object) => object.isLine).length,
+    nodePickables: pickables.length,
+    interactiveLabels: labels.filter((label) => Boolean(label.userData.ref)).length,
+    selected: selected ? { ...selected } : null,
+  };
+}
+
+function clearSelection() {
+  selected = null;
+  detailEl.hidden = true;
+  syncSelectionState();
+}
+
 function applyLayerVisibility() {
   Object.entries(layerObjects).forEach(([layer, objects]) => {
     objects.forEach((object) => {
@@ -443,6 +538,15 @@ function applyLayerVisibility() {
   document.querySelectorAll("[data-layer]").forEach((button) => {
     button.setAttribute("aria-pressed", String(layerVisible[button.dataset.layer]));
   });
+  if (selected) {
+    const key = selectionKey(selected.kind, selected.id);
+    const layer = kindLayers[selected.kind];
+    if (!items.has(key) || (layer && !layerVisible[layer])) {
+      clearSelection();
+      return;
+    }
+  }
+  syncSelectionState();
 }
 
 function appendMeta(label, value) {
@@ -466,6 +570,8 @@ function receiptValues(item) {
 
 function showDetails(kind, item) {
   selected = { kind, id: item.id };
+  pauseAutoRotate();
+  syncSelectionState();
   detailKindEl.textContent = kind;
   detailTitleEl.textContent = item.content || item.signature || item.label || item.id;
   detailMetaEl.replaceChildren();
@@ -589,7 +695,14 @@ function resetCamera() {
 
 function cullLabels() {
   const occupied = [];
-  const maxLabels = window.innerWidth < 760 ? 8 : 20;
+  const mobile = window.innerWidth < 760;
+  const maxLabels = mobile ? 8 : 20;
+  const safeArea = {
+    left: mobile ? 8 : 6,
+    right: window.innerWidth - (mobile ? 8 : 6),
+    top: mobile ? 144 : 104,
+    bottom: window.innerHeight - (mobile ? 70 : 64),
+  };
   let shown = 0;
   const projected = new THREE.Vector3();
   const candidates = labels.filter((label) => label.visible).map((label) => {
@@ -597,16 +710,25 @@ function cullLabels() {
     projected.project(camera);
     const x = (projected.x * 0.5 + 0.5) * window.innerWidth;
     const y = (-projected.y * 0.5 + 0.5) * window.innerHeight;
-    const width = Math.min(window.innerWidth < 760 ? 130 : 220, (label.element.textContent.length * 6.2) + 12);
-    return { label, x, y, width, priority: label.userData.priority || 0, depth: projected.z };
+    const maxWidth = mobile ? 130 : 220;
+    const fallbackWidth = (label.element.textContent.length * 6.2) + 16;
+    const width = Math.min(maxWidth, Math.max(32, label.element.offsetWidth || fallbackWidth));
+    const height = Math.max(21, label.element.offsetHeight || 21);
+    return { label, x, y, width, height, priority: label.userData.priority || 0, depth: projected.z };
   }).sort((a, b) => b.priority - a.priority);
 
   candidates.forEach((candidate) => {
-    const { label, x, y, width, depth } = candidate;
-    const box = { x0: x - width / 2, x1: x + width / 2, y0: y - 9, y1: y + 9 };
+    const { label, x, y, width, height, depth } = candidate;
+    const box = { x0: x - width / 2, x1: x + width / 2, y0: y - height / 2, y1: y + height / 2 };
     const overlaps = occupied.some((other) => box.x0 < other.x1 && box.x1 > other.x0 && box.y0 < other.y1 && box.y1 > other.y0);
-    const hidden = depth < -1 || depth > 1 || overlaps || shown >= maxLabels;
-    label.element.classList.toggle("hidden", hidden);
+    const outsideSafeArea = box.x0 < safeArea.left || box.x1 > safeArea.right
+      || box.y0 < safeArea.top || box.y1 > safeArea.bottom;
+    const hidden = depth < -1 || depth > 1 || outsideSafeArea || overlaps || shown >= maxLabels;
+    if (label.element.classList.contains("hidden") !== hidden) {
+      label.element.classList.toggle("hidden", hidden);
+      label.element.setAttribute("aria-hidden", String(hidden));
+      label.element.tabIndex = hidden ? -1 : 0;
+    }
     if (!hidden) {
       occupied.push(box);
       shown += 1;
@@ -649,10 +771,7 @@ document.getElementById("rotate").addEventListener("click", (event) => {
   event.currentTarget.setAttribute("aria-pressed", String(controls.autoRotate));
 });
 document.getElementById("reset").addEventListener("click", resetCamera);
-document.getElementById("close-detail").addEventListener("click", () => {
-  selected = null;
-  detailEl.hidden = true;
-});
+document.getElementById("close-detail").addEventListener("click", clearSelection);
 
 slider.addEventListener("input", () => {
   updateCutoff();
@@ -680,27 +799,57 @@ document.getElementById("play").addEventListener("click", (event) => {
   }, 240);
 });
 
+function pickAt(event) {
+  const bounds = renderer.domElement.getBoundingClientRect();
+  if (!bounds.width || !bounds.height) return null;
+  pointer.x = ((event.clientX - bounds.left) / bounds.width) * 2 - 1;
+  pointer.y = -((event.clientY - bounds.top) / bounds.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  return raycaster.intersectObjects(pickables.filter((object) => object.visible), false)[0] || null;
+}
+
 renderer.domElement.addEventListener("pointerdown", (event) => {
   pointerDown = { x: event.clientX, y: event.clientY };
+  hoverDirty = false;
+  renderer.domElement.style.cursor = "grabbing";
+});
+renderer.domElement.addEventListener("pointermove", (event) => {
+  if (pointerDown) return;
+  hoverPointer = { clientX: event.clientX, clientY: event.clientY };
+  hoverDirty = true;
+});
+renderer.domElement.addEventListener("pointerleave", () => {
+  hoverPointer = null;
+  hoverDirty = false;
+  if (!pointerDown) renderer.domElement.style.cursor = "grab";
+});
+renderer.domElement.addEventListener("pointercancel", () => {
+  pointerDown = null;
+  hoverPointer = null;
+  hoverDirty = false;
+  renderer.domElement.style.cursor = "grab";
 });
 renderer.domElement.addEventListener("pointerup", (event) => {
   if (!pointerDown) return;
   const movement = Math.abs(event.clientX - pointerDown.x) + Math.abs(event.clientY - pointerDown.y);
   pointerDown = null;
-  if (movement > 5) return;
-  const bounds = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((event.clientX - bounds.left) / bounds.width) * 2 - 1;
-  pointer.y = -((event.clientY - bounds.top) / bounds.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const hit = raycaster.intersectObjects(pickables.filter((object) => object.visible), false)[0];
+  if (movement > 5) {
+    renderer.domElement.style.cursor = "grab";
+    return;
+  }
+  const hit = pickAt(event);
+  renderer.domElement.style.cursor = hit ? "pointer" : "grab";
   if (!hit?.object.userData.ref) {
-    selected = null;
-    detailEl.hidden = true;
+    clearSelection();
     return;
   }
   const ref = hit.object.userData.ref;
-  const item = items.get(`${ref.kind}:${ref.id}`);
+  const item = items.get(selectionKey(ref.kind, ref.id));
   if (item) showDetails(ref.kind, item);
+});
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && selected) clearSelection();
 });
 
 window.addEventListener("resize", () => {
@@ -723,6 +872,10 @@ window.addEventListener("unhandledrejection", (event) => {
 
 function animate() {
   controls.update();
+  if (hoverDirty && hoverPointer && !pointerDown) {
+    renderer.domElement.style.cursor = pickAt(hoverPointer) ? "pointer" : "grab";
+    hoverDirty = false;
+  }
   cullLabels();
   renderer.render(scene, camera);
   labelRenderer.render(scene, camera);

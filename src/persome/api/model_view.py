@@ -17,7 +17,7 @@ MEMORY_VIEW_HTML = """<!doctype html>
 </head>
 <body>
   <main id="viewer" aria-label="Persome personal model explorer">
-    <div id="canvas" aria-hidden="true"></div>
+    <div id="canvas"></div>
 
     <header class="topbar">
       <div class="brand">
@@ -48,7 +48,7 @@ MEMORY_VIEW_HTML = """<!doctype html>
       <div><span class="swatch root"></span><b>Root</b><span>current personal model</span></div>
     </aside>
 
-    <aside id="detail" class="detail" aria-live="polite" hidden>
+    <aside id="detail" class="detail" aria-labelledby="detail-title" aria-live="polite" hidden>
       <button id="close-detail" class="icon-button close" type="button" aria-label="Close details" title="Close details">×</button>
       <p id="detail-kind" class="detail-kind"></p>
       <h1 id="detail-title"></h1>

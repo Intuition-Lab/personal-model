@@ -46,6 +46,8 @@ button {
 
 #canvas canvas {
   display: block;
+  cursor: grab;
+  touch-action: none;
 }
 
 .topbar {
@@ -312,18 +314,48 @@ button {
 }
 
 .model-label {
+  --label-accent: var(--text);
+  appearance: none;
+  min-height: 21px;
   max-width: 220px;
+  margin: 0;
   overflow: hidden;
-  padding: 2px 5px;
+  padding: 2px 6px;
   border: 1px solid rgba(71, 77, 88, 0.76);
   border-radius: 4px;
   background: rgba(8, 10, 13, 0.82);
   color: var(--text);
+  cursor: pointer;
   font-size: 10px;
   line-height: 15px;
+  pointer-events: auto;
+  text-align: left;
   text-overflow: ellipsis;
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
   white-space: nowrap;
-  pointer-events: none;
+}
+
+.model-label[data-kind="point"] { --label-accent: var(--point); }
+.model-label[data-kind="face"] { --label-accent: var(--face); }
+.model-label[data-kind="volume"] { --label-accent: var(--volume); }
+.model-label[data-kind="root"] { --label-accent: var(--root); }
+.model-label[data-kind="context"] { --label-accent: var(--muted); }
+
+.model-label:hover,
+.model-label:focus-visible {
+  border-color: var(--label-accent);
+  background: rgba(27, 31, 38, 0.96);
+}
+
+.model-label[aria-expanded="true"] {
+  border-color: var(--label-accent);
+  background: rgba(27, 31, 38, 0.96);
+  box-shadow: 0 0 0 1px var(--label-accent), 0 5px 16px rgba(0, 0, 0, 0.34);
+}
+
+.model-label:focus-visible {
+  outline: 2px solid var(--label-accent);
+  outline-offset: 2px;
 }
 
 .model-label.context {
@@ -331,7 +363,8 @@ button {
 }
 
 .model-label.hidden {
-  display: none;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 @media (max-width: 760px) {
@@ -394,7 +427,9 @@ button {
   }
 
   .model-label {
+    min-height: 28px;
     max-width: 130px;
+    padding: 5px 7px;
     font-size: 9px;
   }
 }

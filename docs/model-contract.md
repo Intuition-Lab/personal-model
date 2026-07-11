@@ -60,6 +60,11 @@ The layout is append-stable for normal chronological growth: existing nodes keep
 coordinates while later evidence expands the surrounding cloud. `window.__persomeLayoutState`
 exposes aggregate layout health for local visual smoke tests without exposing node content or IDs.
 
+Visible node labels and their Point, Face, Volume, Root, or context meshes open the same provenance
+detail panel. Labels are keyboard-focusable; Escape closes the selection. Lines remain visual
+evidence of evolution, relation, and hierarchy and are intentionally excluded from pointer picking.
+`window.__persomeInteractionState` exposes aggregate interaction counts for local smoke tests.
+
 ## Evidence sources
 
 Relation edges may carry the nullable triplet `source_kind`, `source_id`, and `source_receipt`.
