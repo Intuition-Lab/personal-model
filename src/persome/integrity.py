@@ -134,6 +134,30 @@ def _is_captures_fts_vtable_failure(error: sqlite3.DatabaseError) -> bool:
     return _CAPTURES_FTS_VTABLE_ERROR in str(error)
 
 
+def _rebuild_captures_fts_via_schema_reset(db_path: Path) -> None:
+    """Recover a derived capture FTS that an older SQLite cannot drop normally."""
+    from .store import fts
+
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fts.reset_corrupt_captures_fts_schema(conn)
+        conn.commit()
+        # Schema reset makes the old FTS shadow pages unreachable. VACUUM is
+        # required before integrity_check will accept the rebuilt database.
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fts.rebuild_captures_fts(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _try_rebuild_captures_fts(db_path: Path) -> bool | None:
     """Repair a malformed derived capture FTS index without touching user data.
 
@@ -145,6 +169,7 @@ def _try_rebuild_captures_fts(db_path: Path) -> bool | None:
     """
     conn: sqlite3.Connection | None = None
     captures_fts_only = False
+    requires_schema_reset = False
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
         try:
@@ -161,6 +186,7 @@ def _try_rebuild_captures_fts(db_path: Path) -> bool | None:
             # returning the equivalent malformed-index row. The table name in
             # this error is still narrow enough to rebuild the derived index.
             captures_fts_only = True
+            requires_schema_reset = True
         else:
             captures_fts_only = _is_captures_fts_only_damage(results)
         if not captures_fts_only:
@@ -168,14 +194,20 @@ def _try_rebuild_captures_fts(db_path: Path) -> bool | None:
 
         from .store import fts
 
-        conn.execute("BEGIN IMMEDIATE")
-        fts.rebuild_captures_fts(conn)
-        conn.commit()
+        if requires_schema_reset:
+            conn.close()
+            conn = None
+            _rebuild_captures_fts_via_schema_reset(db_path)
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+            fts.rebuild_captures_fts(conn)
+            conn.commit()
         # Older macOS SQLite builds can retain the malformed virtual-table
         # constructor in this connection after DROP/CREATE. Validate from a
         # fresh connection so that cache cannot turn a successful rebuild into
         # a rollback.
-        conn.close()
+        if conn is not None:
+            conn.close()
         conn = sqlite3.connect(db_path, timeout=5.0)
         repaired = [
             str(row[0])

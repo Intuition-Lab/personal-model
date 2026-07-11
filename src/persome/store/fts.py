@@ -20,6 +20,13 @@ logger = get("persome.store")
 _MIN_SECURE_FTS_SQLITE = (3, 42, 0)
 _FTS_TABLES = ("entries", "captures_fts")
 _SECURE_FTS_MIGRATION_VERSION = 20260711
+_CAPTURES_FTS_OBJECTS = (
+    "captures_fts",
+    "captures_fts_data",
+    "captures_fts_idx",
+    "captures_fts_docsize",
+    "captures_fts_config",
+)
 
 _CAPTURES_FTS_STATEMENTS = tuple(
     dedent(statement).strip()
@@ -391,6 +398,30 @@ def rebuild_captures_fts(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
     conn.execute("INSERT INTO captures_fts(captures_fts) VALUES('rebuild')")
     conn.execute("INSERT INTO captures_fts(captures_fts, rank) VALUES('secure-delete', 1)")
+
+
+def reset_corrupt_captures_fts_schema(conn: sqlite3.Connection) -> None:
+    """Remove only an unloadable derived capture FTS schema.
+
+    Older SQLite builds can refuse to instantiate a damaged FTS5 table, which
+    makes ordinary ``DROP TABLE`` unavailable. The caller must commit, VACUUM,
+    reopen, and call ``rebuild_captures_fts`` immediately after this narrow
+    fallback. It never touches canonical ``captures`` rows.
+    """
+    conn.execute("SELECT 1 FROM captures LIMIT 1")
+    for trigger in ("captures_ai", "captures_ad", "captures_au"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+    placeholders = ", ".join("?" for _ in _CAPTURES_FTS_OBJECTS)
+    conn.execute("PRAGMA writable_schema=ON")
+    try:
+        conn.execute(
+            f"DELETE FROM sqlite_master WHERE name IN ({placeholders})",  # noqa: S608
+            _CAPTURES_FTS_OBJECTS,
+        )
+        conn.execute(f"PRAGMA schema_version={schema_version + 1}")
+    finally:
+        conn.execute("PRAGMA writable_schema=OFF")
 
 
 def purge_deleted_content(conn: sqlite3.Connection) -> None:

@@ -108,6 +108,32 @@ def test_malformed_derived_captures_fts_is_rebuilt_without_quarantine(ac_root: P
     assert [hit.id for hit in hits] == ["capture-derived-fts-test"]
 
 
+def test_schema_reset_rebuilds_unloadable_derived_captures_fts(ac_root: Path) -> None:
+    _make_healthy_db()
+    with fts.cursor() as conn:
+        fts.insert_capture(
+            conn,
+            id="capture-schema-reset-test",
+            timestamp="2026-07-12T00:00:00+00:00",
+            app_name="Test App",
+            bundle_id="com.persome.test",
+            window_title="Schema reset recovery",
+            focused_role="AXTextArea",
+            focused_value="needle",
+            visible_text="needle survives a schema reset",
+            url="https://example.test/schema-reset",
+        )
+        conn.execute("DELETE FROM captures_fts_data WHERE id > 1")
+
+    integrity._rebuild_captures_fts_via_schema_reset(paths.index_db())
+
+    with fts.cursor() as conn:
+        assert [row[0] for row in conn.execute("PRAGMA integrity_check")] == ["ok"]
+        assert conn.execute("SELECT count(*) FROM captures").fetchone()[0] == 1
+        hits = fts.search_captures(conn, query="needle")
+    assert [hit.id for hit in hits] == ["capture-schema-reset-test"]
+
+
 def test_derived_captures_fts_repair_defers_instead_of_quarantining(
     ac_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
