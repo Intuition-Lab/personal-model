@@ -420,7 +420,7 @@ def status() -> None:
         ping = _format_ping(ping_results.get(stage))
         table.add_row(
             f"Model ({stage})",
-            f"{profile.provider}/{profile.model} [{profile.protocol}]   {ping}",
+            f"{profile.provider}/{profile.model} ({profile.protocol})   {ping}",
         )
 
     console.print(table)
