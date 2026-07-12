@@ -48,6 +48,11 @@ file_name, tags, confidence, conflicted, receipt
 `is_latest` identifies a current chain head; historical Points remain available
 for audit and time travel.
 
+The memory owner is the reserved identity `self`, not a person Point. Names and
+handles learned from quoted owner-identity evidence resolve to `self`; if an
+owner alias was previously minted as a person, promotion retires that live
+projection while preserving its historical Point receipts.
+
 ### Line
 
 Lines have two forms:
@@ -70,7 +75,9 @@ receipts. Promotion requires stable repeated support.
 ### Volume
 
 A Volume is one active level-2 cross-domain schema. It relates behavior across
-otherwise separate topics and carries the same audit fields as a Face.
+otherwise separate owner-scoped topics and carries the same audit fields as a
+Face. Person schemas are excluded so evidence about a collaborator cannot be
+fused into the memory owner's behavior.
 
 ### Root
 

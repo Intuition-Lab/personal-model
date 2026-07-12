@@ -55,6 +55,7 @@ class PersonEvent:
     category: str | None = None
     aliases: Sequence[str] = field(default_factory=tuple)
     confidence: float = 1.0
+    source_id: str | None = None
 
 
 @dataclass
@@ -123,10 +124,23 @@ class PersonGraph:
         self._cfg = cfg
         self._source = name_source or EmptyPersonNameSource()
         self._min_confidence = min_confidence
+        self._reserved_owner_keys: set[str] | None = None
 
     @property
     def enabled(self) -> bool:
         return bool(getattr(self._cfg, "person_graph_enabled", False))
+
+    def _owner_keys(self) -> set[str]:
+        if self._reserved_owner_keys is None:
+            try:
+                from . import owner_identity
+
+                self._reserved_owner_keys = {
+                    _norm(alias) for alias in owner_identity.reserved_aliases(self._cfg)
+                }
+            except Exception:  # noqa: BLE001 - identity protection is fail-safe
+                self._reserved_owner_keys = set()
+        return self._reserved_owner_keys
 
     def ingest(self) -> list[str]:
         if not self.enabled:
@@ -144,8 +158,19 @@ class PersonGraph:
         norm = _norm(event.name)
         if not norm:
             return None
+        owner_keys = self._owner_keys()
+        if norm in owner_keys or any(_norm(alias) in owner_keys for alias in event.aliases):
+            _log.debug("person_graph: reserve owner identity %r", event.name)
+            return None
 
         existing = self._find_entity(norm, event.aliases)
+
+        if (
+            existing is not None
+            and event.source_id
+            and self._has_source_event(existing.canonical, event.source_id)
+        ):
+            return existing.canonical
 
         if existing is None and event.confidence < self._min_confidence:
             _log.debug("person_graph: skip low-confidence first sighting %r", event.name)
@@ -248,20 +273,46 @@ class PersonGraph:
             file_name=f"person-{_slug(entity_canonical)}.md",
             tags=_TAG_EVENT,
             occurred_at=(event.occurred_at or now).isoformat(),
-            schema_summary=json.dumps({_META_CANONICAL: entity_canonical}, ensure_ascii=False),
+            schema_summary=json.dumps(
+                {_META_CANONICAL: entity_canonical, "source_id": event.source_id},
+                ensure_ascii=False,
+            ),
         )
         return self._mem.commit_node(node)
+
+    def _has_source_event(self, canonical: str, source_id: str) -> bool:
+        wanted = _norm(canonical)
+        for node in self._mem.store.all_latest():
+            if _TAG_EVENT not in (node.tags or "").split():
+                continue
+            meta = _meta_of(node)
+            if _norm(str(meta.get(_META_CANONICAL, ""))) != wanted:
+                continue
+            if str(meta.get("source_id") or "") == source_id:
+                return True
+        return False
 
     def _entity_nodes(self) -> list[MemoryNode]:
 
         # the file taxonomy IS the kind axis's SSOT, so an adjudicated retype
 
         # roster (and out of knows-edge extraction) by construction.
-        return [
-            n
-            for n in self._mem.store.all_latest()
-            if _TAG_ENTITY in (n.tags or "").split() and (n.file_name or "").startswith("person-")
-        ]
+        owner_keys = self._owner_keys()
+        out: list[MemoryNode] = []
+        for node in self._mem.store.all_latest():
+            if _TAG_ENTITY not in (node.tags or "").split() or not (
+                node.file_name or ""
+            ).startswith("person-"):
+                continue
+            meta = _meta_of(node)
+            names = [
+                str(meta.get(_META_CANONICAL) or node.content),
+                *(str(alias) for alias in (meta.get(_META_ALIASES) or [])),
+            ]
+            if any(_norm(name) in owner_keys for name in names):
+                continue
+            out.append(node)
+        return out
 
     def _find_entity(self, norm_name: str, extra_aliases: Iterable[str]) -> PersonEntity | None:
         wanted = {norm_name, *(_norm(a) for a in extra_aliases)}

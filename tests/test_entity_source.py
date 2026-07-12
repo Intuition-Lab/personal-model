@@ -5,12 +5,15 @@ from __future__ import annotations
 import os
 import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
+from persome.evomem import owner_identity
 from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.evomem.store import NodeStore
 from persome.model.entity_source import EntitySource, MemoryPersonNameSource
 from persome.store import entries as entries_store
 from persome.store import fts
+from persome.store import owner_aliases as owner_alias_store
 
 
 def _seed_person_memory() -> str:
@@ -59,6 +62,82 @@ def test_memory_person_source_implements_person_graph_seam(ac_root) -> None:
     assert [event.name for event in events] == ["alex"]
     assert events[0].summary == "Alex reviews architecture decisions with the user."
     assert events[0].confidence == 0.95
+
+
+def test_event_mentions_keep_only_person_specific_lines(ac_root) -> None:
+    NodeStore().save(
+        MemoryNode(
+            node_id="point-person-kevin",
+            content="Kevin is a launch collaborator.",
+            layer=MemoryLayer.L2_FACT,
+            file_name="person-kevin.md",
+            confidence="high",
+        )
+    )
+    with fts.cursor() as conn:
+        entries_store.create_file(
+            conn,
+            name="event-2026-07-10.md",
+            description="Synthetic mixed activity",
+            tags=["event"],
+        )
+        entries_store.append_entry(
+            conn,
+            name="event-2026-07-10.md",
+            content=(
+                "The user adjusted a private investment portfolio.\n"
+                "- [Feishu] Kevin reviewed the launch checklist.\n"
+                "- [Chrome] The user opened a banking dashboard."
+            ),
+            tags=["work"],
+        )
+        mention = next(
+            event for event in EntitySource(conn).events() if event.source_kind == "entry"
+        )
+
+    assert mention.summary == "- [Feishu] Kevin reviewed the launch checklist."
+    assert "investment" not in mention.summary
+
+
+def test_memory_person_source_filters_configured_owner_alias(ac_root) -> None:
+    node_id = "point-person-owner"
+    NodeStore().save(
+        MemoryNode(
+            node_id=node_id,
+            content="Singularity-tian opened a pull request.",
+            layer=MemoryLayer.L2_FACT,
+            file_name="person-singularity-tian.md",
+            confidence="high",
+        )
+    )
+    cfg = SimpleNamespace(memory_delta=SimpleNamespace(owner_aliases=["Singularity-tian"]))
+
+    assert MemoryPersonNameSource(cfg=cfg).events() == []
+
+
+def test_memory_person_source_filters_learned_owner_alias(ac_root) -> None:
+    NodeStore().save(
+        MemoryNode(
+            node_id="point-person-learned-owner",
+            content="Singularity-tian opened a pull request.",
+            layer=MemoryLayer.L2_FACT,
+            file_name="person-singularity-tian.md",
+            confidence="high",
+        )
+    )
+    with fts.cursor() as conn:
+        for session_id in ("owner-1", "owner-2"):
+            owner_identity.record_candidate(
+                conn,
+                alias="Singularity-tian",
+                session_id=session_id,
+                source_kind=owner_alias_store.SOURCE_OWNED_ACCOUNT,
+                quote="own account Singularity-tian",
+                confidence=0.9,
+            )
+    cfg = SimpleNamespace(memory_delta=SimpleNamespace(owner_aliases=[]))
+
+    assert MemoryPersonNameSource(cfg=cfg).events() == []
 
 
 def test_entity_source_limit_uses_actual_instant_across_offsets(ac_root) -> None:

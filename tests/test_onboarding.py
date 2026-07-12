@@ -713,6 +713,19 @@ def test_installer_runs_strict_onboarding_gate() -> None:
     assert 'die "onboarding is incomplete' in script
 
 
+def test_installer_schedules_and_emphasizes_model_open_cta() -> None:
+    script = (Path(__file__).resolve().parents[1] / "install.sh").read_text(encoding="utf-8")
+
+    assert 'persome" model open --after 30' in script
+    assert "Your Personal Model Opens in 30 Minutes" not in script
+    assert "YOUR NEXT STEP — OPEN YOUR PERSONAL MODEL" not in script
+    assert "MODEL CTA — KEEP PERSOME RUNNING" in script
+    assert "MODEL CTA — OPEN YOUR PERSONAL MODEL" in script
+    main = script.index("main()")
+    assert script.index("run_onboarding\n", main) < script.index("schedule_model_open\n", main)
+    assert script.index("schedule_model_open\n", main) < script.index("print_summary\n", main)
+
+
 def test_preserve_policy_keeps_explicit_ocr_disable(
     ac_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -10,13 +10,13 @@ Root.
 | Writer | Input | Output |
 |---|---|---|
 | session reducer | timeline blocks | `event-YYYY-MM-DD.md` |
-| memory delta + apply | one newly flushed session window | entities, assertions, events, relation Lines in evomem/FTS/Markdown projection |
+| memory delta + apply | one newly flushed session window | owner-alias evidence plus entities, assertions, events, and relation Lines in evomem/FTS/Markdown projection |
 | pattern detector | repeated event evidence | `memory/skills/skill-*.md` |
 | case extractor | error followed by supported resolution | reusable L5 knowledge Points |
 | schema miner | repeated durable facts | level-1 Face candidates |
 | cross-domain sweeper | stable topic-distinct Faces | level-2 Volumes |
 | root synthesis | active Face/Volume/profile evidence | at most one level-3 Root |
-| CLI/MCP correction | explicit user/agent request | audited append, supersede, retype, merge, or revoke |
+| CLI/MCP correction | explicit user/agent request | audited append, supersede, retype, merge, merge-into-self, reject-owner-alias, or revoke |
 
 No writer owns product tasks, notifications, actuation, or evaluation labels.
 
@@ -47,7 +47,8 @@ live Point/Line path is:
 ```text
 new timeline window + structured focus evidence
   -> one memory_delta LLM extraction
-  -> quote / roster / predicate / confidence gates
+  -> owner-alias evidence + quote / roster / predicate / confidence gates
+  -> repeated owner evidence resolves names and handles to reserved self
   -> append-only memory_deltas audit row
   -> deterministic delta_apply
   -> Points, assertions, events, and relation Lines
@@ -57,6 +58,20 @@ Every proposed item must quote session evidence. Entity references must resolve
 through the identity roster or appear explicitly in the session. Relations use
 a closed predicate set. Low-confidence or unsupported items are dropped and
 counted.
+
+The roster always includes the reserved `self` endpoint. The same LLM pass may
+propose `owner_alias_candidates` only when quoted session evidence identifies a
+proper name or handle as an explicit self-identification or owned account. One
+non-explicit observation stays `pending` and enters a bounded seven-day
+PersonGraph quarantine; two independent sessions promote it to an active alias
+of `self`. A quoted explicit
+first-person identity statement may promote immediately. Promotion retires an
+already-minted duplicate person projection without deleting its audit history.
+
+Configured `memory_delta.owner_aliases` remain a trusted override, but ordinary
+operation does not require users to discover or fill the setting themselves.
+Persome's own localhost `/model` output is removed from the delta evidence so a
+rendered Face, Volume, or Root cannot train the next model window on itself.
 
 The deterministic `self engaged_with <entity>` attention floor is direct
 observational evidence, so it becomes an active Line on the first applied
@@ -110,14 +125,20 @@ minted. Cards enter the public deterministic evomem write entrance.
 domain. Bundles smaller than four facts are skipped. A schema contains a central
 proposition, support summary, expected inferences, confidence, and source
 receipts. Low-confidence output is `forming` and excluded from the active model;
-stable output contributes a Face. Re-mining supersedes the prior schema in place.
+stable output contributes a Face. Derived PersonGraph entity/event nodes are
+excluded from schema mining; only durable person facts can support a person
+Face. Owner-scoped Faces anchor to `self`; collaborators mentioned only in the
+supporting receipts are not added as hull identities. Re-mining supersedes the
+prior schema in place.
 
 ### Volumes
 
 `cross_domain_sweeper` compares stable, topic-distinct schemas using a
 deterministic behavior signature before an LLM judge. Confirmed repeated
-cross-domain structure becomes a Volume. Forming candidates stay outside active
-snapshots. The LLM stage has a hard per-build probe budget (8 by default), with
+cross-domain structure becomes a Volume. Person schemas are not eligible inputs:
+collaborator behavior cannot be fused into the owner's project/tool/topic model.
+Forming candidates stay outside active snapshots. The LLM stage has a hard
+per-build probe budget (8 by default), with
 live shadow Volumes whose latest result is still stable/promotable ordered before
 unseen pairs so bounded builds can satisfy the unchanged two-observation
 promotion gate. A negative, failed, or low-confidence retry immediately lowers

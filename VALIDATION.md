@@ -204,6 +204,12 @@ same generation through owner-only `.runtime-state.json`; trusted ingest is
 rejected when its authenticated HTTP endpoint is disabled.
 Non-interactive packaging environments must run the command later from a
 logged-in macOS session.
+Interactive source installs also schedule the authenticated local model viewer
+to open once after 30 minutes. The detached reminder must survive the installer
+terminal, write only to the owner-private `logs/model-open-reminder.log`, and
+exit after invoking `persome model open`; it must not install another permanent
+LaunchAgent. Verify its CLI and installer contract with
+`tests/test_cli_local_access.py` and `tests/test_onboarding.py`.
 `persome ocr-selftest <image>` remains available for a known-image inference
 check.
 

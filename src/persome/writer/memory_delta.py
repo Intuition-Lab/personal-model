@@ -1,7 +1,8 @@
 """Windowed structured modeling: observations to auditable Points and Lines.
 
 One LLM reading of each newly flushed session window, multiple structured heads —
-``memory_delta {entities, assertions, relations, events}``. The gated delta is
+``memory_delta {owner_alias_candidates, entities, assertions, relations, events}``.
+The gated delta is
 persisted first, then ``delta_apply`` deterministically mints or reinforces
 evomem Points and relation Lines. Persist-before-apply makes the windowed path
 auditable and retryable.
@@ -34,9 +35,11 @@ from typing import Any
 
 from .. import prompts
 from ..evomem import identity as identity_mod
+from ..evomem import owner_identity
 from ..logger import get
 from ..store import fts
 from ..store import memory_deltas as deltas_store
+from ..store import owner_aliases as owner_alias_store
 from ..store import relation_edges as edges_store
 from ..timeline import store as tl_store
 from . import llm as llm_mod
@@ -45,10 +48,14 @@ logger = get("persome.writer.memory_delta")
 
 STAGE = "memory_delta"
 
-_HEADS = ("entities", "assertions", "relations", "events")
+_HEADS = ("owner_alias_candidates", "entities", "assertions", "relations", "events")
 _ENTITY_KINDS = frozenset({"person", "org", "project", "artifact"})
 _PREDICATES = frozenset(p.value for p in edges_store.Predicate)
 _POLARITIES = frozenset({"+", "-", "0"})
+_SELF_IDENTITY = "self"
+_LOCAL_MODEL_URL_RE = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/model(?:[/?#]|\b)", re.IGNORECASE
+)
 
 
 def _norm_polarity(item: dict) -> str:
@@ -101,15 +108,11 @@ def _load_roster(cfg: Any) -> list[tuple[str, list[str]]]:
     ``new_entity`` items; nothing breaks).
     """
     try:
-        from ..evomem.engine import EvoMemory
-        from ..evomem.person_graph import PersonGraph
-
-        persons = PersonGraph(EvoMemory(), cfg=cfg).list_persons()
         limit = int(getattr(cfg.memory_delta, "roster_max", 60))
-        return [(p.canonical, list(getattr(p, "aliases", []))) for p in persons[:limit]]
+        return identity_mod.load_roster_entries(cfg, limit=limit)
     except Exception:  # noqa: BLE001 — roster is best-effort
         logger.debug("memory_delta: roster load failed, empty", exc_info=True)
-        return []
+        return [(_SELF_IDENTITY, [])]
 
 
 def _render_roster(roster: list[tuple[str, list[str]]]) -> str:
@@ -118,8 +121,19 @@ def _render_roster(roster: list[tuple[str, list[str]]]) -> str:
     lines = []
     for canonical, aliases in roster:
         alias_part = f" (aliases: {', '.join(aliases)})" if aliases else ""
-        lines.append(f"- {canonical}{alias_part}")
+        owner_part = (
+            " (memory owner; relation endpoint only)" if canonical == _SELF_IDENTITY else ""
+        )
+        lines.append(f"- {canonical}{alias_part}{owner_part}")
     return "\n".join(lines)
+
+
+def _is_local_model_output(entry: str) -> bool:
+    """Match Persome's rendered model, not a typed mention of its URL."""
+    text = str(entry or "")
+    return bool(_LOCAL_MODEL_URL_RE.search(text)) and (
+        "Persome Personal Model" in text or "[Google Chrome]" in text or "[Chrome]" in text
+    )
 
 
 def _render_blocks(blocks: list[tl_store.TimelineBlock]) -> str:
@@ -132,11 +146,15 @@ def _render_blocks(blocks: list[tl_store.TimelineBlock]) -> str:
     """
     parts: list[str] = []
     for b in blocks:
+        raw_entries = list(b.entries or [])
+        entries = [entry for entry in raw_entries if not _is_local_model_output(entry)]
+        if not entries:
+            continue
         window = f"[{b.start_time:%H:%M}-{b.end_time:%H:%M}] apps: {', '.join(b.apps_used)}"
         lines = [window]
-        lines.extend(f"  - {e}" for e in b.entries)
+        lines.extend(f"  - {e}" for e in entries)
         focus = (b.focus_structured or b.focus_excerpt or "").strip()
-        if focus:
+        if focus and len(entries) == len(raw_entries):
             lines.append("  focus:")
             lines.extend(f"    {ln}" for ln in focus.splitlines())
         parts.append("\n".join(lines))
@@ -187,6 +205,50 @@ def _canonicalize(
     return None
 
 
+def gate_owner_alias_candidates(
+    raw: dict,
+    *,
+    session_text: str,
+) -> tuple[list[dict], int]:
+    """Validate probabilistic owner recognition before it reaches the identity store."""
+    text_norm = _norm_ws(session_text)
+    clean: list[dict] = []
+    dropped = 0
+    for item in raw.get("owner_alias_candidates") or []:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        alias = owner_alias_store.clean_alias(str(item.get("alias") or ""))
+        quote = str(item.get("quote") or "").strip()
+        source_kind = str(item.get("source_kind") or "")
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if (
+            alias is None
+            or source_kind
+            not in {
+                owner_alias_store.SOURCE_OWNED_ACCOUNT,
+                owner_alias_store.SOURCE_EXPLICIT_SELF,
+            }
+            or confidence < owner_alias_store.MIN_CANDIDATE_CONFIDENCE
+            or _norm_ws(quote) not in text_norm
+            or identity_mod.norm(alias) not in identity_mod.norm(quote)
+        ):
+            dropped += 1
+            continue
+        clean.append(
+            {
+                "alias": alias,
+                "source_kind": source_kind,
+                "quote": quote,
+                "confidence": confidence,
+            }
+        )
+    return clean, dropped
+
+
 def gate_delta(
     raw: dict,
     *,
@@ -194,6 +256,8 @@ def gate_delta(
     session_text: str,
     min_confidence: float,
     cooccurrence: bool = True,
+    owner_candidates: list[dict] | None = None,
+    protected_owner_aliases: list[str] | None = None,
 ) -> tuple[dict, int]:
     """Deterministic gates over the LLM's delta. Returns (clean, dropped).
 
@@ -204,7 +268,11 @@ def gate_delta(
     """
     text_norm = _norm_ws(session_text)
     clean: dict[str, list[dict]] = {h: [] for h in _HEADS}
+    clean["owner_alias_candidates"] = list(owner_candidates or [])
     dropped = 0
+    protected_owner_keys = {
+        identity_mod.norm(alias) for alias in (protected_owner_aliases or []) if alias
+    }
 
     def conf_ok(item: dict) -> bool:
         try:
@@ -213,7 +281,13 @@ def gate_delta(
             return False
 
     def ident(obj: Any) -> dict[str, str] | None:
-        return _canonicalize(obj, roster, text_norm)
+        canonical = _canonicalize(obj, roster, text_norm)
+        if canonical is None:
+            return None
+        unresolved = canonical.get("new_entity")
+        if unresolved and identity_mod.norm(unresolved) in protected_owner_keys:
+            return None
+        return canonical
 
     for item in raw.get("entities") or []:
         who = ident(item) if isinstance(item, dict) else None
@@ -221,6 +295,7 @@ def gate_delta(
             isinstance(item, dict)
             and item.get("kind") in _ENTITY_KINDS
             and who is not None
+            and who.get("ref") != _SELF_IDENTITY
             and _quote_ok(item, text_norm)
             and conf_ok(item)
         ):
@@ -361,8 +436,10 @@ def run_after_session(
         return result
 
     roster_entries = _load_roster(cfg)
-    roster = identity_mod.Roster.build(roster_entries)
     session_text = _render_blocks(blocks)
+    if not session_text.strip():
+        result.skipped_reason = "model_output_only"
+        return result
 
     _cache = {"type": "ephemeral"}
     messages: list[dict[str, Any]] = [
@@ -398,15 +475,35 @@ def run_after_session(
         result.skipped_reason = "unparseable"
         return result
 
-    clean, dropped = gate_delta(
-        raw,
-        roster=roster,
-        session_text=session_text,
-        min_confidence=float(getattr(cfg.memory_delta, "min_confidence", 0.5)),
-        cooccurrence=bool(getattr(cfg.memory_delta, "cooccurrence_knows", True)),
+    owner_candidates, candidate_dropped = gate_owner_alias_candidates(
+        raw, session_text=session_text
     )
     try:
         with fts.cursor() as conn:
+            for candidate in owner_candidates:
+                owner_identity.record_candidate(
+                    conn,
+                    alias=candidate["alias"],
+                    session_id=session_id,
+                    source_kind=candidate["source_kind"],
+                    quote=candidate["quote"],
+                    confidence=candidate["confidence"],
+                )
+
+            # Rebuild after recording: a second independent session can promote
+            # the alias during this very window, so its relation endpoints must
+            # canonicalize to self immediately.
+            roster = identity_mod.load_roster(cfg)
+            clean, gated_dropped = gate_delta(
+                raw,
+                roster=roster,
+                session_text=session_text,
+                min_confidence=float(getattr(cfg.memory_delta, "min_confidence", 0.5)),
+                cooccurrence=bool(getattr(cfg.memory_delta, "cooccurrence_knows", True)),
+                owner_candidates=owner_candidates,
+                protected_owner_aliases=owner_identity.reserved_aliases(cfg, conn=conn),
+            )
+            dropped = candidate_dropped + gated_dropped
             delta_id = deltas_store.insert(
                 conn,
                 session_id=session_id,

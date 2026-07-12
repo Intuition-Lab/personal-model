@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import stat
 import subprocess
+import sys
 import webbrowser
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,6 +73,74 @@ def test_model_open_exchanges_bearer_for_one_time_browser_url(ac_root: Path, mon
     ]
     assert token not in result.output
     assert token not in opened[0]
+
+
+def test_model_open_can_schedule_detached_one_shot_reminder(ac_root: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    launched: dict[str, object] = {}
+
+    class _ScheduledProcess:
+        pid = 7331
+
+    def fake_popen(command, **kwargs):  # type: ignore[no-untyped-def]
+        launched["command"] = command
+        launched.update(kwargs)
+        return _ScheduledProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    result = CliRunner().invoke(cli.app, ["model", "open", "--after", "30"])
+
+    assert result.exit_code == 0, result.output
+    assert launched["command"] == [
+        sys.executable,
+        "-m",
+        "persome",
+        "model",
+        "open",
+        "--scheduled-after-seconds",
+        "1800",
+    ]
+    assert launched["stdin"] is subprocess.DEVNULL
+    assert launched["stderr"] is subprocess.STDOUT
+    assert launched["close_fds"] is True
+    assert launched["start_new_session"] is True
+    assert launched["env"]["PERSOME_ROOT"] == str(ac_root)
+    log_path = ac_root / "logs" / "model-open-reminder.log"
+    assert launched["stdout"] is not subprocess.DEVNULL
+    assert _mode(log_path) == 0o600
+    assert "open automatically in 30 minutes" in result.output
+    assert "persome model open" in result.output
+
+
+def test_scheduled_model_open_waits_before_requesting_browser_capability(
+    ac_root: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv(LOCAL_API_TOKEN_ENV, "t" * 48)
+    delays: list[float] = []
+    monkeypatch.setattr(cli.time, "sleep", delays.append)
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kwargs: httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {"bootstrap_url": "/auth/browser-bootstrap?nonce=" + "n" * 43},
+            },
+            request=httpx.Request("POST", url),
+        ),
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0: opened.append(url) or True)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["model", "open", "--scheduled-after-seconds", "2.5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert delays == [2.5]
+    assert len(opened) == 1
 
 
 def test_bare_model_command_opens_viewer(monkeypatch) -> None:  # type: ignore[no-untyped-def]
