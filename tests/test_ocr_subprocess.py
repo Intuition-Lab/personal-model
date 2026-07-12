@@ -119,8 +119,10 @@ class TestCrashContainment:
         client = ocr_subprocess.OCRWorkerClient(spawn=_spawn, timeout=10)
         try:
             assert client.recognize_detailed(_JPEG, "tiny") is None  # crash → fail open
+            assert client.state() == "failed"
             # respawn: fresh worker handles the next request normally
             assert client.recognize_detailed(_JPEG, "tiny") == (["ok:tiny"], [[1, 2, 3, 4]], [0.9])
+            assert client.state() == "ready"
         finally:
             client.shutdown()
 
@@ -152,9 +154,11 @@ class TestWarm:
         client = ocr_subprocess.OCRWorkerClient(spawn=_spawner(_ECHO), timeout=10)
         try:
             assert client.warm("tiny") is True
+            assert client.state() == "ready"
             assert client._proc is not None and client._proc.poll() is None
         finally:
             client.shutdown()
+        assert client.state() == "not_started"
 
     def test_cold_start_has_a_separate_timeout(self) -> None:
         client = ocr_subprocess.OCRWorkerClient(timeout=20, startup_timeout=120)
@@ -207,6 +211,21 @@ class TestRouting:
         monkeypatch.delenv("PERSOME_OCR_IN_PROCESS", raising=False)
         monkeypatch.setenv("PERSOME_OCR_WORKER", "1")
         assert ocr_local._use_isolation() is False
+
+
+def test_worker_state_listener_receives_runtime_transitions() -> None:
+    seen: list[str] = []
+    client = ocr_subprocess.OCRWorkerClient(spawn=lambda: pytest.fail("no worker needed"))
+    ocr_subprocess.set_state_listener(seen.append)
+    seen.clear()  # discard the singleton's current-state registration receipt
+    try:
+        client._set_state("warming")
+        client._set_state("ready")
+        client._set_state("failed")
+    finally:
+        ocr_subprocess.set_state_listener(None)
+
+    assert seen == ["warming", "ready", "failed"]
 
 
 @pytest.mark.integration

@@ -9,13 +9,22 @@ from . import paths
 VALID_TIERS = ("tiny", "small", "medium")
 
 
-def save_ocr_config(*, enabled: bool, tier: str, config_path: Path) -> None:
+def save_ocr_config(
+    *,
+    enabled: bool,
+    tier: str,
+    config_path: Path,
+    policy: str | None = None,
+) -> None:
     """Update only the OCR fields while preserving the rest of config.toml."""
     import tomlkit
     from tomlkit.items import Table
 
     if tier not in VALID_TIERS:
         raise ValueError(f"unsupported OCR tier: {tier}")
+    intended_policy = policy or ("enabled" if enabled else "disabled")
+    if intended_policy not in {"auto", "enabled", "disabled"}:
+        raise ValueError(f"unsupported OCR policy: {intended_policy}")
     if config_path.is_symlink():
         raise RuntimeError(f"config file must not be a symlink: {config_path}")
 
@@ -29,6 +38,7 @@ def save_ocr_config(*, enabled: bool, tier: str, config_path: Path) -> None:
         capture = tomlkit.table()
         document["capture"] = capture
     capture["enable_ocr_fallback"] = enabled
+    capture["ocr_policy"] = intended_policy
     capture["ocr_tier"] = tier
     capture["ocr_structured"] = True
 

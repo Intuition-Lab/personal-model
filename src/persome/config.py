@@ -68,6 +68,10 @@ class CaptureConfig:
     ax_timeout_seconds: int = 3
     # OCR fallback for AX-poor apps (WeChat, Feishu, etc.) — on-device PP-OCRv6.
     enable_ocr_fallback: bool = False
+    # ``auto`` = fresh/unconfigured; onboarding may enable the supported
+    # default. Explicit setup/disable records durable intent so repeated
+    # onboarding never silently changes the user's choice.
+    ocr_policy: str = "auto"  # auto | enabled | disabled
     ocr_tier: str = "tiny"  # tiny | small | medium (local PP-OCRv6 weights)
     ocr_min_gap_seconds: float = 15.0
     # Geometry structuring of raw OCR (zero LLM, on-device): reconstruct columns/regions
@@ -494,7 +498,19 @@ def _build_capture(raw: dict) -> CaptureConfig:
     for current, old in legacy.items():
         if current not in section and old in raw:
             section[current] = raw[old]
-    return cast(CaptureConfig, _build_dataclass(CaptureConfig, section))
+    capture = cast(CaptureConfig, _build_dataclass(CaptureConfig, section))
+    if capture.source not in {"daemon", "ingest"}:
+        raise RuntimeError(f"capture.source must be 'daemon' or 'ingest', got {capture.source!r}")
+    if capture.ocr_policy not in {"auto", "enabled", "disabled"}:
+        raise RuntimeError(
+            "capture.ocr_policy must be 'auto', 'enabled', or 'disabled', "
+            f"got {capture.ocr_policy!r}"
+        )
+    if capture.ocr_tier not in {"tiny", "small", "medium"}:
+        raise RuntimeError(
+            f"capture.ocr_tier must be 'tiny', 'small', or 'medium', got {capture.ocr_tier!r}"
+        )
+    return capture
 
 
 def load(path: Path | None = None) -> Config:
@@ -606,6 +622,7 @@ ax_timeout_seconds = 3
 # OCR fallback for apps that block Accessibility API (WeChat, Feishu, NetEase Music, etc.)
 # On-device PP-OCRv6 — the focused-window screenshot is OCR'd locally; nothing leaves the machine.
 enable_ocr_fallback = false   # install.sh verifies the worker, then writes true on supported Macs
+ocr_policy = "auto"           # auto until first setup; then enabled|disabled preserves user intent
 # Inference runs in an isolated local worker, so a native Paddle crash does not
 # kill the daemon. PERSOME_DISABLE_OCR=1 is the deployment kill switch.
 ocr_tier = "tiny"             # tiny (default) | small | medium — local PP-OCRv6 weights

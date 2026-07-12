@@ -583,6 +583,15 @@ func parseArgs() -> Config {
 }
 
 func main() {
+    if CommandLine.arguments.contains("--request-accessibility") {
+        let trusted = AXIsProcessTrustedWithOptions(
+            [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        )
+        exit(trusted ? 0 : 2)
+    }
+    if CommandLine.arguments.contains("--check-accessibility") {
+        exit(AXIsProcessTrusted() ? 0 : 2)
+    }
     let config = parseArgs()
 
     // Check accessibility permission WITHOUT prompting. This helper is spawned
@@ -593,9 +602,9 @@ func main() {
     // Dropping the prompt costs no trust: which variant you call does not change
     // the TCC principal (that's the binary's code identity / responsible process),
     // so once Accessibility is granted this pure check reads it exactly as the
-    // prompting one did. The single user-facing prompt is left to the long-running
-    // mac-ax-watcher, started once per daemon session when event_driven is on (the
-    // default). Untrusted ⇒ exit(2), which the Python caller logs and skips.
+    // prompting one did. User-facing prompts belong only to the explicit
+    // onboarding request modes. Untrusted ⇒ exit(2), which the Python caller
+    // logs and skips.
     let trusted = AXIsProcessTrusted()
     if !trusted {
         fputs("Accessibility permission not granted. Please enable in System Settings.\n", stderr)

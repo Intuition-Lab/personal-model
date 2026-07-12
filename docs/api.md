@@ -37,8 +37,12 @@ endpoint, key variable name, credential presence, and legacy-migration state.
 It never returns the credential value. Provider network probes run only for
 the explicit `GET /status?check_models=true` request and are cached briefly.
 `/status.data.ocr` reports the configured tier, Runtime and model availability,
-kill switch, Screen Recording, and effective readiness. `/health` exposes only
-the compact OCR state because it is the unauthenticated liveness route.
+kill switch, Screen Recording, and effective readiness. `/permissions` does not
+infer Accessibility from the terminal or Python daemon: in daemon mode it runs
+the source-versioned helper and optional watcher self-checks plus the Runtime's
+Screen Recording preflight. In trusted-ingest mode those OS permissions belong
+to the producer and are reported as not applicable to the daemon. `/health`
+exposes only compact OCR state because it is the unauthenticated liveness route.
 
 ## Model contract
 

@@ -20,19 +20,21 @@ Design constraints (BYO-key onboarding):
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import shutil
 import socket
 import sqlite3
 import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from . import config as config_mod
 from . import env_file as env_file_mod
-from . import paths
+from . import paths, runtime_pid
 from .providers import ResolvedLLMProfile, resolve_profile
 
 Status = Literal["ok", "fail", "warn"]
@@ -59,20 +61,36 @@ def _is_executable_file(p: Path) -> bool:
     return p.is_file() and os.access(p, os.X_OK)
 
 
-def _helper_candidates(name: str) -> list[Path]:
-    """Candidate binary locations, in the same order the capture pipeline
-    resolves them (env override → bundled wheel resource → dev source tree).
-    Existence check only — doctor never triggers the on-demand compile."""
-    candidates: list[Path] = []
+def _helper_sources(name: str) -> list[Path]:
+    """Current bundled/dev Swift sources, without compiling either one."""
+    sources: list[Path] = []
     try:
         from importlib.resources import files as _pkg_files
 
-        candidates.append(Path(str(_pkg_files("persome").joinpath("_bundled"))) / name)
+        sources.append(Path(str(_pkg_files("persome").joinpath("_bundled"))) / f"{name}.swift")
     except (ModuleNotFoundError, ValueError):
         pass
-    # Dev source tree: src/persome/doctor.py → parents[2] == repo root.
-    candidates.append(Path(__file__).resolve().parents[2] / "resources" / name)
-    return candidates
+    sources.append(Path(__file__).resolve().parents[2] / "resources" / f"{name}.swift")
+    return sources
+
+
+def _helper_candidates(name: str) -> list[Path]:
+    """Exact immutable binaries for current sources; historical cache is ignored."""
+    from .capture.ax_capture import _native_binary_path
+
+    return [
+        target
+        for source in _helper_sources(name)
+        if source.is_file() and (target := _native_binary_path(source, name)) is not None
+    ]
+
+
+def _configured_helper_path(name: str, env_var: str) -> Path | None:
+    override = os.environ.get(env_var)
+    if override:
+        candidate = Path(override).expanduser()
+        return candidate if _is_executable_file(candidate) else None
+    return next((path for path in _helper_candidates(name) if _is_executable_file(path)), None)
 
 
 def _llm_profile() -> ResolvedLLMProfile:
@@ -206,10 +224,16 @@ def check_base_url(profile: ResolvedLLMProfile | None = None) -> Check:
     return Check("LLM endpoint", "ok", label)
 
 
-def check_helpers() -> list[Check]:
+def check_helpers(capture: config_mod.CaptureConfig | None = None) -> list[Check]:
     """Check compiled helpers or the prerequisites for first-run compilation."""
     out: list[Check] = []
     for name, env_var in _HELPERS:
+        if capture is not None and capture.source == "ingest":
+            out.append(Check(name, "ok", "not applicable; trusted ingest producer owns capture"))
+            continue
+        if capture is not None and name == "mac-ax-watcher" and not capture.event_driven:
+            out.append(Check(name, "ok", "not required; event-driven capture is disabled"))
+            continue
         override = os.environ.get(env_var)
         if override:
             p = Path(override).expanduser()
@@ -222,13 +246,13 @@ def check_helpers() -> list[Check]:
         found = next((c for c in candidates if _is_executable_file(c)), None)
         if found is not None:
             out.append(Check(name, "ok", str(found)))
-        elif any(candidate.with_suffix(".swift").is_file() for candidate in candidates):
+        elif any(source.is_file() for source in _helper_sources(name)):
             if shutil.which("swiftc"):
                 out.append(
                     Check(
                         name,
                         "warn",
-                        "bundled Swift source found — compiles on first capture/start",
+                        "current Swift source found — compile it with the installer",
                     )
                 )
             else:
@@ -251,21 +275,37 @@ def check_helpers() -> list[Check]:
     return out
 
 
-def check_ax_trust() -> Check:
-    """macOS Accessibility trust for THIS process (capture.source='daemon' mode).
+def check_ax_trust(capture: config_mod.CaptureConfig | None = None) -> Check:
+    """macOS Accessibility trust for the configured native capture helpers.
 
     Off-macOS, or when the probe itself errors, the answer is unknowable →
     ``warn`` (unknown), never a hard fail."""
+    capture = capture or config_mod.CaptureConfig()
+    if capture.source == "ingest":
+        return Check("AX trust", "ok", "not applicable; trusted ingest producer owns capture")
     if platform.system() != "Darwin":
         return Check("AX trust", "warn", "unknown (not macOS)")
     try:
-        from .capture.ax_capture import ax_trusted
+        from .capture.ax_capture import _binary_ax_trusted
 
-        trusted = ax_trusted()
+        required = [_HELPERS[0]]
+        if capture.event_driven:
+            required.append(_HELPERS[1])
+        helper_paths = [_configured_helper_path(name, env_var) for name, env_var in required]
+        if any(path is None for path in helper_paths):
+            return Check(
+                "AX trust",
+                "fail",
+                "current bundled AX helper is missing — rerun the Persome installer",
+            )
+        trusted = all(_binary_ax_trusted(path) for path in helper_paths if path is not None)
     except Exception as exc:  # noqa: BLE001 — a TCC probe must never crash doctor
         return Check("AX trust", "warn", f"unknown (probe failed: {exc.__class__.__name__})")
     if trusted:
-        return Check("AX trust", "ok", "Accessibility granted to this process")
+        principals = (
+            "capture helper and event watcher" if capture.event_driven else "capture helper"
+        )
+        return Check("AX trust", "ok", f"Accessibility granted to the bundled {principals}")
     return Check(
         "AX trust",
         "fail",
@@ -276,6 +316,12 @@ def check_ax_trust() -> Check:
 
 def check_screen_recording(capture: config_mod.CaptureConfig) -> Check:
     """Check the TCC permission required by OCR and screenshot capture."""
+    if capture.source == "ingest":
+        return Check(
+            "Screen Recording",
+            "ok",
+            "not applicable; trusted ingest producer owns screen capture",
+        )
     if platform.system() != "Darwin":
         return Check("Screen Recording", "warn", "unknown (not macOS)")
     required = capture.enable_ocr_fallback or capture.include_screenshot
@@ -319,12 +365,24 @@ def check_ocr(capture: config_mod.CaptureConfig) -> Check:
 def check_root_writable() -> Check:
     """The data root exists (created on demand) and accepts writes."""
     root = paths.root()
-    probe = root / ".doctor-write-probe"
+    descriptor: int | None = None
+    probe: str | None = None
     try:
-        paths.atomic_write_private_text(probe, "ok")
-        probe.unlink()
+        root = paths.ensure_private_dir(root)
+        descriptor, probe = tempfile.mkstemp(prefix=".doctor-write-probe.", dir=root)
+        # Unlink before writing so SIGKILL or a crash cannot leave a probe file.
+        os.unlink(probe)
+        probe = None
+        os.write(descriptor, b"ok")
+        os.fsync(descriptor)
     except (OSError, RuntimeError) as exc:
         return Check("data root writable", "fail", f"{root}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if probe is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(probe)
     return Check("data root writable", "ok", str(root))
 
 
@@ -348,17 +406,8 @@ def check_port(host: str, port: int) -> Check:
 
 
 def _running_daemon_pid() -> int | None:
-    try:
-        pid = int(paths.pid_file().read_text().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        return pid
-    return pid
+    process = runtime_pid.resolve_recorded_process()
+    return process.pid if process is not None else None
 
 
 def run_checks(host: str, port: int) -> list[Check]:
@@ -374,8 +423,8 @@ def run_checks(host: str, port: int) -> list[Check]:
         check_api_key(profile),
         check_screenshot_key(),
         check_base_url(profile),
-        *check_helpers(),
-        check_ax_trust(),
+        *check_helpers(cfg.capture),
+        check_ax_trust(cfg.capture),
         check_screen_recording(cfg.capture),
         check_ocr(cfg.capture),
         check_root_writable(),

@@ -707,6 +707,9 @@ func observerCallback(
 // MARK: - Main
 
 func main() {
+    if CommandLine.arguments.contains("--check-accessibility") {
+        exit(AXIsProcessTrusted() ? 0 : 2)
+    }
     if CommandLine.arguments.contains("--request-accessibility") {
         let trusted = AXIsProcessTrustedWithOptions(
             [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
@@ -714,10 +717,9 @@ func main() {
         exit(trusted ? 0 : 2)
     }
 
-    // Check accessibility permission
-    let trusted = AXIsProcessTrustedWithOptions(
-        [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-    )
+    // Normal Runtime starts are pure checks. Only the explicit onboarding
+    // --request-accessibility action may ask macOS to show a permission prompt.
+    let trusted = AXIsProcessTrusted()
     if !trusted {
         fputs("Accessibility permission not granted.\n", stderr)
         exit(2)

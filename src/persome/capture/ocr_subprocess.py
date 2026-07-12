@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from typing import Literal
 
 from ..logger import get
 from . import ocr_protocol
@@ -27,6 +28,8 @@ from . import ocr_protocol
 logger = get("persome.capture.ocr.client")
 
 Spawn = Callable[[], subprocess.Popen]
+WorkerState = Literal["not_started", "warming", "ready", "failed"]
+StateListener = Callable[[WorkerState], None]
 
 _LEN = struct.Struct(">I")
 _KILL_WAIT = 2.0  # seconds to wait for a killed worker to reap
@@ -69,6 +72,8 @@ class OCRWorkerClient:
         self._startup_timeout = timeout if startup_timeout is None else startup_timeout
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        self._state: WorkerState = "not_started"
+        self._state_lock = threading.Lock()
 
     # ─── public API (mirrors ocr_local) ──────────────────────────────────────
 
@@ -76,16 +81,44 @@ class OCRWorkerClient:
         """OCR one image in the worker. Returns ``(texts, boxes, scores)`` or ``None``."""
         if not image_bytes:
             return None
-        return self._request(tier, image_bytes)
+        result = self._request(tier, image_bytes)
+        if result is not None:
+            self._set_state("ready")
+        return result
 
     def warm(self, tier: str) -> bool:
         """Pre-build the worker engine and report whether it became ready."""
-        return self._request(tier, b"") is not None
+        self._set_state("warming")
+        ready = self._request(tier, b"") is not None
+        self._set_state("ready" if ready else "failed")
+        return ready
+
+    def state(self) -> WorkerState:
+        """Return current process liveness without blocking an in-flight inference."""
+        with self._state_lock:
+            state = self._state
+        proc = self._proc
+        if state in {"warming", "ready"} and proc is not None and proc.poll() is not None:
+            self._set_state("failed")
+            return "failed"
+        return state
 
     def shutdown(self) -> None:
         """Terminate the worker (best-effort). The worker also exits on stdin EOF."""
         with self._lock:
             self._kill_worker_locked()
+            self._set_state("not_started")
+
+    def _set_state(self, state: WorkerState) -> None:
+        with self._state_lock:
+            self._state = state
+        with _state_listener_lock:
+            listener = _state_listener
+        if listener is not None:
+            try:
+                listener(state)
+            except Exception as exc:  # noqa: BLE001 - health publication cannot break OCR
+                logger.warning("OCR worker state listener failed: %s", exc)
 
     # ─── internals ────────────────────────────────────────────────────────────
 
@@ -101,11 +134,17 @@ class OCRWorkerClient:
             except _WorkerGone as exc:
                 logger.warning("ocr worker gone (%s); failing open, will respawn", exc)
                 self._kill_worker_locked()
+                self._set_state("failed")
                 return None
             if body is None:  # EOF — worker died (e.g. SIGSEGV) mid-request
                 logger.warning("ocr worker closed stdout mid-request; failing open, will respawn")
                 self._kill_worker_locked()
+                self._set_state("failed")
                 return None
+            # A complete framed response proves that the current worker process
+            # is responsive. ``warm`` still converts an application-level
+            # {ok:false} response back to ``failed`` below.
+            self._set_state("ready")
             return ocr_protocol.decode_response(body)
 
     def _ensure_worker_locked(self) -> tuple[subprocess.Popen | None, bool]:
@@ -116,11 +155,13 @@ class OCRWorkerClient:
             self._kill_worker_locked()
         try:
             self._proc = self._spawn()
+            self._set_state("warming")
             logger.info("spawned ocr worker (pid=%s)", self._proc.pid)
             return self._proc, True
         except Exception as exc:  # noqa: BLE001
             logger.warning("ocr worker spawn failed: %s; OCR degrades to none", exc)
             self._proc = None
+            self._set_state("failed")
             return None, False
 
     def _send(self, proc: subprocess.Popen, tier: str, image_bytes: bytes) -> None:
@@ -192,6 +233,8 @@ class _WorkerGone(Exception):
 # Module singleton — one worker per daemon.
 _client: OCRWorkerClient | None = None
 _client_lock = threading.Lock()
+_state_listener: StateListener | None = None
+_state_listener_lock = threading.Lock()
 
 
 def get_client() -> OCRWorkerClient:
@@ -203,6 +246,23 @@ def get_client() -> OCRWorkerClient:
                 startup_timeout=_startup_timeout_from_env(),
             )
         return _client
+
+
+def current_worker_state() -> WorkerState:
+    """Inspect the existing singleton without creating an OCR subprocess."""
+    with _client_lock:
+        client = _client
+    return "not_started" if client is None else client.state()
+
+
+def set_state_listener(listener: StateListener | None) -> None:
+    """Publish every worker transition to the daemon generation receipt."""
+
+    global _state_listener
+    with _state_listener_lock:
+        _state_listener = listener
+    if listener is not None:
+        listener(current_worker_state())
 
 
 def _timeout_from_env() -> float:

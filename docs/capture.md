@@ -2,14 +2,28 @@
 
 Capture is the only layer that touches the outside world. It produces one JSON file per observation into `~/.persome/capture-buffer/`; nothing above it ever talks to macOS directly.
 
-Live capture requires macOS Accessibility permission for the process that runs
-Persome. Screen Recording is additionally required when screenshots or OCR are
-enabled. In an interactive install, `persome onboard` explains and requests
-Accessibility and Screen Recording separately, verifies bundled OCR on
-supported Apple Silicon Macs, starts the daemon, checks local health, and proves
-one fresh capture before returning success.
+In `source="daemon"` mode, live capture requires Accessibility for the native
+`mac-ax-helper` and, when event-driven capture is enabled, the separate
+`mac-ax-watcher` executable. The terminal and Python daemon do not read AX on
+their behalf. Screen Recording is additionally required when screenshot storage
+or effective OCR needs pixels. In a standard interactive Apple Silicon install,
+`persome onboard` explains and requests each required principal separately,
+verifies bundled OCR, starts the final daemon owner, checks local health, and
+proves one fresh capture inside that daemon before returning success. The
+authenticated `/permissions` endpoint runs the actual helper/watcher trust
+checks plus the Runtime's Screen Recording preflight. With HTTP auto-start
+disabled, the same generation publishes its permission, worker, phase, and
+capture receipts to owner-only `.runtime-state.json`.
+
+In `source="ingest"` mode a trusted local producer owns macOS AX and pixel
+permissions and sends bearer-authenticated frames to `/captures/ingest`; the
+daemon starts no OS watcher. Onboarding proves that ingest runner is ready
+instead of manufacturing a daemon AX capture. This mode requires an enabled
+HTTP transport because the authenticated endpoint is its only input channel.
 
 ## Two signal sources
+
+The following two sources apply to daemon capture mode.
 
 **`mac-ax-watcher`** (primary, event-driven). A vendored Swift binary that subscribes to AX notifications across all running apps: window focus, value changes (typing), title changes, app activation. It emits one JSON object per event on stdout. The Python side reads that stream line-by-line in `capture/watcher.py` → `capture/event_dispatcher.py`.
 
@@ -33,9 +47,13 @@ The same capture scheduler also invokes `SessionManager.on_event` (wired as a `p
 
 The installer runs `persome onboard`, whose OCR step checks the native Runtime
 and bundled weights, requests Screen Recording after an explicit explanation,
-starts the isolated worker, and writes `enable_ocr_fallback = true` only after
-the worker initializes. The standalone `persome ocr setup` repair command keeps
-the same worker and persistence checks. The
+persists enabled intent, then starts the daemon and waits for the daemon-owned
+isolated worker to initialize. `[capture].ocr_policy` distinguishes `auto`
+(fresh/unconfigured), `enabled`, and `disabled` (explicit opt-out). Ordinary
+onboarding and every update preserve an explicit policy and selected tier;
+`persome onboard --tier ...` and `persome ocr setup` explicitly enable OCR,
+while `persome ocr disable` records disabled intent. The standalone setup repair
+command keeps its own explicit worker check. The
 focused screenshot is used locally and is never placed in an LLM prompt. The
 OCR path is:
 
@@ -52,6 +70,13 @@ The subprocess is the native-crash boundary: a Paddle fault fails the OCR call
 without killing the daemon. `PERSOME_DISABLE_OCR=1` prevents Paddle from being
 loaded at all. `PERSOME_OCR_IN_PROCESS=1` exists only for debugging and removes
 that isolation.
+
+The helper and watcher are compiled into immutable
+`<PERSOME_ROOT>/native/<source-digest>/` directories keyed by a format version,
+architecture, and Swift source bytes. A same-version reinstall returns the exact
+existing executables, preserving their macOS TCC identity. Changed helper source
+uses a new digest path and therefore requires a deliberate new Accessibility
+grant; rollback resolves the old wheel source and old binary again.
 
 ```bash
 persome onboard            # permissions + OCR + daemon + health + fresh capture
@@ -233,4 +258,10 @@ Drops a `~/.persome/.paused` sentinel. The watcher keeps streaming but `capture_
 persome capture-once
 ```
 
-Writes one capture immediately, prints its path. Good for confirming Accessibility permission is granted and the helper compiled correctly.
+This is a low-level developer diagnostic. It creates a provider and scheduler in
+the calling CLI, writes one immediate capture, and can confirm the one-shot
+helper returns useful AX content. It does **not** run through the active daemon's
+capture runner, prove the event watcher, bind a Runtime generation or lifecycle
+owner, validate a privacy/mode receipt, or wait for the daemon-owned OCR worker.
+It may race the running scheduler, so stop Persome before using it to isolate a
+helper problem. Use `persome onboard` for onboarding, update, and release proof.

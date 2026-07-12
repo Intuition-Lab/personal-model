@@ -2,9 +2,37 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from persome.store import fts
+
+
+def test_wal_initialization_retries_transient_connection_lock(monkeypatch) -> None:
+    class Result:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def fetchone(self) -> tuple[str]:
+            return (self.value,)
+
+    class Connection:
+        attempts = 0
+
+        def execute(self, statement: str) -> Result:
+            if statement == "PRAGMA journal_mode":
+                return Result("delete")
+            self.attempts += 1
+            if self.attempts < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return Result("wal")
+
+    connection = Connection()
+    monkeypatch.setattr(fts.time, "sleep", lambda delay: None)
+
+    fts._ensure_wal_mode(connection)  # type: ignore[arg-type]
+
+    assert connection.attempts == 3
 
 
 def _seed(conn, *, id, ts, app, title, value, text, url=""):

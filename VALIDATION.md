@@ -56,7 +56,9 @@ uv run python scripts/language_scan.py
 uv run python scripts/check_doc_links.py
 ```
 
-`macos` tests need Accessibility permission or compiled Swift helpers.
+`macos` tests need the source-versioned Swift helpers and, for live AX tests,
+Accessibility grants for the actual `mac-ax-helper` and `mac-ax-watcher`
+executables. Granting only the terminal or daemon is not equivalent.
 `integration` tests use a real provider or the complete local OCR runtime and
 remain outside the offline gate.
 
@@ -73,7 +75,8 @@ drift tests.
 
 ## 5. Build and inspect a local model
 
-After installing the Swift helpers and granting Accessibility permission:
+After installing the Swift helpers and granting Accessibility to both native
+principals used by the configured daemon policy:
 
 ```bash
 bash install.sh
@@ -82,7 +85,6 @@ persome llm status --check
 persome ocr status --check
 persome doctor
 persome status
-persome capture-once
 
 # Work normally while the daemon performs incremental modeling.
 persome model status
@@ -103,6 +105,14 @@ Without a configured hosted credential or keyless local endpoint, capture and
 BM25 retrieval continue while semantic modeling reports degradation. A sparse
 model may correctly remain degraded until it has
 enough repeated evidence for higher geometry.
+
+`persome onboard` is the authoritative live smoke test because it invokes the
+running daemon's capture runner and binds the result to its generation and
+lifecycle owner. `persome capture-once` is only a lower-level helper diagnostic:
+it runs a new scheduler in the calling CLI, does not prove the event watcher,
+daemon ownership, generation, privacy receipt, or isolated worker readiness,
+and can race a running daemon. Stop Persome before using it in a focused helper
+test; do not use it as release or onboarding proof.
 
 ## 6. Verify the release artifact
 
@@ -125,14 +135,46 @@ PERSOME_ROOT=/tmp/persome-wheel-root \
   /tmp/persome-wheel-venv/bin/persome doctor
 PERSOME_ROOT=/tmp/persome-wheel-root \
   /tmp/persome-wheel-venv/bin/persome llm providers
+/tmp/persome-wheel-venv/bin/python - <<'PY'
+from importlib.resources import files
+
+bundled = files("persome") / "_bundled"
+required = (
+    "build-mac-ax-helper.sh",
+    "build-mac-ax-watcher.sh",
+    "mac-ax-helper.swift",
+    "mac-ax-watcher.swift",
+    "mac-url-handlers.swift",
+    "model_assets/LICENSE",
+    "model_assets/three.module.js",
+    "model_assets/layout.mjs",
+    "model_assets/viewer.css",
+    "model_assets/viewer.js",
+    "model_assets/jsm/controls/OrbitControls.js",
+    "model_assets/jsm/renderers/CSS2DRenderer.js",
+    "ocr_models/PP-OCRv6_tiny_det/inference.pdiparams",
+    "ocr_models/PP-OCRv6_tiny_rec/inference.pdiparams",
+)
+for relative in required:
+    assert (bundled / relative).is_file(), relative
+PY
 ```
 
-In an interactive macOS session, `install.sh` runs `persome onboard`. The
-onboarding command separately requests Accessibility and Screen Recording,
-performs a full bundled OCR worker initialization on Apple Silicon, starts the
-daemon, polls the canonical local health endpoint, and requires a fresh capture
-record before it succeeds. Non-interactive packaging environments must run the
-command later from a logged-in macOS session.
+In an interactive macOS session, `install.sh` runs `persome onboard`. For the
+standard Apple Silicon daemon mode, onboarding separately requests Accessibility
+for the source-versioned capture helper and event watcher, requests Screen
+Recording when the effective pixel policy needs it, starts the final owner,
+waits for its bundled OCR worker, polls canonical local health and authenticated
+permission endpoints, and requires an exact fresh-capture receipt from the
+daemon-owned runner. Repeated runs must reuse the same source-versioned native
+binaries and ready worker rather than compile new TCC principals or spawn a
+    second OCR process. The same command must also report truthfully for Intel
+    without local OCR, durable OCR/pixel opt-out, trusted ingest, paused/locked update,
+LaunchAgent-owned, and HTTP-disabled modes. HTTP-disabled daemon mode proves the
+same generation through owner-only `.runtime-state.json`; trusted ingest is
+rejected when its authenticated HTTP endpoint is disabled.
+Non-interactive packaging environments must run the command later from a
+logged-in macOS session.
 `persome ocr-selftest <image>` remains available for a known-image inference
 check.
 
@@ -144,8 +186,25 @@ uv run pytest tests/test_updater.py -q
 ```
 
 These tests pin the official shallow-clone arguments, local-source validation,
-daemon/LaunchAgent stop and recovery behavior, `install.sh --update` handoff,
-and the public CLI result.
+exclusive update ownership, inactive candidate construction, transaction-marker
+validation, one-operation directory exchange, crash recovery before/after that
+exchange, rejection of absolute candidate shebangs, execution of the relocated
+CLI after old-venv cleanup, signal-safe rollback, and final
+background/LaunchAgent ownership.
+Lifecycle tests also cover daemon lifetime locking, PID reuse, malformed live
+generation state, and owner-marker handoff. `tests/test_onboarding.py`,
+`tests/test_launchagent.py`, `tests/test_ax_capture.py`, and
+`tests/test_ocr_subprocess.py` cover the permission/mode cross-product,
+source-versioned helper reuse, durable `ocr_policy`, progress reporting, and
+daemon-owned worker/readiness receipts.
+
+For a manual native-identity regression, record the helper and watcher paths
+printed by two same-version installs and confirm they are byte-for-byte the same
+under `<PERSOME_ROOT>/native/<source-digest>/`. A deliberate helper-source
+change must resolve a different directory and require a fresh Accessibility
+grant; rolling that update back must resolve the old executable again. Never
+copy a newly compiled binary over an existing digest path to make a TCC test
+pass.
 
 For a GitHub Release produced by the current workflow (older releases are not
 retroactively attested), also download `SHA256SUMS`, verify it from the

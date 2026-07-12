@@ -33,9 +33,13 @@ tests can run on Linux with macOS-marked tests deselected.
 
 ## State formation
 
-1. `capture/` receives Accessibility events. Supported installs enable bundled,
-   subprocess-isolated PP-OCRv6 as a fallback when an app exposes no usable AX
-   text; AX remains the primary signal.
+1. In `capture.source="daemon"`, the source-versioned native watcher receives
+   Accessibility events and the matching helper reads focused trees. In
+   `capture.source="ingest"`, a trusted bearer-authenticated producer owns OS
+   capture and the daemon starts no watcher. Both modes converge before S1.
+   Supported Apple Silicon installs can enable bundled, subprocess-isolated
+   PP-OCRv6 as a fallback when an app exposes no usable AX text; AX remains the
+   primary daemon-mode signal.
 2. `parsers/` normalizes app-specific structures into capture records.
 3. `timeline/` groups records into one-minute blocks and preserves authored
    evidence.
@@ -50,6 +54,34 @@ The detailed stage behavior lives in
 [`docs/timeline.md`](docs/timeline.md),
 [`docs/session.md`](docs/session.md), and
 [`docs/writer.md`](docs/writer.md).
+
+## Runtime control plane
+
+`persome onboard` proves the configured mode rather than assuming one universal
+capture path. Daemon mode requests Accessibility for the actual immutable
+`mac-ax-helper` and optional `mac-ax-watcher` principals, requests Screen
+Recording only when the effective pixel policy requires it, and obtains a fresh
+capture from the running scheduler. Ingest mode proves the authenticated ingest
+runner. Intel, explicit OCR opt-out, paused/locked privacy state, and
+HTTP-disabled daemon mode each publish their truthful readiness receipt. The
+durable `[capture].ocr_policy` prevents ordinary onboarding or an update from
+silently reversing an explicit choice.
+
+Every daemon holds `<PERSOME_ROOT>/.daemon.lock` for its lifetime and publishes
+an owner-only `.runtime-state.json` with generation, phase, policy, permission,
+worker, and capture/privacy receipts. PID, current-user process identity, start
+time, executable/command, and generation are revalidated before signaling.
+LaunchAgent ownership also binds the loaded job program/PID and persistent
+`.launchagent-owner` intent marker to that Runtime.
+
+Updates build an inactive, transaction-marked virtualenv, then exchange it with
+the active venv using one same-filesystem kernel operation. The old code remains
+at the replacement path until the new final owner passes onboarding. Fsynced
+transaction phase plus the marker permit deterministic rollback even if the
+updater crashes immediately around the exchange. Swift AX binaries live outside
+either venv at immutable architecture/source-digest paths, so a same-version
+reinstall reuses the exact TCC principal, changed helper source requires an
+explicit new grant, and rollback resolves the old binary again.
 
 ## Model construction
 
@@ -86,6 +118,8 @@ written atomically with owner-only permissions.
 | `index.db` | WAL-mode FTS5, model, provenance, sessions, and vectors |
 | `model-build.json` | last reproducibility manifest |
 | `exports/*.json` | redacted model snapshots, mode `0600` |
+| `.runtime-state.json` | owner-only Runtime generation and readiness receipt |
+| `native/<source-digest>/` | immutable AX helper/watcher binaries |
 
 Markdown remains the default write authority; evomem can be selected
 explicitly. The runtime does not destructively migrate old product tables, and

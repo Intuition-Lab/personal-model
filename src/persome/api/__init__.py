@@ -196,6 +196,12 @@ def build_api_app(cfg: Config | None = None, *, auth_enabled: bool = True) -> Fa
     Authentication is on by default.  In-process tests and schema rendering may
     disable it explicitly; the daemon mount never does.
     """
+    # Route handlers use a process-local config reference.  Reset it for every
+    # app construction so a prior test/app instance cannot leak its capture
+    # policy into this one.  Production always passes the daemon's loaded cfg;
+    # ``None`` deliberately restores the documented load-from-disk behavior.
+    _set_route_config(cfg)
+
     app = FastAPI(
         title="Persome API",
         description="Local-first screen-context memory and personal-model REST API.",

@@ -30,16 +30,26 @@ uv run python scripts/sample_demo.py
 
 ```bash
 bash install.sh
-persome llm status --check
-persome ocr status --check
+persome onboard
+persome status
+persome llm status
+persome ocr status
 persome doctor
-persome start
 persome model open
 ```
 
+The installer already runs onboarding in an interactive macOS session and
+leaves the Runtime running; the explicit `persome onboard` above is an
+idempotent recheck, not a prerequisite `stop`/`start` cycle. It requests
+Accessibility for the actual source-versioned AX helper and watcher, applies
+the durable OCR policy, proves the final Runtime owner and generation, and
+returns the receipt appropriate to daemon, ingest, paused, or locked mode.
+
 Update an existing installation from any directory with `persome update`. The
-command preserves local configuration and personal data, then repeats the
-permission, OCR, health, and fresh-capture proof.
+command builds an inactive candidate, atomically exchanges it with the active
+virtualenv, preserves local configuration and personal data, and commits only
+after the same mode-aware onboarding proof. An interrupted update exchanges the
+old Runtime back before restoring its lifecycle owner.
 
 Persome keeps data under `~/.persome`, uses local AX capture by default, offers
 optional on-device OCR, and serves streamable HTTP MCP at

@@ -76,7 +76,9 @@ def test_ipv6_loopback_host_passes() -> None:
 
 def test_health_allowed_despite_malicious_origin() -> None:
     """``/health`` is always allowed — a hostile Origin can't trip liveness."""
-    client = TestClient(build_api_app(auth_enabled=False))
+    # Pin the default (OCR-disabled) config so this origin-guard test does not
+    # depend on a developer's on-disk config or another in-process API app.
+    client = TestClient(build_api_app(Config(), auth_enabled=False))
     response = client.get(
         "/health",
         headers={"origin": "https://evil.com", "host": "attacker.com"},

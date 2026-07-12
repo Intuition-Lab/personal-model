@@ -8,50 +8,98 @@ resource resolution adapted for a uv/pip-installable package.
 from __future__ import annotations
 
 import contextlib
-import ctypes
+import fcntl
+import hashlib
 import json
 import os
 import platform
 import subprocess
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from .. import paths
 from ..logger import get
 from .ax_models import AXCaptureResult
 
 logger = get("persome.capture")
 
 _SUBPROCESS_TIMEOUT = 10  # seconds (covers --timeout 3 + overhead)
+_AX_TRUST_CACHE_SECONDS = 1.0
+_ax_trust_cache: dict[bool, tuple[float, bool]] = {}
+_ax_trust_lock = threading.Lock()
 
 
-def ax_trusted() -> bool:
-    """Whether **this process** is trusted for macOS Accessibility.
+def _binary_ax_trusted(binary: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [str(binary), "--check-accessibility"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
-    A live TCC read of the daemon's *own* grant. This is authoritative only in
-    ``capture.source = "daemon"`` mode, where the daemon spawns ``mac-ax-helper`` /
-    ``mac-ax-watcher`` to read the AX tree. In ``capture.source = "ingest"`` mode the
-    Swift Persome app owns capture (it reads the AX tree IN-PROCESS under its own TCC
-    identity and pushes frames via ``POST /captures/ingest``); the daemon then needs
-    NO Accessibility grant, so this probe is irrelevant and the app's own
-    ``AXIsProcessTrusted()`` is the signal that matters. (Historically the GUI was
-    told NOT to read the AX tree to avoid a second TCC principal; the ingest design
-    inverts that on purpose — one app-owned principal replaces the daemon's, instead
-    of adding a second.)
 
-    Returns ``False`` on non-macOS hosts or if the framework can't be loaded.
-    Pure check: no options are passed, so the system shows no dialog.
-    """
+def ax_trusted(*, refresh: bool = False, include_watcher: bool = True) -> bool:
+    """Whether every native AX principal used by this capture policy is trusted."""
+
     if platform.system() != "Darwin":
         return False
-    try:
-        appservices = ctypes.cdll.LoadLibrary(
-            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
-        )
-        appservices.AXIsProcessTrusted.restype = ctypes.c_bool
-        return bool(appservices.AXIsProcessTrusted())
-    except Exception as exc:  # noqa: BLE001 — a TCC probe must never crash the daemon
-        logger.warning("AXIsProcessTrusted probe failed: %s", exc)
+    now = time.monotonic()
+    with _ax_trust_lock:
+        if (
+            not refresh
+            and include_watcher in _ax_trust_cache
+            and now - _ax_trust_cache[include_watcher][0] < _AX_TRUST_CACHE_SECONDS
+        ):
+            return _ax_trust_cache[include_watcher][1]
+
+    helper_path = _resolve_helper_path()
+    trusted = bool(helper_path is not None and _binary_ax_trusted(helper_path))
+    if trusted and include_watcher:
+        from . import watcher
+
+        watcher_path = watcher._resolve_watcher_path()
+        trusted = bool(watcher_path is not None and _binary_ax_trusted(watcher_path))
+    with _ax_trust_lock:
+        _ax_trust_cache[include_watcher] = (now, trusted)
+    return trusted
+
+
+def request_accessibility_permission(*, include_watcher: bool = True) -> bool:
+    """Prompt/register exactly the helper binaries used by the capture policy."""
+
+    if platform.system() != "Darwin":
         return False
+    binaries: list[Path | None] = [_resolve_helper_path()]
+    if include_watcher:
+        from . import watcher
+
+        binaries.append(watcher._resolve_watcher_path())
+    requested = False
+    for binary in binaries:
+        if binary is None:
+            continue
+        try:
+            result = subprocess.run(
+                [str(binary), "--request-accessibility"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            requested = requested or result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Accessibility permission request failed for %s: %s", binary, exc)
+    with _ax_trust_lock:
+        _ax_trust_cache.clear()
+    return requested
 
 
 def _strip_frame_fields(value: Any) -> Any:
@@ -195,6 +243,78 @@ def _maybe_compile(swift_path: Path, binary_path: Path) -> None:
         )
 
 
+def _native_source_digest(swift_path: Path) -> str | None:
+    """Return the architecture-bound identity for one native helper source."""
+    try:
+        return hashlib.sha256(
+            b"persome-native-helper-v1\0"
+            + platform.machine().encode("utf-8")
+            + b"\0"
+            + swift_path.read_bytes()
+        ).hexdigest()
+    except OSError:
+        return None
+
+
+def _native_binary_path(swift_path: Path, name: str) -> Path | None:
+    """Expected immutable machine-local path for this exact helper source."""
+    digest = _native_source_digest(swift_path)
+    return paths.native_helpers_dir() / digest / name if digest is not None else None
+
+
+def _stable_native_binary(swift_path: Path, name: str) -> Path | None:
+    """Compile once into an immutable, source-versioned TCC-visible path.
+
+    Swift's ad-hoc linker signature can get a different CDHash on every build.
+    Recompiling inside each replacement venv would therefore invalidate an
+    otherwise valid Accessibility grant. Immutable per-source copies let same-
+    version reinstalls reuse the exact binary and let a failed update return to
+    the old binary byte-for-byte.
+    """
+    target = _native_binary_path(swift_path, name)
+    if target is None:
+        return None
+    digest = target.parent.name
+
+    root = paths.ensure_private_dir(paths.native_helpers_dir())
+    directory = paths.ensure_private_dir(root / digest)
+    lock = paths.open_private_lock_file(root / ".build.lock")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if target.is_symlink():
+            raise RuntimeError("native AX helper paths must not be symlinks")
+        if target.is_file() and os.access(target, os.X_OK):
+            return target
+
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        temporary.unlink()
+        try:
+            _maybe_compile(swift_path, temporary)
+            if not temporary.is_file() or not os.access(temporary, os.X_OK):
+                return None
+            os.chmod(temporary, 0o700)
+            binary_fd = os.open(temporary, os.O_RDONLY)
+            try:
+                os.fsync(binary_fd)
+            finally:
+                os.close(binary_fd)
+            os.replace(temporary, target)
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return target
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
 def _resolve_helper_path() -> Path | None:
     """Find or build the mac-ax-helper binary.
 
@@ -220,20 +340,19 @@ def _resolve_helper_path() -> Path | None:
         from importlib.resources import files as _pkg_files
 
         bundled_dir = Path(str(_pkg_files("persome").joinpath("_bundled")))
-        candidates.append(bundled_dir / "mac-ax-helper")
+        candidates.append(bundled_dir / "mac-ax-helper.swift")
     except (ModuleNotFoundError, ValueError):
         pass
 
     # 2. Dev source tree
     dev_root = Path(__file__).resolve().parents[3]  # .../Persome/
-    candidates.append(dev_root / "resources" / "mac-ax-helper")
+    candidates.append(dev_root / "resources" / "mac-ax-helper.swift")
 
-    for binary_path in candidates:
-        swift_path = binary_path.with_suffix(".swift")
+    for swift_path in candidates:
         if swift_path.is_file():
-            _maybe_compile(swift_path, binary_path)
-        if binary_path.is_file() and os.access(binary_path, os.X_OK):
-            return binary_path
+            binary_path = _stable_native_binary(swift_path, "mac-ax-helper")
+            if binary_path is not None:
+                return binary_path
 
     return None
 
@@ -299,7 +418,8 @@ class MacAXHelperProvider:
         if proc.returncode == 2:
             logger.warning(
                 "Accessibility permission not granted. "
-                "Grant access to your terminal in System Settings → Privacy & Security → Accessibility."
+                "Run `persome onboard` to grant mac-ax-helper in System Settings → "
+                "Privacy & Security → Accessibility."
             )
             return None
         if proc.returncode != 0:

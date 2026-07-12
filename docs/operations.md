@@ -19,20 +19,43 @@ compile the Swift AX helpers.
 
 | Permission | Required | Purpose | Effect when disabled |
 |---|---|---|---|
-| Accessibility | yes for live collection | reads the focused AX tree, application, window, selected control, and visible text | daemon remains healthy but produces no useful live captures |
-| Screen Recording | yes in the standard install | supplies focused-window pixels to the enabled local OCR worker and encrypted screenshot retention | AX collection continues, but health reports OCR degraded and AX-poor surfaces remain sparse |
+| Accessibility | yes for daemon-mode live collection | lets the source-versioned `mac-ax-helper` and optional `mac-ax-watcher` read focused AX structure and events | daemon remains healthy but produces no useful live AX captures |
+| Screen Recording | yes when screenshots or effective OCR are enabled | supplies focused-window pixels to local OCR and encrypted screenshot retention | AX collection continues; pixel features are unavailable |
 | Full Disk Access | no | not used | no effect |
 | Automation / Apple Events | no | not used by the Runtime | no effect |
 
-Grant permissions to the executable that launches Persome. If a terminal starts
-the daemon, grant that terminal. If launchd later owns the daemon, rerun
-`persome doctor` after the handoff and confirm live capture.
+Accessibility belongs to the native executables that actually call AX, not to
+the terminal or Python daemon that launches them. Onboarding requests and probes
+`mac-ax-helper` first and, when `event_driven=true`, `mac-ax-watcher` separately.
+Screen Recording is checked by the Runtime process that captures pixels. If the
+Runtime lifecycle or helper source changes, rerun `persome onboard` and let it
+name any new principal explicitly.
 
-Interactive `install.sh` runs `persome onboard`. It presents separate native
-dialogs for Accessibility and Screen Recording, waits for both live TCC probes,
-verifies the OCR worker, starts the daemon, polls local health, and writes one
-fresh capture. Rerun `persome onboard` after changing the launcher identity;
-use `persome ocr disable` for an explicit OCR opt-out.
+Interactive `install.sh` runs `persome onboard`. Standard daemon mode presents
+separate native dialogs for the helper and watcher Accessibility grants, then
+Screen Recording when the configured pixel policy requires it. It starts the
+final lifecycle owner, verifies its isolated OCR worker when enabled, and writes
+one fresh capture through that daemon's runner. The authenticated `/permissions`
+endpoint invokes the actual helper/watcher probes and the Runtime's Screen
+Recording preflight. HTTP-disabled daemon mode publishes the same generation's
+owner-only state receipt; trusted ingest proves its authenticated runner and
+does not claim daemon-owned macOS permissions. Intel without local OCR and
+explicit OCR/pixel opt-out report their actual remaining AX/pixel capabilities.
+Updates preserve paused/locked privacy state without forcing a frame. The first
+OCR load can take up to two minutes; repeated runs publish progress and normally
+reuse the worker.
+
+`[capture].ocr_policy` makes intent durable: `auto` is a fresh/unconfigured
+state, while `enabled` and `disabled` are explicit choices. `persome onboard`
+without `--tier` preserves the current choice; `persome onboard --tier tiny` or
+`persome ocr setup` enables OCR, and `persome ocr disable` records the opt-out.
+The final notification is non-blocking.
+
+Each compiled AX helper lives at an immutable
+`native/<source-digest>/<helper-name>` path. Same-version reinstalls reuse the
+exact files and grants. A helper-source change produces a new path and requires
+an explicit new Accessibility grant; update rollback returns to the old wheel
+and old helper path.
 
 ## Local paths
 
@@ -50,6 +73,12 @@ use `persome ocr disable` for an explicit OCR opt-out.
 | `backup/` | SQLite safety snapshots containing personal model state |
 | `logs/` | daemon and launchd logs; may contain operational context |
 | `model-build.json` | latest build manifest and degraded-stage report |
+| `.pid`, `.runtime-state.json` | compatibility PID plus owner-only generation, phase, permission, OCR-worker, and capture/privacy receipt |
+| `.daemon.lock` | lifetime single-Runtime lock inherited across background forks |
+| `.launchagent-owner` | durable intent that launchd owns Runtime lifecycle |
+| `.update.lock`, `.update-state.json` | exclusive update lock and crash-recovery phase metadata |
+| `native/<source-digest>/` | immutable machine-local AX binaries; code, not personal data |
+| `venv.replacement.update`, `venv.previous.committed.*`, `venv.failed.update.*` | candidate, retained-old, and cleanup environments during a transaction; code, not personal data |
 | `venv/` | dedicated installer environment; code, not personal data |
 
 Treat the whole root as sensitive. Backups and exports are copies of personal
@@ -69,6 +98,14 @@ before the narrow index reset. Core database damage is still quarantined as
 SQLite writes, so `persome status`, MCP clients, and a second `persome start`
 do not repair or quarantine an open database.
 
+Runtime startup also fails closed on ambiguous process state. `.daemon.lock`
+serializes concurrent starters for the daemon's entire lifetime; `.pid` is
+resolved against current-user ownership, executable/command, process start
+time, and the generation in `.runtime-state.json` before any signal. Never
+manually signal or delete state based only on the numeric PID. Stop the owning
+Desktop app or LaunchAgent first when a live Persome process has an invalid
+generation receipt.
+
 ## Lifecycle and first recall
 
 ```bash
@@ -76,12 +113,16 @@ persome onboard
 persome llm status --check
 persome ocr status --check
 persome doctor
-persome start
 persome status
 persome pause
 persome resume
 persome stop
 ```
+
+`persome onboard` leaves the proved Runtime running. A following `persome start`
+should report that it is already running; stopping and starting again is not
+part of normal installation or update. Use `persome start` only when status says
+the Runtime is safely stopped.
 
 ## Update the Runtime
 
@@ -89,18 +130,44 @@ persome stop
 persome update
 ```
 
-The updater fetches a fresh shallow copy of the official `main` branch instead
-of editing a user's source checkout. It stops either the background daemon or
-the owner LaunchAgent, invokes the same locked wheel installer with existing
-LLM/MCP setup preserved, reruns onboarding and its fresh-capture proof, and
-restores prior LaunchAgent ownership. Configuration, secrets, capture history,
-memory, model state, and logs under `PERSOME_ROOT` are not replaced.
-Update-mode installation keeps the previous virtualenv until onboarding passes;
-a failed proof stops the replacement daemon and restores the prior Runtime.
+The updater fetches a fresh shallow copy of official `main` instead of editing a
+user's checkout. The installer builds a transaction-marked
+`venv.replacement.update` while `venv` remains the working old installation.
+After stopping either the background daemon or owner LaunchAgent, the updater
+atomically exchanges those directories in one same-filesystem kernel operation,
+restores the prior owner with the new executable, and runs mode-aware onboarding
+against that final generation. Configuration, secrets, capture history, memory,
+model state, logs, `ocr_policy`, and lifecycle intent under `PERSOME_ROOT` are
+not replaced.
+
+The exchanged old venv remains at `venv.replacement.update` until permission,
+OCR-policy, health, owner, and capture/readiness proof all pass. Only then is it
+renamed for post-commit cleanup. A failed proof or interruption exchanges the
+directories back before restoring and proving the prior Runtime owner. A
+transaction marker plus fsynced `preparing`/`prepared`/`activated`/`committing`
+state makes crashes on either side of the exchange deterministic to recover.
+INT, TERM, and HUP share that recovery path; further signals cannot interrupt
+rollback. Concurrent updates are serialized by the owner-only root lock.
+Invoking `bash install.sh` from a checkout when Persome is already installed
+delegates to `persome update --source <checkout>` so manual reinstalls receive
+the same stop, rollback, and post-install proof guarantees.
 
 `persome update --source /path/to/checkout` is the explicit developer/offline
 path. The supplied tree must have the complete Persome source layout; the
 updater never pulls or rewrites it.
+
+## Capture diagnostics
+
+Use `persome onboard` for an end-to-end proof. Its capture request runs inside
+the active daemon and binds permission, worker, privacy/mode receipt, generation,
+and lifecycle ownership.
+
+`persome capture-once` is a lower-level developer diagnostic. It constructs a
+new capture provider and scheduler in the calling CLI, so it does not prove the
+daemon's event watcher, lifetime lock, generation, owner, privacy receipt, or
+isolated OCR-worker readiness. It may also race a running capture scheduler.
+Stop Persome before using it to isolate helper output; a successful path is not
+an onboarding or release acceptance result.
 
 The default active-session flush is five minutes. Timeline closure and model
 processing add bounded local work, so the operational target for first useful

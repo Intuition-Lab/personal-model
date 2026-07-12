@@ -5,14 +5,16 @@ desktop wallpaper — every other app's window is blanked by the OS — so a dae
 captures screenshots stores useless wallpaper frames. A launchd background process
 calling the capture API never gets prompted, so the permission must be *requested*
 (which also registers the binary, here ``Persome Backend``, in the Screen Recording list
-so the user can toggle it on).
+so the user can toggle it on). Only explicit onboarding/setup actions call the
+request function; ordinary Runtime startup uses the preflight check only.
 
 We call CoreGraphics directly via ctypes — no pyobjc/Quartz dependency to bundle:
 - ``CGPreflightScreenCaptureAccess()`` → has the permission already been granted?
 - ``CGRequestScreenCaptureAccess()`` → register + prompt (idempotent).
 
-Both fail **open** (return ``True`` / proceed) if the symbols can't be resolved, so a
-non-Darwin host or an SDK without these symbols never blocks capture.
+Non-Darwin hosts treat the permission as not applicable. On macOS, an
+unresolvable CoreGraphics probe fails closed so onboarding can never claim a
+permission it did not actually prove.
 """
 
 from __future__ import annotations
@@ -45,22 +47,22 @@ def _coregraphics() -> ctypes.CDLL | None:
         lib.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
         lib.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
         _cg = lib
-    except Exception as exc:  # noqa: BLE001 — any load failure → fail open
+    except Exception as exc:  # noqa: BLE001 — surfaced as denied on macOS
         logger.debug("CoreGraphics unavailable for screen-recording check: %s", exc)
         _cg = None
     return _cg
 
 
 def has_screen_recording() -> bool:
-    """Whether Screen Recording is granted. Fail-open (True) if unknowable."""
+    """Whether Screen Recording is granted (fail-closed on macOS)."""
     lib = _coregraphics()
     if lib is None:
-        return True
+        return sys.platform != "darwin"
     try:
         return bool(lib.CGPreflightScreenCaptureAccess())
     except Exception as exc:  # noqa: BLE001
         logger.debug("CGPreflightScreenCaptureAccess failed: %s", exc)
-        return True
+        return sys.platform != "darwin"
 
 
 def request_screen_recording() -> bool:
@@ -68,11 +70,12 @@ def request_screen_recording() -> bool:
 
     Returns whether access is granted *now* (usually False on first call — the user
     still has to flip the toggle, but the binary now appears in System Settings).
-    Idempotent; safe to call at every boot.
+    This may show a system dialog and must only be called after an explicit
+    user-facing confirmation, never during ordinary Runtime startup.
     """
     lib = _coregraphics()
     if lib is None:
-        return True
+        return sys.platform != "darwin"
     try:
         granted = bool(lib.CGRequestScreenCaptureAccess())
         if granted:

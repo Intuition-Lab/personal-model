@@ -18,36 +18,73 @@ PYTHON_TARGET=""
 INSTALL_TRANSACTION_ACTIVE=0
 OLD_VENV_BACKUP=""
 ONBOARDING_COMPLETED=0
+DEFER_UPDATE_COMMIT="${PERSOME_UPDATE_DEFER_COMMIT:-0}"
+UPDATE_REPLACEMENT="${PERSOME_UPDATE_REPLACEMENT:-}"
+UPDATE_TRANSACTION_ID="${PERSOME_UPDATE_TRANSACTION_ID:-}"
+UPDATE_LOCK_FD="${PERSOME_UPDATE_LOCK_FD:-}"
 
 rollback_uncommitted_install() {
   local status=$?
-  trap - EXIT
+  trap - EXIT INT TERM HUP
+  set +e
   if [[ ${status} -ne 0 && ${INSTALL_TRANSACTION_ACTIVE} -eq 1 ]]; then
+    if [[ ${UPDATE_MODE} -eq 1 && ${DEFER_UPDATE_COMMIT} -eq 1 ]]; then
+      warn "installation failed; discarding the inactive update candidate"
+      if [[ -n "${UPDATE_REPLACEMENT}" && -d "${UPDATE_REPLACEMENT}" && ! -L "${UPDATE_REPLACEMENT}" ]]; then
+        local failed_candidate="${UPDATE_REPLACEMENT}.failed.$$.$RANDOM"
+        if mv "${UPDATE_REPLACEMENT}" "${failed_candidate}"; then
+          rm -rf "${failed_candidate}" || true
+        else
+          warn "could not quarantine the failed update candidate"
+        fi
+      fi
+      exit "${status}"
+    fi
     warn "installation failed; restoring the previous virtualenv"
     # Update-mode onboarding can start the replacement daemon before its final
     # capture proof. Stop that process before replacing its on-disk virtualenv;
     # the outer `persome update` command restarts the restored Runtime.
     if [[ ${UPDATE_MODE} -eq 1 && -f "${INSTALL_HOME}/.pid" ]]; then
-      local update_pid=""
-      update_pid="$(tr -d '[:space:]' < "${INSTALL_HOME}/.pid" 2>/dev/null || true)"
-      if [[ "${update_pid}" =~ ^[0-9]+$ ]] && kill -0 "${update_pid}" 2>/dev/null; then
-        kill -TERM "${update_pid}" 2>/dev/null || true
-        local attempts=50
-        while (( attempts > 0 )) && kill -0 "${update_pid}" 2>/dev/null; do
-          sleep 0.1
-          attempts=$((attempts - 1))
-        done
+      if [[ -x "${VENV_DIR}/bin/persome" ]]; then
+        PERSOME_ROOT="${INSTALL_HOME}" "${VENV_DIR}/bin/persome" stop --timeout 5 \
+          >/dev/null 2>&1 || true
       fi
     fi
-    rm -rf "${VENV_DIR}"
     if [[ -n "${OLD_VENV_BACKUP}" && -d "${OLD_VENV_BACKUP}" ]]; then
-      mv "${OLD_VENV_BACKUP}" "${VENV_DIR}"
+      # Move the replacement aside first, restore the previous venv with an
+      # atomic rename, and only then do the slow recursive cleanup. This keeps
+      # the installed shim valid even when Ctrl-C initiated the rollback.
+      local failed_venv="${VENV_DIR}.failed.$$.$RANDOM"
+      local replacement_moved=0
+      if [[ -e "${VENV_DIR}" ]]; then
+        if mv "${VENV_DIR}" "${failed_venv}"; then
+          replacement_moved=1
+        else
+          warn "could not move the failed replacement virtualenv aside"
+        fi
+      fi
+      if [[ ! -e "${VENV_DIR}" ]]; then
+        if ! mv "${OLD_VENV_BACKUP}" "${VENV_DIR}"; then
+          warn "could not restore the previous virtualenv"
+          if [[ ${replacement_moved} -eq 1 && -d "${failed_venv}" ]]; then
+            mv "${failed_venv}" "${VENV_DIR}" || true
+          fi
+        fi
+      fi
+      if [[ -d "${VENV_DIR}" && -e "${failed_venv}" ]]; then
+        rm -rf "${failed_venv}" || true
+      fi
+    else
+      rm -rf "${VENV_DIR}" || true
     fi
   fi
   exit "${status}"
 }
 
 trap rollback_uncommitted_install EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # The fallback bootstrap downloads a specific uv release and verifies the
 # archive before executing any of its contents. Update version + both digests
@@ -149,6 +186,82 @@ parse_args() {
         ;;
     esac
   done
+}
+
+validate_internal_update_flags() {
+  case "${DEFER_UPDATE_COMMIT}" in
+    0|1) ;;
+    *) die "PERSOME_UPDATE_DEFER_COMMIT must be 0 or 1" ;;
+  esac
+  if [[ ${DEFER_UPDATE_COMMIT} -eq 1 && ${UPDATE_MODE} -ne 1 ]]; then
+    die "deferred update commit requires --update"
+  fi
+  if [[ ${DEFER_UPDATE_COMMIT} -eq 1 ]]; then
+    validate_deferred_update_transaction
+  fi
+}
+
+validate_deferred_update_transaction() {
+  local expected_replacement="${INSTALL_HOME}/venv.replacement.update"
+  local state_file="${INSTALL_HOME}/.update-state.json"
+  local lock_file="${INSTALL_HOME}/.update.lock"
+  local active_python="${INSTALL_HOME}/venv/bin/python"
+  [[ "${UPDATE_REPLACEMENT}" == "${expected_replacement}" ]] \
+    || die "deferred update candidate must be ${expected_replacement}"
+  [[ "${UPDATE_TRANSACTION_ID}" =~ ^[0-9a-f]{32}$ ]] \
+    || die "deferred update requires a valid transaction ID"
+  [[ "${UPDATE_LOCK_FD}" =~ ^[0-9]+$ ]] \
+    || die "deferred update requires the inherited update-lock descriptor"
+  [[ -x "${active_python}" ]] \
+    || die "deferred update validation requires the active Runtime Python"
+  "${active_python}" - \
+    "${state_file}" "${lock_file}" "${UPDATE_LOCK_FD}" "${UPDATE_TRANSACTION_ID}" <<'PY' \
+    || die "deferred update transaction validation failed"
+import fcntl
+import json
+import os
+import stat
+import sys
+
+state_path, lock_path, lock_fd_text, expected_id = sys.argv[1:]
+lock_fd = int(lock_fd_text)
+state_stat = os.lstat(state_path)
+lock_stat = os.lstat(lock_path)
+fd_stat = os.fstat(lock_fd)
+if not stat.S_ISREG(state_stat.st_mode) or stat.S_ISLNK(state_stat.st_mode):
+    raise SystemExit("unsafe update state file")
+if state_stat.st_uid != os.getuid() or state_stat.st_mode & 0o077:
+    raise SystemExit("update state file is not owner-private")
+if not stat.S_ISREG(lock_stat.st_mode) or (lock_stat.st_dev, lock_stat.st_ino) != (
+    fd_stat.st_dev,
+    fd_stat.st_ino,
+):
+    raise SystemExit("update-lock descriptor does not match the Runtime lock")
+# First prove the lock was already held before this validator ran. Then
+# re-locking the inherited open-file description proves it is the owner rather
+# than an unrelated descriptor blocked by somebody else.
+probe_fd = os.open(lock_path, os.O_RDWR)
+try:
+    try:
+        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        fcntl.flock(probe_fd, fcntl.LOCK_UN)
+        raise SystemExit("update lock was not held by the delegating updater")
+finally:
+    os.close(probe_fd)
+fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+with open(state_path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+if payload != {
+    "schema_version": 2,
+    "launchagent_was_loaded": payload.get("launchagent_was_loaded"),
+    "phase": "preparing",
+    "transaction_id": expected_id,
+} or not isinstance(payload["launchagent_was_loaded"], bool):
+    raise SystemExit("update state does not match the delegated transaction")
+PY
 }
 
 require_repo_root() {
@@ -304,15 +417,26 @@ install_package() {
 
   mkdir -p "${INSTALL_HOME}"
   chmod 0700 "${INSTALL_HOME}"
-  OLD_VENV_BACKUP="${VENV_DIR}.previous.$$"
-  rm -rf "${OLD_VENV_BACKUP}"
-  if [[ -d "${VENV_DIR}" ]]; then
+  [[ ! -L "${VENV_DIR}" ]] || die "virtualenv path must not be a symlink: ${VENV_DIR}"
+  if [[ ${UPDATE_MODE} -eq 1 && ${DEFER_UPDATE_COMMIT} -eq 1 ]]; then
+    # Build beside the active venv. The outer updater performs one kernel-level
+    # directory exchange only after this candidate is complete and marked.
+    VENV_DIR="${UPDATE_REPLACEMENT}"
+    [[ ! -L "${VENV_DIR}" ]] || die "candidate virtualenv path must not be a symlink: ${VENV_DIR}"
+    [[ ! -e "${VENV_DIR}" ]] \
+      || die "unfinished update candidate exists at ${VENV_DIR}; refusing to overwrite it"
+    OLD_VENV_BACKUP=""
+  else
+    OLD_VENV_BACKUP="${VENV_DIR}.previous.$$"
+    rm -rf "${OLD_VENV_BACKUP}"
+  fi
+  if [[ ${DEFER_UPDATE_COMMIT} -ne 1 && -d "${VENV_DIR}" ]]; then
     mv "${VENV_DIR}" "${OLD_VENV_BACKUP}"
   fi
   INSTALL_TRANSACTION_ACTIVE=1
 
   log "creating virtualenv at ${VENV_DIR}"
-  if ! "${UV_BIN}" venv "${VENV_DIR}" --python "${python_target}"; then
+  if ! "${UV_BIN}" venv "${VENV_DIR}" --python "${python_target}" --relocatable; then
     rm -rf "${build_dir}"
     die "failed to create virtualenv"
   fi
@@ -359,11 +483,46 @@ PY
 }
 
 commit_install() {
-  if [[ -n "${OLD_VENV_BACKUP}" ]]; then
-    rm -rf "${OLD_VENV_BACKUP}"
-  fi
+  local committed_backup="${OLD_VENV_BACKUP}"
+  # The replacement is now authoritative. Mark the transaction committed
+  # before deleting the backup so an interrupt during cleanup cannot roll back
+  # by first deleting the working virtualenv.
   OLD_VENV_BACKUP=""
   INSTALL_TRANSACTION_ACTIVE=0
+  if [[ -n "${committed_backup}" ]]; then
+    rm -rf "${committed_backup}" || warn "could not remove old virtualenv backup"
+  fi
+}
+
+defer_install_commit() {
+  [[ ${UPDATE_MODE} -eq 1 && ${DEFER_UPDATE_COMMIT} -eq 1 ]] \
+    || die "deferred commit requested outside update mode"
+  [[ "${VENV_DIR}" == "${UPDATE_REPLACEMENT}" && -d "${VENV_DIR}" && ! -L "${VENV_DIR}" ]] \
+    || die "the inactive update candidate is missing or unsafe"
+  "${VENV_DIR}/bin/python" - "${VENV_DIR}/.persome-update-transaction" \
+    "${UPDATE_TRANSACTION_ID}" <<'PY' \
+    || die "could not persist the update candidate marker"
+import os
+import sys
+
+path, transaction_id = sys.argv[1:]
+descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.write(descriptor, (transaction_id + "\n").encode())
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+directory = os.open(os.path.dirname(path), os.O_RDONLY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+  # The outer updater holds the exclusive lock and owns final activation,
+  # daemon-owned onboarding proof, exchange, commit, and rollback. Disable this
+  # shell's EXIT cleanup only after the complete candidate marker is durable.
+  INSTALL_TRANSACTION_ACTIVE=0
+  log "replacement prepared; final Runtime proof and commit are owned by persome update"
 }
 
 compile_bundled_binaries() {
@@ -418,6 +577,11 @@ install_shim() {
 }
 
 verify_install() {
+  if [[ ${UPDATE_MODE} -eq 1 && ${DEFER_UPDATE_COMMIT} -eq 1 ]]; then
+    PERSOME_ROOT="${INSTALL_HOME}" "${PERSOME_BIN}" --help >/dev/null \
+      || die "installation verification failed (new 'persome --help' did not succeed)"
+    return 0
+  fi
   PERSOME_ROOT="${INSTALL_HOME}" "${PERSOME_BIN}" status >/dev/null \
     || die "installation verification failed ('persome status' did not succeed)"
 }
@@ -566,9 +730,10 @@ run_onboarding() {
   echo "  Permission and Runtime Onboarding"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
-  echo "Persome will explain and request Accessibility and Screen Recording in"
-  echo "separate macOS dialogs. It then verifies local OCR, starts the daemon,"
-  echo "checks the local health endpoint, and writes one fresh capture."
+  echo "Persome will separately explain and request Accessibility for the bundled"
+  echo "capture helper, Accessibility for the optional event watcher, and Screen"
+  echo "Recording when the configured pixel policy needs it. It then verifies local"
+  echo "OCR, the final Runtime owner, readiness, and a mode-aware capture receipt."
   echo ""
   if ! PERSOME_ROOT="${INSTALL_HOME}" "${INSTALL_BIN_DIR}/persome" onboard --tier tiny; then
     die "onboarding is incomplete; rerun 'persome onboard' to finish permissions and runtime verification"
@@ -655,12 +820,16 @@ Connect an agent (MCP):
     persome install claude-desktop
     persome install opencode
 
-Run a health check any time:
+Inspect Runtime and OCR status any time:
   persome doctor
-  persome ocr status --check
+  persome ocr status
 
 Change or verify the LLM provider:
   persome llm setup
+  persome llm status
+
+When those optional features are enabled, run their live probes with:
+  persome ocr status --check
   persome llm status --check
 EOF
 
@@ -668,10 +837,11 @@ EOF
     cat <<'EOF'
 
 Onboarding proof:
-  - Accessibility was granted for focused AX text and structure.
-  - Screen Recording and the isolated local OCR worker were verified.
-  - Persome was started, its local health endpoint passed, and a fresh capture
-    record was written. Persome does not require Full Disk Access or Automation.
+  - The configured capture mode's required macOS permissions were verified.
+  - The effective OCR/pixel policy and final Runtime lifecycle owner were proved.
+  - A mode-aware fresh-capture, ingest-readiness, or preserved-privacy receipt
+    passed through HTTP or the owner-only daemon generation state. Persome does
+    not require Full Disk Access or Automation.
 EOF
   else
     cat <<'EOF'
@@ -679,7 +849,8 @@ EOF
 Onboarding pending:
   This non-interactive install could not request macOS permissions. From a
   logged-in macOS session, run `persome onboard`; it will not report success
-  until Accessibility, local OCR, daemon health, and a fresh capture all pass.
+  until the configured mode's permissions, Runtime owner, OCR policy, and
+  capture/readiness receipt all pass.
 EOF
   fi
 
@@ -692,9 +863,45 @@ EOF
   esac
 }
 
+delegate_existing_install() {
+  if [[ ! -e "${VENV_DIR}" ]]; then
+    return 0
+  fi
+  # The current updater invokes this installer with the deferred transaction
+  # marker. Any other existing-install invocation (including --update from a
+  # previous release) must bootstrap the updater from this source tree first.
+  if [[ ${UPDATE_MODE} -eq 1 && ${DEFER_UPDATE_COMMIT} -eq 1 ]]; then
+    return 0
+  fi
+  [[ ! -L "${VENV_DIR}" ]] \
+    || die "existing virtualenv must not be a symlink: ${VENV_DIR}"
+  [[ -x "${VENV_DIR}/bin/python" ]] \
+    || die "existing installation is incomplete (missing ${VENV_DIR}/bin/python); move it aside and rerun the installer"
+  log "existing installation detected; bootstrapping the current source-tree updater"
+  export PERSOME_ROOT="${INSTALL_HOME}"
+  export PERSOME_INSTALL_HOME="${INSTALL_HOME}"
+  export PYTHONPATH="${ROOT_DIR}/src"
+  export PYTHONNOUSERSITE=1
+  if [[ ${UPDATE_MODE} -eq 1 ]]; then
+    # Compatibility only: a released updater may have booted launchd out before
+    # delegating to this source tree. A direct `bash install.sh --update` has an
+    # interactive shell as parent and must not leave a lock keeper tied to that
+    # long-lived shell.
+    local parent_command
+    parent_command="$(ps -ww -p "${PPID}" -o command= 2>/dev/null || true)"
+    if [[ "${parent_command}" =~ (^|[[:space:]])([^[:space:]]*/)?persome[[:space:]]+update([[:space:]]|$) ]] \
+      || [[ "${parent_command}" =~ [[:space:]]-m[[:space:]]+persome[[:space:]]+update([[:space:]]|$) ]]; then
+      export PERSOME_UPDATE_INFER_LAUNCHAGENT_FROM_PLIST=1
+    fi
+  fi
+  exec "${VENV_DIR}/bin/python" -m persome update --source "${ROOT_DIR}"
+}
+
 main() {
   parse_args "$@"
+  validate_internal_update_flags
   require_repo_root
+  delegate_existing_install
   check_platform
   ensure_xcode_clt
   ensure_uv
@@ -711,6 +918,10 @@ main() {
   # restore the previous venv.
   if [[ ${UPDATE_MODE} -eq 0 ]]; then
     commit_install
+  fi
+  if [[ ${UPDATE_MODE} -eq 1 && ${DEFER_UPDATE_COMMIT} -eq 1 ]]; then
+    defer_install_commit
+    return 0
   fi
   install_shim
   inject_detected_clients
