@@ -92,6 +92,7 @@ onboarding proof:
 ```bash
 uv tool install personal-model
 persome onboard
+persome model open --after 30
 ```
 
 The distribution is named `personal-model`; the installed CLI remains
@@ -104,6 +105,7 @@ same Runtime proof:
 ```bash
 uv tool upgrade personal-model
 persome onboard
+persome model open --after 30
 ```
 
 ```bash
@@ -112,6 +114,7 @@ cd personal-model
 bash install.sh
 
 persome status
+# Source installs schedule this automatically for 30 minutes after onboarding.
 persome model open
 
 # Repeat only to repair/recheck permissions and Runtime proof:
@@ -137,6 +140,13 @@ text for AX-poor apps such as WeChat and Feishu; pixels never enter an LLM
 prompt. The first OCR model load can take up to two minutes; repeated onboarding
 normally finishes in seconds without warming a second worker. Completion never
 waits on a hidden final dialog. Persome does not require Full Disk Access.
+
+After a successful interactive source install, Persome schedules a detached,
+one-shot `persome model open --after 30` reminder. The local viewer opens
+automatically after 30 minutes of real activity and the reminder process then
+exits; no permanent reminder LaunchAgent is installed. Package-manager installs
+can run the same command explicitly. Open the viewer sooner at any time with
+`persome model open`, and keep the Runtime running while Points and Lines form.
 
 OCR intent is durable in `[capture].ocr_policy`: `auto` is an unconfigured fresh
 install, while `enabled` and `disabled` record an explicit choice. Ordinary
