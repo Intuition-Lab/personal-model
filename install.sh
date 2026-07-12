@@ -18,6 +18,7 @@ PYTHON_TARGET=""
 INSTALL_TRANSACTION_ACTIVE=0
 OLD_VENV_BACKUP=""
 ONBOARDING_COMPLETED=0
+MODEL_OPEN_SCHEDULED=0
 DEFER_UPDATE_COMMIT="${PERSOME_UPDATE_DEFER_COMMIT:-0}"
 UPDATE_REPLACEMENT="${PERSOME_UPDATE_REPLACEMENT:-}"
 UPDATE_TRANSACTION_ID="${PERSOME_UPDATE_TRANSACTION_ID:-}"
@@ -741,6 +742,19 @@ run_onboarding() {
   ONBOARDING_COMPLETED=1
 }
 
+schedule_model_open() {
+  if [[ ${UPDATE_MODE} -eq 1 || ! -t 0 ]]; then
+    return 0
+  fi
+
+  echo ""
+  if PERSOME_ROOT="${INSTALL_HOME}" "${INSTALL_BIN_DIR}/persome" model open --after 30; then
+    MODEL_OPEN_SCHEDULED=1
+  else
+    warn "could not schedule the model viewer; open it manually with 'persome model open'"
+  fi
+}
+
 ensure_screenshot_key() {
   local env_path="${INSTALL_HOME}/env"
   local status
@@ -802,11 +816,8 @@ Install root : ${INSTALL_HOME}
 Virtualenv   : ${VENV_DIR}
 CLI shim     : ${INSTALL_BIN_DIR}/persome
 
-Next steps:
-  1. Check status:
-     persome status
-  2. Open the live personal-model viewer:
-     persome model open
+Check Runtime status:
+  persome status
 
 Event memory can appear during a session's five-minute flushes. Points and Lines
 are modeled from each successful flush while the daemon keeps running. Face,
@@ -851,6 +862,26 @@ Onboarding pending:
   logged-in macOS session, run `persome onboard`; it will not report success
   until the configured mode's permissions, Runtime owner, OCR policy, and
   capture/readiness receipt all pass.
+EOF
+  fi
+
+  if [[ ${MODEL_OPEN_SCHEDULED} -eq 1 ]]; then
+    cat <<'EOF'
+
+MODEL CTA — KEEP PERSOME RUNNING:
+  ✓ Your local personal-model viewer is scheduled to open automatically in
+    30 minutes. This is your next step: let Persome learn from real activity,
+    then explore the model it forms. To open it sooner, run:
+
+      persome model open
+EOF
+  else
+    cat <<'EOF'
+
+MODEL CTA — OPEN YOUR PERSONAL MODEL:
+  Keep Persome running for about 30 minutes, then explore the model it forms:
+
+      persome model open
 EOF
   fi
 
@@ -927,6 +958,7 @@ main() {
   inject_detected_clients
   maybe_configure_llm
   run_onboarding
+  schedule_model_open
   if [[ ${UPDATE_MODE} -eq 1 ]]; then
     commit_install
   fi

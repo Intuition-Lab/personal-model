@@ -2675,6 +2675,42 @@ app.add_typer(model_app, name="model")
 
 _MODEL_VIEWER_STARTUP_ATTEMPTS = 20
 _MODEL_VIEWER_STARTUP_RETRY_SECONDS = 0.25
+_MODEL_VIEWER_REMINDER_LOG = "model-open-reminder.log"
+
+
+def _model_open_command() -> list[str]:
+    """Return a relocation-safe command for a detached model-viewer reminder."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, "-m", "persome"]
+
+
+def _schedule_model_open(after_seconds: float) -> tuple[int, Path]:
+    """Start one detached, one-shot process that opens the viewer after a delay."""
+    if after_seconds <= 0:
+        raise ValueError("the model viewer delay must be greater than zero")
+    paths.ensure_dirs()
+    log_path = paths.logs_dir() / _MODEL_VIEWER_REMINDER_LOG
+    env = os.environ.copy()
+    env["PERSOME_ROOT"] = str(paths.root())
+    command = [
+        *_model_open_command(),
+        "model",
+        "open",
+        "--scheduled-after-seconds",
+        str(after_seconds),
+    ]
+    with paths.open_private_append_text(log_path) as log_handle:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            start_new_session=True,
+            env=env,
+        )
+    return process.pid, log_path
 
 
 def _local_viewer_base_url(cfg: config_mod.Config) -> str:
@@ -2783,8 +2819,41 @@ def model_status_cmd() -> None:
 
 
 @model_app.command("open")
-def model_open() -> None:
+def model_open(
+    after: int = typer.Option(
+        0,
+        "--after",
+        min=0,
+        help="Open automatically after this many minutes; 0 opens now.",
+    ),
+    scheduled_after_seconds: float = typer.Option(
+        0.0,
+        "--scheduled-after-seconds",
+        min=0.0,
+        hidden=True,
+    ),
+) -> None:
     """Open the local model viewer through a short-lived browser capability."""
+    if after and scheduled_after_seconds:
+        console.print("[red]Choose either --after or the internal scheduled delay, not both.[/red]")
+        raise typer.Exit(2)
+    if after:
+        try:
+            _pid, log_path = _schedule_model_open(after * 60)
+        except (OSError, RuntimeError, ValueError) as exc:
+            console.print(f"[red]Could not schedule the model viewer:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        unit = "minute" if after == 1 else "minutes"
+        console.print(
+            f"[bold green]✓ Your personal model will open automatically in {after} {unit}.[/bold green]"
+        )
+        console.print("  Keep Persome running so it can learn from real activity.")
+        console.print("  Open it now: [bold]persome model open[/bold]")
+        console.print(f"  Reminder log: {log_path}")
+        return
+    if scheduled_after_seconds:
+        time.sleep(scheduled_after_seconds)
+
     import webbrowser
 
     import httpx
