@@ -440,11 +440,6 @@ Persome is shaped by people across engineering, design, research, and community.
       <td valign="middle">
         <a href="https://github.com/Singularity-tian"><img src="https://avatars.githubusercontent.com/u/113085728?v=4&amp;size=112" width="56" align="left" alt="Singularity" /></a>
         &nbsp;&nbsp;<strong><a href="https://github.com/Singularity-tian">Singularity</a></strong><br />
-        &nbsp;&nbsp;<sub>💻&nbsp;Code &nbsp;·&nbsp; 🚧&nbsp;Maintenance</sub>
-      </td>
-      <td valign="middle">
-        <a href="https://github.com/AMTso7aw"><img src="https://avatars.githubusercontent.com/u/113247039?v=4&amp;size=112" width="56" align="left" alt="Zhiheng Chen" /></a>
-        &nbsp;&nbsp;<strong><a href="https://github.com/AMTso7aw">Zhiheng Chen</a></strong><br />
         &nbsp;&nbsp;<sub>💻&nbsp;Code</sub>
       </td>
       <td valign="middle">
@@ -452,8 +447,18 @@ Persome is shaped by people across engineering, design, research, and community.
         &nbsp;&nbsp;<strong><a href="https://github.com/GouBuliya">Li_Xufeng</a></strong><br />
         &nbsp;&nbsp;<sub>💻&nbsp;Code</sub>
       </td>
+      <td valign="middle">
+        <a href="https://github.com/SiyiZhu1"><img src="https://avatars.githubusercontent.com/u/132850441?v=4&amp;size=112" width="56" align="left" alt="Siyi" /></a>
+        &nbsp;&nbsp;<strong><a href="https://github.com/SiyiZhu1">Siyi</a></strong><br />
+        &nbsp;&nbsp;<sub>🎨&nbsp;Design</sub>
+      </td>
     </tr>
     <tr>
+      <td valign="middle">
+        <a href="https://github.com/AMTso7aw"><img src="https://avatars.githubusercontent.com/u/113247039?v=4&amp;size=112" width="56" align="left" alt="Zhiheng Chen" /></a>
+        &nbsp;&nbsp;<strong><a href="https://github.com/AMTso7aw">Zhiheng Chen</a></strong><br />
+        &nbsp;&nbsp;<sub>💻&nbsp;Code</sub>
+      </td>
       <td valign="middle">
         <a href="https://github.com/huachenjie238-oss"><img src="https://avatars.githubusercontent.com/u/261379605?v=4&amp;size=112" width="56" align="left" alt="huachenjie238-oss" /></a>
         &nbsp;&nbsp;<strong><a href="https://github.com/huachenjie238-oss">huachenjie238-oss</a></strong><br />
@@ -464,22 +469,12 @@ Persome is shaped by people across engineering, design, research, and community.
         &nbsp;&nbsp;<strong><a href="https://github.com/JingYangGit">Jing@Meowy</a></strong><br />
         &nbsp;&nbsp;<sub>📈&nbsp;Growth</sub>
       </td>
+    </tr>
+    <tr>
       <td valign="middle">
         <a href="https://github.com/kevinaimonster"><img src="https://avatars.githubusercontent.com/u/172621334?v=4&amp;size=112" width="56" align="left" alt="Kevin" /></a>
         &nbsp;&nbsp;<strong><a href="https://github.com/kevinaimonster">Kevin</a></strong><br />
         &nbsp;&nbsp;<sub>💻&nbsp;Code</sub>
-      </td>
-    </tr>
-    <tr>
-      <td valign="middle">
-        <a href="https://github.com/SiyiZhu1"><img src="https://avatars.githubusercontent.com/u/132850441?v=4&amp;size=112" width="56" align="left" alt="Siyi" /></a>
-        &nbsp;&nbsp;<strong><a href="https://github.com/SiyiZhu1">Siyi</a></strong><br />
-        &nbsp;&nbsp;<sub>🎨&nbsp;Design</sub>
-      </td>
-      <td valign="middle">
-        <a href="https://github.com/syleemanet"><img src="https://avatars.githubusercontent.com/u/150102494?v=4&amp;size=112" width="56" align="left" alt="syleemanet" /></a>
-        &nbsp;&nbsp;<strong><a href="https://github.com/syleemanet">syleemanet</a></strong><br />
-        &nbsp;&nbsp;<sub>✨&nbsp;Contributor</sub>
       </td>
     </tr>
   </tbody>

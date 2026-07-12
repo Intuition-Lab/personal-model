@@ -17,16 +17,6 @@
       "avatar_url": "https://avatars.githubusercontent.com/u/113085728?v=4",
       "profile": "https://github.com/Singularity-tian",
       "contributions": [
-        "code",
-        "maintenance"
-      ]
-    },
-    {
-      "login": "AMTso7aw",
-      "name": "Zhiheng Chen",
-      "avatar_url": "https://avatars.githubusercontent.com/u/113247039?v=4",
-      "profile": "https://github.com/AMTso7aw",
-      "contributions": [
         "code"
       ]
     },
@@ -35,6 +25,24 @@
       "name": "Li_Xufeng",
       "avatar_url": "https://avatars.githubusercontent.com/u/163627234?v=4",
       "profile": "https://github.com/GouBuliya",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "SiyiZhu1",
+      "name": "Siyi",
+      "avatar_url": "https://avatars.githubusercontent.com/u/132850441?v=4",
+      "profile": "https://github.com/SiyiZhu1",
+      "contributions": [
+        "design"
+      ]
+    },
+    {
+      "login": "AMTso7aw",
+      "name": "Zhiheng Chen",
+      "avatar_url": "https://avatars.githubusercontent.com/u/113247039?v=4",
+      "profile": "https://github.com/AMTso7aw",
       "contributions": [
         "code"
       ]
@@ -63,22 +71,6 @@
       "contributions": [
         "code"
       ]
-    },
-    {
-      "login": "SiyiZhu1",
-      "name": "Siyi",
-      "avatar_url": "https://avatars.githubusercontent.com/u/132850441?v=4",
-      "profile": "https://github.com/SiyiZhu1",
-      "contributions": [
-        "design"
-      ]
-    },
-    {
-      "login": "syleemanet",
-      "name": "syleemanet",
-      "avatar_url": "https://avatars.githubusercontent.com/u/150102494?v=4",
-      "profile": "https://github.com/syleemanet",
-      "contributions": []
     }
   ],
   "contributorsPerLine": 3,
