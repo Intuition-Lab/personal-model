@@ -16,6 +16,8 @@ The default data root is `~/.persome` and can be redirected with
 | provider/local API secrets | `env` | dotenv file, mode `0600` |
 | build metadata | `model-build.json` | hashes/IDs, no API keys |
 | exported model | `exports/*.json` | redacted by default, mode `0600` |
+| Runtime receipts | `.runtime-state.json`, `.update-state.json` | owner-only generation, policy, and transaction metadata |
+| native AX binaries | `native/<source-digest>/` | immutable machine-local permission principals |
 
 The Runtime enforces mode `0700` on the data root and personal-data
 directories, and mode `0600` on databases, capture records, logs, snapshots,
@@ -26,9 +28,11 @@ artifacts are private from creation.
 Default capture retention is seven days. Screenshot payloads are stripped
 earlier by the configured screenshot retention window, except explicitly
 actionable captures covered by extended retention. On supported Apple Silicon
-installs, `install.sh` enables OCR after requesting Screen Recording and proving
-the isolated worker can load bundled PP-OCRv6 weights. Inference remains local;
-`persome ocr disable` is the explicit opt-out.
+installs, explicit onboarding can enable OCR after requesting Screen Recording
+and proving the isolated worker can load bundled PP-OCRv6 weights. Inference
+remains local. `[capture].ocr_policy` records `auto`, explicit `enabled`, or
+explicit `disabled` intent; ordinary onboarding and updates preserve explicit
+intent and tier. `persome ocr disable` is the durable opt-out.
 
 Lock-screen detection is privacy-conservative: when both macOS probes are
 unavailable or error, capture pauses until a probe can establish that the
@@ -46,6 +50,43 @@ and capture terms are removed from ordinary pages and full-text shadow indexes.
 On the first open after this security upgrade it also rebuilds both FTS indexes
 from live rows and vacuums the database, removing segment terms left by deletes
 performed by older releases.
+
+## macOS permission principals
+
+In daemon capture mode, Accessibility is granted to the native executable that
+uses the API: `mac-ax-helper` for focused-tree reads and, when event-driven
+capture is enabled, `mac-ax-watcher` for notifications. Granting the terminal,
+Python daemon, or launchd job is not a substitute. Onboarding explains, requests,
+and live-probes each required native principal separately. Screen Recording is
+preflighted by the Runtime process that obtains pixels. In trusted-ingest mode,
+the producer owns those macOS permissions and Persome proves authenticated
+ingest readiness rather than claiming a daemon grant.
+
+The wheel ships helper source. Persome derives a path from a format version,
+architecture, and source-byte digest, compiles once under
+`<PERSOME_ROOT>/native/<source-digest>/`, and publishes the executable with an
+atomic rename. A same-version reinstall reuses the exact binary and macOS grant.
+Changing helper source intentionally creates a new principal that requires an
+explicit grant. Rolling back runs the prior source version and resolves the old
+binary again; no updater overwrites an existing digest path.
+
+## Runtime and update integrity
+
+The daemon holds `.daemon.lock` for its entire lifetime. Lifecycle code treats
+`.pid` as compatibility metadata, not authority: current-user ownership,
+executable/command, process start time, and the random generation in the
+owner-only `.runtime-state.json` are verified and rechecked immediately before a
+signal. A live Persome-shaped process with ambiguous generation fails closed so
+a second writer cannot start. LaunchAgent ownership additionally binds the
+owner marker, loaded job program/PID, configured plist, and Runtime receipt.
+
+Updates hold one owner-only root lock and build an inactive, transaction-marked
+candidate while the active virtualenv remains untouched. Activation exchanges
+the two same-filesystem directories in one kernel operation. The old venv stays
+available until the new final owner passes mode-aware permission, OCR-policy,
+health, and capture/readiness proof. Fsynced phase metadata and the candidate
+marker make a crash immediately before or after exchange recoverable; rollback
+atomically exchanges the old Runtime back before restoring its lifecycle owner.
 
 ## Network egress
 
@@ -123,7 +164,7 @@ quarantine copies. Journals and orphan sidecars are removed. Explicit clean
 operations enable SQLite/FTS secure deletion, compact free pages, and truncate
 the WAL; a recovery copy that cannot be reliably scrubbed is removed rather
 than silently retaining the requested data. All clean commands refuse to run
-while the daemon PID is live.
+while the verified Runtime identity or its lifetime lock is live.
 
 ## Export caveat
 
@@ -142,7 +183,7 @@ repository are synthetic and pass the PII gate.
 | Provider exfiltration | User chooses endpoints; no-key capture/BM25 mode remains available. |
 | Prompt injection | Generated memory is served as data, never as instructions or executable tools. Consuming MCP clients must still enforce their own tool policy. |
 | Malicious MCP client | Bearer/stdio access is an explicit personal-data capability; connect only trusted clients. |
-| Supply chain | Locked dependencies and the full build-backend closure are pinned; installer fallback downloads are checksum-verified; Actions use immutable SHAs and least privilege; releases made by the current workflow are checksummed, smoke-tested, and attested from an administrator-protected tag reachable from `main`. |
+| Supply chain | Locked dependencies and the full build-backend closure are pinned; installer fallback downloads are checksum-verified; wheel smoke tests inspect bundled Swift sources, viewer assets, and OCR weights outside the checkout; Actions use immutable SHAs and least privilege; releases made by the current workflow are checksummed and attested from an administrator-protected tag reachable from `main`. |
 | Accidental publication | Synthetic fixtures, PII scan, default redaction, and owner-only export permissions. |
 
 Vulnerability reporting instructions are in [SECURITY.md](SECURITY.md).

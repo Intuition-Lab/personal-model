@@ -57,7 +57,7 @@
           "system"
         ],
         "summary": "Permissions",
-        "description": "Return the daemon's current macOS permission state.\n\nAccessibility and Screen Recording belong to the daemon process. A GUI\nonboarding flow should poll this endpoint instead of creating another TCC\nidentity. Each field is ``granted`` or ``denied``.",
+        "description": "Return the daemon's current macOS permission state.\n\nAccessibility is self-probed by the configured bundled AX helper(s);\nScreen Recording is preflighted by the Runtime executable. A GUI onboarding\nflow should poll this aggregate instead of creating another TCC identity.\nFields are ``granted``, ``denied``, or mode-aware ``not_applicable``.",
         "operationId": "permissions_permissions_get",
         "responses": {
           "200": {

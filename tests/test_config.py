@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from persome import config
 
 
@@ -52,6 +54,24 @@ actionable_retention_days = 3
     assert capture.encrypt_screenshots is False
     assert capture.extended_retention_enabled is False
     assert capture.actionable_retention_days == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("source", "typo", "capture.source"),
+        ("ocr_policy", "sometimes", "capture.ocr_policy"),
+        ("ocr_tier", "huge", "capture.ocr_tier"),
+    ],
+)
+def test_invalid_capture_policy_fails_closed(
+    tmp_path: Path, field: str, value: str, message: str
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(f'[capture]\n{field} = "{value}"\n', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=message):
+        config.load(path)
 
 
 def test_legacy_top_level_capture_privacy_settings_still_load(tmp_path: Path) -> None:

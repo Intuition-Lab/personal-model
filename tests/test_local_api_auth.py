@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from persome.api import build_api_app
+from persome.api import routes as routes_mod
 from persome.config import Config
 from persome.mcp.server import build_server, endpoint_url
 from persome.security.auth import (
@@ -88,20 +89,25 @@ def test_health_is_public_but_missing_token_closes_protected_rest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(LOCAL_API_TOKEN_ENV, raising=False)
-    client = TestClient(build_api_app(), headers={"host": "127.0.0.1:8742"})
+    cfg = Config()
+    routes_mod.set_config(cfg)
+    client = TestClient(build_api_app(cfg), headers={"host": "127.0.0.1:8742"})
 
     health = client.get("/health")
     protected = client.get("/openapi.json")
+    onboarding_capture = client.post("/_onboarding/capture")
 
     assert health.status_code == 200
     assert health.json()["data"]["status"] == "ok"
     assert "ocr" in health.json()["data"]
     assert protected.status_code == 503
+    assert onboarding_capture.status_code == 503
     assert protected.headers["connection"] == "close"
     assert protected.json() == {
         "success": False,
         "error": "local API authentication is not configured",
     }
+    routes_mod.set_config(None)
 
 
 def test_unauthorized_rejection_closes_unread_request_body(

@@ -24,7 +24,7 @@ from typing import Any
 
 from ..logger import get
 from . import ax_capture
-from .ax_capture import _maybe_compile
+from .ax_capture import _stable_native_binary
 
 logger = get("persome.capture")
 
@@ -52,19 +52,18 @@ def _resolve_watcher_path() -> Path | None:
         from importlib.resources import files as _pkg_files
 
         bundled_dir = Path(str(_pkg_files("persome").joinpath("_bundled")))
-        candidates.append(bundled_dir / "mac-ax-watcher")
+        candidates.append(bundled_dir / "mac-ax-watcher.swift")
     except (ModuleNotFoundError, ValueError):
         pass
 
     dev_root = Path(__file__).resolve().parents[3]
-    candidates.append(dev_root / "resources" / "mac-ax-watcher")
+    candidates.append(dev_root / "resources" / "mac-ax-watcher.swift")
 
-    for binary_path in candidates:
-        swift_path = binary_path.with_suffix(".swift")
+    for swift_path in candidates:
         if swift_path.is_file():
-            _maybe_compile(swift_path, binary_path)
-        if binary_path.is_file() and os.access(binary_path, os.X_OK):
-            return binary_path
+            binary_path = _stable_native_binary(swift_path, "mac-ax-watcher")
+            if binary_path is not None:
+                return binary_path
 
     return None
 
@@ -201,7 +200,7 @@ class AXWatcherProcess:
             delay = min(delay * 2, self._max_reconnect_delay)
 
     def _wait_for_accessibility(self) -> bool:
-        """Poll the daemon's TCC trust without showing repeated permission dialogs."""
+        """Poll both configured native AX principals without showing dialogs."""
         logger.warning(
             "Accessibility permission not granted — waiting for approval (polling every %.0fs)",
             self._permission_poll,

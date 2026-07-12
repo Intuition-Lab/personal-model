@@ -72,11 +72,14 @@ This sample path is deliberately separate from the real-data path below.
 Requirements: macOS 13 or newer, Xcode Command Line Tools, and a Python build
 with SQLite 3.42+ (the installer verifies the secure FTS capability). The installer
 finds or installs `uv`, provisions Python 3.11-3.13, compiles the Swift AX
-helpers, generates the local screenshot-encryption key, enables and verifies
-local OCR, and offers to register detected MCP clients. Before it reports
-success, a native onboarding flow explains and requests Accessibility and
-Screen Recording separately, starts Persome, checks local health, and writes a
-fresh capture. Its fallback `uv` download is version-pinned and checked
+helpers into immutable source-versioned paths under `~/.persome/native/`,
+generates the local screenshot-encryption key, configures local OCR, and offers
+to register detected MCP clients. Before it reports success, onboarding explains
+and requests Accessibility for the capture helper and event watcher separately,
+then requests Screen Recording only when the effective pixel policy needs it.
+It starts Persome, proves the final lifecycle owner and Runtime generation, and
+obtains a mode-appropriate capture receipt. Its fallback `uv` download is
+version-pinned and checked
 against repository-pinned SHA-256 digests; the Runtime environment is installed
 from the committed `uv.lock`, and the complete build-backend closure is
 hash-constrained rather than resolved afresh.
@@ -86,20 +89,40 @@ git clone https://github.com/Intuition-Lab/personal-model.git
 cd personal-model
 bash install.sh
 
-persome doctor
-persome onboard
-persome ocr status --check
+persome status
 persome model open
+
+# Repeat only to repair/recheck permissions and Runtime proof:
+persome onboard
+# Diagnostic; exits nonzero for intentionally unconfigured optional features:
+persome doctor
 ```
 
-`persome onboard` is the repeatable recovery path. It shows one plain-language
-macOS dialog before each system permission request and does not complete until
-**Accessibility** and **Screen Recording** are granted. It then verifies the
-isolated OCR worker, leaves the daemon running, polls `GET /health`, and forces
-one fresh capture. OCR supplies text for AX-poor apps such as WeChat and Feishu;
-pixels never enter an LLM prompt. The terminal reports each active stage because
-the first OCR model load can take up to two minutes, and completion never waits on
-a hidden dialog. Persome does not require Full Disk Access.
+`persome onboard` is the repeatable recovery path. In standard daemon-capture
+mode it presents a plain-language explanation before each macOS request. The
+versioned `mac-ax-helper` and, when event-driven capture is enabled,
+`mac-ax-watcher` are the Accessibility principals; the terminal and Python
+daemon are not substitutes for those grants. On Apple Silicon it also verifies
+the isolated OCR worker when OCR is enabled, leaves the daemon running, and
+forces one fresh capture through the daemon-owned runner. The authenticated
+`/permissions` result re-runs the actual helper/watcher probes and the Runtime's
+Screen Recording preflight. If HTTP auto-start is intentionally disabled, the
+same generation publishes equivalent owner-only readiness and capture receipts
+in `.runtime-state.json`. Trusted ingest, Intel without local OCR, explicit OCR/pixel
+opt-out, and paused/locked update flows report their effective mode rather than
+claiming an OCR capture occurred. OCR supplies
+text for AX-poor apps such as WeChat and Feishu; pixels never enter an LLM
+prompt. The first OCR model load can take up to two minutes; repeated onboarding
+normally finishes in seconds without warming a second worker. Completion never
+waits on a hidden final dialog. Persome does not require Full Disk Access.
+
+OCR intent is durable in `[capture].ocr_policy`: `auto` is an unconfigured fresh
+install, while `enabled` and `disabled` record an explicit choice. Ordinary
+`persome onboard` preserves an existing tier or opt-out. Running
+`persome onboard --tier tiny` or `persome ocr setup` explicitly enables OCR;
+`persome ocr disable` records the opt-out. In `source="ingest"` mode the trusted
+producer owns macOS capture permissions and Persome proves the authenticated
+ingest runner instead of pretending that its daemon produced an AX frame.
 
 ### Update an existing installation
 
@@ -109,17 +132,33 @@ Run the updater from any directory; no Git checkout is required:
 persome update
 ```
 
-The command downloads a fresh shallow checkout of the official `main` branch,
-stops the old Runtime, runs the locked installer in update mode, preserves
-`~/.persome` configuration, credentials, and personal data, then repeats the
-permission/OCR/health/fresh-capture onboarding proof. It does not modify a
-developer checkout. A failed or interrupted update atomically restores the
-previous virtualenv and restarts the previous Runtime. To test or install an
-already-reviewed local tree instead:
+The command downloads a fresh shallow checkout of the official `main` branch
+and builds a relocatable `venv.replacement.update` while the active `venv`
+remains untouched. Activation rejects a console script that still embeds the
+inactive candidate path.
+Under one owner-only update lock it stops the old Runtime, atomically exchanges
+the prepared and active directories, restores the prior lifecycle owner, and
+runs mode-aware onboarding against that exact generation. Only a successful
+permission, policy, owner, health, and capture/readiness proof commits the
+exchange. A failed, interrupted, or crash-recovered update atomically exchanges
+the old virtualenv back and restores its Runtime owner; repeated interrupts
+cannot abort recovery. Configuration, credentials, personal data, capture
+policy, and lifecycle intent under `~/.persome` are preserved, and a developer
+checkout is never modified. To install an already-reviewed local tree instead:
 
 ```bash
 persome update --source /path/to/personal-model
 ```
+
+Running `bash install.sh` again over an existing installation automatically
+delegates to this same transactional update path; it does not replace a live
+virtualenv in place or rerun LLM provider setup.
+
+The AX binaries are keyed by their source bytes and architecture. Reinstalling
+the same version reuses the exact executable (and therefore its existing macOS
+grant); a release that changes helper source uses a new path and onboarding asks
+for that new principal explicitly. If an update rolls back, the old Runtime
+resolves the old helper path again.
 
 ```bash
 # Recheck or repair OCR onboarding; disable is always explicit and reversible.
@@ -178,10 +217,10 @@ or degraded states instead of inventing geometry.
 
 ### Cross-app
 
-The Swift watcher reads the focused AX tree across native and browser apps.
-Persome normalizes focused element, visible text, window, application, URL, and
-time into one capture and session pipeline. OCR is a fallback, not a parallel
-cloud recorder.
+The source-versioned Swift watcher notices AX events and the matching helper
+reads the focused AX tree across native and browser apps. Persome normalizes
+focused element, visible text, window, application, URL, and time into one
+capture and session pipeline. OCR is a fallback, not a parallel cloud recorder.
 
 ### Agent-ready
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +36,31 @@ _CAPTURES_FTS_OBJECTS = (
     "captures_fts_docsize",
     "captures_fts_config",
 )
+
+
+def _ensure_wal_mode(conn: sqlite3.Connection, *, timeout: float = 10.0) -> None:
+    """Enable WAL without failing a concurrent connection startup spuriously."""
+    deadline = time.monotonic() + timeout
+    delay = 0.01
+    while True:
+        try:
+            current = conn.execute("PRAGMA journal_mode").fetchone()
+            if current is not None and str(current[0]).lower() == "wal":
+                return
+            enabled = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if enabled is not None and str(enabled[0]).lower() == "wal":
+                return
+            error = sqlite3.OperationalError("SQLite did not enable WAL journal mode")
+        except sqlite3.OperationalError as exc:
+            if not any(label in str(exc).lower() for label in ("locked", "busy")):
+                raise
+            error = exc
+        if time.monotonic() >= deadline:
+            raise error
+        time.sleep(delay)
+        delay = min(delay * 2, 0.25)
+
+
 # These indexes are projections. Their canonical sources are Markdown/evo_nodes
 # for entries and captures for screen-context search.
 DERIVED_FTS_SCHEMA_OBJECTS = _ENTRIES_FTS_OBJECTS + _CAPTURES_FTS_OBJECTS
@@ -346,7 +372,7 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     # Personal text must not survive ordinary DELETE operations in free pages.
     # Explicit wipe paths additionally VACUUM + truncate WAL below.
     conn.execute("PRAGMA secure_delete=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
+    _ensure_wal_mode(conn)
     conn.execute("PRAGMA synchronous=NORMAL")
     # Make the auto-checkpoint pages explicit (this is also the SQLite default).
     # Auto-checkpoint resets the WAL pointer but never shrinks the file —

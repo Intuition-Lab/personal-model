@@ -205,6 +205,7 @@ def test_helpers_missing_fail_with_install_hint(
     monkeypatch.delenv("PERSOME_AX_HELPER", raising=False)
     monkeypatch.delenv("PERSOME_AX_WATCHER", raising=False)
     monkeypatch.setattr(doctor, "_helper_candidates", lambda name: [tmp_path / name])
+    monkeypatch.setattr(doctor, "_helper_sources", lambda name: [])
     checks = doctor.check_helpers()
     assert all(c.status == "fail" for c in checks)
     assert "reinstall" in checks[0].detail
@@ -218,12 +219,13 @@ def test_helpers_bundled_source_warns_without_compiling(
     for name in ("mac-ax-helper", "mac-ax-watcher"):
         (tmp_path / f"{name}.swift").write_text("// synthetic")
     monkeypatch.setattr(doctor, "_helper_candidates", lambda name: [tmp_path / name])
+    monkeypatch.setattr(doctor, "_helper_sources", lambda name: [tmp_path / f"{name}.swift"])
     monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/swiftc")
 
     checks = doctor.check_helpers()
 
     assert all(c.status == "warn" for c in checks)
-    assert all("first capture" in c.detail for c in checks)
+    assert all("installer" in c.detail for c in checks)
     assert not any((tmp_path / name).exists() for name in ("mac-ax-helper", "mac-ax-watcher"))
 
 
@@ -235,12 +237,44 @@ def test_helpers_bundled_source_without_swiftc_fails(
     for name in ("mac-ax-helper", "mac-ax-watcher"):
         (tmp_path / f"{name}.swift").write_text("// synthetic")
     monkeypatch.setattr(doctor, "_helper_candidates", lambda name: [tmp_path / name])
+    monkeypatch.setattr(doctor, "_helper_sources", lambda name: [tmp_path / f"{name}.swift"])
     monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
 
     checks = doctor.check_helpers()
 
     assert all(c.status == "fail" for c in checks)
     assert all("Command Line Tools" in c.detail for c in checks)
+
+
+def test_doctor_ignores_historical_helper_cache_and_never_compiles(
+    ac_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from persome.capture import ax_capture
+
+    for name in ("mac-ax-helper", "mac-ax-watcher"):
+        _make_exec(ac_root / "native" / "historical-digest" / name)
+        (tmp_path / f"{name}.swift").write_text("// current source", encoding="utf-8")
+    monkeypatch.setattr(
+        doctor,
+        "_helper_sources",
+        lambda name: [tmp_path / f"{name}.swift"],
+    )
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/swiftc")
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        ax_capture,
+        "_maybe_compile",
+        lambda *args, **kwargs: pytest.fail("doctor must never compile or write helpers"),
+    )
+
+    checks = doctor.check_helpers(CaptureConfig())
+    trust = doctor.check_ax_trust(CaptureConfig())
+
+    assert all(check.status == "warn" for check in checks)
+    assert trust.status == "fail"
+    assert not any(
+        path.parent.name != "historical-digest" for path in (ac_root / "native").glob("*/*")
+    )
 
 
 # ── AX trust ──────────────────────────────────────────────────────────────────
@@ -250,7 +284,12 @@ def test_ax_trust_granted_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
     import persome.capture.ax_capture as ax_capture
 
-    monkeypatch.setattr(ax_capture, "ax_trusted", lambda: True)
+    monkeypatch.setattr(
+        doctor,
+        "_configured_helper_path",
+        lambda name, env_var: Path("/synthetic") / name,
+    )
+    monkeypatch.setattr(ax_capture, "_binary_ax_trusted", lambda path: True)
     assert doctor.check_ax_trust().status == "ok"
 
 
@@ -258,7 +297,12 @@ def test_ax_trust_denied_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
     import persome.capture.ax_capture as ax_capture
 
-    monkeypatch.setattr(ax_capture, "ax_trusted", lambda: False)
+    monkeypatch.setattr(
+        doctor,
+        "_configured_helper_path",
+        lambda name, env_var: Path("/synthetic") / name,
+    )
+    monkeypatch.setattr(ax_capture, "_binary_ax_trusted", lambda path: False)
     c = doctor.check_ax_trust()
     assert c.status == "fail"
     assert "Accessibility" in c.detail
@@ -268,10 +312,15 @@ def test_ax_trust_probe_error_warns_unknown(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
     import persome.capture.ax_capture as ax_capture
 
-    def boom() -> bool:
+    def boom(path: Path) -> bool:
         raise RuntimeError("no TCC")
 
-    monkeypatch.setattr(ax_capture, "ax_trusted", boom)
+    monkeypatch.setattr(
+        doctor,
+        "_configured_helper_path",
+        lambda name, env_var: Path("/synthetic") / name,
+    )
+    monkeypatch.setattr(ax_capture, "_binary_ax_trusted", boom)
     c = doctor.check_ax_trust()
     assert c.status == "warn"
     assert "unknown" in c.detail
@@ -282,6 +331,28 @@ def test_ax_trust_non_macos_warns_unknown(monkeypatch: pytest.MonkeyPatch) -> No
     c = doctor.check_ax_trust()
     assert c.status == "warn"
     assert "unknown" in c.detail
+
+
+def test_ingest_mode_skips_daemon_tcc_and_helper_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = CaptureConfig(source="ingest")
+    import persome.capture.ax_capture as ax_capture
+
+    monkeypatch.setattr(
+        ax_capture,
+        "_binary_ax_trusted",
+        lambda path: pytest.fail("ingest must not probe daemon Accessibility"),
+    )
+    monkeypatch.setattr(
+        screen_recording,
+        "has_screen_recording",
+        lambda: pytest.fail("ingest must not probe daemon Screen Recording"),
+    )
+
+    assert doctor.check_ax_trust(capture).status == "ok"
+    assert doctor.check_screen_recording(capture).status == "ok"
+    assert all(check.status == "ok" for check in doctor.check_helpers(capture))
 
 
 # ── Screen Recording + local OCR ─────────────────────────────────────────────
@@ -358,8 +429,23 @@ def test_root_unwritable_fails(ac_root: Path, monkeypatch: pytest.MonkeyPatch) -
     def boom(*a: object, **kw: object) -> None:
         raise OSError(13, "Permission denied")
 
-    monkeypatch.setattr(paths, "atomic_write_private_text", boom)
+    monkeypatch.setattr(doctor.tempfile, "mkstemp", boom)
     assert doctor.check_root_writable().status == "fail"
+
+
+def test_root_initialization_failure_is_reported(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*a: object, **kw: object) -> None:
+        raise RuntimeError("unsafe data root")
+
+    monkeypatch.setattr(doctor.paths, "ensure_private_dir", boom)
+
+    check = doctor.check_root_writable()
+
+    assert check.status == "fail"
+    assert str(paths.root()) in check.detail
+    assert "unsafe data root" in check.detail
 
 
 def test_root_writable_probe_does_not_follow_symlink(ac_root: Path) -> None:
@@ -372,6 +458,11 @@ def test_root_writable_probe_does_not_follow_symlink(ac_root: Path) -> None:
     assert doctor.check_root_writable().status == "ok"
     assert victim.read_text(encoding="utf-8") == "ORIGINAL"
     assert victim.stat().st_mode & 0o777 == 0o644
+
+
+def test_root_writable_probe_is_unlinked_before_write(ac_root: Path) -> None:
+    assert doctor.check_root_writable().status == "ok"
+    assert not list(paths.root().glob(".doctor-write-probe.*"))
 
 
 # ── port ──────────────────────────────────────────────────────────────────────
@@ -406,11 +497,12 @@ def test_port_taken_by_our_daemon_ok(ac_root: Path, monkeypatch: pytest.MonkeyPa
     assert "12345" in c.detail
 
 
-def test_running_daemon_pid_reads_pid_file(ac_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_running_daemon_pid_rejects_unverified_pid_file(ac_root: Path) -> None:
     import os
 
-    paths.pid_file().write_text(str(os.getpid()))  # our own pid is always alive
-    assert doctor._running_daemon_pid() == os.getpid()
+    # A live PID is not enough: it must resolve to this user's Persome daemon.
+    paths.pid_file().write_text(str(os.getpid()))
+    assert doctor._running_daemon_pid() is None
     paths.pid_file().write_text("not-a-pid")
     assert doctor._running_daemon_pid() is None
 

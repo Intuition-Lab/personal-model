@@ -120,25 +120,42 @@ ax_depth = 100
 ax_timeout_seconds = 3
 
 enable_ocr_fallback = true
+ocr_policy = "enabled"               # auto | enabled | disabled
 ocr_tier = "tiny"                 # tiny | small | medium
 ocr_min_gap_seconds = 15.0
 ocr_structured = true
 cmux_source_enabled = true
 ```
 
-- `source="daemon"` owns macOS AX capture. `source="ingest"` accepts records
+- `source` is validated and must be `"daemon"` or `"ingest"`.
+  `source="daemon"` owns macOS AX capture. `source="ingest"` accepts records
   from the trusted bearer-authenticated `/captures/ingest` producer and starts
   no OS watcher. The producer must obtain `PERSOME_LOCAL_API_TOKEN` through an
   owner-approved local secret channel and must never put it in a URL.
-- Accessibility permission is required for daemon AX capture. `install.sh`
-  runs `persome onboard` in interactive sessions: it asks for Accessibility and
-  Screen Recording separately, enables OCR after its worker initializes, starts
-  the daemon, and proves local health plus one fresh capture.
+- Accessibility is required for the source-versioned `mac-ax-helper` and, when
+  `event_driven=true`, `mac-ax-watcher` in daemon mode. A terminal or Python
+  daemon grant does not replace either native principal. `install.sh` runs
+  `persome onboard` in interactive sessions: it asks for each Accessibility
+  principal and,
+  when screenshots or effective OCR need pixels, Screen Recording separately.
+  It persists the selected OCR policy, starts the final daemon owner, waits for
+  that daemon's isolated worker, and proves a mode-aware capture receipt.
+- `source="ingest"` requires `mcp.auto_start=true` and an HTTP transport because
+  `/captures/ingest` is its only authenticated input channel. Its trusted
+  producer owns the OS permissions; onboarding proves ingest readiness instead
+  of requiring daemon Accessibility.
+- `ocr_policy` is also validated. `auto` means a fresh or older configuration
+  has not recorded intent; `enabled` and `disabled` are durable user choices.
+  Ordinary `persome onboard` and updates preserve that choice and `ocr_tier`.
+  `persome onboard --tier tiny` or `persome ocr setup` explicitly enables OCR;
+  `persome ocr disable` records the opt-out. Do not toggle only
+  `enable_ocr_fallback` when representing user intent.
 - Paddle inference runs in a local worker subprocess so a native crash does not
   kill the daemon. OCR text is backfilled into capture search and consumed by
   timeline/modeling; pixels are not sent to an LLM stage. The source-level
-  config default remains off for unsupported/direct-library environments;
-  supported macOS installation writes the enabled state shown above.
+  config default is `enable_ocr_fallback=false`, `ocr_policy="auto"` for
+  unsupported/direct-library environments; a supported fresh macOS install
+  records the enabled state shown above after explicit onboarding.
 - `PERSOME_DISABLE_OCR=1` is the deployment kill switch.
 - `PERSOME_OCR_IN_PROCESS=1` is a debugging escape hatch that gives up crash
   isolation and should not be used for normal operation.

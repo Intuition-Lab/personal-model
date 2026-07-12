@@ -248,6 +248,10 @@ def test_status_renders_new_fields(ac_root: Path) -> None:
     assert "Last Capture" in result.output
     assert "OCR" in result.output
     assert "Screen Recording" in result.output
+    assert "Capture Source" in result.output
+    assert "Runtime Owner" in result.output
+    assert "Generation" in result.output
+    assert "Accessibility" in result.output
 
 
 def test_status_shows_version(ac_root: Path) -> None:

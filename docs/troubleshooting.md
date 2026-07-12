@@ -12,16 +12,29 @@ persome doctor   # ✓/✗/⚠ per prerequisite; exits 1 if anything FAILS; zero
 
 ## Daemon won't start
 
-Symptom: `persome start` returns `Already running (pid N)` but the process is dead.
+Persome does not trust a PID number by itself. It checks current-user ownership,
+the executable/command shape, process start time, and the random generation in
+`.runtime-state.json`, then rechecks that identity immediately before signaling.
+It also holds `.daemon.lock` for the complete daemon lifetime so concurrent
+`start` calls cannot create two writers.
 
-Check:
+If `persome start` reports an unsafe Runtime lifecycle state, inspect it without
+deleting or signaling from `.pid` alone:
 
 ```bash
-ps -p $(cat ~/.persome/.pid) || rm ~/.persome/.pid
-persome start
+persome status
+cat ~/.persome/.pid
+cat ~/.persome/.runtime-state.json | jq .
+launchctl print "gui/$(id -u)/com.persome.runtime" 2>/dev/null || true
+lsof -nP -iTCP:8742 -sTCP:LISTEN
 ```
 
-A stale PID file is the typical cause; `stop` removes it cleanly, crashes don't.
+A dead PID or one reused by an unrelated process is safely stale and the next
+start can overwrite it. A live Persome-shaped process with an invalid generation
+receipt is intentionally ambiguous: stop its owning Desktop app or LaunchAgent,
+then retry. Do not `kill $(cat ~/.persome/.pid)` or delete `.pid`/
+`.runtime-state.json` while it may be live; that can signal a reused PID or
+remove the evidence preventing a second daemon.
 
 Symptom: foreground start immediately exits without error.
 
@@ -56,17 +69,39 @@ For a reviewed local checkout or an offline repair:
 persome update --source /path/to/personal-model
 ```
 
+The installer prepares `venv.replacement.update` without touching the active
+`venv`. After preparation, the updater stops the current owner and atomically
+exchanges the two directories; the old venv remains available at the replacement
+path until the new final owner passes mode-aware onboarding. Pressing Ctrl-C
+exchanges the old venv back before restarting it, and repeated Ctrl-C cannot
+abort rollback. Running `bash install.sh` over an existing installation delegates
+to this same transactional local-source path.
+
+If a prior process died, the next `persome update` reads the owner-only
+transaction id, phase, and candidate marker and deterministically recovers even
+when the crash happened after the atomic exchange but before its phase write.
+Do not remove `.update-state.json`, `.update.lock`, or either venv directory by
+hand. An invalid live PID/generation receipt also fails closed; stop the owning
+Desktop app/LaunchAgent, inspect `.pid` and `.runtime-state.json`, then retry.
+
 ## Captures are empty / tree has no content
 
-Most common cause: **Accessibility permission not granted** to the terminal you launched from.
+Most common cause: **Accessibility permission is missing for an actual native
+capture principal.** The source-versioned `mac-ax-helper` reads each focused AX
+tree, and `mac-ax-watcher` subscribes to events when `event_driven=true`.
 
 ```bash
 persome onboard
-persome capture-once
 cat ~/.persome/capture-buffer/*.json | jq '.ax_tree | length' | head
 ```
 
-If the tree is `{}` or tiny across the board, open System Settings → Privacy & Security → Accessibility and enable your terminal (Terminal, iTerm2, Warp, VS Code…) plus `persome` itself if it appears.
+If the tree is `{}` or tiny across the board, rerun `persome onboard` and follow
+the separate prompts for `mac-ax-helper` and `mac-ax-watcher`. Granting only
+Terminal, iTerm2, Warp, VS Code, Python, or `persome` does not prove those helper
+grants. Same-version reinstalls reuse the exact executable under
+`~/.persome/native/<source-digest>/`; if helper source changed, the new digest
+path is a new macOS principal and must be granted explicitly. A rollback resolves
+the old path and old grant again.
 
 The daemon watcher waits after an initial denial and polls the non-prompting TCC
 status. Granting Accessibility while the daemon is still running should restart
@@ -75,13 +110,21 @@ fallback for old installs or a changed TCC principal.
 
 Second most common cause: **`ax_depth` too shallow for Electron apps.** See [capture.md](capture.md#ax-depth-the-1-footgun).
 
-The installer normally completes Accessibility, local OCR, daemon health, and a
-fresh capture through `persome onboard`. Rerun that end-to-end gate first:
+In standard Apple Silicon daemon mode, the installer completes Accessibility,
+Screen Recording, local OCR, daemon health, and a fresh capture through
+`persome onboard`. Other configured modes print their own readiness receipt.
+Rerun that end-to-end gate first:
 
 ```bash
 persome onboard
 persome ocr status --check
 ```
+
+Do not substitute `persome capture-once` for this check. That command creates a
+one-shot scheduler in the calling CLI and can diagnose helper output, but it does
+not prove the running daemon's watcher, generation, lifecycle owner, privacy
+receipt, or OCR-worker readiness. Stop the Runtime before using it as an isolated
+developer diagnostic.
 
 If it reports disabled, missing permission, or an incomplete worker setup, run:
 
@@ -95,6 +138,13 @@ persome doctor
 The setup command opens Screen Recording settings when needed. OCR worker
 failures leave the daemon alive. `PERSOME_DISABLE_OCR=1` disables inference
 entirely; remove it if health reports `disabled_by_environment`.
+
+If OCR returns after you intentionally disabled it, inspect `ocr_policy` in the
+`[capture]` section. `disabled` is the durable opt-out and ordinary
+`persome onboard` preserves it. `persome onboard --tier ...` and
+`persome ocr setup` are explicit enable actions. `auto` means the install has
+not yet recorded an explicit choice. Updates preserve all three states and the
+selected tier.
 
 ## No event-daily entries appearing
 

@@ -228,3 +228,13 @@ def test_request_accessibility_uses_one_shot_native_watcher(
 
     assert watcher.request_accessibility_permission() is True
     assert seen == [[str(binary), "--request-accessibility"]]
+
+
+def test_normal_watcher_start_uses_pure_accessibility_check() -> None:
+    source = (Path(__file__).resolve().parents[1] / "resources" / "mac-ax-watcher.swift").read_text(
+        encoding="utf-8"
+    )
+    normal_start = source.split("// Normal Runtime starts are pure checks.", 1)[1]
+
+    assert "let trusted = AXIsProcessTrusted()" in normal_start
+    assert "AXIsProcessTrustedWithOptions" not in normal_start

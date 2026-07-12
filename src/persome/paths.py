@@ -33,6 +33,11 @@ def logs_dir() -> Path:
     return root() / "logs"
 
 
+def native_helpers_dir() -> Path:
+    """Stable machine-local AX binaries whose TCC identity survives reinstalls."""
+    return root() / "native"
+
+
 def exports_dir() -> Path:
     """Generated, user-shareable artifacts such as model snapshots."""
     return root() / "exports"
@@ -66,6 +71,21 @@ def index_db() -> Path:
 
 def pid_file() -> Path:
     return root() / ".pid"
+
+
+def runtime_state_file() -> Path:
+    """Owner-only daemon generation/readiness state for non-HTTP verification."""
+    return root() / ".runtime-state.json"
+
+
+def daemon_lock_file() -> Path:
+    """Lifetime single-writer lock inherited by the foreground/background daemon."""
+    return root() / ".daemon.lock"
+
+
+def launchagent_owner_file() -> Path:
+    """Durable intent marker for launchd-owned Runtime lifecycle."""
+    return root() / ".launchagent-owner"
 
 
 def paused_flag() -> Path:

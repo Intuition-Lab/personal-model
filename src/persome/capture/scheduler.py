@@ -75,6 +75,27 @@ def _set_active_runner(runner: _CaptureRunner | None) -> None:
     _active_runner = runner
 
 
+def capture_now() -> Path | None:
+    """Force one capture through the live daemon runner for onboarding proof."""
+    runner = _active_runner
+    if runner is None:
+        return None
+    return runner.capture_now()
+
+
+def active_runner_state(cfg: CaptureConfig) -> str:
+    """Return a side-effect-free onboarding state for the live capture runner."""
+    runner = _active_runner
+    if runner is None:
+        return "not-ready"
+    gate = capture_gate_reason(cfg)
+    if gate is not None:
+        return gate
+    if cfg.source == "ingest":
+        return "ingest-ready"
+    return "ready"
+
+
 def _submit_ocr_async(
     image_bytes: bytes,
     capture_id: str,
@@ -157,15 +178,20 @@ def _should_skip_capture(cfg: CaptureConfig) -> bool:
     capture rather than risking collection behind the login screen. Both checks
     default on.
     """
+    return capture_gate_reason(cfg) is not None
+
+
+def capture_gate_reason(cfg: CaptureConfig) -> str | None:
+    """Return the active privacy gate, if any, without attempting a capture."""
     paths.ensure_dirs()
     if paths.paused_flag().exists():
         logger.info("capture skipped (paused)")
-        return True
+        return "paused"
     # Privacy guardrail (spec E7): don't collect behind the lock screen / asleep.
     if cfg.pause_on_lock and screen_state.is_screen_locked():
         logger.info("capture skipped (screen locked / asleep)")
-        return True
-    return False
+        return "locked"
+    return None
 
 
 def _attach_screenshot(
@@ -589,10 +615,12 @@ class _CaptureRunner:
         provider: ax_capture.AXProvider | None,
         *,
         pre_capture_hook: Callable[[dict[str, Any]], None] | None = None,
+        capture_receipt_hook: Callable[[Path | None, str], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._provider = provider
         self._pre_capture_hook = pre_capture_hook
+        self._capture_receipt_hook = capture_receipt_hook
         self._lock = threading.Lock()
         self._last_fingerprint: str | None = None
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=self._MAX_PENDING)
@@ -633,13 +661,45 @@ class _CaptureRunner:
             try:
                 if self._provider is None:
                     logger.debug("OS capture skipped: runner is ingest-only")
+                    self._publish_receipt(None, capture_gate_reason(self._cfg) or "ingest-ready")
                     return
                 out = _build_capture(self._cfg, self._provider, trigger)
                 if out is None:
+                    self._publish_receipt(None, capture_gate_reason(self._cfg) or "capture-skipped")
                     return
                 self._commit(out, trigger)
             except Exception as exc:  # noqa: BLE001
                 logger.error("capture failed: %s", exc, exc_info=True)
+
+    def capture_now(self) -> Path | None:
+        """Synchronously force a fresh record through the daemon-owned runner."""
+        with self._lock:
+            try:
+                if self._provider is None:
+                    logger.debug("forced OS capture skipped: runner is ingest-only")
+                    self._publish_receipt(None, capture_gate_reason(self._cfg) or "ingest-ready")
+                    return None
+                out = _build_capture(
+                    self._cfg,
+                    self._provider,
+                    {"event_type": "OnboardingProbe"},
+                )
+                if out is None:
+                    self._publish_receipt(None, capture_gate_reason(self._cfg) or "capture-skipped")
+                    return None
+                return self._commit(out, None, force=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("forced capture failed: %s", exc, exc_info=True)
+                self._publish_receipt(None, "capture-failed")
+                return None
+
+    def _publish_receipt(self, path: Path | None, reason: str) -> None:
+        if self._capture_receipt_hook is None:
+            return
+        try:
+            self._capture_receipt_hook(path, reason)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("capture_receipt_hook failed: %s", exc)
 
     def commit_prebuilt(self, out: dict[str, Any]) -> str | None:
         """Persist a capture built elsewhere (the ingest path) through this runner.
@@ -656,7 +716,13 @@ class _CaptureRunner:
             path = self._commit(out, out.get("trigger"))
             return path.stem if path is not None else None
 
-    def _commit(self, out: dict[str, Any], trigger: dict[str, Any] | None) -> Path | None:
+    def _commit(
+        self,
+        out: dict[str, Any],
+        trigger: dict[str, Any] | None,
+        *,
+        force: bool = False,
+    ) -> Path | None:
         """Content-dedup → write → fire hooks. Caller must hold ``self._lock``.
 
         Returns the written capture path, or None when content-deduped against the
@@ -664,7 +730,7 @@ class _CaptureRunner:
         static screen does not refresh the session idle timer).
         """
         fingerprint = _content_fingerprint(out)
-        if fingerprint == self._last_fingerprint:
+        if not force and fingerprint == self._last_fingerprint:
             meta = out.get("window_meta") or {}
             logger.debug(
                 "capture skipped (content dedup): trigger=%s app=%r title=%r",
@@ -675,6 +741,8 @@ class _CaptureRunner:
             return None
         self._last_fingerprint = fingerprint
         path = _write_capture(out)
+        reason = str((out.get("trigger") or {}).get("event_type") or "capture")
+        self._publish_receipt(path, reason)
         if self._pre_capture_hook is not None and trigger is not None:
             try:
                 self._pre_capture_hook(trigger)
@@ -698,6 +766,7 @@ async def run_forever(
     cfg: CaptureConfig,
     *,
     pre_capture_hook: Callable[[dict[str, Any]], None] | None = None,
+    capture_receipt_hook: Callable[[Path | None, str], None] | None = None,
 ) -> None:
     """Run the capture pipeline until cancelled.
 
@@ -731,6 +800,7 @@ async def run_forever(
         cfg,
         provider,
         pre_capture_hook=pre_capture_hook,
+        capture_receipt_hook=capture_receipt_hook,
     )
     runner.start_worker()
     _set_active_runner(runner)
@@ -739,6 +809,7 @@ async def run_forever(
 
     try:
         if ingest_only:
+            runner._publish_receipt(None, capture_gate_reason(cfg) or "ingest-ready")
             logger.info(
                 "capture source=ingest — OS capture disabled (no watcher / no screenshot "
                 "grab); serving POST /captures/ingest"

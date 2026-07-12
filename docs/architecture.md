@@ -37,9 +37,12 @@ flowchart LR
 
 ### State formation
 
-1. The Swift watcher emits AX events. `capture/event_dispatcher.py` performs
-   event deduplication, debounce, and minimum-gap control.
-2. `capture/scheduler.py` builds an S1 record. AX is primary. When explicitly
+1. With `capture.source="daemon"`, the source-versioned Swift watcher emits AX
+   events and `capture/event_dispatcher.py` performs event deduplication,
+   debounce, and minimum-gap control. With `source="ingest"`, a trusted local
+   producer owns OS capture and sends authenticated frames; the daemon starts no
+   watcher. Both modes converge in the same scheduler/commit path.
+2. `capture/scheduler.py` builds an S1 record. AX is primary in daemon mode. When explicitly
    enabled and AX text is poor, a focused screenshot is sent to an isolated
    local OCR subprocess; its text is backfilled into `captures` FTS.
 3. `timeline/aggregator.py` consults both the capture JSON and OCR backfill,
@@ -50,6 +53,39 @@ flowchart LR
 5. `writer/session_reducer.py` flushes active sessions every five minutes;
    `writer.agent.model_active_session` turns each new window into Points/Lines.
    Session end writes and models only the trailing range.
+
+### Runtime readiness and ownership
+
+The control path is generation-bound. `.daemon.lock` is acquired before start
+preflight and inherited for the complete foreground or double-forked daemon
+lifetime. The daemon publishes `.runtime-state.json` with `starting`/`ready`
+phase, random generation, current permission probes, OCR policy/worker state,
+and its last fresh-capture, ingest-readiness, paused, or locked receipt. HTTP
+onboarding reads the same data through authenticated endpoints; HTTP-disabled
+mode reads the owner-only file directly.
+
+Lifecycle operations treat `.pid` as compatibility input, then verify user,
+command/executable, process start time, and generation again before signaling.
+LaunchAgent ownership additionally requires its loaded job program/PID and
+configured plist to match the recorded Runtime; `.launchagent-owner` preserves
+intent across updates. Ambiguous live state fails closed rather than starting a
+second writer.
+
+AX permissions are similarly bound to the actual principals. The immutable
+`mac-ax-helper` and optional `mac-ax-watcher` each self-check/request
+Accessibility. Their machine-local path is derived from architecture and Swift
+source bytes, so same-version installs reuse the exact executable. Changed
+helper source resolves a new path and requires a new explicit grant; rollback
+resolves the old helper again. `[capture].ocr_policy` independently preserves
+`auto`, explicit enabled, or explicit disabled intent across onboarding/update.
+
+The updater holds a separate owner-only lock, builds a marked inactive
+`venv.replacement.update`, and atomically exchanges it with `venv`. The old code
+stays at the replacement path until the replacement's final background or
+LaunchAgent owner passes the mode-aware readiness proof. Transaction phase and
+candidate marker are fsynced, so recovery can tell whether exchange occurred
+even if the process died before recording the next phase; rollback performs the
+same atomic exchange in reverse.
 
 ### Incremental and terminal modeling
 

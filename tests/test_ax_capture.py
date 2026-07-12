@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -154,6 +155,80 @@ def test_create_provider_darwin_with_helper_is_macax(
     provider = create_provider(depth=4, timeout=2, raw=True)
     assert isinstance(provider, MacAXHelperProvider)
     assert provider.available is True
+
+
+def test_ax_trust_checks_only_helper_when_event_watcher_is_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "mac-ax-helper"
+    helper.write_text("", encoding="utf-8")
+    helper.chmod(0o700)
+    monkeypatch.setattr(ax_capture.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(ax_capture, "_resolve_helper_path", lambda: helper)
+    monkeypatch.setattr(ax_capture, "_binary_ax_trusted", lambda binary: binary == helper)
+    ax_capture._ax_trust_cache.clear()
+
+    assert ax_capture.ax_trusted(refresh=True, include_watcher=False) is True
+
+
+def test_accessibility_request_targets_only_configured_principals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "mac-ax-helper"
+    helper.write_text("", encoding="utf-8")
+    helper.chmod(0o700)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(ax_capture.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(ax_capture, "_resolve_helper_path", lambda: helper)
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(ax_capture.subprocess, "run", run)
+
+    assert ax_capture.request_accessibility_permission(include_watcher=False) is True
+    assert commands == [[str(helper), "--request-accessibility"]]
+
+
+def test_stable_native_binary_is_reused_across_reinstall_sources(
+    ac_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_source = tmp_path / "first" / "mac-ax-helper.swift"
+    second_source = tmp_path / "second" / "mac-ax-helper.swift"
+    first_source.parent.mkdir()
+    second_source.parent.mkdir()
+    first_source.write_text("print(1)\n", encoding="utf-8")
+    second_source.write_text("print(1)\n", encoding="utf-8")
+    builds: list[Path] = []
+
+    def compile_once(source: Path, binary: Path) -> None:
+        builds.append(source)
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o700)
+
+    monkeypatch.setattr(ax_capture, "_maybe_compile", compile_once)
+
+    first = ax_capture._stable_native_binary(first_source, "mac-ax-helper")
+    second = ax_capture._stable_native_binary(second_source, "mac-ax-helper")
+
+    assert first is not None
+    assert first.parent.parent == ac_root / "native"
+    assert second == first
+    assert builds == [first_source]
+    old_bytes = first.read_bytes()
+
+    second_source.write_text("print(2)\n", encoding="utf-8")
+    upgraded = ax_capture._stable_native_binary(second_source, "mac-ax-helper")
+    assert upgraded is not None and upgraded != first
+    assert builds == [first_source, second_source]
+
+    # A cancelled update can resolve the old source again without rebuilding
+    # or changing the old code identity that already owns the TCC grant.
+    rolled_back = ax_capture._stable_native_binary(first_source, "mac-ax-helper")
+    assert rolled_back == first
+    assert rolled_back.read_bytes() == old_bytes
+    assert builds == [first_source, second_source]
 
 
 # --- real macOS hardware smoke (keeps the `macos` marker live) ------------------

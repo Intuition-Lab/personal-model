@@ -9,16 +9,20 @@ memory-delta modeling. A retry task recovers transient reducer failures.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import secrets
 import signal
 import threading
+import time
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from . import paths
-from .capture import ocr_local
+from .capture import ocr_health, ocr_local
 from .capture import scheduler as capture_scheduler
 from .config import Config
 from .logger import get
@@ -122,10 +126,14 @@ def _hard_exit(session_manager: Any, code: int = 0) -> None:
         session_manager.force_end(reason="daemon-shutdown")
     with suppress(FileNotFoundError):
         paths.pid_file().unlink()
+    with suppress(FileNotFoundError):
+        paths.runtime_state_file().unlink()
     os._exit(code)
 
 
-def _build_task_registry() -> list[TaskDefinition]:
+def _build_task_registry(
+    capture_receipt_hook: Callable[[Path | None, str], None] | None = None,
+) -> list[TaskDefinition]:
     """Return the complete set of daemon task definitions."""
     return [
         TaskDefinition(
@@ -134,6 +142,7 @@ def _build_task_registry() -> list[TaskDefinition]:
             create=lambda cfg, sm: capture_scheduler.run_forever(
                 cfg.capture,
                 pre_capture_hook=sm.on_event,
+                capture_receipt_hook=capture_receipt_hook,
             ),
         ),
         TaskDefinition(
@@ -215,16 +224,88 @@ def _create_tasks_from_registry(
 
 async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = False) -> None:
     paths.ensure_dirs()
+    http_enabled = bool(cfg.mcp.auto_start and cfg.mcp.transport in ("sse", "streamable-http"))
+    if cfg.capture.source == "ingest" and not http_enabled:
+        raise RuntimeError(
+            "capture.source='ingest' requires the authenticated HTTP Runtime transport"
+        )
+    runtime_generation = secrets.token_hex(16)
+    # Keep the numeric pidfile backward-compatible with the updater/CLI from
+    # the immediately previous release. The owner-only runtime state written
+    # below binds that PID to a random generation; new lifecycle code requires
+    # both receipts before it sends a signal.
     paths.atomic_write_private_text(paths.pid_file(), str(os.getpid()))
 
-    # Register this daemon ("Persome Backend") in the macOS Screen Recording list + prompt,
-    # so screenshots capture real app windows instead of just the desktop wallpaper (and
-    # so OCR can grab AX-poor apps). Idempotent; a launchd background process won't get a
-    # modal prompt, but the binary now appears in System Settings → Privacy & Security →
-    # Screen Recording for the user to enable, then restart Persome. Never blocks boot.
-    from .capture import screen_recording
+    runtime_started_at = time.time()
+    runtime_state_lock = threading.Lock()
+    runtime_state: dict[str, Any] = {
+        "schema_version": 1,
+        "pid": os.getpid(),
+        "generation": runtime_generation,
+        "capture_mode": cfg.capture.source,
+        "http_enabled": http_enabled,
+        "ocr_worker": "not_started",
+        "ocr": "disabled",
+        "ocr_enabled": bool(cfg.capture.enable_ocr_fallback),
+        "ocr_tier": cfg.capture.ocr_tier,
+        "phase": "starting",
+        "permissions": {
+            "accessibility": "not_applicable",
+            "screen_recording": "not_applicable",
+        },
+        "last_capture_id": None,
+        "last_capture_reason": "not-yet-captured",
+        "started_at": runtime_started_at,
+        "updated_at": runtime_started_at,
+    }
 
-    screen_recording.request_screen_recording()
+    def _publish_runtime_state(
+        *,
+        worker: str | None = None,
+        capture_path: Path | None = None,
+        capture_reason: str | None = None,
+    ) -> None:
+        """Publish this exact daemon generation's owner-only readiness receipt."""
+        from .capture import ax_capture, ocr_health, screen_recording
+
+        with runtime_state_lock:
+            if worker is not None:
+                runtime_state["ocr_worker"] = worker
+            current_ocr = ocr_health.inspect(cfg.capture)
+            runtime_state["ocr"] = current_ocr.state
+            runtime_state["ocr_enabled"] = current_ocr.enabled
+            runtime_state["ocr_tier"] = current_ocr.tier
+            if capture_reason is not None:
+                if capture_path is not None:
+                    runtime_state["last_capture_id"] = capture_path.stem
+                runtime_state["last_capture_reason"] = capture_reason
+                # A receipt can only come from the capture task after storage
+                # recovery, session construction, task creation, and runner startup.
+                runtime_state["phase"] = "ready"
+            if cfg.capture.source == "daemon":
+                runtime_state["permissions"] = {
+                    "accessibility": (
+                        "granted"
+                        if ax_capture.ax_trusted(include_watcher=cfg.capture.event_driven)
+                        else "denied"
+                    ),
+                    "screen_recording": (
+                        "granted" if screen_recording.has_screen_recording() else "denied"
+                    ),
+                }
+            runtime_state["updated_at"] = time.time()
+            paths.atomic_write_private_text(
+                paths.runtime_state_file(),
+                json.dumps(runtime_state, ensure_ascii=False, sort_keys=True),
+            )
+
+    def _capture_receipt(path: Path | None, reason: str) -> None:
+        _publish_runtime_state(capture_path=path, capture_reason=reason)
+
+    # Runtime startup must never surprise the user with a TCC dialog. The
+    # explicit onboarding action is the only Screen Recording request path;
+    # ordinary starts only publish the current preflight state below.
+    _publish_runtime_state(worker="not_started")
 
     # evomem survivability base (SSOT switch design §3.3): chain-invariant
     # self-check at startup. Gated on [evomem] integrity_check_enabled (the
@@ -259,7 +340,7 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
     # reducer via its on_session_end callback. Built even when
     # capture_only is true so session rows still land on disk.
     session_manager = session_tick.build_manager(cfg)
-    registry = _build_task_registry()
+    registry = _build_task_registry(_capture_receipt)
     tasks = _create_tasks_from_registry(registry, cfg, session_manager, capture_only=capture_only)
 
     stop = asyncio.Event()
@@ -300,13 +381,31 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
     # pay the one-time graph-load latency) — but importing PaddleOCR/paddle
     # installs glog's FailureSignalHandler over ours, so re-claim the signals on
     # the loop thread once warmup finishes. Pure side channel; never blocks boot.
+    from .capture import ocr_subprocess
+
+    def _publish_worker_state(worker: str) -> None:
+        ocr_health.set_worker_state(worker)  # type: ignore[arg-type]
+        _publish_runtime_state(worker=worker)
+
+    ocr_subprocess.set_state_listener(_publish_worker_state)
+    ocr_health.set_worker_state("not_started")
+    _publish_runtime_state(worker="not_started")
     if cfg.capture.enable_ocr_fallback:
+        ocr_health.set_worker_state("warming")
+        _publish_runtime_state(worker="warming")
 
         def _warm_ocr() -> None:
             try:
-                if not ocr_local.warm(cfg.capture.ocr_tier):
+                if ocr_local.warm(cfg.capture.ocr_tier):
+                    ocr_health.set_worker_state("ready")
+                    _publish_runtime_state(worker="ready")
+                else:
+                    ocr_health.set_worker_state("failed")
+                    _publish_runtime_state(worker="failed")
                     logger.warning("boot: OCR warmup did not produce a ready engine")
             except Exception as exc:  # noqa: BLE001
+                ocr_health.set_worker_state("failed")
+                _publish_runtime_state(worker="failed")
                 logger.warning("boot: OCR warmup failed: %s", exc)
             finally:
                 # Re-take SIGTERM/SIGINT from paddle/glog (see _hard_stop).
@@ -352,8 +451,12 @@ async def _run(cfg: Config, *, capture_only: bool = False, hard_exit: bool = Fal
     with suppress(Exception):
         session_manager.force_end(reason="daemon-shutdown")
 
+    ocr_subprocess.set_state_listener(None)
+
     with suppress(FileNotFoundError):
         paths.pid_file().unlink()
+    with suppress(FileNotFoundError):
+        paths.runtime_state_file().unlink()
     logger.info("daemon stopped")
 
 

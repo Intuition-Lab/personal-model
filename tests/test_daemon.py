@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -319,16 +321,21 @@ class TestRunLifecycle:
         stub_registry = [
             replace(td, create=lambda c, sm: _never()) for td in _build_task_registry()
         ]
-        monkeypatch.setattr("persome.daemon._build_task_registry", lambda: stub_registry)
+        monkeypatch.setattr(
+            "persome.daemon._build_task_registry", lambda _receipt=None: stub_registry
+        )
 
         async def driver() -> None:
             task = asyncio.create_task(_run(self._no_task_cfg(), capture_only=True))
             # Let _run reach the point where the pid file exists.
             for _ in range(50):
                 await asyncio.sleep(0.01)
-                if paths.pid_file().exists():
+                if paths.pid_file().exists() and paths.runtime_state_file().exists():
                     break
             assert paths.pid_file().exists()
+            state = json.loads(paths.runtime_state_file().read_text(encoding="utf-8"))
+            assert state["pid"] == os.getpid()
+            assert len(state["generation"]) == 32
             # Simulate SIGTERM by signalling the daemon's stop path: the
             # handler just sets an Event, so we cancel the run task which
             # exercises the same shutdown / cleanup branch deterministically.
@@ -351,12 +358,15 @@ class TestRunLifecycle:
         stub_registry = [
             replace(td, create=lambda c, sm: returns()) for td in _build_task_registry()
         ]
-        monkeypatch.setattr("persome.daemon._build_task_registry", lambda: stub_registry)
+        monkeypatch.setattr(
+            "persome.daemon._build_task_registry", lambda _receipt=None: stub_registry
+        )
 
         await _run(self._no_task_cfg(), capture_only=True)
 
         # Health invariant: a cleanly stopped daemon leaves no pid file behind.
         assert not paths.pid_file().exists()
+        assert not paths.runtime_state_file().exists()
 
     async def test_force_end_failure_does_not_crash_shutdown(
         self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
@@ -367,7 +377,9 @@ class TestRunLifecycle:
         stub_registry = [
             replace(td, create=lambda c, sm: returns()) for td in _build_task_registry()
         ]
-        monkeypatch.setattr("persome.daemon._build_task_registry", lambda: stub_registry)
+        monkeypatch.setattr(
+            "persome.daemon._build_task_registry", lambda _receipt=None: stub_registry
+        )
 
         # SessionManager.force_end blowing up during shutdown must be swallowed
         # (it runs inside ``with suppress(Exception)``), so the pid file is
@@ -383,6 +395,37 @@ class TestRunLifecycle:
         boom_manager.force_end.assert_called_once()
         assert not paths.pid_file().exists()
 
+    async def test_runtime_start_never_requests_screen_recording(
+        self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def returns() -> None:
+            return
+
+        stub_registry = [
+            replace(td, create=lambda c, sm: returns()) for td in _build_task_registry()
+        ]
+        monkeypatch.setattr(
+            "persome.daemon._build_task_registry", lambda _receipt=None: stub_registry
+        )
+        monkeypatch.setattr(
+            "persome.capture.screen_recording.request_screen_recording",
+            lambda: pytest.fail("ordinary Runtime startup must never prompt for TCC access"),
+        )
+        cfg = self._no_task_cfg()
+
+        await _run(cfg, capture_only=True)
+
+    async def test_ingest_without_http_transport_refuses_to_start(self, ac_root: Path) -> None:
+        from persome import paths
+
+        cfg = self._no_task_cfg()
+        cfg.capture.source = "ingest"
+
+        with pytest.raises(RuntimeError, match="requires the authenticated HTTP"):
+            await _run(cfg, capture_only=True)
+
+        assert not paths.pid_file().exists()
+
 
 def test_shutdown_timeout_constant_is_sane() -> None:
     # Guard against an accidental 0/negative that would make shutdown not wait.
@@ -396,6 +439,7 @@ def test_hard_exit_persists_session_before_process_exit(
 
     manager = MagicMock()
     paths.pid_file().write_text("123")
+    paths.runtime_state_file().write_text("{}")
     exit_mock = MagicMock()
     monkeypatch.setattr("persome.daemon.os._exit", exit_mock)
 
@@ -403,4 +447,5 @@ def test_hard_exit_persists_session_before_process_exit(
 
     manager.force_end.assert_called_once_with(reason="daemon-shutdown")
     assert not paths.pid_file().exists()
+    assert not paths.runtime_state_file().exists()
     exit_mock.assert_called_once_with(0)

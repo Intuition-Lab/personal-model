@@ -18,6 +18,25 @@ OCRState = Literal[
     "models_missing",
     "permission_required",
 ]
+OCRWorkerState = Literal["not_started", "warming", "ready", "failed"]
+
+_worker_state: OCRWorkerState = "not_started"
+
+
+def set_worker_state(state: OCRWorkerState) -> None:
+    """Publish the daemon-owned isolated worker state to local health checks."""
+    global _worker_state
+    _worker_state = state
+
+
+def worker_state() -> OCRWorkerState:
+    """Return the daemon process's latest isolated-worker initialization state."""
+    from . import ocr_subprocess
+
+    dynamic = ocr_subprocess.current_worker_state()
+    if dynamic != "not_started":
+        return dynamic
+    return _worker_state
 
 
 @dataclass(frozen=True)
@@ -44,7 +63,11 @@ def inspect(cfg: CaptureConfig) -> OCRHealth:
     models_ready = ocr_local.models_available(tier)
     env_disabled = ocr_local.disabled_by_environment()
 
-    if sys.platform == "darwin":
+    if cfg.source == "ingest":
+        # The trusted producer owns Screen Recording and supplies an OCR JPEG.
+        # The daemon only runs local inference over those authenticated bytes.
+        permission = "not_applicable"
+    elif sys.platform == "darwin":
         permission = "granted" if screen_recording.has_screen_recording() else "denied"
     else:
         permission = "not_applicable"
@@ -62,7 +85,7 @@ def inspect(cfg: CaptureConfig) -> OCRHealth:
     elif not models_ready:
         state = "models_missing"
         detail = f"bundled PP-OCRv6 {tier} weights are missing"
-    elif permission != "granted":
+    elif permission not in {"granted", "not_applicable"}:
         state = "permission_required"
         detail = "Screen Recording permission is required"
     else:

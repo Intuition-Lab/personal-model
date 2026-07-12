@@ -13,6 +13,7 @@ if not os.environ.get("SSL_CERT_FILE"):
         pass
 
 import contextlib
+import fcntl
 import json
 import shutil
 import signal
@@ -30,7 +31,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import __version__, integrity, paths
+from . import __version__, integrity, paths, runtime_pid
 from . import config as config_mod
 from . import env_file as env_file_mod
 from . import logger as logger_mod
@@ -47,14 +48,56 @@ app = typer.Typer(
 console = Console()
 
 
-def _init() -> config_mod.Config:
+def _fail_if_runtime_state_is_ambiguous() -> None:
+    problem = runtime_pid.unresolved_runtime_reason()
+    if problem is None:
+        return
+    console.print(f"[red]Unsafe Runtime lifecycle state: {problem}.[/red]")
+    console.print(
+        "[yellow]Stop the owning Desktop app or LaunchAgent and retry; "
+        "Persome will not start a second writer.[/yellow]"
+    )
+    raise typer.Exit(1)
+
+
+def _acquire_daemon_lock():  # type: ignore[no-untyped-def]
+    handle = None
+    try:
+        handle = paths.open_private_lock_file(paths.daemon_lock_file())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError, RuntimeError) as exc:
+        if handle is not None:
+            handle.close()
+        raise RuntimeError("another Persome Runtime is already starting or running") from exc
+    return handle
+
+
+def _daemon_lock_is_held() -> bool:
+    try:
+        handle = paths.open_private_lock_file(paths.daemon_lock_file())
+    except (OSError, RuntimeError):
+        return True
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _init(*, starting_runtime: bool = False) -> config_mod.Config:
     paths.ensure_dirs()
+    _fail_if_runtime_state_is_ambiguous()
     # Logger first so the integrity check's JSON-line output lands in daemon.log.
     logger_mod.setup(console=False)
     # The daemon owns active SQLite writes. A status/MCP/second-start invocation
     # must never quarantine or rebuild an index while that process has it open.
     # When stopped, this remains the first database-touching operation.
-    if not _read_pid():
+    if not _read_pid() and (starting_runtime or not _daemon_lock_is_held()):
         integrity.check_and_recover()
     created = config_mod.write_default_if_missing()
     if created:
@@ -63,21 +106,13 @@ def _init() -> config_mod.Config:
 
 
 def _is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    process = runtime_pid.resolve_recorded_process()
+    return bool(process is not None and process.pid == pid)
 
 
 def _read_pid() -> int | None:
-    try:
-        pid = int(paths.pid_file().read_text().strip())
-    except (FileNotFoundError, ValueError):
-        return None
-    return pid if _is_pid_alive(pid) else None
+    process = runtime_pid.resolve_recorded_process()
+    return process.pid if process is not None else None
 
 
 def _daemon_uptime() -> str:
@@ -242,10 +277,17 @@ def start(
     # Avoid even configuration/integrity writes when the caller only asked to
     # start an already-running daemon. This is also the cross-process guard for
     # editor-launched MCP clients that share the same local database.
+    _fail_if_runtime_state_is_ambiguous()
     if pid := _read_pid():
         console.print(f"[yellow]Already running (pid {pid})[/yellow]")
         raise typer.Exit(1)
-    cfg = _init()
+    try:
+        daemon_lock = _acquire_daemon_lock()
+    except RuntimeError as exc:
+        console.print(f"[yellow]{exc}.[/yellow]")
+        raise typer.Exit(1) from exc
+    _fail_if_runtime_state_is_ambiguous()
+    cfg = _init(starting_runtime=True)
     # Source checkouts and upgrades may start without re-running install.sh.
     # Provision the local HTTP boundary before the daemon binds; the helper is
     # idempotent and preserves every unrelated provider secret in the env file.
@@ -263,6 +305,7 @@ def start(
         console.print("[bold]Persome starting in foreground[/bold] — Ctrl+C to stop.")
         _watch_parent_death()  # exit if the Persome app that spawned us (--foreground child) dies
         daemon.run(cfg, capture_only=capture_only)
+        daemon_lock.close()
         # Hard-exit instead of returning — `daemon.run` has already done the clean
         # shutdown (cancelled tasks, force-ended the session, logged "daemon
         # stopped"), so all durable state is committed (SQLite WAL is crash-safe;
@@ -292,29 +335,27 @@ def start(
     if devnull > 2:
         os.close(devnull)
     daemon.run(cfg, capture_only=capture_only)
+    daemon_lock.close()
     os._exit(0)
 
 
 @app.command()
 def stop(timeout: int = typer.Option(10, help="Seconds to wait for the daemon to exit.")) -> None:
     """Stop the daemon and wait for it to fully exit."""
-    import time
-
     _init()
-    pid = _read_pid()
-    if not pid:
+    process = runtime_pid.resolve_recorded_process()
+    if process is None:
         console.print("[yellow]Daemon not running.[/yellow]")
         raise typer.Exit(1)
-    os.kill(pid, signal.SIGTERM)
-    console.print(f"[green]Sent SIGTERM to pid {pid}.[/green]")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _is_pid_alive(pid):
-            console.print("[green]Daemon stopped.[/green]")
-            return
-        time.sleep(0.2)
+    if not runtime_pid.signal_process(process, signal.SIGTERM):
+        console.print("[red]Daemon identity changed before it could be stopped.[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Sent SIGTERM to pid {process.pid}.[/green]")
+    if runtime_pid.wait_for_exit(process, timeout):
+        console.print("[green]Daemon stopped.[/green]")
+        return
     console.print(
-        f"[yellow]Daemon (pid {pid}) did not exit within {timeout}s — it may still be running.[/yellow]"
+        f"[yellow]Daemon (pid {process.pid}) did not exit within {timeout}s — it may still be running.[/yellow]"
     )
 
 
@@ -340,6 +381,8 @@ def status() -> None:
     cfg = _init()
     # Source the env file before resolving/probing the selected provider.
     env_file_mod.load_env_file(paths.env_file())
+    from . import launchagent
+    from . import onboarding as onboarding_mod
     from .capture.ocr_health import inspect as inspect_ocr
     from .providers import resolve_profile
 
@@ -347,6 +390,27 @@ def status() -> None:
     ocr_health = inspect_ocr(cfg.capture)
     pid = _read_pid()
     paused = paths.paused_flag().exists()
+
+    runtime_state = onboarding_mod._runtime_state(pid) if pid is not None else None
+    permission_state = runtime_state.get("permissions") if runtime_state is not None else None
+    accessibility = (
+        str(permission_state.get("accessibility", "unknown"))
+        if isinstance(permission_state, dict)
+        else "not_applicable"
+        if cfg.capture.source == "ingest"
+        else "unknown"
+    )
+    runtime_generation = (
+        str(runtime_state.get("generation", "unknown")) if runtime_state is not None else "unknown"
+    )
+    owner = "background"
+    if launchagent.is_loaded():
+        binary = launchagent.configured_runtime_binary()
+        owner = (
+            "launchagent"
+            if binary is not None and launchagent.owns_recorded_runtime(binary)
+            else "launchagent (ownership mismatch)"
+        )
 
     uptime = _daemon_uptime()
     last_ts, last_app = _last_capture_info()
@@ -359,6 +423,20 @@ def status() -> None:
     table.add_row("Uptime", uptime)
     table.add_row("Health", f"[{health_style}]{health_label}[/{health_style}]")
     table.add_row("Capture", "[yellow]paused[/yellow]" if paused else "active")
+    table.add_row("Capture Source", cfg.capture.source)
+    table.add_row("Runtime Owner", owner if pid is not None else "stopped")
+    table.add_row("Generation", runtime_generation)
+    accessibility_style = (
+        "green"
+        if accessibility in {"granted", "not_applicable"}
+        else "red"
+        if accessibility == "denied"
+        else "yellow"
+    )
+    table.add_row(
+        "Accessibility",
+        f"[{accessibility_style}]{accessibility}[/{accessibility_style}]",
+    )
     ocr_style = "green" if ocr_health.ready else "yellow" if not ocr_health.enabled else "red"
     table.add_row(
         "OCR",
@@ -493,20 +571,41 @@ def doctor() -> None:
 
 @app.command()
 def onboard(
-    tier: str = typer.Option("tiny", "--tier", help="OCR tier: tiny | small | medium."),
+    tier: str | None = typer.Option(
+        None,
+        "--tier",
+        help="Enable/change OCR tier (tiny | small | medium); omitted preserves prior intent.",
+    ),
     gui: bool = typer.Option(
         True,
         "--gui/--no-gui",
         help="Use native macOS dialogs (falls back to terminal prompts).",
     ),
+    preserve_policy: bool = typer.Option(
+        False,
+        "--preserve-policy",
+        hidden=True,
+        help="Verify the existing capture policy without changing OCR configuration.",
+    ),
+    expected_owner: str = typer.Option(
+        "any",
+        "--expect-owner",
+        hidden=True,
+        help="Require final Runtime ownership (any | launchagent | background).",
+    ),
 ) -> None:
-    """Grant capture permissions, verify OCR, start Persome, and prove capture."""
+    """Verify capture permissions/policy, Runtime ownership, and live readiness."""
     from . import onboarding as onboarding_mod
 
     _init()
     env_file_mod.load_env_file(paths.env_file())
     try:
-        proof = onboarding_mod.onboard(tier=tier, gui=gui)
+        proof = onboarding_mod.onboard(
+            tier=tier,
+            gui=gui,
+            preserve_policy=preserve_policy,
+            expected_owner=expected_owner,
+        )
     except onboarding_mod.OnboardingCancelled as exc:
         console.print(f"[yellow]Onboarding stopped: {exc}.[/yellow]")
         raise typer.Exit(1) from exc
@@ -514,10 +613,38 @@ def onboard(
         console.print(f"[red]Onboarding failed: {exc}.[/red]")
         raise typer.Exit(1) from exc
 
-    console.print("[green]✓ Accessibility granted[/green]")
-    console.print("[green]✓ Local OCR and Screen Recording ready[/green]")
-    console.print(f"[green]✓ Persome running and healthy[/green] (pid {proof.pid})")
-    console.print(f"[green]✓ Fresh capture verified[/green] ({proof.capture_path})")
+    if proof.mode == "ingest":
+        console.print("[green]✓ Trusted ingest capture mode ready[/green]")
+    else:
+        console.print("[green]✓ Accessibility granted[/green]")
+        if proof.screen_recording == "granted":
+            console.print("[green]✓ Screen Recording granted[/green]")
+        if proof.ocr == "ready":
+            console.print("[green]✓ Isolated local OCR worker ready[/green]")
+        else:
+            ocr_message = {
+                "disabled": "disabled by saved policy",
+                "disabled_by_environment": "disabled by PERSOME_DISABLE_OCR",
+                "runtime_unavailable": "unavailable on this Mac",
+                "models_missing": "missing its bundled model files",
+            }.get(proof.ocr, proof.ocr)
+            console.print(f"[yellow]• AX capture ready; local OCR is {ocr_message}[/yellow]")
+    if proof.health == "ok":
+        console.print(
+            f"[green]✓ Persome running and healthy[/green] (pid {proof.pid}, owner {proof.owner})"
+        )
+    else:
+        console.print(
+            f"[yellow]✓ Persome running with {proof.health} optional features[/yellow] "
+            f"(pid {proof.pid}, owner {proof.owner})"
+        )
+    if proof.capture_path is not None:
+        console.print(f"[green]✓ Fresh capture verified[/green] ({proof.capture_path})")
+    elif proof.receipt == "ingest-ready":
+        console.print("[green]✓ Authenticated ingest runner verified[/green]")
+    else:
+        state = proof.receipt.removeprefix("privacy-")
+        console.print(f"[green]✓ Capture privacy state preserved[/green] ({state})")
 
 
 @app.command()
@@ -530,30 +657,86 @@ def update(
     """Update the installed Persome Runtime and prove it is healthy."""
     from . import updater
 
+    updater.claim_legacy_foreground()
     launchagent_was_loaded = False
     runtime_may_have_changed = False
-    try:
-        with updater.acquire_source(source) as update_source:
-            label = "official main" if update_source.official else str(update_source.path)
-            console.print(
-                f"[bold]Updating Persome from {label}[/bold] "
-                f"([dim]{update_source.revision[:12]}[/dim])"
-            )
-            launchagent_was_loaded = updater.launchagent_is_loaded()
-            runtime_may_have_changed = True
-            updater.stop_runtime(launchagent_was_loaded=launchagent_was_loaded)
-            console.print("[green]✓ Previous Runtime stopped[/green]")
-            updater.run_installer(update_source)
-            updater.restore_launchagent(launchagent_was_loaded)
-    except updater.UpdateError as exc:
-        recovery = ""
-        if runtime_may_have_changed:
-            try:
-                updater.recover_runtime(launchagent_was_loaded)
-            except updater.UpdateError as recovery_exc:
-                recovery = f" Recovery also failed: {recovery_exc}"
-        console.print(f"[red]Update failed: {exc}.{recovery}[/red]")
+
+    def fail_update(exc: BaseException, recovery_error: str = "") -> None:
+        cancelled = isinstance(
+            exc,
+            (KeyboardInterrupt, updater.UpdateCancelled, updater.UpdateSignal),
+        )
+        if cancelled:
+            if recovery_error:
+                console.print(
+                    f"[red]Update cancelled, but Runtime recovery failed: {recovery_error}[/red]"
+                )
+            else:
+                message = (
+                    "Update cancelled; the previous Runtime was restored."
+                    if runtime_may_have_changed
+                    else "Update cancelled before the Runtime was changed."
+                )
+                console.print(f"[yellow]{message}[/yellow]")
+            if isinstance(exc, (updater.UpdateCancelled, updater.UpdateSignal)):
+                code = exc.exit_code
+            else:
+                code = 130
+            raise typer.Exit(code) from exc
+        suffix = f" Recovery also failed: {recovery_error}" if recovery_error else ""
+        console.print(f"[red]Update failed: {exc}.{suffix}[/red]")
         raise typer.Exit(1) from exc
+
+    try:
+        with updater.catch_update_signals(), updater.update_lock():
+            # Recovery may already be moving virtualenv directories and
+            # lifecycle ownership. Repeated terminal signals must not leave
+            # that deterministic repair half-applied.
+            console.print("[dim]Checking for an interrupted update to recover...[/dim]")
+            with updater.ignore_update_signals():
+                updater.recover_pending_update()
+            updater.ensure_no_pending_update()
+            if source is None:
+                console.print("[dim]Downloading the latest official main revision...[/dim]")
+            else:
+                console.print(f"[dim]Inspecting local update source {source}...[/dim]")
+            with updater.acquire_source(source) as update_source:
+                try:
+                    label = "official main" if update_source.official else str(update_source.path)
+                    console.print(
+                        f"[bold]Updating Persome from {label}[/bold] "
+                        f"([dim]{update_source.revision[:12]}[/dim])"
+                    )
+                    launchagent_was_loaded = updater.launchagent_should_be_restored()
+                    updater.begin_update_transaction(launchagent_was_loaded)
+                    runtime_may_have_changed = True
+                    updater.stop_runtime(launchagent_was_loaded=launchagent_was_loaded)
+                    console.print("[green]✓ Previous Runtime stopped[/green]")
+                    updater.run_installer(update_source)
+                    updater.mark_update_phase(launchagent_was_loaded, "prepared")
+                    updater.activate_runtime(launchagent_was_loaded)
+                    updater.prove_runtime(launchagent_was_loaded)
+                    with updater.ignore_update_signals():
+                        updater.mark_update_phase(launchagent_was_loaded, "committing")
+                        cleanup = updater.commit_prepared_install()
+                        updater.clear_update_state()
+                        updater.cleanup_committed_install(cleanup)
+                    runtime_may_have_changed = False
+                except (
+                    KeyboardInterrupt,
+                    updater.UpdateError,
+                    updater.UpdateSignal,
+                ) as exc:
+                    recovery_error = ""
+                    if runtime_may_have_changed:
+                        try:
+                            with updater.ignore_update_signals():
+                                updater.rollback_and_recover(launchagent_was_loaded)
+                        except updater.UpdateError as recovery_exc:
+                            recovery_error = str(recovery_exc)
+                    fail_update(exc, recovery_error)
+    except (KeyboardInterrupt, updater.UpdateError, updater.UpdateSignal) as exc:
+        fail_update(exc)
 
     console.print(
         "[green]✓ Persome update complete[/green] — configuration, credentials, and personal "
@@ -750,7 +933,10 @@ def ocr_disable() -> None:
         tier=cfg.capture.ocr_tier,
         config_path=paths.config_file(),
     )
-    console.print("[yellow]Local OCR disabled. Restart the daemon to apply.[/yellow]")
+    console.print(
+        "[yellow]Local OCR disabled. Run `persome onboard` to apply and verify the saved "
+        "policy.[/yellow]"
+    )
 
 
 @app.command("ocr-selftest")
@@ -1463,11 +1649,10 @@ def llm_setup(
             keep_current = True
 
     if selected is None and not keep_current:
-        detected = detected_providers()
-        if declined_current:
-            # A direct "no" means choose something else. Do not immediately
-            # rediscover and silently select the same provider again.
-            detected = [spec for spec in detected if spec.id != current.provider]
+        # A direct "no" means the next provider must be an explicit user
+        # choice. Do not silently select any discovered alternative (or a
+        # regional preset that shares the current credential).
+        detected = [] if declined_current else detected_providers()
         if len(detected) == 1:
             selected = detected[0]
             console.print(f"[green]Found an existing {selected.label} API key.[/green]")

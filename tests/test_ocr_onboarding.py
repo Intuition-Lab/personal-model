@@ -55,6 +55,31 @@ def test_health_reports_disabled_without_hiding_runtime_state(
     assert health.models_available is True
 
 
+def test_screen_recording_probe_fails_closed_when_coregraphics_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(screen_recording.sys, "platform", "darwin")
+    monkeypatch.setattr(screen_recording, "_resolved", True)
+    monkeypatch.setattr(screen_recording, "_cg", None)
+
+    assert screen_recording.has_screen_recording() is False
+    assert screen_recording.request_screen_recording() is False
+
+
+def test_screen_recording_probe_fails_closed_when_preflight_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenCoreGraphics:
+        @staticmethod
+        def CGPreflightScreenCaptureAccess() -> bool:
+            raise OSError("probe failed")
+
+    monkeypatch.setattr(screen_recording.sys, "platform", "darwin")
+    monkeypatch.setattr(screen_recording, "_coregraphics", lambda: BrokenCoreGraphics())
+
+    assert screen_recording.has_screen_recording() is False
+
+
 def test_save_ocr_config_preserves_other_capture_fields(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text("[capture]\ninterval_minutes = 7\n", encoding="utf-8")

@@ -5,7 +5,6 @@ Mounted at root ``/`` inside the MCP server's Starlette app.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 import time
@@ -19,7 +18,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from .. import __version__, paths
+from .. import __version__, paths, runtime_pid
 from ..capture import ax_capture, ocr_health, scheduler, screen_recording
 from ..capture.timestamps import newest_capture_path
 from ..config import Config
@@ -61,17 +60,8 @@ def _get_cfg() -> Config:
 
 
 def _read_pid() -> int | None:
-    try:
-        pid = int(paths.pid_file().read_text().strip())
-    except (FileNotFoundError, ValueError):
-        return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        return pid
-    return pid
+    process = runtime_pid.resolve_recorded_process()
+    return process.pid if process is not None else None
 
 
 def _daemon_uptime() -> str:
@@ -207,8 +197,17 @@ router = APIRouter()
 def health() -> ApiResponse:
     """Return liveness plus the configured local-OCR readiness state."""
     current = ocr_health.inspect(_get_cfg().capture)
-    status = "degraded" if current.enabled and not current.ready else "ok"
-    return ApiResponse(data={"status": status, "ocr": current.state})
+    worker = ocr_health.worker_state()
+    status = "degraded" if current.enabled and (not current.ready or worker != "ready") else "ok"
+    return ApiResponse(
+        data={
+            "status": status,
+            "ocr": current.state,
+            "ocr_worker": worker,
+            "ocr_enabled": current.enabled,
+            "ocr_tier": current.tier,
+        }
+    )
 
 
 @router.post(BROWSER_BOOTSTRAP_PATH, response_model=ApiResponse, tags=["system"])
@@ -258,13 +257,26 @@ def consume_browser_bootstrap(
 def permissions() -> ApiResponse:
     """Return the daemon's current macOS permission state.
 
-    Accessibility and Screen Recording belong to the daemon process. A GUI
-    onboarding flow should poll this endpoint instead of creating another TCC
-    identity. Each field is ``granted`` or ``denied``.
+    Accessibility is self-probed by the configured bundled AX helper(s);
+    Screen Recording is preflighted by the Runtime executable. A GUI onboarding
+    flow should poll this aggregate instead of creating another TCC identity.
+    Fields are ``granted``, ``denied``, or mode-aware ``not_applicable``.
     """
+    cfg = _get_cfg()
+    if cfg.capture.source == "ingest":
+        return ApiResponse(
+            data={
+                "accessibility": "not_applicable",
+                "screen_recording": "not_applicable",
+            }
+        )
     return ApiResponse(
         data={
-            "accessibility": "granted" if ax_capture.ax_trusted() else "denied",
+            "accessibility": (
+                "granted"
+                if ax_capture.ax_trusted(include_watcher=cfg.capture.event_driven)
+                else "denied"
+            ),
             "screen_recording": (
                 "granted" if screen_recording.has_screen_recording() else "denied"
             ),
@@ -363,6 +375,24 @@ def status(check_models: bool = False) -> ApiResponse:
 
 
 # ─── Capture ingest ───────────────────────────────────────────────────────
+
+
+@router.post("/_onboarding/capture", response_model=ApiResponse, include_in_schema=False)
+def onboarding_capture() -> ApiResponse:
+    """Force one owner-authenticated capture inside the running daemon."""
+    state = scheduler.active_runner_state(_get_cfg().capture)
+    if state == "ingest-ready":
+        return ApiResponse(data={"id": None, "mode": "ingest", "receipt": state})
+    if state == "paused":
+        raise HTTPException(status_code=409, detail="capture is paused by the owner")
+    if state == "locked":
+        raise HTTPException(status_code=423, detail="screen is locked or asleep")
+    if state != "ready":
+        raise HTTPException(status_code=503, detail="live capture runner is not ready")
+    path = scheduler.capture_now()
+    if path is None:
+        raise HTTPException(status_code=503, detail="live capture runner is not ready")
+    return ApiResponse(data={"id": path.stem, "mode": "daemon", "receipt": "fresh-capture"})
 
 
 @router.post("/captures/ingest", response_model=ApiResponse, tags=["capture"])

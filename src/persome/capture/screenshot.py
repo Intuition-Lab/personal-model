@@ -30,8 +30,8 @@ def grab(max_width: int = 1920, jpeg_quality: int = 80) -> Screenshot | None:
 
     # Without Screen Recording permission macOS hands `mss` only the desktop wallpaper
     # (every other app's window is blanked), so a capture here would store a useless
-    # wallpaper frame. Skip it — `request_screen_recording()` at boot registers the daemon
-    # in the Screen Recording list + prompts; the user enables it and restarts Persome.
+    # wallpaper frame. Skip it; explicit `persome onboard` explains and requests
+    # the grant, while ordinary Runtime starts never show surprise TCC prompts.
     from . import screen_recording
 
     if not screen_recording.has_screen_recording():

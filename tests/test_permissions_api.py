@@ -21,7 +21,7 @@ def _make_client() -> TestClient:
 
 
 def test_permissions_reports_granted(monkeypatch) -> None:
-    monkeypatch.setattr(ax_capture, "ax_trusted", lambda: True)
+    monkeypatch.setattr(ax_capture, "ax_trusted", lambda **kwargs: True)
     monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: True)
     resp = _make_client().get("/permissions")
     assert resp.status_code == 200
@@ -32,7 +32,7 @@ def test_permissions_reports_granted(monkeypatch) -> None:
 
 
 def test_permissions_reports_denied(monkeypatch) -> None:
-    monkeypatch.setattr(ax_capture, "ax_trusted", lambda: False)
+    monkeypatch.setattr(ax_capture, "ax_trusted", lambda **kwargs: False)
     monkeypatch.setattr(screen_recording, "has_screen_recording", lambda: False)
     resp = _make_client().get("/permissions")
     assert resp.status_code == 200

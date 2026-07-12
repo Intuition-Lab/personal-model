@@ -278,6 +278,38 @@ api_key_env = "PERSOME_LLM_API_KEY"
     assert paths.env_file().read_text() == f"{LLM_API_KEY_ENV}=openai-secret\n"
 
 
+def test_declining_regional_provider_never_auto_switches_to_shared_key_variant(
+    ac_root: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    paths.config_file().write_text(
+        """
+[models.default]
+provider = "qwen-cn"
+protocol = "openai"
+model = "qwen-plus"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "PERSOME_LLM_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    paths.env_file().write_text(f"{LLM_API_KEY_ENV}=qwen-secret\n", encoding="utf-8")
+    paths.env_file().chmod(0o600)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "qwen-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setattr("persome.cli._interactive_terminal", lambda: True)
+
+    result = CliRunner().invoke(
+        app,
+        ["llm", "setup", "--skip-check"],
+        input="n\n2\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Found an existing Qwen (US) API key" not in result.output
+    assert "Choose the LLM provider Persome should use" in result.output
+    assert config.load().model_for("default").provider == "openai"
+
+
 def test_provider_list_hides_routing_details_by_default(ac_root: Path) -> None:
     runner = CliRunner()
 
