@@ -9,8 +9,8 @@ Requirements: Python 3.11+, SQLite 3.42+ with FTS5, `uv`, and macOS 13+ for live
 capture. The offline Runtime tests also run on Linux.
 
 ```bash
-git clone https://github.com/Persome-ai/persome-core.git
-cd persome-core
+git clone https://github.com/Intuition-Lab/personal-model.git
+cd personal-model
 uv sync --all-extras --locked
 ```
 
@@ -145,13 +145,13 @@ tag, and hosted runner:
 shasum -a 256 --check SHA256SUMS
 TAG=vX.Y.Z
 gh attestation verify persome_core-*.whl \
-  --repo Persome-ai/persome-core \
-  --signer-workflow Persome-ai/persome-core/.github/workflows/release.yml \
+  --repo Intuition-Lab/personal-model \
+  --signer-workflow Intuition-Lab/personal-model/.github/workflows/release.yml \
   --source-ref "refs/tags/${TAG}" \
   --deny-self-hosted-runners
 gh attestation verify persome_core-*.tar.gz \
-  --repo Persome-ai/persome-core \
-  --signer-workflow Persome-ai/persome-core/.github/workflows/release.yml \
+  --repo Intuition-Lab/personal-model \
+  --signer-workflow Intuition-Lab/personal-model/.github/workflows/release.yml \
   --source-ref "refs/tags/${TAG}" \
   --deny-self-hosted-runners
 ```

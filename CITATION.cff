@@ -4,11 +4,11 @@ title: "Persome Runtime"
 type: software
 version: "0.2.2"
 license: Apache-2.0
-repository-code: "https://github.com/Persome-ai/persome-core"
-url: "https://github.com/Persome-ai/persome-core"
+repository-code: "https://github.com/Intuition-Lab/personal-model"
+url: "https://github.com/Intuition-Lab/personal-model"
 identifiers:
   - type: url
-    value: "https://github.com/Persome-ai/persome-core/releases/tag/v0.2.2"
+    value: "https://github.com/Intuition-Lab/personal-model/releases/tag/v0.2.2"
     description: "Persome Runtime v0.2.2 release"
 abstract: >-
   Local-first screen-context memory daemon for macOS. It captures Accessibility

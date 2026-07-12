@@ -20,7 +20,7 @@ Linux CI covers the offline Python pipeline only.
 ## Reporting a vulnerability
 
 Use GitHub's private vulnerability reporting:
-https://github.com/Persome-ai/persome-core/security/advisories/new.
+https://github.com/Intuition-Lab/personal-model/security/advisories/new.
 
 Do not include vulnerabilities or personal capture data in a public issue.
 Private vulnerability reporting is enabled for this repository.

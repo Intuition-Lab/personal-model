@@ -56,10 +56,10 @@ dependencies = [
 persome = "persome.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/Persome-ai/persome-core"
-Repository = "https://github.com/Persome-ai/persome-core"
-Issues = "https://github.com/Persome-ai/persome-core/issues"
-Documentation = "https://github.com/Persome-ai/persome-core/tree/main/docs"
+Homepage = "https://github.com/Intuition-Lab/personal-model"
+Repository = "https://github.com/Intuition-Lab/personal-model"
+Issues = "https://github.com/Intuition-Lab/personal-model/issues"
+Documentation = "https://github.com/Intuition-Lab/personal-model/tree/main/docs"
 
 [build-system]
 requires = ["hatchling==1.31.0"]

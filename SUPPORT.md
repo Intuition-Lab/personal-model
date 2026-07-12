@@ -3,11 +3,11 @@
 Use the channel that matches the report:
 
 - **Bug or reproducible runtime problem:** open a
-  [bug report](https://github.com/Persome-ai/persome-core/issues/new?template=bug_report.yml).
+  [bug report](https://github.com/Intuition-Lab/personal-model/issues/new?template=bug_report.yml).
 - **Integration request:** open an
-  [integration request](https://github.com/Persome-ai/persome-core/issues/new?template=integration_request.yml).
+  [integration request](https://github.com/Intuition-Lab/personal-model/issues/new?template=integration_request.yml).
 - **Question, setup help, or idea:** start a
-  [GitHub Discussion](https://github.com/Persome-ai/persome-core/discussions).
+  [GitHub Discussion](https://github.com/Intuition-Lab/personal-model/discussions).
 - **Security vulnerability:** follow [SECURITY.md](SECURITY.md); never disclose
   personal captures or credentials in a public issue.
 

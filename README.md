@@ -4,13 +4,13 @@
 you already use, turns cross-app activity into an inspectable model of a real
 person, and serves that model to MCP agents.
 
-[![CI](https://github.com/Persome-ai/persome-core/actions/workflows/ci.yml/badge.svg)](https://github.com/Persome-ai/persome-core/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Persome-ai/persome-core)](https://github.com/Persome-ai/persome-core/releases)
+[![CI](https://github.com/Intuition-Lab/personal-model/actions/workflows/ci.yml/badge.svg)](https://github.com/Intuition-Lab/personal-model/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Intuition-Lab/personal-model)](https://github.com/Intuition-Lab/personal-model/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-blue)](LICENSE)
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black)](#platform-support)
 [![MCP](https://img.shields.io/badge/interface-MCP-0b7285)](MCP.md)
 
-**[Star Persome on GitHub](https://github.com/Persome-ai/persome-core)** to
+**[Star Persome on GitHub](https://github.com/Intuition-Lab/personal-model)** to
 follow the Runtime and help prioritize the next MCP integrations.
 
 ![Persome local personal-model viewer rendering a dense synthetic Point, Line, Face, Volume, and Root graph](docs/assets/persome-model-hero.png)
@@ -42,8 +42,8 @@ your real `~/.persome` data. This path requires Git and
 [`uv`](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```bash
-git clone https://github.com/Persome-ai/persome-core.git
-cd persome-core
+git clone https://github.com/Intuition-Lab/personal-model.git
+cd personal-model
 uv run python scripts/sample_demo.py
 ```
 
@@ -82,8 +82,8 @@ from the committed `uv.lock`, and the complete build-backend closure is
 hash-constrained rather than resolved afresh.
 
 ```bash
-git clone https://github.com/Persome-ai/persome-core.git
-cd persome-core
+git clone https://github.com/Intuition-Lab/personal-model.git
+cd personal-model
 bash install.sh
 
 persome doctor
@@ -398,9 +398,9 @@ The public roadmap is issue-driven:
 - Intel and future-macOS compatibility evidence;
 - a separate, reproducible personal-model benchmark suite.
 
-Browse [starter issues](https://github.com/Persome-ai/persome-core/issues) or
+Browse [starter issues](https://github.com/Intuition-Lab/personal-model/issues) or
 start a design question in
-[Discussions](https://github.com/Persome-ai/persome-core/discussions).
+[Discussions](https://github.com/Intuition-Lab/personal-model/discussions).
 
 ## Contributing and community
 
@@ -414,9 +414,9 @@ and workflow permissions default to read-only.
 ### Support Persome
 
 If an inspectable, user-owned personal model is useful to your agents,
-**[star Persome on GitHub](https://github.com/Persome-ai/persome-core)** and
+**[star Persome on GitHub](https://github.com/Intuition-Lab/personal-model)** and
 share the MCP client or workflow you want supported in
-[Discussions](https://github.com/Persome-ai/persome-core/discussions).
+[Discussions](https://github.com/Intuition-Lab/personal-model/discussions).
 
 ## License
 

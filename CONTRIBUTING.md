@@ -6,8 +6,8 @@ Requirements: macOS 13+ (for the full capture stack; the Python daemon and its
 offline tests also run on Linux), Python 3.11, [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/Persome-ai/persome-core.git
-cd persome-core
+git clone https://github.com/Intuition-Lab/personal-model.git
+cd personal-model
 uv sync --all-extras
 ```
 
