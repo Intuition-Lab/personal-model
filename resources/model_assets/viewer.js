@@ -112,6 +112,7 @@ let fitDistance = 12;
 let zoomGoalDistance = null;
 let lastZoomPercent = null;
 let lastFrameTime = performance.now();
+let shareReady = false;
 const layerVisible = { points: true, lines: true, faces: true, volumes: true, root: true };
 const kindLayers = { point: "points", context: "points", face: "faces", volume: "volumes", root: "root" };
 const raycaster = new THREE.Raycaster();
@@ -671,7 +672,7 @@ function showShareNotice(title, message, failed = false) {
 }
 
 function setShareBusy(busy) {
-  shareButton.disabled = busy;
+  shareButton.disabled = busy || !shareReady;
   shareButton.setAttribute("aria-busy", String(busy));
   shareButton.querySelector("b").textContent = busy ? "Preparing…" : "Share";
 }
@@ -914,10 +915,16 @@ async function loadModel(force = false) {
     model = payload.model;
     modelGeneratedAt = payload.generated_at || "";
     modelFingerprint = nextFingerprint;
+    shareReady = Boolean(
+      model.points.length || model.faces.length || model.volumes.length || model.root,
+    );
+    setShareBusy(false);
     updateTimelineBounds();
     buildScene();
     errorEl.hidden = true;
   } catch (error) {
+    shareReady = false;
+    setShareBusy(false);
     errorEl.textContent = `Unable to load the personal model. ${error.message || error}`;
     errorEl.hidden = false;
   }

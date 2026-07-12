@@ -43,7 +43,7 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       </div>
       <div class="view-actions">
         <span class="privacy-badge"><i aria-hidden="true"></i>Local only</span>
-        <button id="share-x" class="share-button" type="button" aria-label="Share your constellation to X" title="Share your constellation to X">
+        <button id="share-x" class="share-button" type="button" aria-label="Share your constellation to X" title="Share your constellation to X" disabled>
           <span aria-hidden="true">X</span><b>Share</b>
         </button>
         <div class="zoom-controls" role="group" aria-label="Zoom controls">

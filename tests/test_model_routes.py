@@ -66,6 +66,7 @@ class TestViewPage:
         assert "The shape" in body and "of you." in body
         assert "Local only" in body
         assert 'id="share-x"' in body
+        assert 'title="Share your constellation to X" disabled>' in body
         assert 'id="share-notice"' in body
         assert 'aria-label="Zoom controls"' in body
         assert 'id="zoom-out"' in body
@@ -99,6 +100,7 @@ class TestViewPage:
         assert b"model.root?.signature" in viewer.body
         assert b"controls.zoomToCursor = true" in viewer.body
         assert b"downloadShareCard" in viewer.body
+        assert b"shareReady = Boolean" in viewer.body
         assert b"window.open" in viewer.body
         assert b"my-persome-constellation.png" in share.body
         assert b"window.__persomeZoomState" in viewer.body
