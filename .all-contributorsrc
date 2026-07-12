@@ -7,7 +7,7 @@
     "README.md"
   ],
   "badge": false,
-  "imageSize": 100,
+  "imageSize": 56,
   "commit": false,
   "commitConvention": "angular",
   "contributors": [
@@ -22,6 +22,6 @@
       ]
     }
   ],
-  "contributorsPerLine": 7,
+  "contributorsPerLine": 2,
   "linkToUsage": false
 }

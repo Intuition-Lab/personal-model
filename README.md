@@ -429,30 +429,27 @@ secrets, personal data, non-English source text, contract drift, lint failures,
 and offline regressions. Third-party Actions are pinned to reviewed commit SHAs
 and workflow permissions default to read-only.
 
-## Contributors ✨
+## Contributors
 
-Thanks goes to these wonderful people
-([emoji key](https://allcontributors.org/docs/en/emoji-key)):
+Persome is shaped by people across engineering, design, research, and community.
 
 <!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
-<!-- prettier-ignore-start -->
-<!-- markdownlint-disable -->
 <table>
   <tbody>
     <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Singularity-tian"><img src="https://avatars.githubusercontent.com/u/113085728?v=4?s=100" width="100px;" alt="Singularity"/><br /><sub><b>Singularity</b></sub></a><br /><a href="https://github.com/Intuition-Lab/personal-model/commits?author=Singularity-tian" title="Code">💻</a> <a href="#maintenance-Singularity-tian" title="Maintenance">🚧</a></td>
+      <td valign="middle">
+        <a href="https://github.com/Singularity-tian"><img src="https://avatars.githubusercontent.com/u/113085728?v=4&amp;size=112" width="56" align="left" alt="Singularity" /></a>
+        &nbsp;<strong><a href="https://github.com/Singularity-tian">Singularity</a></strong><br />
+        &nbsp;<sub>💻&nbsp;Code &nbsp;·&nbsp; 🚧&nbsp;Maintenance</sub>
+      </td>
     </tr>
   </tbody>
 </table>
-
-<!-- markdownlint-restore -->
-<!-- prettier-ignore-end -->
-
 <!-- ALL-CONTRIBUTORS-LIST:END -->
 
-This project follows the
-[all-contributors](https://github.com/all-contributors/all-contributors)
-specification. Contributions of any kind are welcome!
+<sub>Contribution labels follow the
+[All Contributors](https://allcontributors.org/docs/en/emoji-key) convention.
+Contributions of every kind are welcome.</sub>
 
 ### Support Persome
 
