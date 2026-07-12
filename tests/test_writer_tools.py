@@ -52,6 +52,39 @@ def test_dispatch_read_memory(ac_root: Path) -> None:
         assert len(r["entries"]) == 1
 
 
+def test_flag_compact_keeps_nested_same_basename_identity(ac_root: Path) -> None:
+    with fts.cursor() as conn:
+        entries_mod.create_file(
+            conn,
+            name="skill-same.md",
+            description="Top-level skill",
+            tags=[],
+        )
+        entries_mod.create_file(
+            conn,
+            name="skills/skill-same.md",
+            description="Nested skill",
+            tags=[],
+        )
+        state = wtools.CommitState()
+
+        result = wtools.tool_flag_compact(
+            conn,
+            path="skills/skill-same.md",
+            reason="nested only",
+            state=state,
+        )
+        flags = {
+            row["path"]: row["needs_compact"]
+            for row in conn.execute(
+                "SELECT path, needs_compact FROM files ORDER BY path"
+            ).fetchall()
+        }
+
+    assert result == {"ok": True}
+    assert flags == {"skill-same.md": 0, "skills/skill-same.md": 1}
+
+
 def test_dispatch_search(ac_root: Path) -> None:
     with fts.cursor() as conn:
         entries_mod.create_file(

@@ -24,7 +24,11 @@ from ..capture.timestamps import newest_capture_path
 from ..config import Config
 from ..config import load as load_config
 from ..logger import get
-from ..model import ActivitySource, build_snapshot, normalize_activity_identity
+from ..model import (
+    ActivitySource,
+    build_live_snapshot,
+    normalize_activity_identity,
+)
 from ..security.auth import (
     BROWSER_BOOTSTRAP_PATH,
     BROWSER_BOOTSTRAP_TTL_SECONDS,
@@ -459,7 +463,7 @@ def model_graph() -> dict[str, Any]:
     from ..store import fts as fts_store
 
     with fts_store.cursor() as conn:
-        snapshot = build_snapshot(conn)
+        snapshot = build_live_snapshot(conn)
     return {
         "generated_at": datetime.now().astimezone().isoformat(),
         "model": snapshot,

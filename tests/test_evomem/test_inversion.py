@@ -8,6 +8,7 @@ import pytest
 
 from persome.evomem import integrity as evo_integrity
 from persome.evomem import inversion as evo_inversion
+from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.store import entries, fts
 from persome.store import files as files_mod
 
@@ -243,6 +244,59 @@ def test_shadow_write_disabled_under_evomem_authority(
             "SELECT COUNT(*) c FROM evo_nodes WHERE file_name LIKE 'skill%'"
         ).fetchone()["c"]
     assert rows == 0
+
+
+def test_nested_skill_stays_direct_markdown_with_initialized_shadow(ac_root: Path) -> None:
+    from persome.evomem.store import NodeStore
+
+    NodeStore().save(
+        MemoryNode(
+            node_id="baseline-node",
+            content="baseline",
+            layer=MemoryLayer.L2_FACT,
+            file_name="project-baseline.md",
+        )
+    )
+    with fts.cursor() as conn:
+        entries.create_file(conn, name="skills/skill-shadow.md", description="d", tags=[])
+        entry_id = entries.append_entry(
+            conn,
+            name="skills/skill-shadow.md",
+            content="direct markdown skill",
+            tags=[],
+        )
+        count = conn.execute(
+            "SELECT count(*) FROM evo_nodes WHERE node_id=?", (entry_id,)
+        ).fetchone()[0]
+
+    assert count == 0
+
+
+def test_markdown_shadow_uses_canonical_filename_when_suffix_is_omitted(ac_root: Path) -> None:
+    from persome.evomem.store import NodeStore
+
+    NodeStore().save(
+        MemoryNode(
+            node_id="baseline-node",
+            content="baseline",
+            layer=MemoryLayer.L2_FACT,
+            file_name="project-baseline.md",
+        )
+    )
+    with fts.cursor() as conn:
+        entries.create_file(conn, name="project-no-suffix", description="d", tags=[])
+        entry_id = entries.append_entry(
+            conn,
+            name="project-no-suffix",
+            content="canonical shadow identity",
+            tags=[],
+        )
+        row = conn.execute(
+            "SELECT file_name FROM evo_nodes WHERE node_id=?", (entry_id,)
+        ).fetchone()
+
+    assert row is not None
+    assert row["file_name"] == "project-no-suffix.md"
 
 
 def test_rollback_flip_back_restores_legacy_path_and_shadow(

@@ -13,12 +13,20 @@ from .build import (
     ModelBuildBusy,
     ModelBuildCoordinator,
     ModelBuildResult,
+    ModelRecoveryIncomplete,
     PipelineOutcome,
+    build_live_snapshot,
     load_last_manifest,
+    load_live_manifest,
     run_model_build,
 )
 from .entity_source import EntityEvent, EntitySource, MemoryPersonNameSource
-from .manifest import create_build_manifest, detect_core_commit, prompt_hashes
+from .manifest import (
+    create_build_manifest,
+    detect_core_commit,
+    is_valid_build_manifest,
+    prompt_hashes,
+)
 from .schema_reader import active_schema_inferences, active_schema_inferences_with_sources
 from .snapshot import (
     SCHEMA_VERSION,
@@ -36,6 +44,7 @@ __all__ = [
     "ModelBuildBusy",
     "ModelBuildCoordinator",
     "ModelBuildResult",
+    "ModelRecoveryIncomplete",
     "ModelContractError",
     "PipelineOutcome",
     "SOURCE_KINDS",
@@ -47,11 +56,14 @@ __all__ = [
     "active_schema_inferences",
     "active_schema_inferences_with_sources",
     "build_snapshot",
+    "build_live_snapshot",
     "create_build_manifest",
     "detect_core_commit",
     "export_snapshot",
     "load_last_manifest",
+    "load_live_manifest",
     "is_activity_identity",
+    "is_valid_build_manifest",
     "model_status",
     "normalize_activity_identity",
     "prompt_hashes",

@@ -514,11 +514,13 @@ button {
 .stat[data-kind="root"] { --stat-color: var(--root); }
 
 .build-state {
+  --build-color: #8d8799;
+  --build-glow: rgba(141, 135, 153, 0.48);
   display: flex;
   align-items: center;
   gap: 7px;
   padding: 0 14px;
-  color: var(--muted);
+  color: var(--build-color);
   font-size: 9px;
   text-transform: capitalize;
 }
@@ -527,8 +529,28 @@ button {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--point);
-  box-shadow: 0 0 9px rgba(78, 240, 195, 0.72);
+  background: var(--build-color);
+  box-shadow: 0 0 9px var(--build-glow);
+}
+
+.build-state--not-built {
+  --build-color: #8d8799;
+  --build-glow: rgba(141, 135, 153, 0.48);
+}
+
+.build-state--building {
+  --build-color: var(--line);
+  --build-glow: rgba(255, 196, 94, 0.68);
+}
+
+.build-state--degraded {
+  --build-color: var(--root);
+  --build-glow: rgba(255, 107, 138, 0.68);
+}
+
+.build-state--complete {
+  --build-color: var(--point);
+  --build-glow: rgba(78, 240, 195, 0.72);
 }
 
 .legend {

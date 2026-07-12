@@ -371,6 +371,23 @@ levels require repeated stable evidence and model status should remain
 `model-build.json` for failed stages and `/model/graph` for the exact snapshot
 currently consumed by the viewer.
 
+After automatic database quarantine, inspect
+`~/.persome/.integrity-recovery.json`. Persome restores a verified snapshot when
+available and otherwise replays the surviving Markdown memory projection, but
+it deliberately marks the structural model as not built. Run `persome model
+build` once the Runtime LLM profile passes `persome llm status --check`; the
+Viewer will not label an unverified projection as `Build complete`.
+If config and database recovery leave
+`.integrity-config-recovery.pending.json` and `write_authority = "unknown"`,
+both Markdown and evomem were intact but neither was provably canonical. Inspect
+the retained snapshot/quarantine, then explicitly set the value to `markdown`
+or `evomem` and rerun a stopped-Runtime command. Persome reconciles the selected
+source before unfreezing; choosing evomem also replaces its conflicting
+Markdown projection.
+If the marker says `capture_buffer_replay_available: true`, run `persome
+rebuild-captures-index --merge` to upsert retained owner-only JSON without
+deleting older snapshot-backed captures before rebuilding downstream history.
+
 ## Resetting
 
 Start from scratch without reinstalling:

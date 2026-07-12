@@ -26,6 +26,11 @@ redact by default, while the owner-only loopback viewer uses raw local content.
 Consumers must branch on `schema_version`. Package versions do not substitute
 for a schema check.
 
+The `build` object has one fixed key set in every state. While a build is in
+progress or no valid completed build exists, unavailable identity fields are
+`null`, maps are empty, and input-window bounds are `null`; these sentinels do
+not claim a successful build.
+
 ## Geometry
 
 ### Point
@@ -91,6 +96,16 @@ duration_ms, degraded_stages, status
 ```
 
 No API keys or full configuration values are copied into the manifest.
+`build_id` is the stable hash of every other manifest field; `complete` requires
+an empty `degraded_stages`, while `degraded` requires at least one stage.
+
+Live HTTP, MCP, and CLI-export snapshots use the last persisted completed or
+degraded build record. If no valid build record exists, they report `status: not_built`,
+`trigger: no_completed_build`, and a null `build_id`; inspecting the current
+database projection never fabricates a successful build. A raw
+`model-build.json` with `status: building` is exposed as `building` only while
+the process still holds `model-build.lock`. If that lock is free, the marker is
+an interrupted-build remnant and public surfaces report `not_built`.
 
 ## Stats
 

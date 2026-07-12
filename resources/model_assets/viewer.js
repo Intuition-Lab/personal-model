@@ -640,12 +640,25 @@ function renderStatus() {
     stat.append(count, name);
     statusEl.append(stat);
   });
-  if (model.build?.status) {
+  const buildStatus = model.build?.status;
+  if (buildStatus) {
     const build = document.createElement("span");
-    build.className = "build-state";
+    const buildStateClass = {
+      not_built: "not-built",
+      building: "building",
+      degraded: "degraded",
+      complete: "complete",
+    }[buildStatus] || "not-built";
+    build.className = `build-state build-state--${buildStateClass}`;
+    build.dataset.status = buildStatus;
     const signal = document.createElement("i");
     signal.setAttribute("aria-hidden", "true");
-    build.append(signal, `Build ${model.build.status}`);
+    const label = buildStatus === "not_built"
+      ? "Not built"
+      : buildStatus === "building"
+        ? "Building…"
+        : `Build ${buildStatus}`;
+    build.append(signal, label);
     statusEl.append(build);
   }
   modelIdentityEl.textContent = model.root?.signature

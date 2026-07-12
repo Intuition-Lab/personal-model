@@ -2,14 +2,35 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
+import pytest
+
+from persome import paths
 from persome.api import routes
 from persome.api.model_view import render_memory_view
 from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.evomem.store import NodeStore
+from persome.model import ModelBuildCoordinator, create_build_manifest
 from persome.store import fts
 from persome.store import relation_edges as edges_store
+
+BUILD_KEYS = {
+    "build_id",
+    "completed_at",
+    "config_hash",
+    "core_commit",
+    "degraded_stages",
+    "duration_ms",
+    "input_window",
+    "mode",
+    "models",
+    "prompt_hashes",
+    "started_at",
+    "status",
+    "trigger",
+}
 
 
 def _save_point(
@@ -30,6 +51,21 @@ def _save_point(
 
 
 class TestGraphJson:
+    def test_graph_uses_transactionally_stable_live_reader(self, ac_root, monkeypatch):
+        sentinel = {"schema_version": 1, "source": "live-reader"}
+        calls = []
+
+        def fake_live_snapshot(conn):  # type: ignore[no-untyped-def]
+            calls.append(conn)
+            return sentinel
+
+        monkeypatch.setattr(routes, "build_live_snapshot", fake_live_snapshot)
+
+        graph = routes.model_graph()
+
+        assert graph["model"] is sentinel
+        assert len(calls) == 1
+
     def test_graph_is_the_canonical_snapshot(self, ac_root):
         _save_point(node_id="point-runtime", content="The runtime stores local context.")
 
@@ -51,6 +87,70 @@ class TestGraphJson:
         graph = routes.model_graph()
         assert graph["model"]["points"] == []
         assert graph["model"]["stats"]["points"] == 0
+        build = graph["model"]["build"]
+        assert set(build) == BUILD_KEYS
+        assert build["status"] == "not_built"
+        assert build["trigger"] == "no_completed_build"
+        assert build["build_id"] is None
+        assert build["started_at"] is None
+        assert build["completed_at"] is None
+
+    def test_incomplete_saved_manifest_does_not_fabricate_completed_build(self, ac_root):
+        paths.atomic_write_private_text(
+            paths.model_build_manifest(),
+            json.dumps({"status": "complete", "build_id": "incomplete"}),
+        )
+
+        build = routes.model_graph()["model"]["build"]
+
+        assert build["status"] == "not_built"
+        assert build["build_id"] is None
+
+    def test_active_build_is_exposed_as_building(self, ac_root):
+        coordinator = ModelBuildCoordinator()
+        with coordinator.acquire(wait_seconds=0):
+            paths.atomic_write_private_text(
+                paths.model_build_manifest(),
+                json.dumps(
+                    {
+                        "build_id": None,
+                        "status": "building",
+                        "trigger": "test-route",
+                        "started_at": "2026-07-12T08:00:00+00:00",
+                        "completed_at": None,
+                        "duration_ms": 0,
+                        "degraded_stages": [],
+                    }
+                ),
+            )
+
+            build = routes.model_graph()["model"]["build"]
+
+        assert build["status"] == "building"
+        assert set(build) == BUILD_KEYS
+        assert build["trigger"] == "test-route"
+        assert build["build_id"] is None
+
+    @pytest.mark.parametrize("degraded_stages", [[], ["root_synthesis"]])
+    def test_saved_build_manifest_is_preserved(self, ac_root, degraded_stages):
+        manifest = create_build_manifest(
+            core_commit="0123456789abcdef",
+            models={"timeline": "fixture-model"},
+            config={"fixture": True},
+            input_window={"start": "2026-07-01T00:00:00+00:00", "end": None},
+            degraded_stages=degraded_stages,
+            started_at="2026-07-12T08:00:00+00:00",
+            completed_at="2026-07-12T08:01:00+00:00",
+            duration_ms=60_000,
+            trigger="test-fixture",
+            mode="mock",
+        )
+        paths.atomic_write_private_text(
+            paths.model_build_manifest(),
+            json.dumps(manifest, ensure_ascii=False),
+        )
+
+        assert routes.model_graph()["model"]["build"] == manifest
 
 
 class TestViewPage:
@@ -98,6 +198,22 @@ class TestViewPage:
         assert b'fetch("/model' not in viewer.body
         assert b"ACESFilmicToneMapping" in viewer.body
         assert b"model.root?.signature" in viewer.body
+        assert b'buildStatus === "not_built"' in viewer.body
+        assert b'buildStatus === "building"' in viewer.body
+        assert "Building…".encode() in viewer.body
+        assert b'not_built: "not-built"' in viewer.body
+        assert b'building: "building"' in viewer.body
+        assert b'degraded: "degraded"' in viewer.body
+        assert b'complete: "complete"' in viewer.body
+        assert b"build-state--${buildStateClass}" in viewer.body
+        assert b".build-state--not-built" in css.body
+        assert b".build-state--building" in css.body
+        assert b".build-state--degraded" in css.body
+        assert b".build-state--complete" in css.body
+        assert b"--build-color: #8d8799" in css.body
+        assert b"--build-color: var(--line)" in css.body
+        assert b"--build-color: var(--root)" in css.body
+        assert b"--build-color: var(--point)" in css.body
         assert b"controls.zoomToCursor = true" in viewer.body
         assert b"downloadShareCard" in viewer.body
         assert b"shareReady = Boolean" in viewer.body

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -46,6 +47,12 @@ app = typer.Typer(
     help="Local-first screen-context memory and personal modeling for macOS.",
 )
 console = Console()
+
+_DAEMON_STARTUP_TIMEOUT_SECONDS = 15.0
+_DAEMON_STARTUP_RETRY_SECONDS = 0.1
+_DAEMON_STARTUP_HTTP_TIMEOUT_SECONDS = 1.0
+_DAEMON_STARTUP_STOP_TIMEOUT_SECONDS = 5.0
+_DAEMON_STARTUP_KILL_TIMEOUT_SECONDS = 2.0
 
 
 def _fail_if_runtime_state_is_ambiguous() -> None:
@@ -91,6 +98,13 @@ def _daemon_lock_is_held() -> bool:
 
 def _init(*, starting_runtime: bool = False) -> config_mod.Config:
     paths.ensure_dirs()
+    # Every initialized CLI command gets the same owner-only Runtime secrets as
+    # the daemon. In particular, one-shot commands such as `model build` run
+    # LLM stages in this process and must not depend on a prior `persome start`
+    # having sourced the file. load_env_file deliberately preserves an
+    # already-exported shell value, so per-invocation debugging overrides keep
+    # precedence over the durable profile.
+    env_file_mod.load_env_file(paths.env_file())
     _fail_if_runtime_state_is_ambiguous()
     # Logger first so the integrity check's JSON-line output lands in daemon.log.
     logger_mod.setup(console=False)
@@ -98,7 +112,36 @@ def _init(*, starting_runtime: bool = False) -> config_mod.Config:
     # must never quarantine or rebuild an index while that process has it open.
     # When stopped, this remains the first database-touching operation.
     if not _read_pid() and (starting_runtime or not _daemon_lock_is_held()):
-        integrity.check_and_recover()
+        recovered = integrity.check_and_recover()
+        if paths.integrity_recovery_pending().exists():
+            console.print(
+                "[red]Persome database recovery is incomplete.[/red] "
+                f"Inspect `{paths.integrity_recovery_marker()}` and the retained "
+                "quarantine files, repair the reported source problem, then rerun "
+                "`persome model status` to resume recovery. Run `persome doctor` after "
+                "it completes. Model builds remain disabled until then."
+            )
+        elif any(item.kind == "database" for item in recovered):
+            console.print(
+                "[yellow]Persome recovered a damaged local database. "
+                "The previous model build is no longer trusted; run "
+                "`persome model build` after startup.[/yellow]"
+            )
+    database_pending = paths.integrity_recovery_pending().exists()
+    authority_pending = paths.integrity_config_recovery_pending().exists()
+    if authority_pending:
+        console.print(
+            "[red]Persome write authority is unresolved.[/red] "
+            f"Inspect `{paths.integrity_config_recovery_pending()}` and set "
+            "`[evomem].write_authority` in config.toml explicitly to `markdown` or `evomem`, "
+            "then rerun `persome model status`."
+        )
+    if starting_runtime and (database_pending or authority_pending):
+        console.print(
+            "[red]Runtime start is blocked until integrity recovery establishes a safe "
+            "database and write authority.[/red]"
+        )
+        raise typer.Exit(2)
     created = config_mod.write_default_if_missing()
     if created:
         console.print(f"[green]Created default config at {paths.config_file()}[/green]")
@@ -268,6 +311,198 @@ def _watch_parent_death() -> None:
     threading.Thread(target=_watch, name="parent-death-watch", daemon=True).start()
 
 
+def _same_runtime_process(
+    left: runtime_pid.ProcessIdentity,
+    right: runtime_pid.ProcessIdentity,
+) -> bool:
+    """Compare the generation-bound identity fields used during startup."""
+    return (
+        left.pid == right.pid
+        and left.generation == right.generation
+        and left.runtime_started_at == right.runtime_started_at
+    )
+
+
+def _probe_background_runtime(
+    cfg: config_mod.Config,
+    expected_process: runtime_pid.ProcessIdentity | None = None,
+) -> tuple[str, str, runtime_pid.ProcessIdentity | None]:
+    """Probe one background-start attempt.
+
+    The returned state is ``ready``, ``retry``, or ``fatal``. An HTTP-enabled
+    Runtime must answer its authenticated status route with this root, version,
+    and generation-bound PID. A random service already listening on the port
+    therefore cannot make ``persome start`` report a false success.
+    """
+    process = runtime_pid.resolve_recorded_process()
+    if process is None:
+        if expected_process is not None:
+            return "fatal", "the new Runtime process exited during startup", expected_process
+        return "retry", "waiting for the new Runtime process receipt", None
+    if process.generation is None or process.runtime_started_at is None:
+        return "retry", "waiting for the generation-bound Runtime receipt", process
+    if expected_process is not None and not _same_runtime_process(process, expected_process):
+        return "fatal", "the Runtime process identity changed during startup", expected_process
+
+    http_enabled = bool(cfg.mcp.auto_start and cfg.mcp.transport in {"sse", "streamable-http"})
+    if not http_enabled:
+        return "ready", "the Runtime process receipt is valid", process
+
+    import httpx
+
+    from .security.auth import auth_headers, loopback_http_url
+
+    try:
+        url = loopback_http_url(cfg.mcp.host, cfg.mcp.port, "/status")
+        response = httpx.get(
+            url,
+            headers=auth_headers(),
+            timeout=_DAEMON_STARTUP_HTTP_TIMEOUT_SECONDS,
+            trust_env=False,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return "fatal", f"local HTTP authentication is not configured: {exc}", process
+    except httpx.HTTPError as exc:
+        return "retry", f"waiting for the local HTTP Runtime ({type(exc).__name__})", process
+
+    if response.status_code >= 500:
+        return (
+            "retry",
+            f"waiting for the local HTTP Runtime (HTTP {response.status_code})",
+            process,
+        )
+    if response.status_code != 200:
+        return (
+            "fatal",
+            f"port {cfg.mcp.port} answered HTTP {response.status_code}, not the expected "
+            "authenticated Persome Runtime",
+            process,
+        )
+    try:
+        payload = response.json()
+    except (UnicodeError, ValueError):
+        return "fatal", f"port {cfg.mcp.port} returned a non-Persome response", process
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not (
+        isinstance(payload, dict)
+        and payload.get("success") is True
+        and isinstance(data, dict)
+        and data.get("version") == __version__
+        and data.get("root") == str(paths.root())
+    ):
+        return (
+            "fatal",
+            f"port {cfg.mcp.port} is in use by a different or incompatible service",
+            process,
+        )
+    if data.get("daemon") != f"running pid {process.pid}":
+        return (
+            "retry",
+            f"waiting for port {cfg.mcp.port} to serve the new Runtime generation",
+            process,
+        )
+    return "ready", "the authenticated local HTTP Runtime is ready", process
+
+
+def _wait_for_background_start(
+    cfg: config_mod.Config,
+    *,
+    timeout_seconds: float = _DAEMON_STARTUP_TIMEOUT_SECONDS,
+) -> tuple[bool, str, runtime_pid.ProcessIdentity | None]:
+    """Wait a bounded time for one exact daemon generation to become usable."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    expected_process: runtime_pid.ProcessIdentity | None = None
+    last_process: runtime_pid.ProcessIdentity | None = None
+    detail = "the Runtime did not publish a readiness receipt"
+    while True:
+        state, detail, process = _probe_background_runtime(cfg, expected_process)
+        if process is not None:
+            last_process = process
+        if (
+            expected_process is None
+            and process is not None
+            and process.generation is not None
+            and process.runtime_started_at is not None
+        ):
+            expected_process = process
+        if state == "ready":
+            return True, detail, expected_process or last_process
+        if state == "fatal":
+            return False, detail, expected_process or last_process
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, f"startup timed out: {detail}", expected_process or last_process
+        time.sleep(min(_DAEMON_STARTUP_RETRY_SECONDS, remaining))
+
+
+def _terminate_failed_background_start(
+    process: runtime_pid.ProcessIdentity | None,
+) -> bool:
+    """Stop only the generation observed during this failed start attempt."""
+    if process is None:
+        return not _daemon_lock_is_held()
+    if not runtime_pid.signal_process(process, signal.SIGTERM):
+        return runtime_pid.resolve_recorded_process() is None and _clear_failed_background_receipts(
+            process
+        )
+    if runtime_pid.wait_for_exit(process, _DAEMON_STARTUP_STOP_TIMEOUT_SECONDS):
+        # SIGTERM can land before the daemon installs its cleanup handler. In
+        # that startup window the process exits but leaves its generation-bound
+        # PID/state receipts behind. Clear only receipts that still name the
+        # exact observed generation; a normal graceful shutdown has already
+        # removed them, so this is an idempotent no-op there.
+        return _clear_failed_background_receipts(process)
+    if not runtime_pid.signal_process(process, signal.SIGKILL):
+        return runtime_pid.resolve_recorded_process() is None and _clear_failed_background_receipts(
+            process
+        )
+    if not runtime_pid.wait_for_exit(process, _DAEMON_STARTUP_KILL_TIMEOUT_SECONDS):
+        return False
+    return _clear_failed_background_receipts(process)
+
+
+def _clear_failed_background_receipts(process: runtime_pid.ProcessIdentity) -> bool:
+    """Remove stale PID/state files only when they still name ``process``.
+
+    A normal SIGTERM shutdown removes both itself. This is the SIGKILL fallback:
+    validate every available receipt before unlinking so a concurrently started
+    generation can never lose its lifecycle identity.
+    """
+    if runtime_pid.same_process_is_running(process):
+        return False
+    state = runtime_pid.read_runtime_generation()
+    if state is not None and not (
+        process.generation is not None
+        and state.pid == process.pid
+        and state.generation == process.generation
+        and state.started_at == process.runtime_started_at
+    ):
+        return False
+    record = runtime_pid.read_pid_file()
+    if record is not None and not (
+        record.pid == process.pid
+        and (record.generation is None or record.generation == process.generation)
+    ):
+        return False
+    for receipt, parsed in (
+        (paths.pid_file(), record),
+        (paths.runtime_state_file(), state),
+    ):
+        if parsed is None:
+            try:
+                receipt.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            # An unreadable or malformed receipt cannot be safely attributed.
+            return False
+    for receipt in (paths.pid_file(), paths.runtime_state_file()):
+        with contextlib.suppress(FileNotFoundError):
+            receipt.unlink()
+    return not paths.pid_file().exists() and not paths.runtime_state_file().exists()
+
+
 @app.command()
 def start(
     foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in this terminal."),
@@ -287,14 +522,12 @@ def start(
         console.print(f"[yellow]{exc}.[/yellow]")
         raise typer.Exit(1) from exc
     _fail_if_runtime_state_is_ambiguous()
-    cfg = _init(starting_runtime=True)
     # Source checkouts and upgrades may start without re-running install.sh.
-    # Provision the local HTTP boundary before the daemon binds; the helper is
-    # idempotent and preserves every unrelated provider secret in the env file.
+    # Provision/repair the local HTTP boundary before generalized env loading,
+    # so a malformed value in the file cannot masquerade as a shell override.
+    # The helper is idempotent and preserves every unrelated provider secret.
     env_file_mod.ensure_local_api_token(paths.env_file())
-    # Source the owner-only env file before any fork so the daemon and every
-    # subsystem reading os.environ see the same values regardless of launcher.
-    env_file_mod.load_env_file(paths.env_file())
+    cfg = _init(starting_runtime=True)
     if pid := _read_pid():
         console.print(f"[yellow]Already running (pid {pid})[/yellow]")
         raise typer.Exit(1)
@@ -319,11 +552,45 @@ def start(
         # below already hard-exits for the same reason; mirror it here.
         os._exit(0)
 
-    # Background: double-fork
-    if os.fork() != 0:
-        console.print("[green]Persome started in background.[/green]")
+    # Background: double-fork. The parent stays alive just long enough to prove
+    # that this exact new generation owns its PID receipt and authenticated HTTP
+    # endpoint. Its copy of the lifetime lock is closed before polling; the
+    # grandchild retains the inherited file description for its whole life.
+    first_child_pid = os.fork()
+    if first_child_pid != 0:
+        daemon_lock.close()
+        try:
+            ready, detail, process = _wait_for_background_start(cfg)
+        except Exception as exc:  # noqa: BLE001 - startup still needs safe cleanup
+            ready = False
+            detail = f"startup verification failed ({type(exc).__name__})"
+            process = None
+            with contextlib.suppress(Exception):
+                process = runtime_pid.resolve_recorded_process()
+        if ready:
+            console.print("[green]Persome started in background.[/green]")
+            console.print(f"Logs: {paths.logs_dir()}")
+            return
+        try:
+            cleaned = _terminate_failed_background_start(process)
+        except Exception:  # noqa: BLE001 - preserve the actionable failure path
+            cleaned = False
+        console.print(f"[red]Persome did not start correctly:[/red] {detail}")
+        if cleaned:
+            console.print("[yellow]The incomplete background Runtime was stopped.[/yellow]")
+        else:
+            console.print(
+                "[yellow]Persome could not confirm that the incomplete Runtime stopped; "
+                "run `persome stop` before retrying.[/yellow]"
+            )
+        if cfg.mcp.auto_start and cfg.mcp.transport in {"sse", "streamable-http"}:
+            console.print(
+                f"Check port {cfg.mcp.port} with "
+                f"`lsof -nP -iTCP:{cfg.mcp.port} -sTCP:LISTEN`, then retry."
+            )
         console.print(f"Logs: {paths.logs_dir()}")
-        return
+        console.print("Next: persome doctor")
+        raise typer.Exit(1)
     os.setsid()
     if os.fork() != 0:
         os._exit(0)
@@ -1069,11 +1336,10 @@ def root_synth(
     without waiting for 00:15. Calls the real LLM. ``--dry-run`` prints the would-be apex
     without upserting.
     """
-    from .config import load as load_cfg
     from .store import fts
     from .writer import root_synthesis as rs
 
-    cfg = load_cfg()
+    cfg = _init()
     with fts.cursor() as conn:
         if dry_run:
             # Gather + call + gates, but roll back the upsert by using a savepoint.
@@ -1098,11 +1364,10 @@ def correct_cmd(
     ),
 ) -> None:
     """Apply a supervised memory correction and retain its source receipts."""
-    from .config import load as load_cfg
     from .store import fts
     from .writer import correct as correct_mod
 
-    cfg = load_cfg()
+    cfg = _init()
     with fts.cursor() as conn:
         res = correct_mod.update_memory(cfg, conn, correction, source="user", dry_run=dry_run)
     typer.echo(f"correct: {res.kind}  ok={res.ok}")
@@ -1315,13 +1580,10 @@ def edge_audit(
     from .evomem import edge_audit as audit_mod
     from .store import fts
 
+    cfg = _init()
     llm_call = None
     if llm:
-        from . import config as config_mod
-        from . import paths as paths_mod
         from .writer import llm as llm_mod
-
-        cfg = config_mod.load(paths_mod.config_file())
 
         def llm_call(messages):  # noqa: F811
             return llm_mod.call_llm(cfg, "relation_extractor", messages=messages, json_mode=True)
@@ -2399,6 +2661,9 @@ app.add_typer(writer_app, name="writer")
 model_app = typer.Typer(help="Build, inspect, and export the personal model.")
 app.add_typer(model_app, name="model")
 
+_MODEL_VIEWER_STARTUP_ATTEMPTS = 20
+_MODEL_VIEWER_STARTUP_RETRY_SECONDS = 0.25
+
 
 def _local_viewer_base_url(cfg: config_mod.Config) -> str:
     """Return a loopback URL for the daemon viewer, never a LAN HTTP origin."""
@@ -2415,11 +2680,14 @@ def model_build(
     no_wait: bool = typer.Option(False, "--no-wait", help="Return busy immediately."),
 ) -> None:
     """Run the shared one-shot Point/Line/Face/Volume/Root build."""
-    from .model import ModelBuildBusy, run_model_build
+    from .model import ModelBuildBusy, ModelRecoveryIncomplete, run_model_build
 
     cfg = _init()
     try:
         result = run_model_build(cfg, wait_seconds=0.0 if no_wait else wait_seconds)
+    except ModelRecoveryIncomplete as exc:
+        console.print(f"[red]model build blocked: {exc}[/red]")
+        raise typer.Exit(2) from exc
     except ModelBuildBusy as exc:
         console.print(f"[yellow]busy: {exc}[/yellow]")
         raise typer.Exit(2) from exc
@@ -2430,6 +2698,18 @@ def model_build(
         f"{counts['evolution_lines'] + counts['relation_lines']} "
         f"faces={counts['faces']} volumes={counts['volumes']} roots={counts['roots']}"
     )
+    cross_domain = getattr(result, "stages", {}).get("cross_domain_sweeper", {})
+    if cross_domain.get("status") == "complete":
+        deferred = int(cross_domain.get("pairs_deferred", 0))
+        console.print(
+            "cross-domain: "
+            f"probed={int(cross_domain.get('pairs_probed', 0))} "
+            f"deferred={deferred} limit={int(cross_domain.get('probe_limit', 0))}"
+        )
+        if deferred:
+            console.print(
+                "[yellow]Deferred pairs stay queued for later scheduled or explicit builds.[/yellow]"
+            )
     console.print(f"manifest: {result.manifest_path}")
 
 
@@ -2439,18 +2719,18 @@ def model_export(
     raw: bool = typer.Option(False, "--raw", help="Include unredacted local text."),
 ) -> None:
     """Export the current versioned model snapshot; redacted by default."""
-    from .model import export_snapshot, load_last_manifest
+    from .model import build_live_snapshot, export_snapshot
 
     _init()
     if raw:
         console.print("[yellow]warning: --raw may contain sensitive personal data[/yellow]")
     target = Path(out).expanduser() if out else None
     with fts.cursor() as conn:
+        snapshot = build_live_snapshot(conn, redact=not raw)
         path = export_snapshot(
             conn,
             out_path=target,
-            redact=not raw,
-            build_metadata=load_last_manifest(),
+            snapshot_data=snapshot,
         )
     console.print(f"model snapshot: {path}")
 
@@ -2458,22 +2738,36 @@ def model_export(
 @model_app.command("status")
 def model_status_cmd() -> None:
     """Show live model readiness, geometry counts, and the last build id."""
-    from .model import load_last_manifest, model_status
+    from .model import build_live_snapshot, model_status
 
     _init()
     with fts.cursor() as conn:
-        status = model_status(conn)
-    last = load_last_manifest()
+        snapshot = build_live_snapshot(conn)
+        status = model_status(conn, snapshot_data=snapshot)
+    last = snapshot["build"]
+    build_status = str(last["status"])
+    if build_status == "not_built":
+        readiness = "not built"
+    elif build_status == "building":
+        readiness = "building"
+    else:
+        readiness = "ready" if status["ready"] else "not ready"
+    issues = list(status["issues"])
+    if build_status == "not_built":
+        issues.append("no_completed_build")
+    elif build_status == "building":
+        issues.append("build_in_progress")
     counts = status["stats"]
     console.print(
-        f"[bold]model: {'ready' if status['ready'] else 'not ready'}[/bold]  "
+        f"[bold]model: {readiness}[/bold]  "
         f"points={counts['points']} lines="
         f"{counts['evolution_lines'] + counts['relation_lines']} "
         f"faces={counts['faces']} volumes={counts['volumes']} roots={counts['roots']}"
     )
-    if status["issues"]:
-        console.print(f"issues: {', '.join(status['issues'])}")
-    console.print(f"last build: {last.get('build_id') if last else 'none'}")
+    if issues:
+        console.print(f"issues: {', '.join(issues)}")
+    console.print(f"build status: {build_status}")
+    console.print(f"last build: {last.get('build_id') or 'none'}")
 
 
 @model_app.command("open")
@@ -2487,21 +2781,47 @@ def model_open() -> None:
     if cfg.mcp.transport not in {"sse", "streamable-http"}:
         console.print("[red]The model viewer requires the daemon HTTP transport.[/red]")
         raise typer.Exit(1)
-    env_file_mod.load_env_file(paths.env_file())
 
     from .security.auth import BROWSER_BOOTSTRAP_PATH, auth_headers
 
     try:
         base_url = _local_viewer_base_url(cfg)
         headers = auth_headers()
-        response = httpx.post(
-            f"{base_url}{BROWSER_BOOTSTRAP_PATH}",
-            headers=headers,
-            timeout=5.0,
-            trust_env=False,
-        )
+        for attempt in range(_MODEL_VIEWER_STARTUP_ATTEMPTS):
+            try:
+                response = httpx.post(
+                    f"{base_url}{BROWSER_BOOTSTRAP_PATH}",
+                    headers=headers,
+                    timeout=5.0,
+                    trust_env=False,
+                )
+                break
+            except httpx.ConnectError:
+                # `persome start` returns after forking, just before uvicorn has
+                # necessarily bound its loopback socket. Retry only that
+                # connection-refused startup race. Any HTTP response (notably
+                # 401/403) is handled below immediately instead of being hidden
+                # behind retries. A genuinely stopped Runtime fails
+                # immediately instead of looking like another CLI hang.
+                runtime_starting = _read_pid() is not None or _daemon_lock_is_held()
+                if not runtime_starting or attempt + 1 == _MODEL_VIEWER_STARTUP_ATTEMPTS:
+                    raise
+                time.sleep(_MODEL_VIEWER_STARTUP_RETRY_SECONDS)
         response.raise_for_status()
         payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403}:
+            console.print(
+                "[red]Local model viewer authentication failed[/red] "
+                f"(HTTP {exc.response.status_code}). The daemon and this CLI may be using "
+                "different owner credentials; restart Persome, then retry."
+            )
+        else:
+            console.print(
+                "[red]The local model viewer request failed[/red] "
+                f"(HTTP {exc.response.status_code}). Check `persome status`, then retry."
+            )
+        raise typer.Exit(1) from exc
     except (RuntimeError, ValueError, httpx.HTTPError) as exc:
         console.print(
             "[red]Could not authorize the local model viewer.[/red] "
@@ -2802,12 +3122,19 @@ def evomem_import_markdown(
 
 
 @app.command("rebuild-captures-index")
-def rebuild_captures_index() -> None:
+def rebuild_captures_index(
+    merge: bool = typer.Option(
+        False,
+        "--merge",
+        help="Upsert surviving buffer JSON without deleting older snapshot-backed rows.",
+    ),
+) -> None:
     """Reconcile captures_fts exactly from capture-buffer/*.json on disk.
 
-    Re-runnable: stale rows are cleared before every surviving JSON is indexed,
-    so this is safe whenever the captures index has fallen out of sync (for
-    example after an interrupted filesystem/SQLite cleanup).
+    By default stale rows are cleared before every surviving JSON is indexed.
+    ``--merge`` preserves existing rows and is the safe mode after restoring an
+    older database snapshot whose historical captures may predate buffer
+    retention.
     """
     import json
 
@@ -2818,9 +3145,11 @@ def rebuild_captures_index() -> None:
     indexed = 0
     skipped = 0
     with fts.cursor() as conn:
-        # Rebuild is reconciliation, not just an upsert pass. Rows whose source
-        # JSON was removed during a previous failed retention pass must vanish.
-        conn.execute("DELETE FROM captures")
+        # Exact rebuild is reconciliation, not just an upsert pass. Recovery
+        # merge intentionally preserves older snapshot rows whose source JSON
+        # has already aged out of the bounded capture buffer.
+        if not merge:
+            conn.execute("DELETE FROM captures")
         for p in files:
             try:
                 data = json.loads(p.read_text())
@@ -2851,7 +3180,8 @@ def rebuild_captures_index() -> None:
                 console.print(f"  indexed {indexed} / {len(files)}…")
 
     console.print(
-        f"[green]Captures index rebuilt: {indexed} indexed, {skipped} skipped "
+        f"[green]Captures index {'merged' if merge else 'rebuilt'}: "
+        f"{indexed} indexed, {skipped} skipped "
         f"(of {len(files)} files).[/green]"
     )
 
@@ -2953,6 +3283,7 @@ _MODEL_TABLES = (
     "memory_contradictions",
     "relation_edges",
     "schema_faces",
+    "cross_domain_probe_state",
     "evo_nodes",
     "projection_state",
     "entry_metadata",
@@ -3009,6 +3340,8 @@ def _clean_memory() -> tuple[int, int, int, int]:
             paths.model_build_lock(),
             paths.session_model_lock(),
             paths.integrity_recovery_marker(),
+            paths.integrity_recovery_pending(),
+            paths.integrity_config_recovery_pending(),
         )
     )
     artifacts += sum(
@@ -3016,6 +3349,8 @@ def _clean_memory() -> tuple[int, int, int, int]:
         for path in _private_atomic_crash_artifacts(
             paths.model_build_manifest(),
             paths.integrity_recovery_marker(),
+            paths.integrity_recovery_pending(),
+            paths.integrity_config_recovery_pending(),
         )
     )
     # Integrity-quarantine copies live beside the active DB, outside backup/.
@@ -3142,12 +3477,16 @@ def clean_all(
         paths.session_model_lock(),
         paths.paused_flag(),
         paths.integrity_recovery_marker(),
+        paths.integrity_recovery_pending(),
+        paths.integrity_config_recovery_pending(),
         paths.pid_file(),
     )
     quarantined_personal_data = tuple(paths.root().glob("*.corrupt.*"))
     atomic_crash_data = _private_atomic_crash_artifacts(
         paths.model_build_manifest(),
         paths.integrity_recovery_marker(),
+        paths.integrity_recovery_pending(),
+        paths.integrity_config_recovery_pending(),
         paths.pid_file(),
         paths.paused_flag(),
         paths.writer_state(),

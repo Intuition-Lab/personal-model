@@ -178,7 +178,7 @@ def tool_flag_compact(
     if evo_inversion.routes_to_engine(path):
         evo_inversion.flag_needs_compact(conn, name=path, value=True)
     else:
-        fts.set_needs_compact(conn, p.name, True)
+        fts.set_needs_compact(conn, files_mod.memory_name(p), True)
         files_mod.update_frontmatter(p, {"needs_compact": True})
     state.flagged_compact.append(path)
     logger.info("flag_compact: %s (%s)", path, reason)

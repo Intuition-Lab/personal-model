@@ -73,6 +73,8 @@ and old helper path.
 | `backup/` | SQLite safety snapshots containing personal model state |
 | `logs/` | daemon and launchd logs; may contain operational context |
 | `model-build.json` | latest build manifest and degraded-stage report |
+| `.integrity-recovery.pending.json` | crash-resumable full-database quarantine/replay journal |
+| `.integrity-config-recovery.pending.json` | config-quarantine intent retained until database authority is reconciled |
 | `.pid`, `.runtime-state.json` | compatibility PID plus owner-only generation, phase, permission, OCR-worker, and capture/privacy receipt |
 | `.daemon.lock` | lifetime single-Runtime lock inherited across background forks |
 | `.launchagent-owner` | durable intent that launchd owns Runtime lifecycle |
@@ -94,9 +96,49 @@ from authoritative `captures` rows and `entries` from Markdown/evo_nodes. It
 also handles older SQLite builds that collapse both damaged FTS projections
 into a generic malformed-database error, while verifying every regular table
 before the narrow index reset. Core database damage is still quarantined as
-`index.db.corrupt.<timestamp>` for inspection. The running daemon owns active
-SQLite writes, so `persome status`, MCP clients, and a second `persome start`
-do not repair or quarantine an open database.
+`index.db.corrupt.<timestamp>` for inspection. Persome then restores the newest
+structurally verified daily snapshot when one exists and reconciles the current
+Markdown memory projection without making LLM calls. Without a usable snapshot,
+it still rebuilds the retrieval projection and Point state from Markdown; the
+recovery marker lists database-only components that could not be reconstructed.
+In both cases the old `model-build.json` is invalidated, because Faces, Volumes,
+and Root must be verified by a fresh `persome model build` rather than reported
+as a completed build from stale metadata. Details and recovered row counts are
+written to `.integrity-recovery.json`.
+
+Before moving a damaged database, Persome atomically writes
+`.integrity-recovery.pending.json` with the exact quarantine destination and
+phase. If the process exits after quarantine, snapshot copy, or projection
+replay, the next stopped-Runtime startup resumes that journal instead of
+treating a missing `index.db` as a clean install. The journal is removed only
+after a completed recovery marker is durable. Snapshot recovery remains
+best-effort: the marker records its timestamp and warns that writes since that
+snapshot may be absent. Retained capture-buffer JSON can be reconciled with
+`persome rebuild-captures-index --merge` when the marker reports a pending
+replay. Recovery mode preserves older snapshot-backed captures whose buffer
+JSON has already aged out; the command without `--merge` remains an exact
+buffer-only rebuild and deletes such rows.
+Unreadable or semantically invalid versioned journals (missing fields, unknown
+phases, or paths outside the canonical recovery namespace) are themselves moved
+to a timestamped forensic quarantine before normal integrity checks continue;
+they do not become permanent startup blockers.
+
+Config replacement has its own earlier intent journal,
+`.integrity-config-recovery.pending.json`. Persome writes it before moving a
+corrupt `config.toml`, and keeps database replay authority unknown until the
+database is verified or restored. A structurally complete `evo_nodes` table in
+a snapshot is not by itself proof of evomem authority: it can be a lagging
+shadow from a Markdown-authoritative runtime. Recovery compares the snapshot's
+last retrieval projection with both surviving sources before replay. If neither
+source is uniquely provable, it preserves snapshot entries, snapshot nodes, and
+current Markdown, writes `write_authority = "unknown"`, and waits for the owner
+to choose. The intent is cleared only after that choice has transactionally
+rebuilt the retrieval projection; an evomem choice also reprojects canonical
+nodes to Markdown. This prevents a crash-created default from silently choosing
+either source.
+
+The running daemon owns active SQLite writes, so `persome status`, MCP clients,
+and a second `persome start` do not repair or quarantine an open database.
 
 Runtime startup also fails closed on ambiguous process state. `.daemon.lock`
 serializes concurrent starters for the daemon's entire lifetime; `.pid` is

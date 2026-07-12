@@ -8,7 +8,7 @@ import sqlite3
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ _TRACE_WINDOW_MINUTES = 15
 # Pre-filter thresholds (overridable via SchemaConfig).
 _DEFAULT_BEHAVIOR_MAX_DISTANCE = 0.5  # ≤ this behavior distance == "behavior-near"
 _DEFAULT_MIN_CONFIDENCE = 0.6  # fused schema below this is born ``forming``
+_DEFAULT_MAX_PROBES = 8  # hard per-build LLM-call budget
 # Topic token-overlap ceiling: above this the two schemas are too on-topic to be a
 # cross-domain pair (the LLM would just dedup them). Generous — source-distinctness
 # already does most of the work; this only drops near-identical propositions.
@@ -75,7 +76,10 @@ class CrossSweepResult:
 
     written: list[stage.WrittenSchema] = field(default_factory=list)
     pairs_considered: int = 0
+    eligible_pairs: int = 0  # survived deterministic topic/behavior filters
     pairs_probed: int = 0  # survived the behavior pre-filter, sent to the LLM
+    probe_limit: int = _DEFAULT_MAX_PROBES
+    pairs_deferred: int = 0  # eligible but left for a later build by the hard budget
     collisions: int = 0  # LLM said detected=true
 
     @property
@@ -448,36 +452,43 @@ def _persist_cross_schema(
     # EACH parent — a signal-only contribution (empty members, so the parents'
     # mined footprint history stays untouched) that can escalate the parent's
     # provenance to ``both``. Shadow-only SQLite write, fail-open.
-    try:
-        parent_anchors: set[str] = set()
-        for parent in (a, b):
-            row = schema_faces._find_match(  # noqa: SLF001 — same-module family
-                conn, signature=parent.central, members=set(), level=1
-            )
-            if row is not None:
-                with contextlib.suppress(TypeError, ValueError):
-                    parent_anchors.update(json.loads(row["anchors"] or "[]"))
-        body_id = schema_faces.record_face(
-            conn,
-            source=schema_faces.PROVENANCE_EMERGENT,
-            signature=central,
-            members=[a.name, b.name],
-            confidence=collision.confidence,
-            level=2,
-            anchors=sorted(parent_anchors),
-        )
-        schema_faces.maybe_promote(conn, body_id)
-        for parent in (a, b):
-            pid = schema_faces.record_face(
+    if status == "stable":
+        try:
+            # The normal sweep preloads scheduling state, which creates this
+            # table as a side effect. Keep the persistence station independently
+            # safe as well: direct/recovery callers may land the first stable
+            # collision before any scheduling read has run.
+            schema_faces.ensure_schema(conn)
+            parent_anchors: set[str] = set()
+            for parent in (a, b):
+                row = schema_faces._find_match(  # noqa: SLF001 — same-module family
+                    conn, signature=parent.central, members=set(), level=1
+                )
+                if row is not None:
+                    with contextlib.suppress(TypeError, ValueError):
+                        parent_anchors.update(json.loads(row["anchors"] or "[]"))
+            body_id = schema_faces.record_face(
                 conn,
                 source=schema_faces.PROVENANCE_EMERGENT,
-                signature=parent.central,
-                members=[],
+                signature=central,
+                members=[a.name, b.name],
                 confidence=collision.confidence,
+                level=2,
+                anchors=sorted(parent_anchors),
             )
-            schema_faces.maybe_promote(conn, pid)
-    except Exception:
-        logger.exception("schema_faces record failed for %s", name)
+            schema_faces.maybe_promote(conn, body_id)
+            for parent in (a, b):
+                pid = schema_faces.record_face(
+                    conn,
+                    source=schema_faces.PROVENANCE_EMERGENT,
+                    signature=parent.central,
+                    members=[],
+                    confidence=collision.confidence,
+                )
+                schema_faces.maybe_promote(conn, pid)
+        except Exception:
+            logger.exception("schema_faces record failed for %s", name)
+            raise
     return stage.WrittenSchema(
         path=name,
         status=status,
@@ -485,6 +496,129 @@ def _persist_cross_schema(
         expected_inferences=list(collision.expected_inferences),
         updated_in_place=updated_in_place,
     )
+
+
+@dataclass(frozen=True)
+class _CandidatePair:
+    """One deterministic, pre-filtered cross-domain probe candidate."""
+
+    a: _StableSchema
+    b: _StableSchema
+    sig_a: BehaviorSignature
+    sig_b: BehaviorSignature
+    priority: int
+    last_probed_at: str | None = None
+
+    @property
+    def sort_key(self) -> tuple[int, str, str, str]:
+        lo, hi = sorted((self.a.name, self.b.name))
+        return (self.priority, self.last_probed_at or "", lo, hi)
+
+    @property
+    def pair_key(self) -> str:
+        return _pair_key(self.a.name, self.b.name)
+
+
+def _pair_key(a_name: str, b_name: str) -> str:
+    return json.dumps(sorted((a_name, b_name)), ensure_ascii=False, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class _ProbeHistory:
+    """Last persisted scheduling result for one pair.
+
+    ``promotable`` means the last probe produced stable evidence that was
+    eligible for the Volume promotion path. A negative, failed, or forming
+    result is false and must not leave an old shadow at highest priority.
+    """
+
+    last_probed_at: str
+    promotable: bool
+
+
+def _probe_history(conn: sqlite3.Connection) -> dict[str, _ProbeHistory]:
+    schema_faces.ensure_schema(conn)
+    return {
+        str(row[0]): _ProbeHistory(last_probed_at=str(row[1]), promotable=bool(row[2]))
+        for row in conn.execute(
+            "SELECT pair_key, last_probed_at, detected FROM cross_domain_probe_state"
+        ).fetchall()
+    }
+
+
+def _record_probe(candidate: _CandidatePair, conn: sqlite3.Connection, *, detected: bool) -> None:
+    conn.execute(
+        "INSERT INTO cross_domain_probe_state"
+        " (pair_key, last_probed_at, probe_count, detected) VALUES (?, ?, 1, ?)"
+        " ON CONFLICT(pair_key) DO UPDATE SET"
+        " last_probed_at=excluded.last_probed_at,"
+        " probe_count=cross_domain_probe_state.probe_count + 1,"
+        " detected=excluded.detected",
+        (
+            candidate.pair_key,
+            datetime.now(UTC).isoformat(),
+            1 if detected else 0,
+        ),
+    )
+
+
+def _record_probe_fail_open(
+    candidate: _CandidatePair,
+    conn: sqlite3.Connection,
+    *,
+    detected: bool,
+) -> None:
+    try:
+        _record_probe(candidate, conn, detected=detected)
+    except Exception:  # pragma: no cover - scheduling metadata must not abort the stage
+        logger.exception("cross-domain probe history write failed for %s", candidate.pair_key)
+
+
+def _live_volume_pair_statuses(conn: sqlite3.Connection) -> dict[frozenset[str], str]:
+    """Map live two-schema Volume footprints to ``shadow`` or ``active``.
+
+    The cross-domain sweeper is the honest producer for level-2 objects. A live
+    shadow pair needs another independent sweep observation before promotion, so
+    it is the most valuable use of a bounded probe budget.
+    """
+    schema_faces.ensure_schema(conn)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT members, status FROM schema_faces "
+        "WHERE level = 2 AND valid_to IS NULL AND status IN ('shadow', 'active')"
+    ).fetchall()
+    statuses: dict[frozenset[str], str] = {}
+    for row in rows:
+        try:
+            members = frozenset(str(member) for member in json.loads(row["members"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if len(members) != 2:
+            continue
+        # A shadow row always wins if a damaged/legacy store happens to contain
+        # duplicate live footprints: it is the one that still needs evidence.
+        status = str(row["status"])
+        if status == "shadow" or members not in statuses:
+            statuses[members] = status
+    return statuses
+
+
+def _candidate_priority(
+    a: _StableSchema,
+    b: _StableSchema,
+    volume_statuses: dict[frozenset[str], str],
+    probe_history: dict[str, _ProbeHistory],
+) -> int:
+    pair_key = _pair_key(a.name, b.name)
+    history = probe_history.get(pair_key)
+    status = volume_statuses.get(frozenset((a.name, b.name)))
+    if status == "shadow" and (history is None or history.promotable):
+        return 0
+    if status is None and history is None:
+        return 1
+    if status != "active":
+        return 2
+    return 3  # active pairs refresh after corroborating, unseen, and rejected pairs
 
 
 # ── main entry ────────────────────────────────────────────────────────────────
@@ -496,17 +630,23 @@ def sweep_cross_domain(
     *,
     behavior_max_distance: float = _DEFAULT_BEHAVIOR_MAX_DISTANCE,
     min_confidence: float = _DEFAULT_MIN_CONFIDENCE,
+    max_probes: int = _DEFAULT_MAX_PROBES,
     llm_call: Callable[[list[dict]], Any] | None = None,
 ) -> CrossSweepResult:
     """Pair stable schemas, behavior-prefilter, LLM-judge collisions, land fusions.
 
     Behavior signatures pre-filter pairs cheaply (behavior-near + topic-distinct);
-    only survivors hit the LLM. ``llm_call`` is injectable for tests. A per-pair
-    failure is logged and skipped — the sweep never aborts (schema is a decoration,
-    must not cascade).
+    only survivors hit the LLM, up to ``max_probes`` per call. Shadows whose
+    last observation was still promotable are retried first, then unseen pairs,
+    then negative/forming/failed retries oldest-first, and finally active pairs.
+    This prevents a stale shadow from permanently consuming a bounded budget.
+    Ties use schema filenames for deterministic ordering. ``llm_call`` is
+    injectable for tests. A per-pair failure is logged and skipped — the sweep
+    never aborts (schema is a decoration, must not cascade).
     """
+    probe_limit = max(0, int(max_probes))
     schemas = _load_stable_schemas(conn)
-    result = CrossSweepResult()
+    result = CrossSweepResult(probe_limit=probe_limit)
     if len(schemas) < 2:
         return result
 
@@ -515,26 +655,81 @@ def sweep_cross_domain(
     sigs: dict[str, BehaviorSignature] = {
         s.name: _schema_behavior_signature(conn, s.source_path) for s in schemas
     }
+    volume_statuses = _live_volume_pair_statuses(conn)
+    probe_history = _probe_history(conn)
+    candidates: list[_CandidatePair] = []
 
     for i in range(len(schemas)):
         for j in range(i + 1, len(schemas)):
-            a, b = schemas[i], schemas[j]
+            # Normalize A/B as well as queue order. The entries query is newest
+            # first, so insertion timestamps must not change prompt orientation.
+            a, b = sorted((schemas[i], schemas[j]), key=lambda schema: schema.name)
             result.pairs_considered += 1
             if not _topic_distinct(a, b):
                 continue
             sig_a, sig_b = sigs[a.name], sigs[b.name]
             if _signature_distance(sig_a, sig_b) > behavior_max_distance:
                 continue  # behavior too different — not a cross-domain twin
-            result.pairs_probed += 1
-            try:
-                collision = _probe_collision(cfg, a, b, sig_a, sig_b, call)
-            except Exception:  # pragma: no cover - defensive; one bad pair can't kill the sweep
-                logger.exception("cross-domain probe failed on %s × %s", a.name, b.name)
-                continue
-            if not collision.detected:
-                continue
-            result.collisions += 1
-            written = _persist_cross_schema(conn, a, b, collision, stable_threshold=min_confidence)
-            if written is not None:
-                result.written.append(written)
+            history = probe_history.get(_pair_key(a.name, b.name))
+            candidates.append(
+                # The history table is intentionally consulted once per build:
+                # each result affects the next scheduling pass, never the order
+                # of candidates already selected in this one.
+                _CandidatePair(
+                    a=a,
+                    b=b,
+                    sig_a=sig_a,
+                    sig_b=sig_b,
+                    priority=_candidate_priority(a, b, volume_statuses, probe_history),
+                    last_probed_at=history.last_probed_at if history is not None else None,
+                )
+            )
+
+    candidates.sort(key=lambda candidate: candidate.sort_key)
+    result.eligible_pairs = len(candidates)
+    result.pairs_deferred = max(0, len(candidates) - probe_limit)
+
+    for candidate in candidates[:probe_limit]:
+        result.pairs_probed += 1
+        a, b = candidate.a, candidate.b
+        try:
+            collision = _probe_collision(cfg, a, b, candidate.sig_a, candidate.sig_b, call)
+        except Exception:  # pragma: no cover - defensive; one bad pair can't kill the sweep
+            logger.exception("cross-domain probe failed on %s × %s", a.name, b.name)
+            _record_probe_fail_open(candidate, conn, detected=False)
+            continue
+        if not collision.detected:
+            _record_probe_fail_open(candidate, conn, detected=False)
+            continue
+        result.collisions += 1
+        try:
+            written = _persist_cross_schema(
+                conn,
+                a,
+                b,
+                collision,
+                stable_threshold=min_confidence,
+            )
+        except Exception:  # pragma: no cover - one failed projection must not monopolize the queue
+            logger.exception("cross-domain persistence failed on %s × %s", a.name, b.name)
+            _record_probe_fail_open(candidate, conn, detected=False)
+            continue
+        # The historical column is named ``detected`` for compatibility. Its
+        # scheduling meaning is stricter: only stable output is promotable.
+        _record_probe_fail_open(
+            candidate,
+            conn,
+            detected=written is not None and written.status == "stable",
+        )
+        if written is not None:
+            result.written.append(written)
+
+    if result.pairs_deferred:
+        logger.info(
+            "cross-domain probe budget reached: probed=%d eligible=%d deferred=%d limit=%d",
+            result.pairs_probed,
+            result.eligible_pairs,
+            result.pairs_deferred,
+            result.probe_limit,
+        )
     return result

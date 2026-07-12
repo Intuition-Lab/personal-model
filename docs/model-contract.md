@@ -15,9 +15,12 @@ persome model export --out model-snapshot.json
 
 `model build` uses an exclusive `<PERSOME_ROOT>/model-build.lock`. It waits up to 30 seconds by
 default; `--wait-seconds` changes the bound and `--no-wait` returns `busy` immediately. The kernel
-releases the lock on process exit. Successful or degraded runs atomically write an owner-only
-`model-build.json`; missing Points, Lines, Faces, Volumes, or Root is recorded as degraded, never
-as success. `model status` uses the same completeness rule for its `ready` result.
+releases the lock on process exit. A run first atomically records `status: building`, invalidating
+any older completed manifest before a mutating stage starts. Successful or degraded runs replace it
+with an owner-only `model-build.json`. That marker is exposed as `building` only while the process
+holds `model-build.lock`; once the lock is free, a leftover marker is exposed as `not_built`, never
+as the previous success. Missing Points, Lines, Faces, Volumes, or Root is recorded as degraded.
+`model status` also requires a valid completed/degraded manifest before reporting `ready`.
 
 ## Geometry
 
@@ -41,6 +44,15 @@ from package releases.
 Every `build` object records the core commit, stage model names, prompt hashes, a config hash, input
 window, mock/real mode, timing, and degraded stages. Configuration values themselves are not copied
 into the manifest. Fixed inputs and timestamps produce the same `build_id`.
+The live HTTP, MCP, and CLI-export projections preserve that persisted manifest
+exactly. The manifest `build_id` must match the stable hash of every other manifest field, and
+`complete`/`degraded` must agree with an empty/non-empty `degraded_stages` list. If there is no valid
+completed or degraded manifest, the projection reports
+`status: not_built`, `trigger: no_completed_build`, and a null `build_id`
+instead of synthesizing a completed build from the current database contents.
+The `not_built` and `building` states keep the same fixed build-object keys;
+unavailable commit, config hash, mode, and timestamps are null, model and prompt
+maps are empty, and the input-window bounds are null.
 
 A Face becomes active only after mined and emergent signals agree across stable footprints. A
 Volume has one honest producer (the cross-domain sweeper), so it becomes active after two stable

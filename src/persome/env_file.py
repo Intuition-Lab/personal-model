@@ -2,8 +2,9 @@
 
 Runtime secrets live in ``~/.persome/env``. A user may edit that owner-only
 file directly, or an embedding product may mirror secrets from its own secure
-store. Business code stays on ``os.environ.get(...)``; this loader merges the
-file's contents into ``os.environ`` once, at CLI ``start`` time, before forking.
+store. Business code stays on ``os.environ.get(...)``; initialized CLI commands
+merge the file's contents into ``os.environ`` before doing work, and ``start``
+does so before forking.
 
 Semantics:
 
@@ -13,11 +14,14 @@ Semantics:
   ignored, optional single/double-quoted values (quotes stripped, no escapes).
 * No shell expansion, no ``$VAR`` interpolation — behavior is identical for
   direct CLI and embedding-product launch paths.
+* ``PERSOME_ROOT`` is never sourced from the file stored under that root. The
+  parent process must select the data root before the owner env is located.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import tempfile
 from pathlib import Path
@@ -28,6 +32,8 @@ _SCREENSHOT_KEY_HEX_LENGTH = 64
 LOCAL_API_TOKEN_ENV = "PERSOME_LOCAL_API_TOKEN"
 _LOCAL_API_TOKEN_MIN_BYTES = 32
 _LOCAL_API_TOKEN_MAX_BYTES = 512
+_LOCAL_API_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
+_OWNER_ENV_BLOCKED_KEYS = frozenset({"PERSOME_ROOT"})
 
 ScreenshotKeyStatus = Literal["existing", "generated"]
 LocalAPITokenStatus = Literal["existing", "generated"]
@@ -68,6 +74,8 @@ def load_env_file(path: Path) -> int:
         if parsed is None:
             continue
         key, value = parsed
+        if key in _OWNER_ENV_BLOCKED_KEYS:
+            continue
         if key in os.environ:
             continue
         os.environ[key] = value
@@ -130,10 +138,15 @@ def is_valid_screenshot_key(value: str | None) -> bool:
 
 
 def is_valid_local_api_token(value: str | None) -> bool:
-    """Return whether ``value`` is a safe opaque local bearer credential."""
-    if value is None or value != value.strip() or "\r" in value or "\n" in value:
+    """Return whether ``value`` is a durable URL-safe bearer credential.
+
+    The canonical value is persisted without a dotenv escaping layer. Using
+    the same alphabet as ``token_urlsafe`` makes that serialization exactly
+    reversible for every later CLI or daemon process.
+    """
+    if value is None or _LOCAL_API_TOKEN_RE.fullmatch(value) is None:
         return False
-    length = len(value.encode("utf-8"))
+    length = len(value)
     return _LOCAL_API_TOKEN_MIN_BYTES <= length <= _LOCAL_API_TOKEN_MAX_BYTES
 
 
@@ -141,7 +154,9 @@ def ensure_local_api_token(path: Path) -> LocalAPITokenStatus:
     """Generate and preserve one owner-only local REST/MCP bearer token.
 
     The value is never returned or logged. Invalid/duplicate entries are
-    replaced atomically with a fresh high-entropy URL-safe token.
+    replaced atomically with a fresh high-entropy URL-safe token. A valid
+    shell-provided token becomes the durable canonical value so the daemon and
+    later CLI processes cannot diverge onto different bearer credentials.
     """
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -159,18 +174,16 @@ def ensure_local_api_token(path: Path) -> LocalAPITokenStatus:
                 canonical = value
             continue
 
-    if canonical is None:
+    shell_override = os.environ.get(LOCAL_API_TOKEN_ENV)
+    if is_valid_local_api_token(shell_override):
+        canonical = shell_override
+        status: LocalAPITokenStatus = "existing"
+    elif canonical is None:
         canonical = secrets.token_urlsafe(48)
-        status: LocalAPITokenStatus = "generated"
+        status = "generated"
     else:
         status = "existing"
-    shell_override = os.environ.get(LOCAL_API_TOKEN_ENV)
     write_env_values(path, {LOCAL_API_TOKEN_ENV: canonical})
-    # Match load_env_file's documented precedence: a deliberate shell export
-    # remains a process-local debugging override instead of being silently
-    # replaced when `persome start` performs idempotent provisioning.
-    if shell_override is not None:
-        os.environ[LOCAL_API_TOKEN_ENV] = shell_override
     return status
 
 

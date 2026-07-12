@@ -259,10 +259,13 @@ class SchemaConfig:
     # bounded — a low-quality collision gets a low LLM confidence → born ``forming``
     # → excluded from active model reads (only ``stable`` >= min_confidence fusions
     # are visible), and the sweeper prompt is biased to refuse strained merges. The
-    # main cost is the per-tick LLM probes, capped by the topic/behavior pre-filter.
+    # main cost is the per-tick LLM probes, hard-capped after the topic/behavior
+    # pre-filter. Existing shadow Volumes are retried before unseen pairs so the
+    # two-observation promotion gate can make progress within that budget.
     cross_domain_enabled: bool = True
     cross_domain_behavior_max_distance: float = 0.5  # ≤ this == "behavior-near" (pre-filter)
     cross_domain_min_confidence: float = 0.6  # fused schema below this is born ``forming``
+    cross_domain_max_probes: int = 8  # hard LLM-call budget per structural build
     # One bounded LLM compresses active Volume/Face/profile evidence into the
     # single level-3 Root. Default ON:
     # born active, chain-supersedes the prior root, 3 deterministic gates + fail-open
@@ -723,6 +726,7 @@ daily_tick_minute = 15            # local-time minute for the daily schema tick
 cross_domain_enabled = true       # Hy-Memory cross-domain sweeper: collide topic-far/behavior-near schemas (no embedding); low-quality fusions stay forming, only stable ones enter active model reads
 cross_domain_behavior_max_distance = 0.5  # behavior-distance ceiling for the deterministic pre-filter (≤ == behavior-near)
 cross_domain_min_confidence = 0.6 # fused cross-domain schema below this confidence is born forming (not injected)
+cross_domain_max_probes = 8       # hard LLM-call budget per build; shadow Volumes are retried before unseen pairs
 root_synthesis_enabled = true      # synthesize at most one active Root
 root_token_budget = 1500
 

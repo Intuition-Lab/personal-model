@@ -1,13 +1,32 @@
 """Test MCP tool functions directly (bypassing FastMCP wiring)."""
 
+import json
 from pathlib import Path
 
-from persome import __version__
+from persome import __version__, paths
+from persome import model as model_mod
 from persome.mcp import captures as captures_mod
 from persome.mcp import server as mcp_server
+from persome.model import ModelBuildCoordinator, create_build_manifest
 from persome.store import entries as entries_mod
 from persome.store import fts
 from persome.timeline import store as timeline_store
+
+BUILD_KEYS = {
+    "build_id",
+    "completed_at",
+    "config_hash",
+    "core_commit",
+    "degraded_stages",
+    "duration_ms",
+    "input_window",
+    "mode",
+    "models",
+    "prompt_hashes",
+    "started_at",
+    "status",
+    "trigger",
+}
 
 
 def test_list_memories(ac_root: Path) -> None:
@@ -68,6 +87,71 @@ def test_get_model_snapshot_uses_versioned_contract(ac_root: Path) -> None:
     assert out["points"] == []
     assert out["root"] is None
     assert out["stats"]["roots"] == 0
+    assert set(out["build"]) == BUILD_KEYS
+    assert out["build"]["status"] == "not_built"
+    assert out["build"]["trigger"] == "no_completed_build"
+    assert out["build"]["build_id"] is None
+
+
+def test_get_model_snapshot_uses_transactionally_stable_live_reader(
+    ac_root: Path, monkeypatch
+) -> None:
+    sentinel = {"schema_version": 1, "source": "live-reader"}
+    calls = []
+
+    def fake_live_snapshot(conn, *, redact=True):  # type: ignore[no-untyped-def]
+        calls.append((conn, redact))
+        return sentinel
+
+    monkeypatch.setattr(model_mod, "build_live_snapshot", fake_live_snapshot)
+    with fts.cursor() as conn:
+        out = mcp_server._get_model_snapshot(conn, redact=False)
+
+    assert out is sentinel
+    assert len(calls) == 1
+    assert calls[0][1] is False
+
+
+def test_get_model_snapshot_keeps_build_contract_while_building(ac_root: Path) -> None:
+    marker = {
+        "build_id": None,
+        "status": "building",
+        "trigger": "test-mcp",
+        "started_at": "2026-07-12T08:00:00+00:00",
+        "completed_at": None,
+        "duration_ms": 0,
+        "degraded_stages": [],
+    }
+    coordinator = ModelBuildCoordinator()
+    with coordinator.acquire(wait_seconds=0):
+        paths.atomic_write_private_text(paths.model_build_manifest(), json.dumps(marker))
+        with fts.cursor() as conn:
+            out = mcp_server._get_model_snapshot(conn)
+
+    assert out["build"]["status"] == "building"
+    assert set(out["build"]) == BUILD_KEYS
+
+
+def test_get_model_snapshot_preserves_saved_manifest(ac_root: Path) -> None:
+    manifest = create_build_manifest(
+        core_commit="0123456789abcdef",
+        models={"timeline": "fixture-model"},
+        config={"fixture": True},
+        degraded_stages=["root_synthesis"],
+        started_at="2026-07-12T08:00:00+00:00",
+        completed_at="2026-07-12T08:01:00+00:00",
+        duration_ms=60_000,
+        trigger="test-fixture",
+        mode="mock",
+    )
+    paths.atomic_write_private_text(
+        paths.model_build_manifest(),
+        json.dumps(manifest, ensure_ascii=False),
+    )
+    with fts.cursor() as conn:
+        out = mcp_server._get_model_snapshot(conn)
+
+    assert out["build"] == manifest
 
 
 def test_server_reports_runtime_version(ac_root: Path) -> None:

@@ -72,8 +72,10 @@ def note_out_of_band_rewrite(names: Sequence[str]) -> None:
         if inversion.evomem_active():
             return
         for name in names:
+            if "/" in name:
+                continue
             try:
-                prefix = files_mod.validate_prefix(files_mod.memory_path(name).name)
+                prefix = files_mod.validate_prefix(name)
             except ValueError:
                 continue
             if prefix == "event":
@@ -104,7 +106,10 @@ def _shadow_write(conn: sqlite3.Connection, *, name: str, entry_ids: list[str]) 
     if inversion.evomem_active():
         return
     path = files_mod.memory_path(name)
-    prefix = files_mod.validate_prefix(path.name)
+    file_name = files_mod.memory_name(path)
+    if "/" in file_name:
+        return
+    prefix = files_mod.validate_prefix(file_name)
     if prefix == "event":
         return
     if not _evo_ready(conn):
@@ -191,7 +196,7 @@ def _shadow_write(conn: sqlite3.Connection, *, name: str, entry_ids: list[str]) 
         nodes.append(
             backfill.map_entry_to_node(
                 e,
-                file_name=path.name,
+                file_name=file_name,
                 prefix=prefix,
                 supersedes=preds.get(e.id, []),
                 superseded_by=(

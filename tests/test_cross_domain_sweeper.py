@@ -10,6 +10,7 @@ from persome.config import Config
 from persome.model import schema_reader
 from persome.store import entries as entries_mod
 from persome.store import files as files_mod
+from persome.store import schema_faces
 from persome.timeline import store as timeline_store
 from persome.writer import cross_domain_sweeper as sweeper
 from persome.writer import schema_miner_stage as stage
@@ -218,6 +219,277 @@ def test_no_collision_writes_nothing(ac_root):
         assert res.written_count == 0
         assert res.collisions == 0
         assert res.pairs_probed == 1  # ungrounded → pre-filter passes; LLM said no
+
+
+def test_probe_budget_is_hard_and_pair_order_is_deterministic(ac_root):
+    from persome.store import fts
+
+    with fts.cursor() as conn:
+        # Seed out of lexical order: scheduling must not inherit insertion or
+        # timestamp order from the entries projection.
+        for name, central in (
+            ("schema-gamma.md", "Repeatedly sample while tuning databases"),
+            ("schema-alpha.md", "Collect maps before planning travel"),
+            ("schema-delta.md", "Verify experience before hiring interviews"),
+            ("schema-beta.md", "Track heart rate throughout training"),
+        ):
+            _seed_schema(conn, name, central, [f"Inference derived from: {central}"])
+
+        probed: list[str] = []
+
+        def fake(messages):
+            probed.append(messages[1]["content"])
+            return _fake_llm({"detected": False})(messages)
+
+        result = sweeper.sweep_cross_domain(Config(), conn, max_probes=2, llm_call=fake)
+
+        assert result.pairs_considered == 6
+        assert result.eligible_pairs == 6
+        assert result.probe_limit == 2
+        assert result.pairs_probed == 2
+        assert result.pairs_deferred == 4
+        assert len(probed) == 2
+        assert "## Schema A (topic: alpha.md)" in probed[0]
+        assert "## Schema B (topic: beta.md)" in probed[0]
+        assert "## Schema A (topic: alpha.md)" in probed[1]
+        assert "## Schema B (topic: delta.md)" in probed[1]
+
+
+def test_deferred_pairs_rotate_into_later_builds(ac_root):
+    from persome.store import fts
+
+    with fts.cursor() as conn:
+        for name, central in (
+            ("schema-alpha.md", "Collect maps before travel"),
+            ("schema-beta.md", "Track heart rate during training"),
+            ("schema-delta.md", "Verify experience before interviews"),
+            ("schema-gamma.md", "Sample repeatedly while tuning"),
+        ):
+            _seed_schema(conn, name, central, [f"Inference from {central}"])
+
+        first: list[str] = []
+        second: list[str] = []
+
+        def record(target):  # type: ignore[no-untyped-def]
+            def fake(messages):  # type: ignore[no-untyped-def]
+                target.append(messages[1]["content"])
+                return _fake_llm({"detected": False})(messages)
+
+            return fake
+
+        one = sweeper.sweep_cross_domain(Config(), conn, max_probes=2, llm_call=record(first))
+        two = sweeper.sweep_cross_domain(Config(), conn, max_probes=2, llm_call=record(second))
+
+        assert one.pairs_deferred == 4
+        assert two.pairs_deferred == 4
+        assert len(first) == len(second) == 2
+        assert set(first).isdisjoint(second)
+
+
+def test_shadow_volume_is_reprobed_first_and_promoted_without_weakening_gate(ac_root):
+    from persome.store import fts
+
+    with fts.cursor() as conn:
+        _seed_schema(conn, "schema-alpha.md", "Check maps before travel", ["Confirm routes early"])
+        _seed_schema(
+            conn,
+            "schema-beta.md",
+            "Track heart rate during training",
+            ["Adjust intensity from measurements"],
+        )
+        _seed_schema(
+            conn,
+            "schema-gamma.md",
+            "Repeat samples while tuning",
+            ["Collect measurements before deciding"],
+        )
+
+        shadow_id = schema_faces.record_face(
+            conn,
+            source=schema_faces.PROVENANCE_EMERGENT,
+            signature="Measure continuously before adjusting",
+            members=["schema-beta.md", "schema-gamma.md"],
+            confidence=0.82,
+            level=2,
+        )
+        before = conn.execute(
+            "SELECT status, observations FROM schema_faces WHERE face_id = ?", (shadow_id,)
+        ).fetchone()
+        assert tuple(before) == ("shadow", 1)
+
+        probed: list[str] = []
+
+        def fake(messages):
+            probed.append(messages[1]["content"])
+            return _fake_llm(
+                {
+                    "detected": True,
+                    "central_proposition": "Measure continuously before adjusting",
+                    "supporting_summary": "Both domains use measurement loops to guide changes",
+                    "expected_inferences": ["Samples before acting under uncertainty"],
+                    "confidence": 0.84,
+                }
+            )(messages)
+
+        result = sweeper.sweep_cross_domain(Config(), conn, max_probes=1, llm_call=fake)
+
+        assert result.eligible_pairs == 3
+        assert result.pairs_probed == 1
+        assert result.pairs_deferred == 2
+        assert len(probed) == 1
+        assert "topic: beta.md" in probed[0] and "topic: gamma.md" in probed[0]
+        after = conn.execute(
+            "SELECT status, observations, footprints FROM schema_faces WHERE face_id = ?",
+            (shadow_id,),
+        ).fetchone()
+        assert after[0] == "active"
+        assert after[1] == 2
+        assert len(json.loads(after[2])) == 2
+
+
+def test_negative_shadow_retry_yields_budget_to_every_unseen_pair(ac_root):
+    """A stale shadow gets one priority retry, then joins the rotating queue."""
+    from persome.store import fts
+
+    with fts.cursor() as conn:
+        for name, central in (
+            ("schema-alpha.md", "Check maps before travel"),
+            ("schema-beta.md", "Track heart rate during training"),
+            ("schema-delta.md", "Verify experience before interviews"),
+            ("schema-gamma.md", "Repeat samples while tuning databases"),
+        ):
+            _seed_schema(conn, name, central, [f"Inference from {central}"])
+
+        shadow_id = schema_faces.record_face(
+            conn,
+            source=schema_faces.PROVENANCE_EMERGENT,
+            signature="Prepare with measurements before committing",
+            members=["schema-alpha.md", "schema-beta.md"],
+            confidence=0.82,
+            level=2,
+        )
+        probed: list[str] = []
+
+        def reject(messages):  # type: ignore[no-untyped-def]
+            probed.append(messages[1]["content"])
+            return _fake_llm({"detected": False})(messages)
+
+        # Four schemas produce six eligible pairs. The shadow consumes the
+        # first one-probe build, then its negative result must let each of the
+        # five unseen pairs run in the next five builds.
+        for _ in range(6):
+            result = sweeper.sweep_cross_domain(Config(), conn, max_probes=1, llm_call=reject)
+            assert result.eligible_pairs == 6
+            assert result.pairs_probed == 1
+
+        assert "topic: alpha.md" in probed[0] and "topic: beta.md" in probed[0]
+        assert len(set(probed)) == 6
+        history = conn.execute(
+            "SELECT probe_count, detected FROM cross_domain_probe_state WHERE pair_key = ?",
+            (sweeper._pair_key("schema-alpha.md", "schema-beta.md"),),
+        ).fetchone()
+        assert tuple(history) == (1, 0)
+        shadow = conn.execute(
+            "SELECT status, observations FROM schema_faces WHERE face_id = ?",
+            (shadow_id,),
+        ).fetchone()
+        assert tuple(shadow) == ("shadow", 1)
+
+
+def test_probe_history_write_failure_does_not_abort_sweep(ac_root, monkeypatch):
+    from persome.store import fts
+
+    with fts.cursor() as conn:
+        _seed_schema(conn, "schema-alpha.md", "Check maps before travel", ["Confirm routes"])
+        _seed_schema(
+            conn,
+            "schema-beta.md",
+            "Track heart rate during training",
+            ["Adjust from measurements"],
+        )
+        monkeypatch.setattr(
+            sweeper,
+            "_record_probe",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("history unavailable")),
+        )
+
+        result = sweeper.sweep_cross_domain(
+            Config(),
+            conn,
+            max_probes=1,
+            llm_call=_fake_llm({"detected": False}),
+        )
+
+    assert result.pairs_probed == 1
+    assert result.written == []
+
+
+def test_failed_volume_evidence_is_not_recorded_as_promotable(ac_root, monkeypatch):
+    from persome.store import fts
+
+    with fts.cursor() as conn:
+        _seed_schema(conn, "schema-alpha.md", "Check maps before travel", ["Confirm routes"])
+        _seed_schema(
+            conn,
+            "schema-beta.md",
+            "Track heart rate during training",
+            ["Adjust from measurements"],
+        )
+        monkeypatch.setattr(
+            schema_faces,
+            "record_face",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("face write failed")),
+        )
+        collision = _fake_llm(
+            {
+                "detected": True,
+                "central_proposition": "Measure before adjusting",
+                "supporting_summary": "Both domains gather evidence first",
+                "expected_inferences": ["Samples before acting"],
+                "confidence": 0.9,
+            }
+        )
+
+        result = sweeper.sweep_cross_domain(Config(), conn, max_probes=1, llm_call=collision)
+        history = conn.execute("SELECT detected FROM cross_domain_probe_state").fetchone()
+
+    assert result.written == []
+    assert history is not None and history[0] == 0
+
+
+def test_repeated_low_confidence_collision_never_promotes_volume(ac_root):
+    from persome.store import fts
+
+    with fts.cursor() as conn:
+        _seed_schema(conn, "schema-alpha.md", "Check maps before travel", ["Confirm routes"])
+        _seed_schema(
+            conn,
+            "schema-beta.md",
+            "Track heart rate during training",
+            ["Adjust from measurements"],
+        )
+        fake = _fake_llm(
+            {
+                "detected": True,
+                "central_proposition": "Measure before adjusting",
+                "supporting_summary": "Both domains gather evidence first",
+                "expected_inferences": ["Samples before acting"],
+                "confidence": 0.3,
+            }
+        )
+
+        first = sweeper.sweep_cross_domain(Config(), conn, llm_call=fake)
+        second = sweeper.sweep_cross_domain(Config(), conn, llm_call=fake)
+
+        assert [first.written[0].status, second.written[0].status] == ["forming", "forming"]
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM schema_faces WHERE level=2 AND status='active'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert conn.execute("SELECT count(*) FROM schema_faces WHERE level=2").fetchone()[0] == 0
+        assert conn.execute("SELECT detected FROM cross_domain_probe_state").fetchone()[0] == 0
 
 
 def test_fewer_than_two_schemas_is_noop(ac_root):

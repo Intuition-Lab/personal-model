@@ -295,6 +295,7 @@ def create_file(
         raise ValueError("description is required")
     prefix = _ensure_prefix(name)
     path = files_mod.memory_path(name)
+    file_name = files_mod.memory_name(path)
     # Lock around the exists-check + write so two concurrent classifiers
     # deciding to create the same file don't both pass the check and have
     # the second clobber the first's freshly written content.
@@ -310,7 +311,7 @@ def create_file(
         fts.upsert_file(
             conn,
             fts.FileRow(
-                path=path.name,
+                path=file_name,
                 prefix=prefix,
                 description=description,
                 tags=" ".join(tags),
@@ -321,7 +322,7 @@ def create_file(
                 needs_compact=0,
             ),
         )
-    logger.info("created file: %s (status=%s)", path.name, status)
+    logger.info("created file: %s (status=%s)", file_name, status)
     return path
 
 
@@ -338,12 +339,13 @@ def set_file_status(conn: sqlite3.Connection, *, name: str, status: str) -> None
     if evo_inversion.routes_to_engine(name):
         return evo_inversion.set_file_status(conn, name=name, status=status)
     path = files_mod.memory_path(name)
+    file_name = files_mod.memory_name(path)
     if not path.exists():
         return
     # `update_frontmatter` takes the file lock itself (non-reentrant), so don't
     # wrap it in another. The DB update is independent and doesn't need the lock.
     files_mod.update_frontmatter(path, {"status": status})
-    conn.execute("UPDATE files SET status = ? WHERE path = ?", (status, path.name))
+    conn.execute("UPDATE files SET status = ? WHERE path = ?", (status, file_name))
     conn.commit()
     logger.info("file status set: %s -> %s", path.name, status)
 
@@ -380,6 +382,7 @@ def append_entry(
             occurred_at=occurred_at,
         )
     path = files_mod.memory_path(name)
+    file_name = files_mod.memory_name(path)
     if not path.exists():
         raise FileNotFoundError(f"{path.name} does not exist; call create_file first")
     prefix = _ensure_prefix(name)
@@ -425,7 +428,7 @@ def append_entry(
         derived_append_rows(
             conn,
             entry_id=entry_id,
-            path_name=path.name,
+            path_name=file_name,
             prefix=prefix,
             ts=ts,
             tags_str=" ".join(all_tags),
@@ -437,7 +440,7 @@ def append_entry(
         fts.upsert_file(
             conn,
             fts.FileRow(
-                path=path.name,
+                path=file_name,
                 prefix=prefix,
                 description=str(post.metadata.get("description", "")),
                 tags=" ".join(post.metadata.get("tags", []) or []),
@@ -539,6 +542,7 @@ def supersede_entry(
             occurred_at=occurred_at,
         )
     path = files_mod.memory_path(name)
+    file_name = files_mod.memory_name(path)
     if not path.exists():
         raise FileNotFoundError(path.name)
 
@@ -613,7 +617,7 @@ def supersede_entry(
             conn,
             old_entry_id=old_entry_id,
             new_entry_id=new_id,
-            path_name=path.name,
+            path_name=file_name,
             prefix=prefix,
             ts=ts,
             tags_str=" ".join(new_tags),
@@ -625,7 +629,7 @@ def supersede_entry(
         fts.upsert_file(
             conn,
             fts.FileRow(
-                path=path.name,
+                path=file_name,
                 prefix=prefix,
                 description=str(post.metadata.get("description", "")),
                 tags=" ".join(post.metadata.get("tags", []) or []),
@@ -646,6 +650,7 @@ def mark_entry_deleted(conn: sqlite3.Connection, *, name: str, entry_id: str) ->
     if evo_inversion.routes_to_engine(name):
         return evo_inversion.mark_entry_deleted(conn, name=name, entry_id=entry_id)
     path = files_mod.memory_path(name)
+    file_name = files_mod.memory_name(path)
     if not path.exists():
         raise FileNotFoundError(path.name)
     with files_mod.file_lock(path):
@@ -716,7 +721,7 @@ def mark_entry_deleted(conn: sqlite3.Connection, *, name: str, entry_id: str) ->
             fts.upsert_file(
                 conn,
                 fts.FileRow(
-                    path=path.name,
+                    path=file_name,
                     prefix=prefix,
                     description=str(post.metadata.get("description", "")),
                     tags=" ".join(post.metadata.get("tags", []) or []),
@@ -753,11 +758,20 @@ def _retryable_rebuild_error(exc: BaseException) -> bool:
     return "locked" in message or "busy" in message
 
 
-def rebuild_index(conn: sqlite3.Connection) -> tuple[int, int]:
+def rebuild_index(
+    conn: sqlite3.Connection,
+    *,
+    source_authority: str | None = None,
+    allow_incomplete_recovery: bool = False,
+) -> tuple[int, int]:
+    if not allow_incomplete_recovery:
+        evo_integrity.ensure_writes_allowed()
+    if source_authority not in {None, "markdown", "evomem"}:
+        raise ValueError("source_authority must be 'markdown', 'evomem', or None")
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            return _rebuild_index_once(conn)
+            return _rebuild_index_once(conn, source_authority=source_authority)
         except BaseException as exc:
             if attempt == max_attempts or not _retryable_rebuild_error(exc):
                 raise
@@ -770,14 +784,20 @@ def rebuild_index(conn: sqlite3.Connection) -> tuple[int, int]:
     raise AssertionError("unreachable")
 
 
-def _rebuild_index_once(conn: sqlite3.Connection) -> tuple[int, int]:
+def _rebuild_index_once(
+    conn: sqlite3.Connection,
+    *,
+    source_authority: str | None,
+) -> tuple[int, int]:
     savepoint = "persome_rebuild_index"
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
-        if evo_inversion.evomem_active():
-            result = _rebuild_from_evo_nodes(conn)
-        else:
-            result = _rebuild_from_markdown(conn)
+        use_evomem = (
+            evo_inversion.evomem_active()
+            if source_authority is None
+            else source_authority == "evomem"
+        )
+        result = _rebuild_from_evo_nodes(conn) if use_evomem else _rebuild_from_markdown(conn)
         # Rebuild is a reconciliation boundary. Derived rows for source entries
         # that no longer exist must not retain deleted personal text or vectors.
         conn.execute(
@@ -856,14 +876,15 @@ def _markdown_temporal_bounds(
     source_by_id = {entry_id: "the canonical evomem store" for entry_id in timestamp_by_id}
     source_state_by_id: dict[str, tuple[str, str | None, int, str | None, str | None]] = {}
     for path, _prefix in sources:
+        source_name = files_mod.memory_name(path)
         parsed = files_mod.read_file(path)
         for entry in parsed.entries:
             previous_source = source_by_id.get(entry.id)
             if previous_source is not None:
                 raise ValueError(
-                    f"duplicate entry id {entry.id!r} in {previous_source!r} and {path.name!r}"
+                    f"duplicate entry id {entry.id!r} in {previous_source!r} and {source_name!r}"
                 )
-            source_by_id[entry.id] = path.name
+            source_by_id[entry.id] = source_name
             timestamp_by_id[entry.id] = entry.timestamp
             source_state_by_id[entry.id] = _temporal_source_state(entry)
 
@@ -916,10 +937,11 @@ def _ingest_markdown_file(
     supersedes_by_id: dict[str, set[str]] | None = None,
 ) -> int:
     parsed = files_mod.read_file(path)
+    name = files_mod.memory_name(path)
     fts.upsert_file(
         conn,
         fts.FileRow(
-            path=path.name,
+            path=name,
             prefix=prefix,
             description=parsed.description,
             tags=" ".join(parsed.tags),
@@ -934,7 +956,7 @@ def _ingest_markdown_file(
         if expected_source_state is not None:
             expected = expected_source_state.get(e.id)
             if expected is None or _temporal_source_state(e) != expected:
-                raise _RebuildSourceChanged(f"Markdown source {path.name!r} changed during rebuild")
+                raise _RebuildSourceChanged(f"Markdown source {name!r} changed during rebuild")
         superseded = _superseded_from_tags(e)
         # Only strip the strike markers off entries we judged superseded —
         # a refined-from / live entry keeps its body verbatim so a legitimate
@@ -947,7 +969,7 @@ def _ingest_markdown_file(
         fts.insert_entry(
             conn,
             id=e.id,
-            path=path.name,
+            path=name,
             prefix=prefix,
             timestamp=e.timestamp,
             tags=" ".join(e.tags),
@@ -981,11 +1003,11 @@ def _rebuild_from_markdown(conn: sqlite3.Connection) -> tuple[int, int]:
     # required because a superseded entry may point to a successor in another
     # Markdown file.
     memory_files = files_mod.list_memory_files()
-    source_names = {path.name for path in memory_files}
+    source_names = {files_mod.memory_name(path) for path in memory_files}
     sources: list[tuple[Path, str]] = []
     for path in memory_files:
         try:
-            prefix = _ensure_prefix(path.name)
+            prefix = _ensure_prefix(files_mod.memory_name(path))
         except ValueError as exc:
             logger.warning("skipping %s: %s", path.name, exc)
             continue
@@ -1016,9 +1038,108 @@ def _rebuild_from_markdown(conn: sqlite3.Connection) -> tuple[int, int]:
         )
     if entry_count != len(temporal_by_id):
         raise _RebuildSourceChanged("Markdown entries changed during rebuild")
-    if {path.name for path in files_mod.list_memory_files()} != source_names:
+    if {files_mod.memory_name(path) for path in files_mod.list_memory_files()} != source_names:
         raise _RebuildSourceChanged("Markdown file set changed during rebuild")
     return len(sources), entry_count
+
+
+def _legacy_nested_skill_node_ids(
+    conn: sqlite3.Connection,
+    *,
+    rows: list[sqlite3.Row],
+    memory_files: list[Path],
+) -> set[str]:
+    """Identify old basename-shadow rows only when their origin is provable.
+
+    Older runtimes shadowed ``skills/skill-*.md`` entries into ``evo_nodes``
+    with only ``skill-*.md`` in ``file_name``.  Under evomem authority that row
+    looks like a canonical top-level source, while the nested Markdown remains
+    a direct source, so a rebuild sees the same entry id twice.
+
+    A basename is not enough to delete a canonical node.  Treat a row as the
+    legacy shadow only when all three independent records agree: the unique
+    Markdown entry lives at the corresponding nested path, its semantic content
+    matches the node, and the existing retrieval row is the exact projection of
+    that nested source.  Any collision with incomplete or divergent evidence is
+    left untouched and the rebuild is rejected.
+    """
+    from ..evomem.store import _row_to_node
+
+    parsed_sources: dict[str, list[tuple[str, files_mod.ParsedEntry]]] = {}
+    source_names: set[str] = set()
+    for path in memory_files:
+        source_name = files_mod.memory_name(path)
+        source_names.add(source_name)
+        parsed = files_mod.read_file(path)
+        for entry in parsed.entries:
+            parsed_sources.setdefault(entry.id, []).append((source_name, entry))
+
+    legacy_ids: set[str] = set()
+    for row in rows:
+        node = _row_to_node(row)
+        if (
+            "/" in node.file_name
+            or not node.file_name.startswith("skill-")
+            or not node.file_name.endswith(".md")
+        ):
+            continue
+        nested_name = f"skills/{node.file_name}"
+        matches = parsed_sources.get(node.node_id, [])
+        nested_matches = [(name, entry) for name, entry in matches if name == nested_name]
+        if not nested_matches:
+            continue
+        if len(matches) != 1 or len(nested_matches) != 1:
+            raise ValueError(
+                f"ambiguous legacy nested skill node {node.node_id!r}: "
+                f"Markdown identity is not unique; refusing automatic migration"
+            )
+        _source_name, entry = nested_matches[0]
+        superseded = _superseded_from_tags(entry)
+        semantic_content = _content_from_markdown_entry(entry, superseded=superseded)
+        expected_fts_content = _fts_content_from_markdown_entry(
+            entry,
+            superseded=superseded,
+            supersedes=set(node.supersedes),
+        )
+        retrieval_rows = conn.execute(
+            "SELECT id, path, prefix, timestamp, tags, content, superseded FROM entries WHERE id=?",
+            (node.node_id,),
+        ).fetchall()
+        expected_retrieval_tail = (
+            "skill",
+            entry.timestamp,
+            " ".join(entry.tags),
+            expected_fts_content,
+            superseded,
+        )
+        actual_retrieval = [
+            (
+                str(current["id"]),
+                str(current["path"]),
+                str(current["prefix"]),
+                str(current["timestamp"]),
+                str(current["tags"] or ""),
+                str(current["content"]),
+                int(current["superseded"] or 0),
+            )
+            for current in retrieval_rows
+        ]
+        exact_nested_projection = [(node.node_id, nested_name, *expected_retrieval_tail)]
+        # The same old versions that lost ``skills/`` in evo_nodes also used
+        # Path.name in the FTS/files projection. Accept that legacy source shape
+        # only when no physical top-level file exists; otherwise the basename
+        # cannot prove which source produced the node.
+        exact_legacy_projection = [(node.node_id, node.file_name, *expected_retrieval_tail)]
+        source_is_proven = actual_retrieval == exact_nested_projection or (
+            actual_retrieval == exact_legacy_projection and node.file_name not in source_names
+        )
+        if node.content != semantic_content or not source_is_proven:
+            raise ValueError(
+                f"ambiguous legacy nested skill node {node.node_id!r}: "
+                f"content or source projection differs; refusing automatic migration"
+            )
+        legacy_ids.add(node.node_id)
+    return legacy_ids
 
 
 def _rebuild_from_evo_nodes(conn: sqlite3.Connection) -> tuple[int, int]:
@@ -1026,10 +1147,34 @@ def _rebuild_from_evo_nodes(conn: sqlite3.Connection) -> tuple[int, int]:
     from ..evomem.store import _row_to_node
     from . import projector
 
-    groups: dict[str, list] = {}
-    for r in conn.execute(
+    memory_files = files_mod.list_memory_files()
+    node_rows = conn.execute(
         "SELECT * FROM evo_nodes WHERE user_id='default' AND agent_id='default' ORDER BY node_id"
-    ).fetchall():
+    ).fetchall()
+    legacy_nested_ids = _legacy_nested_skill_node_ids(
+        conn,
+        rows=node_rows,
+        memory_files=memory_files,
+    )
+    for node_id in sorted(legacy_nested_ids):
+        deleted = conn.execute(
+            "DELETE FROM evo_nodes WHERE node_id=? AND user_id='default' AND agent_id='default'",
+            (node_id,),
+        ).rowcount
+        if deleted != 1:
+            raise _RebuildSourceChanged(
+                f"legacy nested skill node {node_id!r} changed during rebuild"
+            )
+    if legacy_nested_ids:
+        logger.info(
+            "rebuild: removed %d verified legacy nested-skill shadow node(s)",
+            len(legacy_nested_ids),
+        )
+
+    groups: dict[str, list] = {}
+    for r in node_rows:
+        if str(r["node_id"]) in legacy_nested_ids:
+            continue
         node = _row_to_node(r)
         if not node.file_name:
             continue
@@ -1046,14 +1191,14 @@ def _rebuild_from_evo_nodes(conn: sqlite3.Connection) -> tuple[int, int]:
         for node in nodes:
             external_timestamp_by_id[node.node_id] = projector._heading_ts(node)
 
-    memory_files = files_mod.list_memory_files()
-    source_names = {path.name for path in memory_files}
+    source_names = {files_mod.memory_name(path) for path in memory_files}
     markdown_sources: list[tuple[Path, str]] = []
     for path in memory_files:
-        if path.name in groups:
+        name = files_mod.memory_name(path)
+        if name in groups:
             continue
         try:
-            prefix = _ensure_prefix(path.name)
+            prefix = _ensure_prefix(name)
         except ValueError as exc:
             logger.warning("skipping %s: %s", path.name, exc)
             continue
@@ -1158,7 +1303,7 @@ def _rebuild_from_evo_nodes(conn: sqlite3.Connection) -> tuple[int, int]:
         file_count += 1
     if markdown_entry_count != len(markdown_temporal):
         raise _RebuildSourceChanged("Markdown entries changed during rebuild")
-    if {path.name for path in files_mod.list_memory_files()} != source_names:
+    if {files_mod.memory_name(path) for path in files_mod.list_memory_files()} != source_names:
         raise _RebuildSourceChanged("Markdown file set changed during rebuild")
 
     # the file-level metadata truth). But a row that once had nodes, now has NONE

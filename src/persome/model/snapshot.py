@@ -345,8 +345,14 @@ def build_snapshot(
     if len(roots) > 1:
         raise ModelContractError(f"expected at most one live Root, found {len(roots)}")
 
-    build = create_build_manifest(started_at=timestamp, completed_at=timestamp)
-    build.update(build_metadata or {})
+    # A caller-supplied live manifest is already the complete truth surface.
+    # Do not merge not_built/building sentinels into a freshly fabricated
+    # successful manifest with unrelated hashes and commit metadata.
+    build = (
+        dict(build_metadata)
+        if build_metadata is not None
+        else create_build_manifest(started_at=timestamp, completed_at=timestamp)
+    )
     snapshot = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": timestamp,
@@ -393,9 +399,15 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
         raise ModelContractError("model snapshot must contain zero or one live Root")
 
 
-def model_status(conn: sqlite3.Connection) -> dict[str, Any]:
+def model_status(
+    conn: sqlite3.Connection,
+    *,
+    snapshot_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return a compact readiness/status view backed by the same model contract."""
-    snapshot = build_snapshot(conn)
+    snapshot = snapshot_data if snapshot_data is not None else build_snapshot(conn)
+    if snapshot_data is not None:
+        validate_snapshot(snapshot)
     issues: list[str] = []
     if not snapshot["points"]:
         issues.append("no_points")
@@ -424,14 +436,19 @@ def export_snapshot(
     redact: bool = True,
     build_metadata: dict[str, Any] | None = None,
     generated_at: str | None = None,
+    snapshot_data: dict[str, Any] | None = None,
 ) -> Path:
     """Atomically write a model snapshot. Exports are redacted and mode 0600 by default."""
-    snapshot = build_snapshot(
-        conn,
-        redact=redact,
-        build_metadata=build_metadata,
-        generated_at=generated_at,
-    )
+    snapshot = snapshot_data
+    if snapshot is None:
+        snapshot = build_snapshot(
+            conn,
+            redact=redact,
+            build_metadata=build_metadata,
+            generated_at=generated_at,
+        )
+    else:
+        validate_snapshot(snapshot)
     target = out_path
     if target is None:
         stamp = snapshot["generated_at"].replace(":", "-").replace("+", "_")

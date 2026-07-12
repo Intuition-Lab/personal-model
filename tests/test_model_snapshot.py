@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,17 +10,20 @@ from pathlib import Path
 import pytest
 
 from persome import config as config_mod
+from persome import paths
 from persome.evomem.models import MemoryLayer, MemoryNode, MemoryStatus
 from persome.evomem.store import NodeStore
 from persome.model import (
     ModelBuildBusy,
     ModelBuildCoordinator,
     ModelContractError,
+    ModelRecoveryIncomplete,
     PipelineOutcome,
     build_snapshot,
     create_build_manifest,
     export_snapshot,
     load_last_manifest,
+    load_live_manifest,
     model_status,
     run_model_build,
 )
@@ -28,6 +32,12 @@ from persome.store import relation_edges as edges
 
 FIXTURE = Path(__file__).parent / "fixtures" / "runtime_model" / "model_seed.json"
 GOLDEN = Path(__file__).parent / "fixtures" / "runtime_model" / "model_snapshot_v1.golden.json"
+
+
+def _rehash_manifest(manifest: dict) -> None:
+    unsigned = {key: value for key, value in manifest.items() if key != "build_id"}
+    payload = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    manifest["build_id"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
 
 
 def _seed_model(monkeypatch: pytest.MonkeyPatch) -> dict:
@@ -324,6 +334,138 @@ def test_empty_model_build_is_degraded_not_success(ac_root) -> None:
     assert result.manifest["degraded_stages"] == ["model_contract"]
     assert result.stats["points"] == 0
     assert result.stats["roots"] == 0
+
+
+def test_interrupted_model_build_invalidates_previous_completed_manifest(ac_root) -> None:
+    cfg = config_mod.load(ac_root / "config.toml")
+    first = run_model_build(
+        cfg,
+        pipeline_runner=lambda _cfg: PipelineOutcome(),
+        now=lambda: datetime(2026, 7, 10, 8, 0, tzinfo=UTC),
+        trigger="first-build",
+    )
+    assert load_live_manifest()["build_id"] == first.manifest["build_id"]
+
+    def interrupted(_cfg):  # type: ignore[no-untyped-def]
+        raise RuntimeError("synthetic interruption")
+
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        run_model_build(
+            cfg,
+            pipeline_runner=interrupted,
+            now=lambda: datetime(2026, 7, 10, 9, 0, tzinfo=UTC),
+            trigger="interrupted-build",
+        )
+
+    assert load_last_manifest()["status"] == "building"
+    assert load_live_manifest()["status"] == "not_built"
+
+
+@pytest.mark.parametrize("pending_kind", ["database", "config"])
+def test_model_build_is_blocked_while_integrity_recovery_is_pending(
+    ac_root,
+    pending_kind,
+) -> None:
+    cfg = config_mod.load(ac_root / "config.toml")
+    pending_path = (
+        paths.integrity_recovery_pending()
+        if pending_kind == "database"
+        else paths.integrity_config_recovery_pending()
+    )
+    paths.atomic_write_private_text(pending_path, '{"version": 1}')
+
+    with pytest.raises(ModelRecoveryIncomplete, match="recovery is incomplete"):
+        run_model_build(cfg, pipeline_runner=lambda _cfg: PipelineOutcome())
+
+    assert not paths.model_build_manifest().exists()
+
+
+def test_active_building_manifest_is_live_only_while_lock_is_held(ac_root) -> None:
+    coordinator = ModelBuildCoordinator()
+    marker = {
+        "build_id": None,
+        "status": "building",
+        "trigger": "test-active",
+        "started_at": "2026-07-12T08:00:00+00:00",
+        "completed_at": None,
+        "duration_ms": 0,
+        "degraded_stages": [],
+    }
+    with coordinator.acquire(wait_seconds=0):
+        paths.atomic_write_private_text(
+            paths.model_build_manifest(),
+            json.dumps(marker),
+        )
+        live = load_live_manifest()
+        assert all(live[key] == value for key, value in marker.items())
+        assert set(live) == set(json.loads(GOLDEN.read_text(encoding="utf-8"))["build"])
+
+    assert load_last_manifest() == marker
+    assert load_live_manifest()["status"] == "not_built"
+
+
+def test_build_lock_hides_previous_manifest_before_building_marker(ac_root, tmp_path) -> None:
+    previous = create_build_manifest(
+        core_commit="0123456789abcdef",
+        prompt_dir=tmp_path / "missing-prompts",
+        started_at="2026-07-12T07:00:00+00:00",
+        completed_at="2026-07-12T07:01:00+00:00",
+        trigger="previous-build",
+        mode="mock",
+    )
+    paths.atomic_write_private_text(paths.model_build_manifest(), json.dumps(previous))
+
+    coordinator = ModelBuildCoordinator()
+    with coordinator.acquire(wait_seconds=0):
+        # The exclusive lock is acquired before run_model_build writes its
+        # provisional marker. Never expose the previous completed manifest in
+        # that window.
+        live = load_live_manifest()
+
+    assert live["status"] == "building"
+    assert live["build_id"] is None
+    assert live["trigger"] == "unknown"
+    assert live["started_at"] is None
+
+
+def test_live_manifest_rejects_tampered_build_id(ac_root, tmp_path) -> None:
+    manifest = create_build_manifest(
+        core_commit="0123456789abcdef",
+        prompt_dir=tmp_path / "missing-prompts",
+        degraded_stages=["root_synthesis"],
+        started_at="2026-07-12T08:00:00+00:00",
+        completed_at="2026-07-12T08:01:00+00:00",
+        mode="mock",
+    )
+    manifest["status"] = "complete"
+    paths.atomic_write_private_text(paths.model_build_manifest(), json.dumps(manifest))
+
+    assert load_live_manifest()["status"] == "not_built"
+
+
+@pytest.mark.parametrize(
+    ("status", "degraded_stages"),
+    [("complete", ["root_synthesis"]), ("degraded", [])],
+)
+def test_live_manifest_rejects_rehashed_status_stage_contradiction(
+    ac_root,
+    tmp_path,
+    status,
+    degraded_stages,
+) -> None:
+    manifest = create_build_manifest(
+        core_commit="0123456789abcdef",
+        prompt_dir=tmp_path / "missing-prompts",
+        started_at="2026-07-12T08:00:00+00:00",
+        completed_at="2026-07-12T08:01:00+00:00",
+        mode="mock",
+    )
+    manifest["status"] = status
+    manifest["degraded_stages"] = degraded_stages
+    _rehash_manifest(manifest)
+    paths.atomic_write_private_text(paths.model_build_manifest(), json.dumps(manifest))
+
+    assert load_live_manifest()["status"] == "not_built"
 
 
 def test_model_build_lock_no_wait_reports_busy(ac_root) -> None:

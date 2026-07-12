@@ -72,6 +72,14 @@ OPENAI_API_KEY=...
 # OPENAI_BASE_URL=https://example.test/v1
 ```
 
+The daemon and initialized CLI commands, including `persome model build`, load
+this file before resolving provider credentials. An explicitly exported shell
+variable takes precedence for that one command; the durable `env` file is not
+rewritten by such an override. The owner-local `PERSOME_LOCAL_API_TOKEN` is the
+one exception: `persome start` persists a valid exported value as the canonical
+bearer so the daemon and later CLI processes cannot end up with different
+credentials.
+
 Common model stages are `timeline`, `reducer`, `classifier`, `memory_delta`,
 `pattern_detector`, `case_extractor`, `compact`, `schema_miner`,
 `cross_domain_sweeper`, `root_synthesis`, `contradiction_check`, and
@@ -256,6 +264,7 @@ daily_tick_minute = 15
 cross_domain_enabled = true
 cross_domain_behavior_max_distance = 0.5
 cross_domain_min_confidence = 0.6
+cross_domain_max_probes = 8
 root_synthesis_enabled = true
 root_token_budget = 1500
 ```
@@ -265,7 +274,16 @@ After new Point/Line evidence, the Runtime calls the same
 `refresh_minutes` cadence. The 00:15 tick remains an unconditional daily pass.
 Both run pending state formation, enrichment, Face mining, Volume synthesis,
 Root synthesis, vectors, and layout. Forming schemas are excluded from active
-snapshots. Missing repeated evidence yields a truthful degraded build.
+snapshots. Each build makes at most `cross_domain_max_probes` cross-domain LLM
+calls. A shadow Volume is retried first only while its latest persisted result
+remains stable/promotable, so the two-observation evidence gate can make
+progress. A negative, failed, or forming retry demotes that pair behind every
+never-probed pair; older retries then rotate oldest-first. Thus stale shadows
+cannot monopolize the budget, and every finite unseen queue is reached in later
+builds. Any remainder is reported as deferred for a later build. Collisions below
+`cross_domain_min_confidence` remain dormant `forming` Markdown and cannot enter
+the Face/Volume promotion table. Missing repeated evidence yields a truthful
+degraded build.
 
 ## Writer and maintenance
 
@@ -322,8 +340,13 @@ contradiction_max_pairs = 10
 
 `markdown` is the default authority and shadows current state to evomem.
 `evomem` makes the graph authoritative and projects Markdown/FTS from it. An
-operator flips this manually; code never changes the authority. Before a
-rollback, project current evomem state to Markdown, then rebuild the index.
+operator flips this manually. Integrity recovery may temporarily write
+`unknown` when a damaged/missing config leaves both Markdown and evomem as
+plausible sources; writes and model builds remain frozen until the operator
+chooses `markdown` or `evomem`. That explicit choice is reconciled into the
+retrieval index before the guard journal is removed, and choosing `evomem`
+also reprojects its canonical state to Markdown. Before a normal rollback,
+project current evomem state to Markdown, then rebuild the index.
 
 Snapshots are verified before atomic promotion. Integrity failures are emitted
 as structured error logs. The old runtime SSE event bus no longer exists.

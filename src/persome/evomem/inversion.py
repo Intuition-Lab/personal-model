@@ -51,6 +51,10 @@ _miss_count = 0
 def authority() -> str:
     """Normalize write authority and fail safely to ``markdown``."""
     raw = (config_mod.load().evomem.write_authority or "markdown").strip().lower()
+    if raw == "unknown":
+        raise integrity.WriteFrozenError(
+            "write authority is unresolved; choose markdown or evomem before writing"
+        )
     if raw not in ("markdown", "evomem"):
         _log.warning("unknown [evomem] write_authority %r — falling back to 'markdown'", raw)
         return "markdown"

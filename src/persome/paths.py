@@ -104,6 +104,21 @@ def integrity_recovery_marker() -> Path:
     return root() / ".integrity-recovery.json"
 
 
+def integrity_recovery_pending() -> Path:
+    """Crash-resumable journal for a full database quarantine/replay."""
+    return root() / ".integrity-recovery.pending.json"
+
+
+def integrity_config_recovery_pending() -> Path:
+    """Crash-resumable intent for config quarantine before DB inspection.
+
+    This is separate from the database journal because it must be durable
+    before a corrupt config is replaced.  Until it is cleared, a subsequent
+    database recovery must not infer write authority from the fresh default.
+    """
+    return root() / ".integrity-config-recovery.pending.json"
+
+
 def backup_dir() -> Path:
     """Daily ``VACUUM INTO`` snapshots of ``index.db`` (``evo-YYYYMMDD.db``).
 

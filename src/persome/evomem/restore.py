@@ -41,15 +41,18 @@ def import_from_markdown(*, dry_run: bool = False) -> RestoreReport:
     report = RestoreReport(dry_run=dry_run)
     parsed_files: list[tuple[str, list[files_mod.ParsedEntry]]] = []
     for path in files_mod.list_memory_files():
+        name = files_mod.memory_name(path)
         try:
-            prefix = files_mod.validate_prefix(path.name)
+            prefix = files_mod.validate_prefix(name)
         except ValueError as exc:
-            _log.warning("restore: skipping %s: %s", path.name, exc)
+            _log.warning("restore: skipping %s: %s", name, exc)
             continue
         if prefix == "event":
             report.skipped_event_files += 1
             continue
-        parsed_files.append((path.name, files_mod.read_file(path).entries))
+        if "/" in name:
+            continue
+        parsed_files.append((name, files_mod.read_file(path).entries))
         report.files += 1
 
     nodes = projector.rebuild_nodes_from_projection(parsed_files)

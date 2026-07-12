@@ -10,6 +10,43 @@ from persome.store import files as files_mod
 from persome.store import fts, index_md
 
 
+def test_memory_discovery_rejects_symlinked_external_markdown(
+    ac_root: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside-private.md"
+    outside.write_text("EXTERNAL PRIVATE CONTENT", encoding="utf-8")
+    skills = ac_root / "memory" / "skills"
+    skills.mkdir(parents=True, exist_ok=True)
+    leak = skills / "skill-leak.md"
+    leak.symlink_to(outside)
+
+    assert leak not in files_mod.list_memory_files()
+    with fts.cursor() as conn:
+        files, rows = entries_mod.rebuild_index(conn)
+        hits = fts.search(conn, query="EXTERNAL")
+    assert (files, rows) == (0, 0)
+    assert hits == []
+
+
+def test_memory_discovery_does_not_traverse_symlinked_external_directory(
+    ac_root: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside-skills"
+    outside.mkdir()
+    (outside / "skill-leak.md").write_text(
+        "EXTERNAL DIRECTORY PRIVATE CONTENT",
+        encoding="utf-8",
+    )
+    (ac_root / "memory" / "skills").symlink_to(outside, target_is_directory=True)
+
+    assert files_mod.list_memory_files() == []
+    with fts.cursor() as conn:
+        files, rows = entries_mod.rebuild_index(conn)
+        hits = fts.search(conn, query="EXTERNAL")
+    assert (files, rows) == (0, 0)
+    assert hits == []
+
+
 def test_make_id_uniqueness() -> None:
     ids = {entries_mod.make_id("2026-04-21T10:30") for _ in range(200)}
     assert len(ids) == 200
@@ -46,6 +83,220 @@ def test_create_append_search(ac_root: Path) -> None:
         # GLOB path filter
         hits3 = fts.search(conn, query="Python", path_patterns=["project-*.md"], top_k=5)
         assert len(hits3) >= 1
+
+
+def test_nested_and_top_level_files_with_same_basename_keep_distinct_identities(
+    ac_root: Path,
+) -> None:
+    top_name = "skill-same.md"
+    nested_name = "skills/skill-same.md"
+
+    with fts.cursor() as conn:
+        entries_mod.create_file(
+            conn,
+            name=top_name,
+            description="Top-level skill",
+            tags=["top"],
+        )
+        entries_mod.create_file(
+            conn,
+            name=nested_name,
+            description="Nested direct skill",
+            tags=["nested"],
+        )
+        top_id = entries_mod.append_entry(
+            conn,
+            name=top_name,
+            content="Top-level behavior",
+            tags=["top"],
+        )
+        nested_id = entries_mod.append_entry(
+            conn,
+            name=nested_name,
+            content="Nested behavior",
+            tags=["nested"],
+        )
+        entries_mod.set_file_status(conn, name=nested_name, status="dormant")
+
+        before = {
+            row["path"]: (row["description"], row["status"])
+            for row in conn.execute(
+                "SELECT path, description, status FROM files ORDER BY path"
+            ).fetchall()
+        }
+        entry_paths = {
+            row["id"]: row["path"]
+            for row in conn.execute(
+                "SELECT id, path FROM entries WHERE id IN (?, ?)",
+                (top_id, nested_id),
+            ).fetchall()
+        }
+
+        assert before == {
+            top_name: ("Top-level skill", "active"),
+            nested_name: ("Nested direct skill", "dormant"),
+        }
+        assert entry_paths == {top_id: top_name, nested_id: nested_name}
+
+        assert entries_mod.rebuild_index(conn) == (2, 2)
+        after = {
+            row["path"]: (row["description"], row["status"])
+            for row in conn.execute(
+                "SELECT path, description, status FROM files ORDER BY path"
+            ).fetchall()
+        }
+        rebuilt_entry_paths = {
+            row["id"]: row["path"]
+            for row in conn.execute(
+                "SELECT id, path FROM entries WHERE id IN (?, ?)",
+                (top_id, nested_id),
+            ).fetchall()
+        }
+
+    assert after == before
+    assert rebuilt_entry_paths == entry_paths
+
+
+def test_evomem_rebuild_migrates_verified_legacy_nested_skill_shadow(
+    ac_root: Path,
+) -> None:
+    """Upgrade a pre-fix basename shadow without losing the direct source."""
+    from persome import config as config_mod
+    from persome import paths
+    from persome.evomem.models import MemoryLayer, MemoryNode
+    from persome.evomem.store import NodeStore
+
+    nested_name = "skills/skill-upgrade.md"
+    content = "Prefer explicit proof before changing durable state."
+    with fts.cursor() as conn:
+        entries_mod.create_file(
+            conn,
+            name=nested_name,
+            description="Direct behavioral memory",
+            tags=["behavior"],
+        )
+        entry_id = entries_mod.append_entry(
+            conn,
+            name=nested_name,
+            content=content,
+            tags=["observed"],
+        )
+
+    # Old shadow.py used Path.name here, erasing the ``skills/`` identity.
+    NodeStore().save(
+        MemoryNode(
+            node_id=entry_id,
+            content=content,
+            layer=MemoryLayer.L2_FACT,
+            file_name="skill-upgrade.md",
+            tags="observed",
+        )
+    )
+    NodeStore(user_id="other-user", agent_id="other-agent").save(
+        MemoryNode(
+            node_id=entry_id,
+            content="Other scope remains independent.",
+            layer=MemoryLayer.L2_FACT,
+            file_name="skill-upgrade.md",
+        )
+    )
+    with fts.cursor() as conn:
+        # Complete the on-disk shape produced by the affected versions: both
+        # the canonical-node route and the derived source route lost skills/.
+        conn.execute(
+            "UPDATE entries SET path='skill-upgrade.md' WHERE id=?",
+            (entry_id,),
+        )
+        conn.execute(
+            "UPDATE files SET path='skill-upgrade.md' WHERE path=?",
+            (nested_name,),
+        )
+    config_mod.write_default_if_missing()
+    paths.atomic_write_private_text(
+        paths.config_file(),
+        paths.config_file()
+        .read_text(encoding="utf-8")
+        .replace('write_authority = "markdown"', 'write_authority = "evomem"'),
+    )
+
+    with fts.cursor() as conn:
+        assert entries_mod.rebuild_index(conn) == (1, 1)
+        default_node = conn.execute(
+            "SELECT 1 FROM evo_nodes WHERE node_id=? AND user_id='default' AND agent_id='default'",
+            (entry_id,),
+        ).fetchone()
+        other_node = conn.execute(
+            "SELECT file_name, content FROM evo_nodes "
+            "WHERE node_id=? AND user_id='other-user' AND agent_id='other-agent'",
+            (entry_id,),
+        ).fetchone()
+        rebuilt = conn.execute(
+            "SELECT path, content FROM entries WHERE id=?",
+            (entry_id,),
+        ).fetchall()
+
+    assert default_node is None
+    assert other_node is not None and tuple(other_node) == (
+        "skill-upgrade.md",
+        "Other scope remains independent.",
+    )
+    assert [tuple(row) for row in rebuilt] == [(nested_name, content)]
+
+
+@pytest.mark.parametrize("ambiguity", ["source", "content"])
+def test_evomem_rebuild_rejects_ambiguous_legacy_nested_skill_shadow(
+    ac_root: Path,
+    ambiguity: str,
+) -> None:
+    from persome.evomem.models import MemoryLayer, MemoryNode
+    from persome.evomem.store import NodeStore
+
+    nested_name = "skills/skill-ambiguous-upgrade.md"
+    content = "Nested source must win only with complete proof."
+    with fts.cursor() as conn:
+        entries_mod.create_file(conn, name=nested_name, description="d", tags=[])
+        entry_id = entries_mod.append_entry(
+            conn,
+            name=nested_name,
+            content=content,
+            tags=[],
+        )
+        if ambiguity == "source":
+            entries_mod.create_file(
+                conn,
+                name="skill-ambiguous-upgrade.md",
+                description="Potential top-level source",
+                tags=[],
+            )
+    node_content = content if ambiguity == "source" else "DIVERGENT CANONICAL CONTENT"
+    NodeStore().save(
+        MemoryNode(
+            node_id=entry_id,
+            content=node_content,
+            layer=MemoryLayer.L2_FACT,
+            file_name="skill-ambiguous-upgrade.md",
+        )
+    )
+
+    # Exercise both proof failures: a basename with a possible top-level source,
+    # and a node whose canonical content disagrees with the nested entry.
+    with fts.cursor() as conn:
+        conn.execute(
+            "UPDATE entries SET path='skill-ambiguous-upgrade.md' WHERE id=?",
+            (entry_id,),
+        )
+        with pytest.raises(ValueError, match="source projection differs"):
+            entries_mod.rebuild_index(conn, source_authority="evomem")
+        node = conn.execute(
+            "SELECT file_name, content FROM evo_nodes "
+            "WHERE node_id=? AND user_id='default' AND agent_id='default'",
+            (entry_id,),
+        ).fetchone()
+
+    assert node is not None and tuple(node) == (
+        "skill-ambiguous-upgrade.md",
+        node_content,
+    )
 
 
 def test_search_multiterm_is_or_ranked_not_and(ac_root: Path) -> None:

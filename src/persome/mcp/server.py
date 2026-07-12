@@ -148,9 +148,9 @@ def _read_memory(  # type: ignore[no-untyped-def]
 
 def _get_model_snapshot(conn, *, redact: bool = True) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     """Project the live personal model through the same versioned contract as CLI export."""
-    from ..model import build_snapshot, load_last_manifest
+    from ..model import build_live_snapshot
 
-    return build_snapshot(conn, redact=redact, build_metadata=load_last_manifest())
+    return build_live_snapshot(conn, redact=redact)
 
 
 def _search(  # type: ignore[no-untyped-def]

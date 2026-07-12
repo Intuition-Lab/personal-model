@@ -34,6 +34,23 @@ def test_does_not_overwrite_existing(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert os.environ["KEEP_ME"] == "shell-wins"
 
 
+def test_owner_env_cannot_redirect_persome_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file under one root cannot redirect initialization to another root."""
+    monkeypatch.delenv("PERSOME_ROOT", raising=False)
+    monkeypatch.delenv("SAFE_OWNER_KEY", raising=False)
+    path = tmp_path / "env"
+    path.write_text(
+        f"PERSOME_ROOT={tmp_path / 'different-root'}\nSAFE_OWNER_KEY=loaded\n",
+        encoding="utf-8",
+    )
+
+    assert load_env_file(path) == 1
+    assert "PERSOME_ROOT" not in os.environ
+    assert os.environ["SAFE_OWNER_KEY"] == "loaded"
+
+
 def test_comments_blanks_and_quotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("A_KEY", "B_KEY", "C_KEY"):
         monkeypatch.delenv(name, raising=False)
@@ -130,7 +147,10 @@ def test_ensure_screenshot_key_replaces_invalid_duplicates(tmp_path: Path) -> No
     assert env_file.is_valid_screenshot_key(canonical[0])
 
 
-def test_ensure_local_api_token_generates_owner_only_secret(tmp_path: Path) -> None:
+def test_ensure_local_api_token_generates_owner_only_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(env_file.LOCAL_API_TOKEN_ENV, raising=False)
     path = tmp_path / "env"
     path.write_text("KEEP=yes\n", encoding="utf-8")
 
@@ -146,7 +166,10 @@ def test_ensure_local_api_token_generates_owner_only_secret(tmp_path: Path) -> N
     assert "KEEP=yes" in path.read_text(encoding="utf-8")
 
 
-def test_ensure_local_api_token_preserves_valid_value(tmp_path: Path) -> None:
+def test_ensure_local_api_token_preserves_valid_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(env_file.LOCAL_API_TOKEN_ENV, raising=False)
     path = tmp_path / "env"
     original = "local-token-" + "a" * 40
     path.write_text(f"{env_file.LOCAL_API_TOKEN_ENV}={original}\n", encoding="utf-8")
@@ -157,7 +180,10 @@ def test_ensure_local_api_token_preserves_valid_value(tmp_path: Path) -> None:
     assert original in path.read_text(encoding="utf-8")
 
 
-def test_ensure_local_api_token_replaces_invalid_duplicates(tmp_path: Path) -> None:
+def test_ensure_local_api_token_replaces_invalid_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(env_file.LOCAL_API_TOKEN_ENV, raising=False)
     path = tmp_path / "env"
     path.write_text(
         f"{env_file.LOCAL_API_TOKEN_ENV}=short\n{env_file.LOCAL_API_TOKEN_ENV}=also-short\n",
@@ -174,7 +200,7 @@ def test_ensure_local_api_token_replaces_invalid_duplicates(tmp_path: Path) -> N
     assert env_file.is_valid_local_api_token(values[0])
 
 
-def test_ensure_local_api_token_preserves_shell_override(
+def test_ensure_local_api_token_persists_shell_override_as_canonical(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "env"
@@ -186,4 +212,78 @@ def test_ensure_local_api_token_preserves_shell_override(
     assert env_file.ensure_local_api_token(path) == "existing"
 
     assert os.environ[env_file.LOCAL_API_TOKEN_ENV] == shell_token
-    assert file_token in path.read_text(encoding="utf-8")
+    payload = path.read_text(encoding="utf-8")
+    assert f"{env_file.LOCAL_API_TOKEN_ENV}={shell_token}" in payload
+    assert file_token not in payload
+
+    # A later process without the original shell export must load the same
+    # credential the daemon used at startup.
+    monkeypatch.delenv(env_file.LOCAL_API_TOKEN_ENV)
+    assert env_file.load_env_file(path) == 1
+    assert os.environ[env_file.LOCAL_API_TOKEN_ENV] == shell_token
+
+
+@pytest.mark.parametrize(
+    "unsafe_shell_token",
+    [
+        '"' + "q" * 40 + '"',
+        "'" + "q" * 40 + "'",
+        "q" * 40 + "+",
+        chr(233) * 32,
+    ],
+    ids=["double-quoted", "single-quoted", "non-url-safe", "non-ascii"],
+)
+def test_ensure_local_api_token_repairs_non_reversible_shell_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_shell_token: str,
+) -> None:
+    path = tmp_path / "env"
+    monkeypatch.setenv(env_file.LOCAL_API_TOKEN_ENV, unsafe_shell_token)
+
+    assert env_file.ensure_local_api_token(path) == "generated"
+
+    disk_value = path.read_text(encoding="utf-8").strip().partition("=")[2]
+    assert env_file.is_valid_local_api_token(disk_value)
+    assert disk_value != unsafe_shell_token
+    assert os.environ[env_file.LOCAL_API_TOKEN_ENV] == disk_value
+
+    # Simulate a later CLI process: the byte-for-byte same canonical token is
+    # recovered, so the daemon and browser client cannot diverge.
+    monkeypatch.delenv(env_file.LOCAL_API_TOKEN_ENV)
+    assert env_file.load_env_file(path) == 1
+    assert os.environ[env_file.LOCAL_API_TOKEN_ENV] == disk_value
+
+
+def test_ensure_local_api_token_repairs_invalid_process_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "env"
+    path.write_text(
+        f"{env_file.LOCAL_API_TOKEN_ENV}=short\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(env_file.LOCAL_API_TOKEN_ENV, "also-short")
+
+    assert env_file.ensure_local_api_token(path) == "generated"
+
+    disk_value = path.read_text(encoding="utf-8").strip().partition("=")[2]
+    assert env_file.is_valid_local_api_token(disk_value)
+    assert os.environ[env_file.LOCAL_API_TOKEN_ENV] == disk_value
+
+
+def test_invalid_file_token_cannot_survive_load_then_provision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "env"
+    path.write_text(f"{env_file.LOCAL_API_TOKEN_ENV}=short\n", encoding="utf-8")
+    monkeypatch.setenv(env_file.LOCAL_API_TOKEN_ENV, "temporary")
+    monkeypatch.delenv(env_file.LOCAL_API_TOKEN_ENV)
+
+    assert env_file.load_env_file(path) == 1
+    assert os.environ[env_file.LOCAL_API_TOKEN_ENV] == "short"
+    assert env_file.ensure_local_api_token(path) == "generated"
+
+    disk_value = path.read_text(encoding="utf-8").strip().partition("=")[2]
+    assert env_file.is_valid_local_api_token(disk_value)
+    assert os.environ[env_file.LOCAL_API_TOKEN_ENV] == disk_value

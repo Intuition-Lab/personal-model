@@ -246,6 +246,13 @@ CREATE INDEX idx_parser_ticks_ts ON parser_ticks(ts DESC);
 
 -- ---- store/schema_faces.py ----
 
+CREATE TABLE cross_domain_probe_state (
+    pair_key       TEXT PRIMARY KEY,
+    last_probed_at TEXT NOT NULL,
+    probe_count    INTEGER NOT NULL DEFAULT 1,
+    detected       INTEGER NOT NULL DEFAULT 0  -- last result was stable/promotable
+);
+
 CREATE TABLE schema_faces (
     face_id      TEXT PRIMARY KEY,
     level        INTEGER NOT NULL DEFAULT 1,   -- 1=Face, 2=Volume, 3=Root
@@ -261,6 +268,9 @@ CREATE TABLE schema_faces (
     valid_to     TEXT,
     created_at   TEXT NOT NULL
 , anchors TEXT NOT NULL DEFAULT '[]');
+
+CREATE INDEX ix_cross_domain_probe_age
+    ON cross_domain_probe_state(last_probed_at, pair_key);
 
 CREATE INDEX ix_faces_status ON schema_faces(status, level);
 

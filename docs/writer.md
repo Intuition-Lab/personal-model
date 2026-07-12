@@ -117,7 +117,15 @@ stable output contributes a Face. Re-mining supersedes the prior schema in place
 `cross_domain_sweeper` compares stable, topic-distinct schemas using a
 deterministic behavior signature before an LLM judge. Confirmed repeated
 cross-domain structure becomes a Volume. Forming candidates stay outside active
-snapshots.
+snapshots. The LLM stage has a hard per-build probe budget (8 by default), with
+live shadow Volumes whose latest result is still stable/promotable ordered before
+unseen pairs so bounded builds can satisfy the unchanged two-observation
+promotion gate. A negative, failed, or low-confidence retry immediately lowers
+that shadow into the oldest-first retry queue; it cannot reserve top priority on
+later builds. Probe history is persisted locally, so every finite set of unseen
+pairs receives budget before those rejected retries return. Low-confidence
+`forming` collisions remain dormant and never contribute promotion evidence.
+Deferred candidates remain eligible for later structural builds.
 
 ### Root
 

@@ -174,10 +174,11 @@ def _build_nodes(report: BackfillReport, *, user_id: str, agent_id: str) -> list
     """Parse markdown + side tables into the full node list (read-only phase)."""
     parsed_files: list[tuple[str, str, list[files_mod.ParsedEntry]]] = []
     for path in files_mod.list_memory_files():
+        name = files_mod.memory_name(path)
         try:
-            prefix = files_mod.validate_prefix(path.name)
+            prefix = files_mod.validate_prefix(name)
         except ValueError as exc:
-            _log.warning("backfill: skipping %s: %s", path.name, exc)
+            _log.warning("backfill: skipping %s: %s", name, exc)
             continue
         parsed = files_mod.read_file(path)
         report.files += 1
@@ -185,7 +186,9 @@ def _build_nodes(report: BackfillReport, *, user_id: str, agent_id: str) -> list
         if prefix == "event":
             report.skipped_event += len(parsed.entries)
             continue
-        parsed_files.append((path.name, prefix, parsed.entries))
+        if "/" in name:
+            continue
+        parsed_files.append((name, prefix, parsed.entries))
 
     with fts.cursor() as conn:
         metadata, temporal = _load_side_tables(conn)

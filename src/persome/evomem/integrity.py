@@ -8,6 +8,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import paths
 from ..config import Config
 from ..logger import get
 
@@ -131,6 +132,13 @@ def ensure_writes_allowed() -> None:
     ``store/entries.py`` and NodeStore writers in ``evomem/store.py``). With the
     default config the flag is never set, so this is a pure flag check —
     behaviorally identical to before."""
+    if (
+        paths.integrity_recovery_pending().exists()
+        or paths.integrity_config_recovery_pending().exists()
+    ):
+        raise WriteFrozenError(
+            "memory writes are frozen while database/config recovery is incomplete"
+        )
     reason = write_frozen()
     if reason is not None:
         raise WriteFrozenError(f"memory writes are frozen by integrity check: {reason}")

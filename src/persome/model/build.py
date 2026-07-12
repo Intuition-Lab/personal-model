@@ -15,7 +15,7 @@ from typing import Any
 from .. import paths
 from ..evomem.store import NodeStore
 from ..store import fts
-from .manifest import create_build_manifest
+from .manifest import create_build_manifest, is_valid_build_manifest
 from .snapshot import build_snapshot
 
 DEFAULT_WAIT_SECONDS = 30.0
@@ -30,10 +30,31 @@ _MODEL_STAGES = (
     "cross_domain_sweeper",
     "root_synthesis",
 )
+_PERSISTED_MANIFEST_KEYS = frozenset(
+    {
+        "build_id",
+        "core_commit",
+        "models",
+        "prompt_hashes",
+        "config_hash",
+        "input_window",
+        "mode",
+        "trigger",
+        "status",
+        "degraded_stages",
+        "started_at",
+        "completed_at",
+        "duration_ms",
+    }
+)
 
 
 class ModelBuildBusy(RuntimeError):
     """Another process still owns the model-build lock after the requested wait."""
+
+
+class ModelRecoveryIncomplete(RuntimeError):
+    """Crash recovery has not established a safe database/write authority."""
 
 
 @dataclass
@@ -181,11 +202,16 @@ def _run_pipeline(cfg: Any) -> PipelineOutcome:
                 conn,
                 behavior_max_distance=cfg.schema.cross_domain_behavior_max_distance,
                 min_confidence=cfg.schema.cross_domain_min_confidence,
+                max_probes=cfg.schema.cross_domain_max_probes,
             )
         return {
             "written": result.written_count,
             "pairs_considered": result.pairs_considered,
+            "eligible_pairs": result.eligible_pairs,
             "pairs_probed": result.pairs_probed,
+            "probe_limit": result.probe_limit,
+            "pairs_deferred": result.pairs_deferred,
+            "collisions": result.collisions,
         }
 
     _run_stage(
@@ -262,6 +288,151 @@ def load_last_manifest() -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _recovery_marker_blocks_manifest() -> bool:
+    if paths.integrity_recovery_pending().exists():
+        return True
+    marker = paths.integrity_recovery_marker()
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        database = payload.get("database_recovery") if isinstance(payload, dict) else None
+        if not isinstance(database, dict) or not database.get("model_rebuild_required"):
+            return False
+        return paths.model_build_manifest().stat().st_mtime_ns <= marker.stat().st_mtime_ns
+    except FileNotFoundError:
+        return False
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        # A malformed old recovery marker cannot prove that the current
+        # manifest is stale. The manifest's own strict validation still applies.
+        return False
+
+
+def _not_built_manifest() -> dict[str, Any]:
+    return {
+        "build_id": None,
+        "core_commit": None,
+        "models": {},
+        "prompt_hashes": {},
+        "config_hash": None,
+        "input_window": {"start": None, "end": None},
+        "mode": None,
+        "status": "not_built",
+        "trigger": "no_completed_build",
+        "started_at": None,
+        "completed_at": None,
+        "duration_ms": 0,
+        "degraded_stages": [],
+    }
+
+
+def _building_manifest(manifest: dict[str, Any] | None) -> dict[str, Any]:
+    marker_is_current = manifest is not None and manifest.get("status") == "building"
+    return {
+        "build_id": None,
+        "core_commit": None,
+        "models": {},
+        "prompt_hashes": {},
+        "config_hash": None,
+        "input_window": {"start": None, "end": None},
+        "mode": None,
+        "status": "building",
+        "trigger": manifest.get("trigger", "unknown") if marker_is_current else "unknown",
+        "started_at": manifest.get("started_at") if marker_is_current else None,
+        "completed_at": None,
+        "duration_ms": 0,
+        "degraded_stages": [],
+    }
+
+
+def _classify_persisted_manifest(manifest: dict[str, Any] | None) -> dict[str, Any]:
+    recovery_blocked = _recovery_marker_blocks_manifest()
+    if (
+        manifest is not None
+        and not recovery_blocked
+        and manifest.keys() >= _PERSISTED_MANIFEST_KEYS
+        and isinstance(manifest.get("started_at"), str)
+        and isinstance(manifest.get("completed_at"), str)
+        and is_valid_build_manifest(manifest)
+    ):
+        return manifest
+    return _not_built_manifest()
+
+
+@contextmanager
+def _shared_build_lock_if_available() -> Iterator[bool]:
+    """Hold a shared build lock when no structural build is already active."""
+    try:
+        handle = paths.open_private_lock_file(paths.model_build_lock())
+    except (OSError, RuntimeError):
+        yield False
+        return
+    acquired = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            pass
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def load_live_manifest() -> dict[str, Any]:
+    """Return truthful metadata for a live projection or export.
+
+    Merely reading the current database is not a model build. A missing,
+    malformed, or interrupted manifest must therefore never be replaced by the
+    snapshot helper's synthetic ``complete`` metadata. The shared lock closes
+    the pre-marker race where a builder owns the exclusive lock but has not yet
+    replaced the previous completed manifest.
+    """
+    with _shared_build_lock_if_available() as shared_lock_acquired:
+        manifest = load_last_manifest()
+        if not shared_lock_acquired:
+            return _building_manifest(manifest)
+        return _classify_persisted_manifest(manifest)
+
+
+def build_live_snapshot(
+    conn: Any,
+    *,
+    redact: bool = True,
+    generated_at: str | None = None,
+) -> dict[str, Any]:
+    """Read one transactionally stable geometry + manifest projection.
+
+    A shared build lock prevents a new explicit structural build from starting
+    between manifest and geometry reads. If a build already owns the exclusive
+    lock, the public manifest is ``building`` and the SQLite savepoint still
+    gives all geometry queries one WAL snapshot.
+    """
+    with _shared_build_lock_if_available() as shared_lock_acquired:
+        if shared_lock_acquired:
+            # Our own shared lock would make a separate exclusive-lock probe
+            # look busy. With the shared lock held, no structural writer can
+            # start, so classify the persisted manifest directly.
+            build_metadata = _classify_persisted_manifest(load_last_manifest())
+        else:
+            build_metadata = _building_manifest(load_last_manifest())
+        savepoint = "persome_live_model_snapshot"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            snapshot = build_snapshot(
+                conn,
+                redact=redact,
+                generated_at=generated_at,
+                build_metadata=build_metadata,
+            )
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return snapshot
+        except BaseException:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+
+
 def run_model_build(
     cfg: Any,
     *,
@@ -272,11 +443,31 @@ def run_model_build(
     now: Callable[[], datetime] | None = None,
 ) -> ModelBuildResult:
     """Run one idempotent build and persist its reproducibility manifest."""
+    if (
+        paths.integrity_recovery_pending().exists()
+        or paths.integrity_config_recovery_pending().exists()
+    ):
+        raise ModelRecoveryIncomplete(
+            "database/config recovery is incomplete; repair the reported source and rerun "
+            "a stopped-Runtime CLI command before building"
+        )
     clock = now or (lambda: datetime.now(UTC))
     coordinator = coordinator or ModelBuildCoordinator()
     with coordinator.acquire(wait_seconds=wait_seconds):
         started_dt = clock()
         started_monotonic = time.monotonic()
+        _write_json_owner_only(
+            paths.model_build_manifest(),
+            {
+                "build_id": None,
+                "status": "building",
+                "trigger": trigger,
+                "started_at": started_dt.isoformat(),
+                "completed_at": None,
+                "duration_ms": 0,
+                "degraded_stages": [],
+            },
+        )
         NodeStore()  # ensure the Point store exists even on a completely fresh root
         outcome = pipeline_runner(cfg)
 

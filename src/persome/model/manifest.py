@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,33 @@ from typing import Any
 def _stable_hash(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def is_valid_build_manifest(manifest: Mapping[str, Any]) -> bool:
+    """Return whether persisted build metadata is internally trustworthy.
+
+    ``build_id`` signs every other persisted field, including fields added by a
+    future schema revision. Status also has to agree with ``degraded_stages`` so
+    a re-hashed but contradictory manifest cannot be presented as complete.
+    """
+    build_id = manifest.get("build_id")
+    degraded_stages = manifest.get("degraded_stages")
+    status = manifest.get("status")
+    if (
+        not isinstance(build_id, str)
+        or not build_id.strip()
+        or not isinstance(degraded_stages, list)
+        or not all(isinstance(stage, str) and stage for stage in degraded_stages)
+        or status not in {"complete", "degraded"}
+        or (status == "complete") != (not degraded_stages)
+    ):
+        return False
+    unsigned = {key: value for key, value in manifest.items() if key != "build_id"}
+    try:
+        expected = _stable_hash(unsigned)[:20]
+    except (TypeError, ValueError):
+        return False
+    return build_id == expected
 
 
 def prompt_hashes(prompt_dir: Path | None = None) -> dict[str, str]:

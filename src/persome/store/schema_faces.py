@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS schema_faces (
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_faces_status ON schema_faces(status, level);
+CREATE TABLE IF NOT EXISTS cross_domain_probe_state (
+    pair_key       TEXT PRIMARY KEY,
+    last_probed_at TEXT NOT NULL,
+    probe_count    INTEGER NOT NULL DEFAULT 1,
+    detected       INTEGER NOT NULL DEFAULT 0  -- last result was stable/promotable
+);
+CREATE INDEX IF NOT EXISTS ix_cross_domain_probe_age
+    ON cross_domain_probe_state(last_probed_at, pair_key);
 """
 
 

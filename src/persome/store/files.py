@@ -318,9 +318,87 @@ def update_frontmatter(path: Path, updates: dict[str, Any]) -> None:
         atomic_write_text(path, frontmatter.dumps(post) + "\n")
 
 
-def list_memory_files() -> list[Path]:
-    if not paths.memory_dir().exists():
+def list_memory_files(*, strict: bool = False) -> list[Path]:
+    """List supported memory Markdown without following filesystem links.
+
+    Normal reads skip unsafe or transiently unreadable candidates. Recovery
+    callers pass ``strict=True`` because treating an incomplete discovery as a
+    complete source set could incorrectly delete snapshot-backed canonical
+    nodes that merely failed discovery.
+    """
+    memory_dir = paths.memory_dir()
+    if not memory_dir.exists():
         return []
-    return sorted(
-        p for p in paths.memory_dir().iterdir() if p.suffix == ".md" and p.name != "index.md"
-    )
+    if memory_dir.is_symlink():
+        if strict:
+            raise RuntimeError(f"memory directory must not be a symlink: {memory_dir}")
+        return []
+    candidates: list[Path] = []
+    try:
+        with os.scandir(memory_dir) as root_entries:
+            for entry in root_entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        if entry.name.endswith(".md") and entry.name != "index.md":
+                            candidates.append(Path(entry.path))
+                        continue
+                    if entry.name.endswith(".md") and entry.name != "index.md":
+                        if strict:
+                            raise RuntimeError(
+                                f"memory Markdown must be one regular file: {entry.path}"
+                            )
+                        continue
+                    if entry.name in VALID_SUBDIRS and entry.is_symlink():
+                        if strict:
+                            raise RuntimeError(
+                                f"memory subdirectory must not be a symlink: {entry.path}"
+                            )
+                        continue
+                    if entry.name not in VALID_SUBDIRS or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    with os.scandir(entry.path) as nested_entries:
+                        for nested in nested_entries:
+                            if nested.is_file(follow_symlinks=False):
+                                if nested.name.endswith(".md") and nested.name != "index.md":
+                                    candidates.append(Path(nested.path))
+                                continue
+                            if nested.name.endswith(".md") and nested.name != "index.md" and strict:
+                                raise RuntimeError(
+                                    f"memory Markdown must be one regular file: {nested.path}"
+                                )
+                except OSError as exc:
+                    if strict:
+                        raise RuntimeError(
+                            f"memory discovery failed for {entry.path}: {exc}"
+                        ) from exc
+                    continue
+    except OSError as exc:
+        if strict:
+            raise RuntimeError(f"memory discovery failed for {memory_dir}: {exc}") from exc
+        return []
+
+    files: list[Path] = []
+    memory_root = memory_dir.resolve()
+    for path in candidates:
+        try:
+            paths.ensure_private_file(path)
+            path.resolve(strict=True).relative_to(memory_root)
+            memory_name(path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            if strict:
+                raise RuntimeError(f"unsafe or unreadable memory file {path}: {exc}") from exc
+            continue
+        files.append(path)
+    return sorted(files, key=memory_name)
+
+
+def memory_name(path: Path) -> str:
+    """Return the canonical root-relative name for a supported memory file."""
+    try:
+        name = path.relative_to(paths.memory_dir()).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"memory file is outside the data root: {path}") from exc
+    expected = memory_path(name)
+    if expected != path:
+        raise ValueError(f"unsupported memory file path: {path}")
+    return name

@@ -107,6 +107,9 @@ labels, ports, and data roots do not belong in core.
 | `model-build.lock` | cross-process build lock |
 | `session-model.lock` | cross-process terminal-session finalization lock |
 | `model-build.json` | last build manifest |
+| `.integrity-recovery.pending.json` | resumable full-database recovery phase journal |
+| `.integrity-config-recovery.pending.json` | pre-quarantine config intent and authority guard |
+| `.integrity-recovery.json` | last completed quarantine/recovery report |
 | `exports/` | owner-only snapshots |
 | `backup/` | optional SQLite snapshots |
 | `logs/` | component logs |
