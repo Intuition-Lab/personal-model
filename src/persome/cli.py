@@ -96,7 +96,11 @@ def _daemon_lock_is_held() -> bool:
         handle.close()
 
 
-def _init(*, starting_runtime: bool = False) -> config_mod.Config:
+def _init(
+    *,
+    starting_runtime: bool = False,
+    recover_integrity: bool = True,
+) -> config_mod.Config:
     paths.ensure_dirs()
     # Every initialized CLI command gets the same owner-only Runtime secrets as
     # the daemon. In particular, one-shot commands such as `model build` run
@@ -111,7 +115,7 @@ def _init(*, starting_runtime: bool = False) -> config_mod.Config:
     # The daemon owns active SQLite writes. A status/MCP/second-start invocation
     # must never quarantine or rebuild an index while that process has it open.
     # When stopped, this remains the first database-touching operation.
-    if not _read_pid() and (starting_runtime or not _daemon_lock_is_held()):
+    if recover_integrity and not _read_pid() and (starting_runtime or not _daemon_lock_is_held()):
         recovered = integrity.check_and_recover()
         if paths.integrity_recovery_pending().exists():
             console.print(
@@ -1090,12 +1094,12 @@ def _format_ping(res) -> str:  # type: ignore[no-untyped-def]
 @app.command()
 def mcp() -> None:
     """Run the MCP server (stdio). For LLM client config."""
-    _init()
-
-    # env file (OPENAI_* embeddings creds live there) exactly like `persome start`,
-    # else the stdio server's read path can never activate hybrid dense and an
-    # LLM client silently gets a weaker memory than the in-daemon server.
-    env_file_mod.load_env_file(paths.env_file())
+    # Per-client MCP startup must never run database recovery. Besides adding a
+    # full SQLite scan to every handshake, an older daemon may not publish the
+    # current PID/lock receipts and could be writing while a newer stdio client
+    # decides the database is offline. Daemon startup and explicit maintenance
+    # commands retain the recovery path.
+    _init(recover_integrity=False)
     from .mcp import server as mcp_server
 
     mcp_server.run_stdio()

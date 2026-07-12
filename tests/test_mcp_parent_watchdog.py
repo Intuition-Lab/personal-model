@@ -111,12 +111,18 @@ def test_watchdog_arms_a_daemon_thread_when_a_client_is_watchable(
 
 def test_run_stdio_starts_the_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     started: list[bool] = []
+    build_args: list[dict[str, bool]] = []
     monkeypatch.setattr(mcp_server, "_start_parent_watchdog", lambda: started.append(True))
 
     class _FakeServer:
         def run(self) -> None:  # pragma: no cover - trivial
             pass
 
-    monkeypatch.setattr(mcp_server, "build_server", lambda auth_enabled: _FakeServer())
+    def _build_server(**kwargs: bool) -> _FakeServer:
+        build_args.append(kwargs)
+        return _FakeServer()
+
+    monkeypatch.setattr(mcp_server, "build_server", _build_server)
     mcp_server.run_stdio()
     assert started == [True]
+    assert build_args == [{"auth_enabled": False, "include_http_routes": False}]

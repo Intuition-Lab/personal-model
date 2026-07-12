@@ -16,7 +16,10 @@ persome mcp
 
 The daemon endpoint requires `Authorization: Bearer <PERSOME_LOCAL_API_TOKEN>`.
 The token is provisioned in the owner-only Runtime env file. Stdio does not
-need or copy that bearer.
+need or copy that bearer. Stdio also skips construction of the daemon-only
+REST/Chat application and never runs database recovery, keeping per-client cold
+starts bounded to MCP tools. Integrity recovery remains a daemon-start and
+maintenance responsibility.
 
 Example stdio client configuration:
 

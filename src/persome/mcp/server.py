@@ -29,16 +29,6 @@ from ..config import Config
 from ..config import load as load_config
 from ..logger import get
 from ..prompts import load as load_prompt
-from ..security.auth import (
-    add_local_api_auth_middleware,
-    loopback_http_url,
-    reset_browser_auth_state,
-    validate_bind_host,
-)
-from ..security.body_limit import (
-    RequestBodyLimitMiddleware,
-    RequestConcurrencyLimitMiddleware,
-)
 from ..store import files as files_mod
 from ..store import fts
 from ..timeline import attention_trajectory as attention_traj
@@ -765,6 +755,12 @@ def _protect_http_app(app: Any, *, host: str, auth_enabled: bool) -> Any:
     therefore the single outer boundary for MCP, REST, and future custom
     routes.  Keep this helper composable with other outer ASGI limits.
     """
+    from ..security.auth import add_local_api_auth_middleware, validate_bind_host
+    from ..security.body_limit import (
+        RequestBodyLimitMiddleware,
+        RequestConcurrencyLimitMiddleware,
+    )
+
     if auth_enabled:
         validate_bind_host(host)
     # Starlette applies middleware in reverse add order.  Add resource limits
@@ -779,11 +775,19 @@ def build_server(
     cfg: Config | None = None,
     *,
     auth_enabled: bool = True,
+    include_http_routes: bool = True,
 ):  # type: ignore[no-untyped-def]
-    """Construct and return a FastMCP server instance (not yet running)."""
+    """Construct and return a FastMCP server instance (not yet running).
+
+    ``include_http_routes`` mounts the REST/Chat application used by daemon
+    transports. A stdio client has no HTTP surface, so importing and building
+    that application would only add several seconds of cold-start work.
+    """
     from mcp.server.fastmcp import FastMCP  # lazy import
 
     if auth_enabled:
+        from ..security.auth import reset_browser_auth_state
+
         # HTTP cookies are not port-bound. Invalidate every capability whenever
         # a listener generation is rebuilt so a cookie captured during a crash
         # / port-rebind window cannot be replayed after the daemon recovers.
@@ -806,6 +810,8 @@ def build_server(
     from mcp.server.transport_security import TransportSecuritySettings
 
     if auth_enabled and cfg.mcp.transport != "stdio":
+        from ..security.auth import validate_bind_host
+
         validate_bind_host(cfg.mcp.host)
 
     class _ProtectedFastMCP(FastMCP):
@@ -1441,9 +1447,10 @@ def build_server(
                 ensure_ascii=False,
             )
 
-    from ..api import register_routes
+    if include_http_routes:
+        from ..api import register_routes
 
-    register_routes(server, cfg, auth_enabled=auth_enabled)
+        register_routes(server, cfg, auth_enabled=auth_enabled)
     return server
 
 
@@ -1514,7 +1521,7 @@ def run_stdio() -> None:
     _start_parent_watchdog()
     # Stdio has no HTTP request surface and therefore no bearer header.  Keep it
     # explicitly outside the local HTTP authentication boundary.
-    server = build_server(auth_enabled=False)
+    server = build_server(auth_enabled=False, include_http_routes=False)
     server.run()  # FastMCP.run() uses stdio by default
 
 
@@ -1524,8 +1531,14 @@ async def run_async(cfg: Config | None = None, *, transport: str | None = None) 
     transport = transport or cfg.mcp.transport
     auth_enabled = transport != "stdio"
     if auth_enabled:
+        from ..security.auth import validate_bind_host
+
         validate_bind_host(cfg.mcp.host)
-    server = build_server(cfg, auth_enabled=auth_enabled)
+    server = build_server(
+        cfg,
+        auth_enabled=auth_enabled,
+        include_http_routes=transport != "stdio",
+    )
     if transport == "stdio":
         await server.run_stdio_async()
     elif transport == "sse":
@@ -1540,6 +1553,8 @@ async def run_async(cfg: Config | None = None, *, transport: str | None = None) 
 
 def endpoint_url(cfg: Config) -> str:
     """Return the public URL where the daemon-hosted MCP server is reachable."""
+    from ..security.auth import loopback_http_url
+
     transport = cfg.mcp.transport
     if transport == "sse":
         return loopback_http_url(cfg.mcp.host, cfg.mcp.port, "/sse")

@@ -159,6 +159,11 @@ def test_server_reports_runtime_version(ac_root: Path) -> None:
     assert server._mcp_server.version == __version__
 
 
+def test_stdio_server_skips_daemon_http_routes(ac_root: Path) -> None:
+    server = mcp_server.build_server(auth_enabled=False, include_http_routes=False)
+    assert server._custom_starlette_routes == []
+
+
 # ─── search_captures + current_context ────────────────────────────────────
 
 
