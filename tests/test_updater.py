@@ -107,21 +107,57 @@ def test_installer_uses_update_mode_without_shell_interpolation(
 ) -> None:
     source = updater.UpdateSource(_source_tree(tmp_path / "source"), "c" * 40, False)
     seen: dict[str, object] = {}
+    monkeypatch.setenv("SSL_CERT_FILE", str(paths.root() / "venv" / "cert.pem"))
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        seen.update(command=command, kwargs=kwargs)
-        return subprocess.CompletedProcess(command, 0)
+    class Process:
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            seen.update(command=command, kwargs=kwargs)
 
-    monkeypatch.setattr(updater.subprocess, "run", fake_run)
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    monkeypatch.setattr(updater.subprocess, "Popen", Process)
 
     updater.run_installer(source)
 
     assert seen["command"] == ["/bin/bash", str(source.path / "install.sh"), "--update"]
     assert seen["kwargs"]["cwd"] == source.path  # type: ignore[index]
-    assert seen["kwargs"]["check"] is False  # type: ignore[index]
+    assert seen["kwargs"]["start_new_session"] is True  # type: ignore[index]
     env = seen["kwargs"]["env"]  # type: ignore[index]
     assert env["PERSOME_ROOT"] == str(paths.root())
     assert env["PERSOME_INSTALL_HOME"] == str(paths.root())
+    assert "SSL_CERT_FILE" not in env
+
+
+def test_interrupted_installer_waits_for_transaction_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = updater.UpdateSource(_source_tree(tmp_path / "source"), "c" * 40, False)
+    signals: list[tuple[int, int]] = []
+
+    class Process:
+        pid = 4242
+
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            self.waits = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise KeyboardInterrupt
+            assert timeout == 30
+            return 130
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(updater.subprocess, "Popen", Process)
+    monkeypatch.setattr(updater.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    with pytest.raises(updater.UpdateError, match="cancelled.*restored"):
+        updater.run_installer(source)
+
+    assert signals == [(4242, updater.signal.SIGINT)]
 
 
 def test_failed_update_recovers_background_runtime(
@@ -268,3 +304,8 @@ def test_update_mode_skips_setup_prompts_but_keeps_runtime_proof() -> None:
     assert "onboard --tier tiny --no-gui" in script
     assert script.index("run_onboarding\n") < script.rindex("commit_install\n")
     assert "restoring the previous virtualenv" in script
+    move_failed = script.index('mv "${VENV_DIR}" "${failed_venv}"')
+    restore_previous = script.index('mv "${OLD_VENV_BACKUP}" "${VENV_DIR}"')
+    remove_failed = script.index('rm -rf "${failed_venv}"')
+    assert move_failed < restore_previous < remove_failed
+    assert "trap - EXIT INT TERM HUP" in script

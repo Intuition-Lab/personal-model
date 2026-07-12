@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 from persome import config, paths
 from persome.cli import app
 from persome.llm_setup import ProbeResult, probe_profile, save_profile
-from persome.providers import LLM_API_KEY_ENV, make_profile
+from persome.providers import LLM_API_KEY_ENV, make_profile, provider_spec
 
 
 def _profile(api_key: str = "synthetic-secret"):  # type: ignore[no-untyped-def]
@@ -240,6 +240,42 @@ def test_rerun_keeps_advanced_route_without_reasking_for_routing(
     assert "Advanced setup" not in rerun.output
     assert "API endpoint" not in rerun.output
     assert "Model id" not in rerun.output
+
+
+def test_declining_current_provider_does_not_auto_select_it_again(
+    ac_root: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    paths.config_file().write_text(
+        """
+[models.default]
+provider = "anthropic"
+protocol = "anthropic"
+model = "claude-sonnet-4-5"
+base_url = "https://api.anthropic.com"
+api_key_env = "PERSOME_LLM_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    paths.env_file().write_text(f"{LLM_API_KEY_ENV}=anthropic-secret\n", encoding="utf-8")
+    paths.env_file().chmod(0o600)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setattr("persome.cli._interactive_terminal", lambda: True)
+    anthropic = provider_spec("anthropic")
+    assert anthropic is not None
+    monkeypatch.setattr("persome.providers.detected_providers", lambda: [anthropic])
+
+    result = CliRunner().invoke(
+        app,
+        ["llm", "setup", "--skip-check"],
+        input="n\n2\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Found an existing Anthropic API key" not in result.output
+    assert "Choose the LLM provider Persome should use" in result.output
+    selected = config.load().model_for("default")
+    assert selected.provider == "openai"
+    assert paths.env_file().read_text() == f"{LLM_API_KEY_ENV}=openai-secret\n"
 
 
 def test_provider_list_hides_routing_details_by_default(ac_root: Path) -> None:

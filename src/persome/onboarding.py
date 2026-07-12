@@ -50,10 +50,10 @@ on run argv
 end run
 """
 
-_INFO_SCRIPT = """
+_NOTIFICATION_SCRIPT = """
 on run argv
-    display dialog (item 2 of argv) with title (item 1 of argv) buttons {"Done"} default button "Done" with icon note
-    return "Done"
+    display notification (item 2 of argv) with title (item 1 of argv)
+    return "Notified"
 end run
 """
 
@@ -67,6 +67,8 @@ class OnboardingCancelled(OnboardingError):
 
 
 class PermissionUI(Protocol):
+    def status(self, message: str) -> None: ...
+
     def confirm(self, *, title: str, message: str, action: str) -> bool: ...
 
     def wait_for_permission(self, *, title: str, message: str) -> PermissionAction: ...
@@ -78,7 +80,7 @@ class OnboardingUI:
     def __init__(self, *, gui: bool = True) -> None:
         self.gui = gui and sys.platform == "darwin" and shutil.which("osascript") is not None
 
-    def _osascript(self, script: str, *args: str) -> str | None:
+    def _osascript(self, script: str, *args: str, timeout: float | None = None) -> str | None:
         if not self.gui:
             return None
         try:
@@ -87,8 +89,9 @@ class OnboardingUI:
                 check=False,
                 capture_output=True,
                 text=True,
+                timeout=timeout,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return None
         if result.returncode != 0:
             return None
@@ -107,6 +110,10 @@ class OnboardingUI:
         if result is not None:
             return result == action
         return self._terminal_confirm(title, message, action)
+
+    @staticmethod
+    def status(message: str) -> None:
+        print(message, flush=True)
 
     def wait_for_permission(self, *, title: str, message: str) -> PermissionAction:
         result = self._osascript(_WAIT_SCRIPT, title, message)
@@ -128,8 +135,10 @@ class OnboardingUI:
         return "cancel"
 
     def success(self, message: str) -> None:
-        if self._osascript(_INFO_SCRIPT, "Persome is ready", message) is None:
-            print(f"\nPersome is ready\n{message}")
+        # Completion must never hold the CLI open behind a modal dialog. Keep
+        # the terminal authoritative and use a best-effort notification only.
+        print(f"\nPersome is ready\n{message}", flush=True)
+        self._osascript(_NOTIFICATION_SCRIPT, "Persome is ready", message, timeout=5)
 
 
 def _open_privacy_settings(pane: str) -> None:
@@ -161,7 +170,9 @@ def _ensure_permission(
     explanation: str,
 ) -> bool:
     """Request one permission and do not return until its live probe passes."""
+    ui.status(f"Checking {label} permission...")
     if check():
+        ui.status(f"✓ {label} already granted")
         return True
     if not ui.confirm(
         title=f"Persome needs {label}",
@@ -170,6 +181,7 @@ def _ensure_permission(
     ):
         raise OnboardingCancelled(f"{label} request was cancelled")
 
+    ui.status(f"Requesting {label} from macOS...")
     request()
     while not check():
         action = ui.wait_for_permission(
@@ -184,6 +196,7 @@ def _ensure_permission(
             raise OnboardingCancelled(f"{label} was not granted")
         if action == "open_settings":
             open_settings()
+    ui.status(f"✓ {label} granted")
     return True
 
 
@@ -210,6 +223,7 @@ def ensure_local_ocr(*, tier: str, ui: PermissionUI) -> bool:
     from .config import load
     from .ocr_setup import VALID_TIERS, save_ocr_config
 
+    ui.status(f"Checking bundled local OCR ({tier})...")
     if tier not in VALID_TIERS:
         raise OnboardingError(f"unsupported OCR tier {tier!r}: choose {', '.join(VALID_TIERS)}")
     if ocr_local.disabled_by_environment():
@@ -232,6 +246,9 @@ def ensure_local_ocr(*, tier: str, ui: PermissionUI) -> bool:
         ),
     )
 
+    ui.status(
+        "Initializing the isolated OCR worker (the first model load can take up to two minutes)..."
+    )
     if not ocr_local.warm(tier):
         raise OnboardingError("the isolated local OCR worker could not initialize")
 
@@ -241,6 +258,7 @@ def ensure_local_ocr(*, tier: str, ui: PermissionUI) -> bool:
     health = ocr_health.inspect(load().capture)
     if not health.ready:
         raise OnboardingError(f"local OCR verification failed: {health.state}: {health.detail}")
+    ui.status("✓ Local OCR worker ready")
     return changed
 
 
@@ -304,13 +322,17 @@ def _latest_capture() -> Path | None:
     return max(captures, key=lambda path: path.stat().st_mtime, default=None)
 
 
-def ensure_runtime(*, restart: bool, timeout: float = 45.0) -> RuntimeProof:
+def ensure_runtime(
+    *, restart: bool, timeout: float = 45.0, ui: PermissionUI | None = None
+) -> RuntimeProof:
     """Leave the daemon running and prove HTTP health plus one fresh capture."""
     from .config import load
 
     cfg = load()
     pid = _running_daemon_pid()
     if restart and pid is not None:
+        if ui is not None:
+            ui.status("Restarting Persome to apply the OCR configuration...")
         _run_cli("stop", "--timeout", "20", timeout=25)
         deadline = time.monotonic() + 25
         while _running_daemon_pid() is not None and time.monotonic() < deadline:
@@ -318,11 +340,15 @@ def ensure_runtime(*, restart: bool, timeout: float = 45.0) -> RuntimeProof:
         pid = _running_daemon_pid()
 
     if pid is None:
+        if ui is not None:
+            ui.status("Starting the Persome Runtime...")
         result = _run_cli("start", timeout=30)
         if result.returncode != 0 and _running_daemon_pid() is None:
             detail = result.stderr.strip() or result.stdout.strip() or "unknown start failure"
             raise OnboardingError(f"Persome could not start: {detail}")
 
+    if ui is not None:
+        ui.status("Checking the local Runtime health endpoint...")
     deadline = time.monotonic() + timeout
     payload: dict[str, str] | None = None
     while time.monotonic() < deadline:
@@ -338,6 +364,11 @@ def ensure_runtime(*, restart: bool, timeout: float = 45.0) -> RuntimeProof:
             f"the daemon is degraded (status={payload.get('status')}, ocr={payload.get('ocr')})"
         )
 
+    if ui is not None:
+        ui.status(
+            "Writing one fresh capture to verify the complete path "
+            "(this can take up to three minutes)..."
+        )
     started_at = time.time()
     capture = _run_cli("capture-once", timeout=180)
     if capture.returncode != 0:
@@ -370,6 +401,9 @@ def ensure_runtime(*, restart: bool, timeout: float = 45.0) -> RuntimeProof:
     if not record.get("timestamp") or not has_context:
         raise OnboardingError("fresh capture record contains no usable screen context")
 
+    if ui is not None:
+        ui.status("✓ Runtime healthy and fresh capture verified")
+
     return RuntimeProof(
         pid=pid,
         health=payload["status"],
@@ -385,7 +419,7 @@ def onboard(*, tier: str = "tiny", gui: bool = True) -> RuntimeProof:
     ui = OnboardingUI(gui=gui)
     ensure_accessibility(ui)
     ocr_changed = ensure_local_ocr(tier=tier, ui=ui)
-    proof = ensure_runtime(restart=ocr_changed)
+    proof = ensure_runtime(restart=ocr_changed, ui=ui)
     ui.success(
         "Accessibility and local OCR are ready. Persome is running, its local health endpoint "
         "is OK, and a fresh capture was written successfully."

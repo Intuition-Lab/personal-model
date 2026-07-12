@@ -23,7 +23,11 @@ class ScriptedUI:
         self.confirm_result = confirm
         self.actions = list(actions or [])
         self.confirmed: list[str] = []
+        self.status_messages: list[str] = []
         self.success_messages: list[str] = []
+
+    def status(self, message: str) -> None:
+        self.status_messages.append(message)
 
     def confirm(self, *, title: str, message: str, action: str) -> bool:
         self.confirmed.append(action)
@@ -54,6 +58,11 @@ def test_permission_flow_explains_requests_and_waits_for_live_grant() -> None:
     assert ui.confirmed == ["Request Accessibility"]
     assert requested == [True]
     assert opened == [True]
+    assert ui.status_messages == [
+        "Checking Accessibility permission...",
+        "Requesting Accessibility from macOS...",
+        "✓ Accessibility granted",
+    ]
 
 
 def test_permission_flow_cancellation_is_a_hard_stop() -> None:
@@ -155,12 +164,29 @@ def test_complete_onboarding_orders_permissions_before_runtime_proof(
     monkeypatch.setattr(
         onboarding,
         "ensure_runtime",
-        lambda restart: calls.append(f"runtime:{restart}") or proof,
+        lambda restart, ui: calls.append(f"runtime:{restart}") or proof,
     )
 
     assert onboarding.onboard() == proof
     assert calls == ["accessibility", "ocr", "runtime:True"]
     assert ui.success_messages
+
+
+def test_success_is_printed_and_uses_a_nonblocking_notification(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ui = onboarding.OnboardingUI(gui=True)
+    calls: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        ui,
+        "_osascript",
+        lambda script, *args, **kwargs: calls.append((script, kwargs)) or "Notified",
+    )
+
+    ui.success("Everything passed.")
+
+    assert "Persome is ready" in capsys.readouterr().out
+    assert calls == [(onboarding._NOTIFICATION_SCRIPT, {"timeout": 5})]
 
 
 def test_cli_onboard_reports_each_completed_gate(

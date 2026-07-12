@@ -185,13 +185,35 @@ def run_installer(source: UpdateSource) -> None:
     # accident.
     env["PERSOME_ROOT"] = str(paths.root())
     env["PERSOME_INSTALL_HOME"] = str(paths.root())
-    result = subprocess.run(
+    # The running CLI points SSL_CERT_FILE into its current virtualenv. The
+    # transactional installer moves that directory aside, so forwarding the
+    # path produces a stale-certificate warning and can break downloads.
+    env.pop("SSL_CERT_FILE", None)
+    process = subprocess.Popen(
         ["/bin/bash", str(source.path / "install.sh"), "--update"],
         cwd=source.path,
-        check=False,
         env=env,
+        start_new_session=True,
     )
-    if result.returncode != 0:
+    try:
+        returncode = process.wait()
+    except KeyboardInterrupt as exc:
+        # The installer owns an on-disk transaction. Forward cancellation to
+        # its process group, then wait for its EXIT trap to restore the old
+        # virtualenv before the outer updater tries to restart the Runtime.
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGINT)
+        try:
+            process.wait(timeout=30)
+        except (KeyboardInterrupt, subprocess.TimeoutExpired):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        raise UpdateError(
+            "update cancelled; the previous Persome installation was restored"
+        ) from exc
+    if returncode != 0:
         raise UpdateError(
             "the installer did not complete; the existing Persome data and secrets were preserved"
         )

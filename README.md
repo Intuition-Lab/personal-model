@@ -97,7 +97,9 @@ macOS dialog before each system permission request and does not complete until
 **Accessibility** and **Screen Recording** are granted. It then verifies the
 isolated OCR worker, leaves the daemon running, polls `GET /health`, and forces
 one fresh capture. OCR supplies text for AX-poor apps such as WeChat and Feishu;
-pixels never enter an LLM prompt. Persome does not require Full Disk Access.
+pixels never enter an LLM prompt. The terminal reports each active stage because
+the first OCR model load can take up to two minutes, and completion never waits on
+a hidden dialog. Persome does not require Full Disk Access.
 
 ### Update an existing installation
 
@@ -111,7 +113,9 @@ The command downloads a fresh shallow checkout of the official `main` branch,
 stops the old Runtime, runs the locked installer in update mode, preserves
 `~/.persome` configuration, credentials, and personal data, then repeats the
 permission/OCR/health/fresh-capture onboarding proof. It does not modify a
-developer checkout. To test or install an already-reviewed local tree instead:
+developer checkout. A failed or interrupted update atomically restores the
+previous virtualenv and restarts the previous Runtime. To test or install an
+already-reviewed local tree instead:
 
 ```bash
 persome update --source /path/to/personal-model

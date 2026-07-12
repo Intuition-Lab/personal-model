@@ -21,7 +21,8 @@ ONBOARDING_COMPLETED=0
 
 rollback_uncommitted_install() {
   local status=$?
-  trap - EXIT
+  trap - EXIT INT TERM HUP
+  set +e
   if [[ ${status} -ne 0 && ${INSTALL_TRANSACTION_ACTIVE} -eq 1 ]]; then
     warn "installation failed; restoring the previous virtualenv"
     # Update-mode onboarding can start the replacement daemon before its final
@@ -37,17 +38,47 @@ rollback_uncommitted_install() {
           sleep 0.1
           attempts=$((attempts - 1))
         done
+        if kill -0 "${update_pid}" 2>/dev/null; then
+          warn "replacement Runtime did not stop cleanly; forcing it down before rollback"
+          kill -KILL "${update_pid}" 2>/dev/null || true
+        fi
       fi
     fi
-    rm -rf "${VENV_DIR}"
     if [[ -n "${OLD_VENV_BACKUP}" && -d "${OLD_VENV_BACKUP}" ]]; then
-      mv "${OLD_VENV_BACKUP}" "${VENV_DIR}"
+      # Move the replacement aside first, restore the previous venv with an
+      # atomic rename, and only then do the slow recursive cleanup. This keeps
+      # the installed shim valid even when Ctrl-C initiated the rollback.
+      local failed_venv="${VENV_DIR}.failed.$$.$RANDOM"
+      local replacement_moved=0
+      if [[ -e "${VENV_DIR}" ]]; then
+        if mv "${VENV_DIR}" "${failed_venv}"; then
+          replacement_moved=1
+        else
+          warn "could not move the failed replacement virtualenv aside"
+        fi
+      fi
+      if [[ ! -e "${VENV_DIR}" ]]; then
+        if ! mv "${OLD_VENV_BACKUP}" "${VENV_DIR}"; then
+          warn "could not restore the previous virtualenv"
+          if [[ ${replacement_moved} -eq 1 && -d "${failed_venv}" ]]; then
+            mv "${failed_venv}" "${VENV_DIR}" || true
+          fi
+        fi
+      fi
+      if [[ -d "${VENV_DIR}" && -e "${failed_venv}" ]]; then
+        rm -rf "${failed_venv}" || true
+      fi
+    else
+      rm -rf "${VENV_DIR}" || true
     fi
   fi
   exit "${status}"
 }
 
 trap rollback_uncommitted_install EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # The fallback bootstrap downloads a specific uv release and verifies the
 # archive before executing any of its contents. Update version + both digests
@@ -359,11 +390,15 @@ PY
 }
 
 commit_install() {
-  if [[ -n "${OLD_VENV_BACKUP}" ]]; then
-    rm -rf "${OLD_VENV_BACKUP}"
-  fi
+  local committed_backup="${OLD_VENV_BACKUP}"
+  # The replacement is now authoritative. Mark the transaction committed
+  # before deleting the backup so an interrupt during cleanup cannot roll back
+  # by first deleting the working virtualenv.
   OLD_VENV_BACKUP=""
   INSTALL_TRANSACTION_ACTIVE=0
+  if [[ -n "${committed_backup}" ]]; then
+    rm -rf "${committed_backup}" || warn "could not remove old virtualenv backup"
+  fi
 }
 
 compile_bundled_binaries() {

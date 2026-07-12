@@ -31,8 +31,10 @@ the daemon, grant that terminal. If launchd later owns the daemon, rerun
 Interactive `install.sh` runs `persome onboard`. It presents separate native
 dialogs for Accessibility and Screen Recording, waits for both live TCC probes,
 verifies the OCR worker, starts the daemon, polls local health, and writes one
-fresh capture. Rerun `persome onboard` after changing the launcher identity;
-use `persome ocr disable` for an explicit OCR opt-out.
+fresh capture. The terminal reports every stage because the first OCR model load
+can take up to two minutes; the final notification is non-blocking. Rerun
+`persome onboard` after changing the launcher identity; use `persome ocr disable`
+for an explicit OCR opt-out.
 
 ## Local paths
 
@@ -96,7 +98,8 @@ LLM/MCP setup preserved, reruns onboarding and its fresh-capture proof, and
 restores prior LaunchAgent ownership. Configuration, secrets, capture history,
 memory, model state, and logs under `PERSOME_ROOT` are not replaced.
 Update-mode installation keeps the previous virtualenv until onboarding passes;
-a failed proof stops the replacement daemon and restores the prior Runtime.
+a failed proof or interruption first restores the previous virtualenv with
+atomic directory renames, then restores the prior Runtime process or LaunchAgent.
 
 `persome update --source /path/to/checkout` is the explicit developer/offline
 path. The supplied tree must have the complete Persome source layout; the

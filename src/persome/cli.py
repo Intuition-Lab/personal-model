@@ -1448,6 +1448,7 @@ def llm_setup(
 
     selected = None
     keep_current = False
+    declined_current = False
     if provider:
         selected = provider_spec(provider)
         if selected is None:
@@ -1457,11 +1458,16 @@ def llm_setup(
         if interactive:
             console.print(f"Current provider: [bold]{current.provider_label}[/bold]")
             keep_current = typer.confirm("Use and verify this provider?", default=True)
+            declined_current = not keep_current
         else:
             keep_current = True
 
     if selected is None and not keep_current:
         detected = detected_providers()
+        if declined_current:
+            # A direct "no" means choose something else. Do not immediately
+            # rediscover and silently select the same provider again.
+            detected = [spec for spec in detected if spec.id != current.provider]
         if len(detected) == 1:
             selected = detected[0]
             console.print(f"[green]Found an existing {selected.label} API key.[/green]")
@@ -1502,7 +1508,10 @@ def llm_setup(
             api_key = os.environ.get(source_key_env)
         else:
             api_key = os.environ.get(selected.discovery_api_key_env)
-            api_key = api_key or os.environ.get(LLM_API_KEY_ENV)
+            # The neutral key belongs to the active profile. Reuse it only
+            # when reconfiguring that same provider, never after a switch.
+            if api_key is None and selected.id == current.provider:
+                api_key = current.api_key
 
     selected_spec = selected or provider_spec(provider_id)
     provider_label = selected_spec.label if selected_spec is not None else current.provider_label
