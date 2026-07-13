@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import pytest
+
+from persome import evidence as evidence_mod
 from persome.evidence import parse_reference, resolve_evidence
 from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.evomem.store import NodeStore
@@ -145,7 +148,7 @@ def test_point_receipt_exposes_human_readable_version_history(ac_root) -> None:
     assert old["history"][0]["label"] == "The user now prefers concise answers with evidence."
 
 
-def test_aggregate_geometry_labels_inherited_receipts_with_point_content(ac_root) -> None:
+def test_aggregate_geometry_reuses_snapshot_point_labels(ac_root, monkeypatch) -> None:
     store = NodeStore()
     store.save(
         MemoryNode(
@@ -168,6 +171,11 @@ def test_aggregate_geometry_labels_inherited_receipts_with_point_content(ac_root
                 "2026-07-01T00:00:00+00:00",
                 "2026-07-01T00:00:00+00:00",
             ),
+        )
+        monkeypatch.setattr(
+            evidence_mod,
+            "_reference_label",
+            lambda *_args: pytest.fail("snapshot Point labels should not trigger receipt queries"),
         )
         result = resolve_evidence(conn, "face-evidence")
 

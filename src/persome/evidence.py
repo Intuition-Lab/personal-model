@@ -475,13 +475,21 @@ def _resolve_geometry(
         return None
     kind, item = match
     references = _receipt_values(item)
+    point_labels = {
+        str(point["receipt"]): _short_label(
+            point.get("content"),
+            _humanize_path(str(point.get("file_name") or "")) or str(point.get("id") or "Point"),
+        )
+        for point in snapshot["points"]
+        if point.get("receipt")
+    }
     sources = [
         _link(
             relation="direct_evidence",
             kind="receipt",
             identifier=parse_reference(value)[0],
             reference=value,
-            label=_reference_label(conn, value),
+            label=point_labels.get(value) or _reference_label(conn, value),
         )
         for value in references
     ]
