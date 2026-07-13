@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from persome import paths
+from persome.model import build as model_build
 from persome.model import human
 
 
@@ -182,6 +186,7 @@ def test_render_sorts_and_caps_faces_and_root_member_volumes() -> None:
 
 def test_materialize_is_owner_only_and_atomically_replaces_managed_file(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "HUMAN.md"
     initial = _snapshot(generated_at="2026-07-13T12:00:01Z")
@@ -190,11 +195,21 @@ def test_materialize_is_owner_only_and_atomically_replaces_managed_file(
 
     with target.open("r", encoding="utf-8") as previous_handle:
         previous_inode = os.fstat(previous_handle.fileno()).st_ino
+        original_exchange = human.paths.atomic_exchange
+        observations: list[tuple[bool, bool]] = []
+
+        def observed_exchange(first: Path, second: Path) -> None:
+            before = second.exists()
+            original_exchange(first, second)
+            observations.append((before, second.exists()))
+
+        monkeypatch.setattr(human.paths, "atomic_exchange", observed_exchange)
         human.materialize_human_markdown(updated, out_path=target)
 
         assert target.stat().st_ino != previous_inode
         assert "2026-07-13T12:00:01Z" in previous_handle.read()
 
+    assert observations == [(True, True)]
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert "2026-07-13T12:00:02Z" in target.read_text(encoding="utf-8")
     assert list(tmp_path.glob(".HUMAN.md.*")) == [tmp_path / ".HUMAN.md.lock"]
@@ -254,19 +269,37 @@ def test_managed_operation_preserves_unknown_file_swapped_in_after_check(
 ) -> None:
     target = tmp_path / "HUMAN.md"
     human.materialize_human_markdown(_snapshot(), out_path=target)
-    original_move = human._move_existing_target
     replacement = "# Edited concurrently\n\nThis file belongs to the user.\n"
+    swapped = False
 
-    def swap_then_move(path: Path) -> Path:
-        editor_temp = path.with_name("editor-HUMAN.md")
+    def swap_target() -> None:
+        nonlocal swapped
+        editor_temp = target.with_name("editor-HUMAN.md")
         editor_temp.write_text(replacement, encoding="utf-8")
         editor_temp.chmod(0o640)
-        os.replace(editor_temp, path)
-        return original_move(path)
+        os.replace(editor_temp, target)
+        swapped = True
 
-    monkeypatch.setattr(human, "_move_existing_target", swap_then_move)
+    if operation == "refresh":
+        original_exchange = human.paths.atomic_exchange
 
-    with pytest.raises(human.HumanMarkdownConflict, match="changed during refresh"):
+        def swap_then_exchange(first: Path, second: Path) -> None:
+            if not swapped and second == target:
+                swap_target()
+            original_exchange(first, second)
+
+        monkeypatch.setattr(human.paths, "atomic_exchange", swap_then_exchange)
+    else:
+        original_rename = human.paths.atomic_rename_noreplace
+
+        def swap_then_rename(first: Path, second: Path) -> None:
+            if not swapped and first == target:
+                swap_target()
+            original_rename(first, second)
+
+        monkeypatch.setattr(human.paths, "atomic_rename_noreplace", swap_then_rename)
+
+    with pytest.raises(human.HumanMarkdownConflict, match="refusing to replace|changed"):
         if operation == "refresh":
             human.materialize_human_markdown(
                 _snapshot(generated_at="2026-07-13T12:00:02Z"),
@@ -292,40 +325,143 @@ def test_materialize_fails_open_when_another_projection_holds_the_lock(tmp_path:
     assert not target.exists()
 
 
-def test_materialize_recovers_same_inode_staged_link_after_crash(tmp_path: Path) -> None:
+def test_materialize_preserves_managed_human_hardlink_backup(tmp_path: Path) -> None:
     target = tmp_path / "HUMAN.md"
     human.materialize_human_markdown(_snapshot(), out_path=target)
-    stranded = tmp_path / ".HUMAN.md.stranded"
-    os.link(target, stranded)
+    before = target.read_bytes()
+    backup = tmp_path / ".HUMAN.md.my-backup"
+    os.link(target, backup)
     assert target.stat().st_nlink == 2
 
-    human.materialize_human_markdown(
-        _snapshot(generated_at="2026-07-13T12:00:02Z"),
-        out_path=target,
-    )
+    with pytest.raises(human.HumanMarkdownConflict, match="non-regular"):
+        human.materialize_human_markdown(
+            _snapshot(generated_at="2026-07-13T12:00:02Z"),
+            out_path=target,
+        )
 
-    assert not stranded.exists()
-    assert target.stat().st_nlink == 1
-    assert "2026-07-13T12:00:02Z" in target.read_text(encoding="utf-8")
+    assert backup.exists()
+    assert target.stat().st_ino == backup.stat().st_ino
+    assert target.stat().st_nlink == 2
+    assert target.read_bytes() == before
 
 
-def test_materialize_recovers_unknown_restore_link_but_still_preserves_it(
+def test_materialize_preserves_unknown_human_hardlink_backup(
     tmp_path: Path,
 ) -> None:
     target = tmp_path / "HUMAN.md"
     unknown = "# Concurrent user file\n"
     target.write_text(unknown, encoding="utf-8")
     target.chmod(0o640)
-    stranded = tmp_path / ".HUMAN.md.replaced.stranded"
-    os.link(target, stranded)
+    backup = tmp_path / ".HUMAN.md.my-backup"
+    os.link(target, backup)
 
     with pytest.raises(human.HumanMarkdownConflict, match="refusing to replace"):
         human.materialize_human_markdown(_snapshot(), out_path=target)
 
-    assert not stranded.exists()
+    assert backup.exists()
     assert target.read_text(encoding="utf-8") == unknown
-    assert target.stat().st_nlink == 1
+    assert target.stat().st_ino == backup.stat().st_ino
+    assert target.stat().st_nlink == 2
     assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_materialize_recovers_journaled_initial_link_crash(tmp_path: Path) -> None:
+    target = tmp_path / "HUMAN.md"
+    initial = _snapshot(generated_at="2026-07-13T12:00:01Z")
+    with human._human_lock(target) as handle:
+        stage, _transaction = human._stage_publish_transaction(
+            target,
+            human.render_human_markdown(initial),
+            None,
+            handle,
+        )
+        os.link(stage, target, follow_symlinks=False)
+
+    assert target.stat().st_nlink == 2
+    assert stage.exists()
+
+    human.materialize_human_markdown(
+        _snapshot(generated_at="2026-07-13T12:00:02Z"),
+        out_path=target,
+    )
+
+    assert not stage.exists()
+    assert target.stat().st_nlink == 1
+    assert "2026-07-13T12:00:02Z" in target.read_text(encoding="utf-8")
+    assert (tmp_path / ".HUMAN.md.lock").read_bytes() == b""
+
+
+def test_materialize_recovers_journaled_post_exchange_crash(tmp_path: Path) -> None:
+    target = tmp_path / "HUMAN.md"
+    human.materialize_human_markdown(_snapshot(), out_path=target)
+    crashed = _snapshot(generated_at="2026-07-13T12:00:02Z")
+    with human._human_lock(target) as handle:
+        expected = human._managed_metadata(target)
+        assert expected is not None
+        stage, _transaction = human._stage_publish_transaction(
+            target,
+            human.render_human_markdown(crashed),
+            expected,
+            handle,
+        )
+        paths.atomic_exchange(stage, target)
+
+    assert stage.exists()
+    assert "2026-07-13T12:00:02Z" in target.read_text(encoding="utf-8")
+
+    human.materialize_human_markdown(
+        _snapshot(generated_at="2026-07-13T12:00:03Z"),
+        out_path=target,
+    )
+
+    assert not stage.exists()
+    assert "2026-07-13T12:00:03Z" in target.read_text(encoding="utf-8")
+    assert list(tmp_path.glob(".HUMAN.md.persome-stage.*")) == []
+
+
+def test_materialize_ignores_truncated_transaction_tail(tmp_path: Path) -> None:
+    target = tmp_path / "HUMAN.md"
+    stage = human._new_stage_path(target)
+    transaction = human._HumanTransaction("publish", stage.name, None, None)
+
+    with human._human_lock(target) as handle:
+        human._write_transaction(handle, transaction)
+        handle.seek(0, os.SEEK_END)
+        handle.write(b'{"candidate": [1,')
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    human.materialize_human_markdown(_snapshot(), out_path=target)
+
+    assert target.exists()
+    assert not stage.exists()
+    assert (tmp_path / ".HUMAN.md.lock").read_bytes() == b""
+
+
+def test_materialize_fails_closed_when_atomic_exchange_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "HUMAN.md"
+    human.materialize_human_markdown(_snapshot(), out_path=target)
+    before = target.stat()
+    before_content = target.read_bytes()
+
+    def unsupported(_first: Path, _second: Path) -> None:
+        raise OSError(errno.ENOTSUP, "unsupported")
+
+    monkeypatch.setattr(human.paths, "atomic_exchange", unsupported)
+    with pytest.raises(human.HumanMarkdownConflict, match="cannot atomically replace"):
+        human.materialize_human_markdown(
+            _snapshot(generated_at="2026-07-13T12:00:02Z"),
+            out_path=target,
+        )
+
+    after = target.stat()
+    assert after.st_ino == before.st_ino
+    assert target.read_bytes() == before_content
+    assert list(tmp_path.glob(".HUMAN.md.persome-stage.*")) == []
+    assert (tmp_path / ".HUMAN.md.lock").read_bytes() == b""
 
 
 def test_sync_writes_truthful_cold_start_placeholder(
@@ -333,7 +469,12 @@ def test_sync_writes_truthful_cold_start_placeholder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = _manifest(build_id=None, status="not_built")
-    monkeypatch.setattr("persome.model.build.load_live_manifest", lambda: manifest)
+
+    @contextmanager
+    def generation():
+        yield manifest
+
+    monkeypatch.setattr("persome.model.build.live_model_generation", generation)
 
     target = human.sync_live_human_markdown()
     rendered = target.read_text(encoding="utf-8")
@@ -357,18 +498,78 @@ def test_sync_is_noop_when_build_schema_and_renderer_match(
     target = human.materialize_human_markdown(snapshot)
     before = target.stat()
     before_content = target.read_bytes()
-    monkeypatch.setattr(
-        "persome.model.build.load_live_manifest",
-        lambda: snapshot["build"],
-    )
+
+    @contextmanager
+    def generation():
+        yield snapshot["build"]
+
+    monkeypatch.setattr("persome.model.build.live_model_generation", generation)
 
     def fail_if_rebuilt(*args: Any, **kwargs: Any) -> dict[str, Any]:
         raise AssertionError("matching HUMAN.md must not rebuild the live snapshot")
 
-    monkeypatch.setattr("persome.model.build.build_live_snapshot", fail_if_rebuilt)
+    monkeypatch.setattr("persome.model.build._build_live_snapshot_from_manifest", fail_if_rebuilt)
 
     assert human.sync_live_human_markdown() == ac_root / "HUMAN.md"
     after = target.stat()
     assert after.st_ino == before.st_ino
     assert after.st_mtime_ns == before.st_mtime_ns
     assert target.read_bytes() == before_content
+
+
+def test_sync_holds_shared_generation_lock_through_publication(
+    ac_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _snapshot(root={"id": "root-1", "signature": "Stable portrait", "members": []})
+    original_materialize = human.materialize_human_markdown
+
+    @contextmanager
+    def locked_generation():
+        with model_build._shared_build_lock_if_available() as acquired:
+            assert acquired is True
+            yield snapshot["build"]
+
+    monkeypatch.setattr(model_build, "live_model_generation", locked_generation)
+    monkeypatch.setattr(
+        model_build,
+        "_build_live_snapshot_from_manifest",
+        lambda _conn, _manifest, *, redact: snapshot,
+    )
+
+    def checked_materialize(*args: Any, **kwargs: Any) -> Path:
+        with (
+            pytest.raises(model_build.ModelBuildBusy),
+            model_build.ModelBuildCoordinator().acquire(wait_seconds=0),
+        ):
+            pass
+        return original_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(human, "materialize_human_markdown", checked_materialize)
+
+    assert human.sync_live_human_markdown() == ac_root / "HUMAN.md"
+    assert 'build_id: "build-1"' in paths.human_file().read_text(encoding="utf-8")
+
+
+def test_sync_does_not_publish_placeholder_during_active_build(ac_root: Path) -> None:
+    with (
+        model_build.ModelBuildCoordinator().acquire(wait_seconds=0),
+        pytest.raises(human.HumanMarkdownConflict, match="active model build"),
+    ):
+        human.sync_live_human_markdown()
+
+    assert not paths.human_file().exists()
+
+
+def test_update_receipt_defers_all_canonical_publication_without_artifacts(
+    ac_root: Path,
+) -> None:
+    paths.update_state_file().write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(human.HumanMarkdownDeferred, match="update to commit"):
+        human.materialize_human_markdown(_snapshot())
+    with pytest.raises(human.HumanMarkdownDeferred, match="update to commit"):
+        human.sync_live_human_markdown()
+
+    assert not paths.human_file().exists()
+    assert list(ac_root.glob(".HUMAN.md.*")) == []

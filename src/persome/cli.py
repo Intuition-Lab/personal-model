@@ -868,14 +868,15 @@ def onboard(
 ) -> None:
     """Verify capture permissions/policy, Runtime ownership, and live readiness."""
     from . import onboarding as onboarding_mod
+    from .model.human import HumanMarkdownDeferred, sync_live_human_markdown
 
     _init()
     env_file_mod.load_env_file(paths.env_file())
     try:
-        from .model.human import sync_live_human_markdown
-
         human_path = sync_live_human_markdown()
         console.print(f"[green]✓ HUMAN.md ready[/green]  [dim]{human_path}[/dim]")
+    except HumanMarkdownDeferred:
+        console.print("[dim]• HUMAN.md will be created after the Runtime update commits[/dim]")
     except Exception as exc:  # noqa: BLE001 - onboarding still proves the core Runtime
         console.print(f"[yellow]⚠ HUMAN.md was preserved or could not be refreshed: {exc}[/yellow]")
     try:

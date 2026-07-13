@@ -6,13 +6,13 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import stat
-import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .. import paths
 from .snapshot import SCHEMA_VERSION, validate_snapshot
@@ -24,10 +24,15 @@ _MAX_FACES = 8
 _MAX_VOLUMES = 8
 _HANDLE_RE = re.compile(r"⟨([^⟨⟩]+)⟩")
 _SUPPORTED_BUILD_STATUSES = frozenset({"complete", "degraded"})
+_TRANSACTION_VERSION = 1
 
 
 class HumanMarkdownConflict(RuntimeError):
     """The target exists but is not a Persome-managed HUMAN.md projection."""
+
+
+class HumanMarkdownDeferred(RuntimeError):
+    """Canonical publication is deferred until an in-flight update commits."""
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,14 @@ class _ManagedHuman:
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.values.get(key, default)
+
+
+@dataclass(frozen=True)
+class _HumanTransaction:
+    operation: str
+    stage_name: str
+    expected: tuple[int, int] | None
+    candidate: tuple[int, int] | None
 
 
 def _yaml_scalar(value: Any) -> str:
@@ -307,10 +320,312 @@ def _managed_metadata(path: Path) -> _ManagedHuman | None:
     raise HumanMarkdownConflict(f"HUMAN.md changed during ownership inspection: {path}")
 
 
+def _fsync_parent(target: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(target.parent, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(directory_fd)
+
+
+def _is_canonical_target(target: Path) -> bool:
+    return os.path.abspath(os.fspath(target)) == os.path.abspath(os.fspath(paths.human_file()))
+
+
+def _raise_if_update_pending(target: Path) -> None:
+    if _is_canonical_target(target) and os.path.lexists(paths.update_state_file()):
+        raise HumanMarkdownDeferred("HUMAN.md publication waits for the Runtime update to commit")
+
+
+def _path_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    return metadata.st_dev, metadata.st_ino
+
+
+def _parse_identity(value: Any) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(type(item) is not int or item < 0 for item in value)
+    ):
+        raise ValueError("invalid HUMAN.md transaction identity")
+    return value[0], value[1]
+
+
+def _write_transaction(handle: BinaryIO, transaction: _HumanTransaction | None) -> None:
+    if transaction is None:
+        payload = (
+            json.dumps({"version": _TRANSACTION_VERSION, "clear": True}, sort_keys=True).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
+    else:
+        payload = (
+            json.dumps(
+                {
+                    "version": _TRANSACTION_VERSION,
+                    "operation": transaction.operation,
+                    "stage": transaction.stage_name,
+                    "expected": list(transaction.expected) if transaction.expected else None,
+                    "candidate": list(transaction.candidate) if transaction.candidate else None,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
+    # Never erase the last durable recovery record before its successor is
+    # complete. A crash-shortened tail is discarded at its last newline; the
+    # preceding fsynced record remains authoritative.
+    handle.flush()
+    handle.seek(0)
+    existing = handle.read()
+    complete_length = existing.rfind(b"\n") + 1
+    if complete_length != len(existing):
+        os.ftruncate(handle.fileno(), complete_length)
+        os.fsync(handle.fileno())
+    handle.seek(0, os.SEEK_END)
+    written = handle.write(payload)
+    if written != len(payload):
+        raise OSError("short HUMAN.md transaction journal write")
+    handle.flush()
+    os.fsync(handle.fileno())
+    if transaction is None:
+        # The durable clear record makes both the old log and an empty inode
+        # truthful. Compacting is therefore safe on either side of a crash.
+        os.ftruncate(handle.fileno(), 0)
+        os.fsync(handle.fileno())
+        handle.seek(0)
+
+
+def _read_transaction(target: Path, handle: BinaryIO) -> _HumanTransaction | None:
+    handle.seek(0)
+    if os.fstat(handle.fileno()).st_size > 16_384:
+        raise HumanMarkdownConflict(f"HUMAN.md transaction journal is too large: {target}")
+    payload = handle.read()
+    current: _HumanTransaction | None = None
+    for raw_record in payload.splitlines(keepends=True):
+        if not raw_record.endswith(b"\n"):
+            break
+        try:
+            value = json.loads(raw_record.decode("utf-8"))
+            if not isinstance(value, dict) or value.get("version") != _TRANSACTION_VERSION:
+                raise ValueError("invalid version")
+            if value.get("clear") is True:
+                current = None
+                continue
+            operation = value.get("operation")
+            stage_name = value.get("stage")
+            prefix = f".{target.name}.persome-stage."
+            token = stage_name.removeprefix(prefix) if isinstance(stage_name, str) else ""
+            if operation not in {"publish", "remove"}:
+                raise ValueError("invalid operation")
+            if (
+                not isinstance(stage_name, str)
+                or not stage_name.startswith(prefix)
+                or not re.fullmatch(r"[0-9a-f]{32}", token)
+            ):
+                raise ValueError("invalid stage")
+            expected = _parse_identity(value.get("expected"))
+            candidate = _parse_identity(value.get("candidate"))
+            if operation == "remove" and (expected is None or candidate is not None):
+                raise ValueError("invalid remove transaction")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise HumanMarkdownConflict(f"invalid HUMAN.md transaction journal: {target}") from exc
+        current = _HumanTransaction(operation, stage_name, expected, candidate)
+    return current
+
+
+def _new_stage_path(target: Path) -> Path:
+    for _attempt in range(8):
+        candidate = target.parent / f".{target.name}.persome-stage.{secrets.token_hex(16)}"
+        if not os.path.lexists(candidate):
+            return candidate
+    raise HumanMarkdownConflict(f"cannot reserve a HUMAN.md transaction stage: {target}")
+
+
+def _unlink_if_identity(path: Path, identity: tuple[int, int]) -> bool:
+    if _path_identity(path) != identity:
+        return False
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HumanMarkdownConflict(f"cannot remove HUMAN.md transaction stage: {path}") from exc
+    return True
+
+
+def _managed_identity_matches(path: Path, identity: tuple[int, int]) -> bool:
+    try:
+        managed = _managed_metadata(path)
+    except HumanMarkdownConflict:
+        return False
+    return managed is not None and managed.identity == identity
+
+
+def _clear_recovered_transaction(target: Path, handle: BinaryIO) -> None:
+    _fsync_parent(target)
+    _write_transaction(handle, None)
+
+
+def _recover_publish_transaction(
+    target: Path,
+    stage: Path,
+    transaction: _HumanTransaction,
+    handle: BinaryIO,
+) -> None:
+    expected = transaction.expected
+    candidate = transaction.candidate
+    if candidate is None:
+        # Content is written only after the candidate identity is journaled. A
+        # crash in this reservation window can therefore leave at most an empty
+        # owner-only inode, never raw model text.
+        try:
+            metadata = stage.lstat()
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None:
+            safe_empty_reservation = (
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_nlink == 1
+                and metadata.st_size == 0
+                and metadata.st_uid == os.getuid()
+                and not metadata.st_mode & 0o077
+            )
+            if not safe_empty_reservation:
+                _write_transaction(handle, None)
+                raise HumanMarkdownConflict(
+                    f"preserved an unrecognized HUMAN.md transaction stage: {stage}"
+                )
+            stage.unlink()
+        _clear_recovered_transaction(target, handle)
+        return
+
+    target_identity = _path_identity(target)
+    stage_identity = _path_identity(stage)
+
+    if expected is None:
+        if target_identity == candidate:
+            if stage_identity == candidate:
+                _unlink_if_identity(stage, candidate)
+            elif stage_identity is not None:
+                _write_transaction(handle, None)
+                raise HumanMarkdownConflict(
+                    f"preserved a changed HUMAN.md transaction stage: {stage}"
+                )
+            _clear_recovered_transaction(target, handle)
+            return
+        if stage_identity == candidate:
+            _unlink_if_identity(stage, candidate)
+        elif stage_identity is not None:
+            _write_transaction(handle, None)
+            raise HumanMarkdownConflict(
+                f"preserved an unrecognized HUMAN.md transaction stage: {stage}"
+            )
+        _clear_recovered_transaction(target, handle)
+        return
+
+    if target_identity == candidate:
+        if stage_identity is None:
+            _clear_recovered_transaction(target, handle)
+            return
+        if stage_identity == expected and _managed_identity_matches(stage, expected):
+            _unlink_if_identity(stage, expected)
+            _clear_recovered_transaction(target, handle)
+            return
+        try:
+            paths.atomic_exchange(stage, target)
+        except (OSError, ValueError) as exc:
+            raise HumanMarkdownConflict(
+                f"cannot restore a concurrently changed HUMAN.md from {stage}"
+            ) from exc
+        if not _unlink_if_identity(stage, candidate):
+            _clear_recovered_transaction(target, handle)
+            raise HumanMarkdownConflict(
+                f"preserved a concurrently changed HUMAN.md stage after rollback: {stage}"
+            )
+        _clear_recovered_transaction(target, handle)
+        return
+
+    if stage_identity == candidate:
+        _unlink_if_identity(stage, candidate)
+        _clear_recovered_transaction(target, handle)
+        return
+    if stage_identity == expected and _managed_identity_matches(stage, expected):
+        _unlink_if_identity(stage, expected)
+        _clear_recovered_transaction(target, handle)
+        return
+    if stage_identity is None:
+        _clear_recovered_transaction(target, handle)
+        return
+    if target_identity is None:
+        try:
+            paths.atomic_rename_noreplace(stage, target)
+        except (OSError, ValueError) as exc:
+            raise HumanMarkdownConflict(
+                f"cannot restore a displaced user HUMAN.md from {stage}"
+            ) from exc
+        _clear_recovered_transaction(target, handle)
+        return
+    _write_transaction(handle, None)
+    raise HumanMarkdownConflict(f"preserved a displaced user HUMAN.md at {stage}")
+
+
+def _recover_remove_transaction(
+    target: Path,
+    stage: Path,
+    transaction: _HumanTransaction,
+    handle: BinaryIO,
+) -> None:
+    expected = transaction.expected
+    assert expected is not None
+    target_identity = _path_identity(target)
+    stage_identity = _path_identity(stage)
+    if stage_identity is None:
+        _clear_recovered_transaction(target, handle)
+        return
+    if stage_identity == expected and _managed_identity_matches(stage, expected):
+        _unlink_if_identity(stage, expected)
+        _clear_recovered_transaction(target, handle)
+        return
+    if target_identity is None:
+        try:
+            paths.atomic_rename_noreplace(stage, target)
+        except (OSError, ValueError) as exc:
+            raise HumanMarkdownConflict(
+                f"cannot restore a user HUMAN.md displaced during removal: {stage}"
+            ) from exc
+        _clear_recovered_transaction(target, handle)
+        return
+    _write_transaction(handle, None)
+    raise HumanMarkdownConflict(f"preserved a displaced user HUMAN.md at {stage}")
+
+
+def _recover_transaction(target: Path, handle: BinaryIO) -> None:
+    transaction = _read_transaction(target, handle)
+    if transaction is None:
+        return
+    stage = target.parent / transaction.stage_name
+    if transaction.operation == "publish":
+        _recover_publish_transaction(target, stage, transaction, handle)
+    else:
+        _recover_remove_transaction(target, stage, transaction, handle)
+
+
 @contextmanager
-def _human_lock(target: Path) -> Iterator[None]:
+def _human_lock(target: Path) -> Iterator[BinaryIO]:
     lock_path = target.parent / f".{target.name}.lock"
-    if target == paths.human_file():
+    if _is_canonical_target(target):
         handle = paths.open_private_lock_file(lock_path)
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -340,167 +655,139 @@ def _human_lock(target: Path) -> Iterator[None]:
         except BlockingIOError as exc:
             raise HumanMarkdownConflict(f"HUMAN.md refresh is already active: {target}") from exc
         try:
-            _recover_hardlink_crash(target)
-            yield
+            _recover_transaction(target, handle)
+            yield handle
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _stage_private_text(target: Path, content: str) -> Path:
-    """Write a complete private inode next to target without publishing it."""
+def _stage_publish_transaction(
+    target: Path,
+    content: str,
+    expected: _ManagedHuman | None,
+    handle: BinaryIO,
+) -> tuple[Path, _HumanTransaction]:
     target.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-    staged = Path(name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        staged.unlink(missing_ok=True)
-        raise
-    return staged
-
-
-def _fsync_parent(target: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        directory_fd = os.open(target.parent, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(directory_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(directory_fd)
-
-
-def _recover_hardlink_crash(target: Path) -> None:
-    """Drop only our same-inode temp names after a link-publication crash."""
-    try:
-        target_metadata = target.lstat()
-    except FileNotFoundError:
-        return
-    if not stat.S_ISREG(target_metadata.st_mode) or target_metadata.st_nlink <= 1:
-        return
-
-    identity = (target_metadata.st_dev, target_metadata.st_ino)
-    lock_name = f".{target.name}.lock"
-    removed = False
-    try:
-        candidates = tuple(target.parent.glob(f".{target.name}.*"))
-    except OSError as exc:
-        raise HumanMarkdownConflict(f"cannot inspect HUMAN.md crash artifacts: {target}") from exc
-    for candidate in candidates:
-        if candidate.name == lock_name:
-            continue
-        try:
-            metadata = candidate.lstat()
-        except FileNotFoundError:
-            continue
-        if stat.S_ISREG(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == identity:
-            try:
-                candidate.unlink()
-            except OSError as exc:
-                raise HumanMarkdownConflict(
-                    f"cannot recover HUMAN.md crash artifact: {candidate}"
-                ) from exc
-            removed = True
-    if removed:
-        _fsync_parent(target)
-
-
-def _move_existing_target(target: Path) -> Path:
-    """Move the exact current target aside so it can be verified before replacement."""
-    fd, name = tempfile.mkstemp(prefix=f".{target.name}.replaced.", dir=target.parent)
-    os.close(fd)
-    displaced = Path(name)
-    try:
-        os.replace(target, displaced)
-    except BaseException:
-        displaced.unlink(missing_ok=True)
-        raise
-    return displaced
-
-
-def _restore_displaced(target: Path, displaced: Path) -> bool:
-    """Restore a captured unknown inode without overwriting a newer target."""
-    try:
-        metadata = displaced.lstat()
-        if stat.S_ISREG(metadata.st_mode):
-            os.link(displaced, target, follow_symlinks=False)
-        elif stat.S_ISLNK(metadata.st_mode):
-            os.symlink(os.readlink(displaced), target)
-        else:
-            return False
-    except OSError:
-        return False
-    displaced.unlink(missing_ok=True)
-    _fsync_parent(target)
-    return True
-
-
-def _raise_changed_target(target: Path, displaced: Path) -> None:
-    if _restore_displaced(target, displaced):
-        raise HumanMarkdownConflict(f"HUMAN.md changed during refresh and was preserved: {target}")
-    raise HumanMarkdownConflict(
-        f"HUMAN.md changed during refresh; preserved the displaced file at {displaced}"
+    stage = _new_stage_path(target)
+    transaction = _HumanTransaction(
+        operation="publish",
+        stage_name=stage.name,
+        expected=expected.identity if expected else None,
+        candidate=None,
     )
-
-
-def _capture_managed_target(target: Path, expected: _ManagedHuman) -> Path:
+    _write_transaction(handle, transaction)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
-        displaced = _move_existing_target(target)
-    except FileNotFoundError as exc:
-        raise HumanMarkdownConflict(f"HUMAN.md disappeared during refresh: {target}") from exc
+        fd = os.open(stage, flags, 0o600)
+    except OSError as exc:
+        _write_transaction(handle, None)
+        raise HumanMarkdownConflict(f"cannot create HUMAN.md transaction stage: {stage}") from exc
+    candidate: tuple[int, int] | None = None
     try:
-        captured = _managed_metadata(displaced)
-    except HumanMarkdownConflict:
-        _raise_changed_target(target, displaced)
-    if captured is None or captured.identity != expected.identity:
-        _raise_changed_target(target, displaced)
-    return displaced
-
-
-def _publish_staged(target: Path, staged: Path, expected: _ManagedHuman | None) -> None:
-    displaced: Path | None = None
-    if expected is not None:
-        displaced = _capture_managed_target(target, expected)
-    try:
-        # Hard-link publication is create-if-absent. Unlike os.replace(), it
-        # cannot destroy an unknown file an editor placed after our check.
-        os.link(staged, target, follow_symlinks=False)
-    except FileExistsError as exc:
-        if displaced is not None:
-            displaced.unlink(missing_ok=True)
-        raise HumanMarkdownConflict(
-            f"refusing to replace HUMAN.md created during refresh: {target}"
-        ) from exc
-    except BaseException as exc:
-        if displaced is not None and not _restore_displaced(target, displaced):
-            raise RuntimeError(
-                f"HUMAN.md refresh failed; previous projection preserved at {displaced}"
-            ) from exc
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise HumanMarkdownConflict(f"unsafe HUMAN.md transaction stage: {stage}")
+        os.fchmod(fd, 0o600)
+        candidate = metadata.st_dev, metadata.st_ino
+        transaction = _HumanTransaction(
+            operation="publish",
+            stage_name=stage.name,
+            expected=expected.identity if expected else None,
+            candidate=candidate,
+        )
+        _write_transaction(handle, transaction)
+        with os.fdopen(fd, "w", encoding="utf-8") as stage_handle:
+            fd = -1
+            stage_handle.write(content)
+            stage_handle.flush()
+            os.fsync(stage_handle.fileno())
+        _fsync_parent(target)
+        return stage, transaction
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        if candidate is not None:
+            _unlink_if_identity(stage, candidate)
+        _clear_recovered_transaction(target, handle)
         raise
-    staged.unlink(missing_ok=True)
-    if displaced is not None:
-        displaced.unlink(missing_ok=True)
-    _fsync_parent(target)
+
+
+def _publish_text_transaction(
+    target: Path,
+    content: str,
+    expected: _ManagedHuman | None,
+    handle: BinaryIO,
+) -> None:
+    stage, transaction = _stage_publish_transaction(target, content, expected, handle)
+    candidate = transaction.candidate
+    assert candidate is not None
+    try:
+        if expected is None:
+            try:
+                os.link(stage, target, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise HumanMarkdownConflict(
+                    f"refusing to replace HUMAN.md created during refresh: {target}"
+                ) from exc
+            _fsync_parent(target)
+            if _path_identity(target) != candidate:
+                raise HumanMarkdownConflict(f"HUMAN.md changed during publication: {target}")
+            if not _unlink_if_identity(stage, candidate):
+                raise HumanMarkdownConflict(
+                    f"HUMAN.md transaction stage changed during publication: {stage}"
+                )
+        else:
+            try:
+                paths.atomic_exchange(stage, target)
+            except (OSError, ValueError) as exc:
+                raise HumanMarkdownConflict(
+                    f"cannot atomically replace managed HUMAN.md: {target}"
+                ) from exc
+            _fsync_parent(target)
+            captured = _managed_metadata(stage)
+            if captured is None or captured.identity != expected.identity:
+                raise HumanMarkdownConflict(f"HUMAN.md changed during refresh: {target}")
+            if _path_identity(target) != candidate:
+                raise HumanMarkdownConflict(f"HUMAN.md changed after publication: {target}")
+            if not _unlink_if_identity(stage, expected.identity):
+                raise HumanMarkdownConflict(
+                    f"HUMAN.md transaction stage changed during publication: {stage}"
+                )
+        _fsync_parent(target)
+        _write_transaction(handle, None)
+    except BaseException:
+        _recover_transaction(target, handle)
+        raise
 
 
 def remove_managed_human_markdown(path: Path | None = None) -> bool:
     """Remove only a Persome-owned projection; preserve unknown user files."""
     target = path or paths.human_file()
-    with _human_lock(target):
+    with _human_lock(target) as handle:
         metadata = _managed_metadata(target)
         if metadata is None:
             return False
-        displaced = _capture_managed_target(target, metadata)
-        displaced.unlink(missing_ok=True)
-        _fsync_parent(target)
-        return True
+        stage = _new_stage_path(target)
+        transaction = _HumanTransaction("remove", stage.name, metadata.identity, None)
+        _write_transaction(handle, transaction)
+        try:
+            try:
+                paths.atomic_rename_noreplace(target, stage)
+            except (OSError, ValueError) as exc:
+                raise HumanMarkdownConflict(f"cannot atomically remove HUMAN.md: {target}") from exc
+            _fsync_parent(target)
+            captured = _managed_metadata(stage)
+            if captured is None or captured.identity != metadata.identity:
+                raise HumanMarkdownConflict(f"HUMAN.md changed during removal: {target}")
+            if not _unlink_if_identity(stage, metadata.identity):
+                raise HumanMarkdownConflict(
+                    f"HUMAN.md transaction stage changed during removal: {stage}"
+                )
+            _clear_recovered_transaction(target, handle)
+            return True
+        except BaseException:
+            _recover_transaction(target, handle)
+            raise
 
 
 def materialize_human_markdown(
@@ -510,16 +797,14 @@ def materialize_human_markdown(
     redacted: bool = False,
 ) -> Path:
     """Atomically write a truthful HUMAN.md, including an honest cold-start view."""
-    validate_snapshot(snapshot)
     target = out_path or paths.human_file()
+    _raise_if_update_pending(target)
+    validate_snapshot(snapshot)
     content = render_human_markdown(snapshot, redacted=redacted)
-    with _human_lock(target):
+    with _human_lock(target) as handle:
+        _raise_if_update_pending(target)
         metadata = _managed_metadata(target)
-        staged = _stage_private_text(target, content)
-        try:
-            _publish_staged(target, staged, metadata)
-        finally:
-            staged.unlink(missing_ok=True)
+        _publish_text_transaction(target, content, metadata, handle)
     return target
 
 
@@ -556,29 +841,30 @@ def sync_live_human_markdown() -> Path:
     explicit forming-state file rather than a fabricated portrait.
     """
     from ..store import fts
-    from .build import build_live_snapshot, load_live_manifest
+    from .build import _build_live_snapshot_from_manifest, live_model_generation
 
     target = paths.human_file()
-    manifest = load_live_manifest()
-    current = _managed_metadata(target)
-    build_id = manifest.get("build_id")
-    if (
-        current is not None
-        and current.get("human_schema_version") == HUMAN_SCHEMA_VERSION
-        and current.get("renderer_version") == HUMAN_RENDERER_VERSION
-        and current.get("build_id") == build_id
-        and current.get("build_status") == manifest.get("status")
-    ):
-        return target
+    _raise_if_update_pending(target)
+    with live_model_generation() as manifest:
+        with _human_lock(target):
+            current = _managed_metadata(target)
+        build_id = manifest.get("build_id")
+        if (
+            current is not None
+            and current.get("human_schema_version") == HUMAN_SCHEMA_VERSION
+            and current.get("renderer_version") == HUMAN_RENDERER_VERSION
+            and current.get("build_id") == build_id
+            and current.get("build_status") == manifest.get("status")
+        ):
+            return target
 
-    if manifest.get("status") == "building" and current is not None:
-        return target
-    if manifest.get("status") not in _SUPPORTED_BUILD_STATUSES:
-        return materialize_human_markdown(_placeholder_snapshot(manifest), out_path=target)
+        if manifest.get("status") == "building":
+            if current is not None:
+                return target
+            raise HumanMarkdownConflict("HUMAN.md backfill waits for the active model build")
+        if manifest.get("status") not in _SUPPORTED_BUILD_STATUSES:
+            return materialize_human_markdown(_placeholder_snapshot(manifest), out_path=target)
 
-    with fts.cursor() as conn:
-        snapshot = build_live_snapshot(conn, redact=False)
-    snapshot_build = snapshot.get("build") if isinstance(snapshot.get("build"), dict) else {}
-    if snapshot_build.get("status") not in _SUPPORTED_BUILD_STATUSES:
-        return materialize_human_markdown(_placeholder_snapshot(snapshot_build), out_path=target)
-    return materialize_human_markdown(snapshot, out_path=target)
+        with fts.cursor() as conn:
+            snapshot = _build_live_snapshot_from_manifest(conn, manifest, redact=False)
+        return materialize_human_markdown(snapshot, out_path=target)
