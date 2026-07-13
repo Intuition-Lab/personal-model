@@ -165,6 +165,34 @@ def test_stdio_server_skips_daemon_http_routes(ac_root: Path) -> None:
     assert server._custom_starlette_routes == []
 
 
+# MCP clients truncate server instructions hard (Claude Code cuts at 2048
+# chars); everything an agent needs to decide WHETHER and WHAT to call must
+# survive that cut, with the fold marker telling truncated clients the rest
+# is elaboration.
+_INSTRUCTIONS_TRUNCATION_BUDGET = 2048
+
+
+def test_server_instructions_fit_client_truncation_budget() -> None:
+    head = mcp_server._SERVER_INSTRUCTIONS[:_INSTRUCTIONS_TRUNCATION_BUDGET]
+    assert "## When to use" in head
+    assert "## Tool routing" in head
+    for tool in (
+        "behavior_patterns",
+        "entity_graph",
+        "search(query)",
+        "verify_fact",
+        "current_context",
+        "search_captures",
+        "recent_activity",
+        "list_memories",
+        "read_memory",
+        "correct_memory",
+        "remember",
+    ):
+        assert tool in head, f"routing for {tool} fell below the truncation fold"
+    assert "suffice if this document was truncated" in head
+
+
 # ─── search_captures + current_context ────────────────────────────────────
 
 
