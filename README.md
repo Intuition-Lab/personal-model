@@ -1,14 +1,14 @@
-# Readme
+<h1 align="center">Readme</h1>
 
-**About**: **Build your HUMAN.md.**
+<p align="center"><b>About</b>: <b>Build your HUMAN.md.</b></p>
 
-<p align="center"><b>[Personal Model]</b></p>
+<h2 align="center">[Personal Model]</h2>
 
-<p align="center"><b>Build your Personal Model →</b><br>☆ Star Persome on GitHub</p>
+<p align="center"><b>Build your Personal Model →</b><br>☆ <a href="https://github.com/Intuition-Lab/personal-model">Star Persome on GitHub</a></p>
 
-### **Build your Personal Model**
+<h3 align="center">Build your Personal Model</h3>
 
-The open-source personal model that makes every AI yours.
+<p align="center">The open-source personal model that makes every AI yours.</p>
 
 Persome learns how you actually think and work from everything you see, say, hear, and do—then gives Codex, Claude Code, and any MCP agent the context to pick up where you left off, understand what matters, and work while you sleep.
 
@@ -16,7 +16,9 @@ Persome learns how you actually think and work from everything you see, say, hea
 
 **Runs locally on your Mac. Private by default. Yours to inspect, correct, export, and delete.**
 
-### What is it？
+---
+
+## What is it？
 
 Your `HUMAN.md`
 
@@ -32,9 +34,11 @@ Persome connects activity into progressively deeper context:
 
 New evidence can strengthen, revise, or overturn an earlier inference. Every important claim keeps receipts.
 
-### Use case
+---
 
-1. **One Root — A Model of You**
+## Use case
+
+### 1. One Root — A Model of You
 
 **Thousands of moments. One evolving model of you.**
 
@@ -44,7 +48,7 @@ Persome turns sourced observations into relationships, patterns, higher-order st
 
 From Points to Lines, Faces, Volumes, and one Root—a living model of who you are and what matters now.
 
-1. **Same AI. Different You.**
+### 2. Same AI. Different You.
 
 <p align="center"><img src="docs/assets/readme/same-ai-different-you.png" alt="" width="100%"></p>
 
@@ -54,7 +58,7 @@ Two people can give the same AI the same prompt and deserve different answers. Y
 
 The same prompt should not produce the same answer for everyone. Give AI a model of you.
 
-1. **One MCP - Trun coding agent into proactive agent** 
+### 3. One MCP - Trun coding agent into proactive agent
 
 <p align="center"><img src="docs/assets/readme/one-mcp.png" alt="" width="100%"></p>
 
@@ -64,19 +68,21 @@ Connect Persome once through MCP. Codex, Claude Code, and other trusted agents c
 
 Persome identifies unfinished work, ranks it against your priorities, and separates safe local tasks from decisions that need you. The connected agent executes; you keep authority over external actions.
 
-**-Continue where you left off** 
+#### -Continue where you left off
 
 <p align="center"><img src="docs/assets/readme/continue-where-you-left-off.png" alt="这张图片展示了Persome作为编程代理的功能场景，核心呈现“继续未完工作”的能力。页面左侧标注了三个待处理任务，分别为README、Onboarding和MCP，附带对应时间；右侧CODEX区域显示已恢复的工作状态，即此前准备Persome的启动事宜，当前目标是让Personal Model在五分钟内可见，下一步工作为修复新用户引导的验证，同时呈现了当前项目目录、git状态及未暂存的文件改动，印证该工具可将个人工作模型同步给编程代理，帮助用户从断点处继续推进工作。" width="100%"></p>
 
-**-Work while you sleep**
+#### -Work while you sleep
 
 <p align="center"><img src="docs/assets/readme/work-while-you-sleep.png" alt="图片展示了Persome的“Work While You Sleep”功能界面。左侧“30 OPEN LOOPS”部分，呈现了Personal Model、Tests、Dependencies、Codebase、Docs等模块及对应数值。中间“5 SAFE TO COMPLETE”部分，有Safe Task Filter，可筛选权限范围、数据访问、网络、命令、外部动作等。右侧“MORNING REPORT”部分，列出已完成本地任务、等待决策任务、外部动作等，还展示了权限边界设置。该图与上下文介绍的Persome功能相呼应，直观呈现其工作模式。" width="100%"></p>
 
-### Install, connect, and verify
+---
+
+## Install, connect, and verify
 
 **Choose the path that matches what you want to prove.** The synthetic demo and the real-data install are intentionally separate.
 
-#### 1. Five-minute synthetic demo
+### 1. Five-minute synthetic demo
 
 Try the complete Persome model without touching your personal data. This path requires Git and [uv](https://docs.astral.sh/uv/getting-started/installation/), but no API key, macOS Accessibility permission, or access to your existing `~/.persome` data.
 
@@ -88,7 +94,7 @@ uv run python scripts/sample_demo.py
 
 The script opens the local viewer at `http://127.0.0.1:8743/model` and deletes its temporary synthetic data when you press `Ctrl-C`. Add `--showcase` for the denser, still fully synthetic graph shown in the README.
 
-#### 2. Install with your data
+### 2. Install with your data
 
 Requirements: macOS 13 or newer and Xcode Command Line Tools. For the shortest package-managed installation:
 
@@ -125,7 +131,7 @@ persome llm setup
 persome llm status --check
 ```
 
-#### 3. Connect a trusted MCP client
+### 3. Connect a trusted MCP client
 
 Register whichever owner-local clients you use:
 
@@ -146,7 +152,7 @@ persome install mcp-json --filename persome-mcp.json
 
 > MCP access is a personal-data capability; register only clients you trust.
 
-#### 4. Verify and ask grounded questions
+### 4. Verify and ask grounded questions
 
 ```text
 persome status
@@ -165,7 +171,7 @@ After connecting an MCP client, try:
 
 Active work is reduced every five minutes by default. With valid capture and a working semantic provider, a first useful recall is operationally expected within about ten minutes—not guaranteed as a benchmark result.
 
-#### 5. Update Persome
+### 5. Update Persome
 
 For a `uv tool` installation, upgrade with the package manager and re-run Runtime proof:
 
@@ -182,5 +188,7 @@ persome update
 ```
 
 `persome update` preserves configuration, credentials, personal data, capture policy, and lifecycle intent, and performs its own mode-aware onboarding before committing the update. Do not use it to update a package-manager-managed installation.
+
+---
 
 <p align="center"><a href="https://github.com/Intuition-Lab/personal-model"><b>Star Persome on GitHub</b></a> · <a href="https://registry.modelcontextprotocol.io/?q=Persome">Official MCP Registry</a> · <a href="https://github.com/Intuition-Lab/personal-model/blob/main/docs/mcp-clients.md">MCP client setup</a> · <a href="https://github.com/Intuition-Lab/personal-model/blob/main/SECURITY_PRIVACY.md">Security &amp; privacy</a></p>
