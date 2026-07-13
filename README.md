@@ -26,11 +26,10 @@ export, and delete.**
 **[Connect an MCP client](#3-connect-a-trusted-mcp-client)** ·
 **[Star Persome on GitHub](https://github.com/Intuition-Lab/personal-model)**
 
-![Persome local personal-model viewer rendering a dense synthetic Point, Line, Face, Volume, and Root graph](docs/assets/persome-model-hero.png)
+![Illustration of the Persome Personal Model, with evidence-linked Points, Lines, Faces, Volumes, and a Root](docs/assets/persome-readme-hero.png)
 
-_Actual `/model` screenshot produced by `scripts/sample_demo.py --showcase`: 424
-synthetic Points, 146 Lines, 12 Faces, 4 Volumes, and 1 Root. It contains no
-personal data._
+_Illustration of an evidence-backed Personal Model. The real local `/model`
+viewer and synthetic Runtime proof are shown in the demo below._
 
 ## What Persome does
 
@@ -66,11 +65,17 @@ degraded instead of fabricating a Face, Volume, or Root. Every important claim
 keeps receipts, and new evidence can strengthen, revise, or overturn an earlier
 inference.
 
+![Illustration of activity becoming evidence-linked Points, Lines, Faces, Volumes, and at most one current Root](docs/assets/persome-one-root.png)
+
+_Concept illustration; higher layers appear only when supported by evidence._
+
 ## Same AI. Your context.
 
 Two people can ask the same assistant the same question and reasonably need
 different answers. Persome gives a connected agent source-linked context about
 the person it is working for without hiding where that context came from.
+
+![The same AI using different personal-model context to give two people different grounded answers](docs/assets/persome-same-ai.png)
 
 - **Continue where you left off.** Search recent work and decisions, inspect
   receipts, and look for evidence of unfinished work.
@@ -97,8 +102,14 @@ cd personal-model
 uv run python scripts/sample_demo.py
 ```
 
-Add `--showcase` to render the denser, still fully synthetic model used in the
-README image.
+Add `--showcase` to render the denser, still fully synthetic model shown in the
+Runtime screenshot below.
+
+![Persome local personal-model viewer rendering a dense synthetic Point, Line, Face, Volume, and Root graph](docs/assets/persome-model-hero.png)
+
+_Actual `/model` screenshot produced by `scripts/sample_demo.py --showcase`: 424
+synthetic Points, 146 Lines, 12 Faces, 4 Volumes, and 1 Root. It contains no
+personal data._
 
 The script opens `http://127.0.0.1:8743/model`, serves MCP at
 `http://127.0.0.1:8743/mcp`, and deletes its temporary synthetic data when you
