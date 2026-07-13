@@ -252,10 +252,16 @@ class TestViewPage:
         assert 'id="zoom-reset"' in body
         assert 'id="zoom-in"' in body
         assert "Scroll or pinch to zoom" in body
+        assert 'role="tablist"' in body
+        assert 'data-detail-tab="overview"' in body
+        assert 'data-detail-tab="evidence"' in body
+        assert 'data-detail-tab="history"' in body
+        assert 'id="evidence-breadcrumbs"' in body
 
     def test_bundled_viewer_assets_are_served(self, ac_root):
         three = routes.model_asset("three.module.js")
         layout = routes.model_asset("layout.mjs")
+        evidence = routes.model_asset("evidence.mjs")
         share = routes.model_asset("share.mjs")
         viewer = routes.model_asset("viewer.js")
         css = routes.model_asset("viewer.css")
@@ -263,6 +269,7 @@ class TestViewPage:
         assert len(three.body) > 1_000_000
         assert b"class WebGLRenderer" in three.body
         assert b"computeClusterLayout" in layout.body
+        assert b"nodeEvidenceCards" in evidence.body
         assert b"buildXIntentUrl" in share.body
         assert b"drawShareCard" in share.body
         assert b'from "./layout.mjs"' in viewer.body
@@ -278,6 +285,11 @@ class TestViewPage:
         assert b"controller.abort()" in viewer.body
         assert b'retry.textContent = "Retry"' in viewer.body
         assert b"fetch(`./node" in viewer.body
+        assert b"fetch(`./evidence?ref=" in viewer.body
+        assert b"Direct evidence" in viewer.body
+        assert b"Nearby context" in viewer.body
+        assert b"Technical details" in viewer.body
+        assert b"evidenceTrail" in viewer.body
         assert b'fetch("/model' not in viewer.body
         assert b"ACESFilmicToneMapping" in viewer.body
         assert b"model.root?.signature" in viewer.body
@@ -310,6 +322,8 @@ class TestViewPage:
         assert b".zoom-controls" in css.body
         assert b".share-button" in css.body
         assert b".share-notice" in css.body
+        assert b".evidence-link" in css.body
+        assert b".evidence-breadcrumbs" in css.body
         assert b".error button" in css.body
         assert b"(min-width: 1181px) and (max-width: 1360px)" in css.body
         assert b"top: 116px" in css.body
@@ -333,6 +347,32 @@ class TestViewPage:
         assert "pickables.push(line)" not in viewer
         assert "pointer-events: auto" in css
         assert '.model-label[aria-expanded="true"]' in css
+
+
+class TestEvidenceResolverRoute:
+    def test_point_receipt_resolves_through_unified_endpoint(self, ac_root):
+        _save_point(
+            node_id="point-runtime",
+            content="The runtime stores auditable local context.",
+            file_name="synthetic/runtime.md",
+        )
+
+        detail = routes.model_evidence(ref="⟨point-runtime:synthetic/runtime.md⟩")
+
+        assert detail["kind"] == "point"
+        assert detail["id"] == "point-runtime"
+        assert detail["path"] == "synthetic/runtime.md"
+        assert detail["summary"] == "The runtime stores auditable local context."
+        assert detail["status"] == "active"
+
+    def test_unknown_receipt_remains_an_inspectable_missing_result(self, ac_root):
+        receipt = "⟨expired:project-old.md⟩"
+
+        detail = routes.model_evidence(ref=receipt)
+
+        assert detail["canonical_reference"] == receipt
+        assert detail["status"] == "missing"
+        assert detail["metadata"]["receipt_preserved"] is True
 
 
 class TestNodeReceipts:

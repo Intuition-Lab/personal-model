@@ -80,8 +80,22 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       <button id="close-detail" class="icon-button close" type="button" aria-label="Close details" title="Close details">×</button>
       <p class="detail-eyebrow"><span id="detail-kind" class="detail-kind"></span><span>Evidence-backed</span></p>
       <h1 id="detail-title"></h1>
-      <div id="detail-meta" class="detail-meta"></div>
-      <div id="detail-receipts" class="detail-receipts"></div>
+      <nav id="detail-tabs" class="detail-tabs" role="tablist" aria-label="Detail views">
+        <button id="detail-tab-overview" type="button" role="tab" data-detail-tab="overview" aria-controls="detail-overview" aria-selected="true">Overview</button>
+        <button id="detail-tab-evidence" type="button" role="tab" data-detail-tab="evidence" aria-controls="detail-evidence" aria-selected="false" tabindex="-1">Evidence</button>
+        <button id="detail-tab-history" type="button" role="tab" data-detail-tab="history" aria-controls="detail-history" aria-selected="false" tabindex="-1">History</button>
+      </nav>
+      <section id="detail-overview" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-overview">
+        <div id="detail-summary" class="detail-summary"></div>
+        <div id="detail-meta" class="detail-meta"></div>
+      </section>
+      <section id="detail-evidence" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-evidence" hidden>
+        <nav id="evidence-breadcrumbs" class="evidence-breadcrumbs" aria-label="Evidence drill-down"></nav>
+        <div id="detail-receipts" class="detail-receipts"></div>
+      </section>
+      <section id="detail-history" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-history" hidden>
+        <div id="detail-history-list" class="detail-receipts"></div>
+      </section>
     </aside>
 
     <div id="empty" class="empty" hidden>

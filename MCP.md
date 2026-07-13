@@ -54,6 +54,7 @@ Example client configuration:
 | `read_memory` | Read a memory file with time, tag, and tail filters. |
 | `search` | Search durable memory with lexical and optional dense retrieval. |
 | `read_receipt` | Resolve an entry ID to local provenance. |
+| `resolve_evidence` | Resolve any model ID or receipt one layer down with human labels; separates direct sources, nearby context, and Point history. |
 | `recent_activity` | Read recent durable event entries. |
 | `behavior_patterns` | Read modeled patterns and supporting evidence. |
 | `get_model_snapshot` | Return the versioned Point/Line/Face/Volume/Root model. |
@@ -79,6 +80,11 @@ Example client configuration:
 
 The server exposes no computer-use, meeting, notification, product dashboard,
 or task-lifecycle tools.
+
+`resolve_evidence` returns a human-readable `label` for display, keeps the
+stable technical handle in `reference`, and separates `sources`, `context`, and
+Point predecessor/successor `history`. Consumers must not present nearby
+`context` as direct proof.
 
 ## Transport configuration
 

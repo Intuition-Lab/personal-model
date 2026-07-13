@@ -3,6 +3,13 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
 import { computeClusterLayout, zoomMath } from "./layout.mjs";
 import {
+  evidenceBreadcrumb,
+  evidenceOverview,
+  nodeEvidenceCards,
+  nodeHistoryCards,
+  relationLabel,
+} from "./evidence.mjs";
+import {
   SHARE_CARD_HEIGHT,
   SHARE_CARD_WIDTH,
   SHARE_FILE_NAME,
@@ -26,8 +33,13 @@ const statusEl = document.getElementById("status");
 const detailEl = document.getElementById("detail");
 const detailKindEl = document.getElementById("detail-kind");
 const detailTitleEl = document.getElementById("detail-title");
+const detailSummaryEl = document.getElementById("detail-summary");
 const detailMetaEl = document.getElementById("detail-meta");
 const detailReceiptsEl = document.getElementById("detail-receipts");
+const detailHistoryEl = document.getElementById("detail-history-list");
+const evidenceBreadcrumbsEl = document.getElementById("evidence-breadcrumbs");
+const detailTabEls = [...document.querySelectorAll("[data-detail-tab]")];
+const detailPanelEls = [...document.querySelectorAll(".detail-panel")];
 const emptyEl = document.getElementById("empty");
 const errorEl = document.getElementById("error");
 const modelIdentityEl = document.getElementById("model-identity");
@@ -97,6 +109,10 @@ let pointerDown = null;
 let hoverPointer = null;
 let hoverDirty = false;
 let selected = null;
+let selectedItem = null;
+let detailMode = "node";
+let evidenceTrail = [];
+let evidenceRequest = 0;
 let portraitMode = null;
 let labels = [];
 let pickables = [];
@@ -785,7 +801,11 @@ function syncSelectionState() {
 }
 
 function clearSelection() {
+  evidenceRequest += 1;
   selected = null;
+  selectedItem = null;
+  detailMode = "node";
+  evidenceTrail = [];
   detailEl.hidden = true;
   delete detailEl.dataset.kind;
   syncSelectionState();
@@ -821,26 +841,259 @@ function appendMeta(label, value) {
   detailMetaEl.appendChild(row);
 }
 
-function receiptValues(item) {
+function setDetailTab(tab, focus = false) {
+  detailTabEls.forEach((button) => {
+    const active = button.dataset.detailTab === tab;
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+    if (active && focus) button.focus();
+  });
+  detailPanelEls.forEach((panel) => {
+    panel.hidden = panel.id !== `detail-${tab}`;
+  });
+}
+
+function technicalDetails(link) {
+  const details = document.createElement("details");
+  details.className = "evidence-technical";
+  const summary = document.createElement("summary");
+  summary.textContent = "Technical details";
   const values = [
-    item.receipt,
-    item.source_evidence?.receipt,
-    ...(item.member_receipts || []),
-    ...(item.source_receipts || []),
+    link.id ? `ID: ${link.id}` : "",
+    link.reference ? `Receipt: ${link.reference}` : "",
   ].filter(Boolean);
-  return [...new Set(values)];
+  const body = document.createElement("div");
+  body.textContent = values.join("\n");
+  details.append(summary, body);
+  return details;
+}
+
+function evidenceCard(link, { drill = true } = {}) {
+  const card = document.createElement("article");
+  card.className = "evidence-card";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "evidence-link";
+  const relationEl = document.createElement("span");
+  relationEl.textContent = relationLabel(link.relation);
+  const labelEl = document.createElement("b");
+  labelEl.textContent = link.label || "Recorded evidence";
+  button.append(relationEl, labelEl);
+  if (link.timestamp || link.status) {
+    const meta = document.createElement("small");
+    meta.textContent = [link.status, link.timestamp].filter(Boolean).join(" · ");
+    button.appendChild(meta);
+  }
+  if (drill && (link.reference || link.id)) {
+    button.addEventListener("click", () => {
+      setDetailTab("evidence");
+      loadEvidence(link.reference || link.id);
+    });
+  } else {
+    button.disabled = true;
+  }
+  card.append(button, technicalDetails(link));
+  return card;
+}
+
+function appendEvidenceGroup(title, links, note = "") {
+  if (!links?.length) return;
+  const heading = document.createElement("strong");
+  heading.textContent = title;
+  detailReceiptsEl.appendChild(heading);
+  if (note) {
+    const copy = document.createElement("p");
+    copy.className = "evidence-note";
+    copy.textContent = note;
+    detailReceiptsEl.appendChild(copy);
+  }
+  links.forEach((link) => {
+    detailReceiptsEl.appendChild(evidenceCard(link));
+  });
+}
+
+function renderBreadcrumbs() {
+  evidenceBreadcrumbsEl.replaceChildren();
+  evidenceTrail.forEach((crumb, index) => {
+    if (index) {
+      const separator = document.createElement("span");
+      separator.textContent = "/";
+      separator.setAttribute("aria-hidden", "true");
+      evidenceBreadcrumbsEl.appendChild(separator);
+    }
+    if (index === evidenceTrail.length - 1) {
+      const current = document.createElement("strong");
+      current.textContent = crumb.label;
+      current.setAttribute("aria-current", "page");
+      evidenceBreadcrumbsEl.appendChild(current);
+      return;
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = crumb.label;
+    button.addEventListener("click", () => {
+      evidenceTrail = evidenceTrail.slice(0, index + 1);
+      if (crumb.data) renderEvidence(crumb.data);
+      else renderNodeEvidence(selected.kind, selectedItem);
+    });
+    evidenceBreadcrumbsEl.appendChild(button);
+  });
+}
+
+function renderEvidence(data) {
+  detailReceiptsEl.replaceChildren();
+  renderBreadcrumbs();
+
+  const heading = document.createElement("strong");
+  heading.textContent = evidenceBreadcrumb(data);
+  detailReceiptsEl.appendChild(heading);
+  if (data.summary) {
+    const summary = document.createElement("p");
+    summary.className = "evidence-summary";
+    summary.textContent = data.summary;
+    detailReceiptsEl.appendChild(summary);
+  }
+  const facts = [
+    data.kind ? `Kind: ${data.kind}` : "",
+    data.status ? `Status: ${data.status}` : "",
+    data.timestamp ? `Time: ${data.timestamp}` : "",
+  ].filter(Boolean);
+  facts.forEach((fact) => {
+    const row = document.createElement("div");
+    row.className = "evidence-fact";
+    row.textContent = fact;
+    detailReceiptsEl.appendChild(row);
+  });
+  appendEvidenceGroup("Direct sources", data.sources);
+  appendEvidenceGroup("Version history", data.history);
+  appendEvidenceGroup(
+    "Nearby context",
+    data.context,
+    "These captures are close in time. They are investigation clues, not claimed direct proof.",
+  );
+  if (data.status === "missing") {
+    const missing = document.createElement("p");
+    missing.className = "evidence-note evidence-missing";
+    missing.textContent = "The receipt is retained, but its local payload was not found or has expired.";
+    detailReceiptsEl.appendChild(missing);
+  }
+  const technical = technicalDetails({
+    id: data.id,
+    reference: data.canonical_reference || data.reference,
+  });
+  if (data.path) {
+    const body = technical.querySelector("div");
+    body.textContent += `${body.textContent ? "\n" : ""}Path: ${data.path}`;
+  }
+  detailReceiptsEl.appendChild(technical);
+}
+
+async function loadEvidence(reference) {
+  if (!selected || !reference) return;
+  detailMode = "evidence";
+  const request = ++evidenceRequest;
+  detailReceiptsEl.replaceChildren();
+  const loading = document.createElement("div");
+  loading.className = "evidence-loading";
+  loading.textContent = "Resolving evidence…";
+  detailReceiptsEl.appendChild(loading);
+  try {
+    const response = await fetch(`./evidence?ref=${encodeURIComponent(reference)}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (!selected || request !== evidenceRequest || detailMode !== "evidence") return;
+    evidenceTrail.push({ label: evidenceBreadcrumb(data), data });
+    renderEvidence(data);
+  } catch (error) {
+    if (!selected || request !== evidenceRequest || detailMode !== "evidence") return;
+    detailReceiptsEl.replaceChildren();
+    renderBreadcrumbs();
+    const message = document.createElement("p");
+    message.className = "evidence-note evidence-missing";
+    message.textContent = `Unable to resolve evidence. ${error.message || error}`;
+    detailReceiptsEl.appendChild(message);
+  }
+}
+
+function renderNodeEvidence(kind, item) {
+  detailMode = "node";
+  evidenceRequest += 1;
+  detailReceiptsEl.replaceChildren();
+  renderBreadcrumbs();
+
+  const cards = nodeEvidenceCards(item, model);
+  if (cards.length) {
+    const heading = document.createElement("strong");
+    heading.textContent = "Direct evidence";
+    detailReceiptsEl.appendChild(heading);
+    cards.slice(0, 12).forEach((card) => {
+      detailReceiptsEl.appendChild(evidenceCard(card));
+    });
+  } else {
+    const empty = document.createElement("p");
+    empty.className = "evidence-note";
+    empty.textContent = "No direct evidence receipts are attached to this object.";
+    detailReceiptsEl.appendChild(empty);
+  }
+
+  if (kind === "point") {
+    fetch(`./node?id=${encodeURIComponent(item.id)}`)
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => {
+        if (!data || !selected || detailMode !== "node"
+          || selected.kind !== kind || selected.id !== item.id) return;
+        (data.raw || []).slice(0, 3).forEach((raw) => {
+          const row = document.createElement("div");
+          row.className = "evidence-preview";
+          row.textContent = `${raw.ts ? `${String(raw.ts).slice(0, 16)}  ` : ""}${raw.text || ""}`;
+          detailReceiptsEl.appendChild(row);
+        });
+      })
+      .catch(() => {});
+  }
+}
+
+function renderOverview(kind, item) {
+  detailSummaryEl.replaceChildren();
+  const overview = evidenceOverview(kind, item, model);
+  const heading = document.createElement("strong");
+  heading.textContent = overview.title;
+  const copy = document.createElement("p");
+  copy.textContent = overview.copy;
+  detailSummaryEl.append(heading, copy);
+  overview.highlights.forEach((card) => {
+    detailSummaryEl.appendChild(evidenceCard(card));
+  });
+}
+
+function renderNodeHistory(item) {
+  detailHistoryEl.replaceChildren();
+  const history = nodeHistoryCards(item, model);
+  if (!history.length) {
+    const empty = document.createElement("p");
+    empty.className = "evidence-note";
+    empty.textContent = "No previous or next version is recorded for this object.";
+    detailHistoryEl.appendChild(empty);
+    return;
+  }
+  const heading = document.createElement("strong");
+  heading.textContent = "Version trail";
+  detailHistoryEl.appendChild(heading);
+  history.forEach((link) => detailHistoryEl.appendChild(evidenceCard(link)));
 }
 
 function showDetails(kind, item) {
   selected = { kind, id: item.id };
+  selectedItem = item;
   pauseAutoRotate();
   syncSelectionState();
   detailEl.dataset.kind = kind;
   detailKindEl.textContent = kind;
   detailTitleEl.textContent = item.content || item.signature || item.label || item.id;
+  evidenceTrail = [{ label: detailTitleEl.textContent, data: null }];
   detailMetaEl.replaceChildren();
-  detailReceiptsEl.replaceChildren();
-  appendMeta("ID", item.id);
   appendMeta("Layer", item.layer || item.level);
   appendMeta("Status", item.status);
   appendMeta("Predicate", item.label || item.predicate);
@@ -848,33 +1101,11 @@ function showDetails(kind, item) {
   appendMeta("Observations", item.observations);
   appendMeta("Valid from", item.valid_from);
   appendMeta("Members", item.members?.length);
-
-  const receipts = receiptValues(item);
-  if (receipts.length) {
-    const heading = document.createElement("strong");
-    heading.textContent = "Receipts";
-    detailReceiptsEl.appendChild(heading);
-    receipts.slice(0, 12).forEach((receipt) => {
-      const row = document.createElement("div");
-      row.textContent = receipt;
-      detailReceiptsEl.appendChild(row);
-    });
-  }
+  renderOverview(kind, item);
+  renderNodeEvidence(kind, item);
+  renderNodeHistory(item);
+  setDetailTab("overview");
   detailEl.hidden = false;
-
-  if (kind === "point") {
-    fetch(`./node?id=${encodeURIComponent(item.id)}`)
-      .then((response) => response.ok ? response.json() : null)
-      .then((data) => {
-        if (!data || !selected || selected.kind !== kind || selected.id !== item.id) return;
-        (data.raw || []).slice(0, 3).forEach((raw) => {
-          const row = document.createElement("div");
-          row.textContent = `${raw.ts ? `${String(raw.ts).slice(0, 16)}  ` : ""}${raw.text || ""}`;
-          detailReceiptsEl.appendChild(row);
-        });
-      })
-      .catch(() => {});
-  }
 }
 
 function updateTimelineBounds() {
@@ -1147,6 +1378,17 @@ document.querySelectorAll("[data-layer]").forEach((button) => {
     layerVisible[layer] = !layerVisible[layer];
     applyLayerVisibility();
     if (window.__persomeViewerState) window.__persomeViewerState.layers = { ...layerVisible };
+  });
+});
+
+detailTabEls.forEach((button, index) => {
+  button.addEventListener("click", () => setDetailTab(button.dataset.detailTab));
+  button.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const direction = event.key === "ArrowRight" ? 1 : -1;
+    const next = (index + direction + detailTabEls.length) % detailTabEls.length;
+    setDetailTab(detailTabEls[next].dataset.detailTab, true);
   });
 });
 

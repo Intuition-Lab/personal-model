@@ -261,8 +261,8 @@ capture and session pipeline. OCR is a fallback, not a parallel cloud recorder.
 - Authenticated streamable HTTP MCP: `http://127.0.0.1:8742/mcp`
 - stdio MCP: `persome mcp`
 - Stable model contract: `persome model export` and `GET /model/graph`
-- Evidence tools: `search`, `read_receipt`, `verify_fact`, and
-  `get_model_snapshot`
+- Evidence tools: `search`, `read_receipt`, `resolve_evidence`, `verify_fact`,
+  and `get_model_snapshot`
 
 ## Connect an MCP client
 
