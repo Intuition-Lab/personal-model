@@ -24,6 +24,13 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
 </head>
 <body>
   <main id="viewer" aria-label="Persome personal model explorer">
+    <div id="line-explorer" class="line-explorer" hidden>
+      <label for="line-select">Open a model line</label>
+      <select id="line-select">
+        <option value="">Choose a relationship…</option>
+      </select>
+    </div>
+
     <div id="canvas"></div>
 
     <header class="topbar">
@@ -75,13 +82,6 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       <div><span class="swatch volume"></span><b>Volume</b><span>cross-pattern structure</span></div>
       <div><span class="swatch root"></span><b>Root</b><span>current personal model</span></div>
     </aside>
-
-    <div id="line-explorer" class="line-explorer" hidden>
-      <label for="line-select">Open a model line</label>
-      <select id="line-select">
-        <option value="">Choose a relationship…</option>
-      </select>
-    </div>
 
     <aside id="detail" class="detail" aria-labelledby="detail-title" aria-live="polite" hidden>
       <button id="close-detail" class="icon-button close" type="button" aria-label="Close details" title="Close details">×</button>
