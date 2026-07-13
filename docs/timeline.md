@@ -37,7 +37,7 @@ Only closed windows are produced. The current half-formed window sits as "traili
 `timeline/aggregator.py` reads each capture's S1 fields (`focused_element`, `visible_text`, `url`, `window_meta`) — **not** the raw AX tree during normal operation. This keeps the prompt tractable:
 
 - `visible_text` is a pre-rendered, length-capped markdown view of the AX tree (capped at 10 KB per capture by S1, then capped at 4 KB per capture by the timeline prompt).
-- `focused_element` carries the user's current cursor / input context (role, title, value, editable flag). When `is_editable=true` and `value_length > 0`, the value is the user's own typed content — the prompt treats this as the highest-priority signal to preserve verbatim.
+- `focused_element` carries the user's current cursor / input context (role, title, value, editable flag). Before this boundary, S1 removes standard AX placeholders and locally matched Chromium `.placeholder` descendants. Therefore, when `is_editable=true` and `value_length > 0`, the remaining value is user-authored content and the prompt treats it as the highest-priority signal to preserve verbatim.
 - `url` is regex-extracted from visible text when present.
 - When capture JSON has no AX text and `ocr_submitted=true`, the aggregator
   consults the OCR backfill in `captures` FTS before declaring the window empty.
@@ -111,7 +111,7 @@ SELECT * FROM timeline_blocks
  ORDER BY start_time ASC
 ```
 
-Where `:start_bound` is `flush_end` (or `session.start` on the first flush) and `:end_bound` is `now` (flush) or `session.end` (terminal). All overlapping blocks are fed to the reducer LLM along with the window's wall-clock range. The reducer emits per-window-range sub_tasks like `[13:25-13:30, Cursor] edited tick.py; "fixed _stem_to_dt for negative offsets"; involving persome/timeline/aggregator.py`.
+Where `:start_bound` is `flush_end` (or `session.start` on the first flush) and `:end_bound` is `now` (flush) or `session.end` (terminal). All overlapping blocks are fed to the reducer LLM along with the window's wall-clock range. Earlier entries from the same daily file are deliberately not included: `flush_end` already prevents overlap, while replaying old task bodies biases later same-day summaries toward stale work. The reducer emits per-window-range sub_tasks like `[13:25-13:30, Cursor] edited tick.py; "fixed _stem_to_dt for negative offsets"; involving persome/timeline/aggregator.py`.
 
 ## Tuning
 

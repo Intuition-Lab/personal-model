@@ -129,6 +129,55 @@ def test_non_starting_client_skips_integrity_during_pid_publication_window(
         lock.close()
 
 
+def test_non_recovering_init_never_inspects_or_repairs_database(
+    ac_root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_fail_if_runtime_state_is_ambiguous", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "_read_pid",
+        lambda: pytest.fail("non-recovering init inspected the daemon PID"),
+    )
+    monkeypatch.setattr(
+        cli.integrity,
+        "check_and_recover",
+        lambda: pytest.fail("non-recovering init touched SQLite"),
+    )
+
+    assert cli._init(recover_integrity=False) is not None
+
+
+def test_mcp_uses_non_recovering_initialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    init_kwargs: list[dict[str, bool]] = []
+    started: list[bool] = []
+    monkeypatch.setattr(cli, "_init", lambda **kwargs: init_kwargs.append(kwargs))
+
+    from persome.mcp import server as mcp_server
+
+    monkeypatch.setattr(mcp_server, "run_stdio", lambda: started.append(True))
+    cli.mcp()
+
+    assert init_kwargs == [{"recover_integrity": False}]
+    assert started == [True]
+
+
+def test_mcp_keeps_initialization_notices_off_protocol_stdout(
+    ac_root,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli.paths.config_file().unlink(missing_ok=True)
+
+    from persome.mcp import server as mcp_server
+
+    monkeypatch.setattr(mcp_server, "run_stdio", lambda: None)
+    cli.mcp()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Created default config" in captured.err
+
+
 def test_cli_surfaces_database_recovery_and_model_rebuild_next_step(
     ac_root, monkeypatch: pytest.MonkeyPatch
 ) -> None:

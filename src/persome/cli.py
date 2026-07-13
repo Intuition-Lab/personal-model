@@ -96,7 +96,11 @@ def _daemon_lock_is_held() -> bool:
         handle.close()
 
 
-def _init(*, starting_runtime: bool = False) -> config_mod.Config:
+def _init(
+    *,
+    starting_runtime: bool = False,
+    recover_integrity: bool = True,
+) -> config_mod.Config:
     paths.ensure_dirs()
     # Every initialized CLI command gets the same owner-only Runtime secrets as
     # the daemon. In particular, one-shot commands such as `model build` run
@@ -111,7 +115,7 @@ def _init(*, starting_runtime: bool = False) -> config_mod.Config:
     # The daemon owns active SQLite writes. A status/MCP/second-start invocation
     # must never quarantine or rebuild an index while that process has it open.
     # When stopped, this remains the first database-touching operation.
-    if not _read_pid() and (starting_runtime or not _daemon_lock_is_held()):
+    if recover_integrity and not _read_pid() and (starting_runtime or not _daemon_lock_is_held()):
         recovered = integrity.check_and_recover()
         if paths.integrity_recovery_pending().exists():
             console.print(
@@ -1090,12 +1094,15 @@ def _format_ping(res) -> str:  # type: ignore[no-untyped-def]
 @app.command()
 def mcp() -> None:
     """Run the MCP server (stdio). For LLM client config."""
-    _init()
-
-    # env file (OPENAI_* embeddings creds live there) exactly like `persome start`,
-    # else the stdio server's read path can never activate hybrid dense and an
-    # LLM client silently gets a weaker memory than the in-daemon server.
-    env_file_mod.load_env_file(paths.env_file())
+    # Per-client MCP startup must never run database recovery. Besides adding a
+    # full SQLite scan to every handshake, an older daemon may not publish the
+    # current PID/lock receipts and could be writing while a newer stdio client
+    # decides the database is offline. Daemon startup and explicit maintenance
+    # commands retain the recovery path.
+    # Stdio stdout is the JSON-RPC transport. Keep first-run config notices and
+    # lifecycle diagnostics visible on stderr without corrupting the protocol.
+    with contextlib.redirect_stdout(sys.stderr):
+        _init(recover_integrity=False)
     from .mcp import server as mcp_server
 
     mcp_server.run_stdio()
@@ -3219,6 +3226,8 @@ def rebuild_captures_index(
     """
     import json
 
+    from .capture import s1_parser
+
     _init()
     buf = paths.capture_buffer_dir()
     files = sorted(p for p in buf.iterdir() if p.is_file() and p.suffix == ".json")
@@ -3226,6 +3235,16 @@ def rebuild_captures_index(
     indexed = 0
     skipped = 0
     with fts.cursor() as conn:
+        # OCR text is a DB-only backfill: raw JSON intentionally keeps an
+        # empty ``visible_text`` sentinel plus ``ocr_submitted=true``. Preserve
+        # those rows across both exact and merge rebuilds instead of silently
+        # replacing recognized text with the raw empty sentinel.
+        ocr_backfills = {
+            str(row["id"]): str(row["visible_text"] or "")
+            for row in conn.execute(
+                "SELECT id, visible_text FROM captures WHERE visible_text != ''"
+            ).fetchall()
+        }
         # Exact rebuild is reconciliation, not just an upsert pass. Recovery
         # merge intentionally preserves older snapshot rows whose source JSON
         # has already aged out of the bounded capture buffer.
@@ -3238,6 +3257,18 @@ def rebuild_captures_index(
                 skipped += 1
                 console.print(f"[yellow]skip {p.name}: {exc}[/yellow]")
                 continue
+            if not isinstance(data, dict):
+                skipped += 1
+                console.print(f"[yellow]skip {p.name}: capture is not a JSON object[/yellow]")
+                continue
+            preserve_ocr = bool(data.get("ocr_submitted")) and not str(
+                data.get("visible_text") or ""
+            )
+            data = s1_parser.sanitize_capture(data)
+            preserved_ocr = s1_parser.sanitize_ocr_text(
+                data,
+                ocr_backfills.get(p.stem, ""),
+            )
             meta = data.get("window_meta") or {}
             focused = data.get("focused_element") or {}
             try:
@@ -3250,7 +3281,11 @@ def rebuild_captures_index(
                     window_title=meta.get("title") or "",
                     focused_role=focused.get("role") or "",
                     focused_value=focused.get("value") or "",
-                    visible_text=data.get("visible_text") or "",
+                    visible_text=(
+                        preserved_ocr
+                        if preserve_ocr and not data.get("visible_text")
+                        else data.get("visible_text") or ""
+                    ),
                     url=data.get("url") or "",
                 )
                 indexed += 1
