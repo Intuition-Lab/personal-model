@@ -44,7 +44,7 @@ idempotent recheck, not a prerequisite `stop`/`start` cycle. It requests
 Accessibility for the actual source-versioned AX helper and watcher, applies
 the durable OCR policy, proves the final Runtime owner and generation, and
 returns the receipt appropriate to daemon, ingest, paused, or locked mode.
-Onboarding also offers a read-only history import so the first model need not
+Unified localhost onboarding also offers a read-only history import so the first model need not
 start empty. Local folders are always available; Obsidian and Notion choices
 appear only when detected locally. See [Import existing knowledge](importing.md).
 

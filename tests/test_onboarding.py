@@ -722,7 +722,7 @@ def test_installer_runs_strict_onboarding_gate() -> None:
 def test_installer_schedules_and_emphasizes_model_open_cta() -> None:
     script = (Path(__file__).resolve().parents[1] / "install.sh").read_text(encoding="utf-8")
 
-    assert 'persome" model open --after 30' in script
+    assert 'persome" model open --onboarding' in script
     assert "Your Personal Model Opens in 30 Minutes" not in script
     assert "YOUR NEXT STEP — OPEN YOUR PERSONAL MODEL" not in script
     assert "MODEL CTA — KEEP PERSOME RUNNING" in script

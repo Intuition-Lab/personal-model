@@ -756,10 +756,10 @@ schedule_model_open() {
   fi
 
   echo ""
-  if PERSOME_ROOT="${INSTALL_HOME}" "${INSTALL_BIN_DIR}/persome" model open --after 30; then
+  if PERSOME_ROOT="${INSTALL_HOME}" "${INSTALL_BIN_DIR}/persome" model open --onboarding; then
     MODEL_OPEN_SCHEDULED=1
   else
-    warn "could not schedule the model viewer; open it manually with 'persome model open'"
+    warn "could not open setup; open it manually with 'persome model open --onboarding'"
   fi
 }
 
@@ -877,19 +877,18 @@ EOF
     cat <<'EOF'
 
 MODEL CTA — KEEP PERSOME RUNNING:
-  ✓ Your local personal-model viewer is scheduled to open automatically in
-    30 minutes. This is your next step: let Persome learn from real activity,
-    then explore the model it forms. To open it sooner, run:
+  ✓ Unified setup opened in your browser. Choose any existing history, then
+    Persome will build and open your local personal model. To reopen setup, run:
 
-      persome model open
+      persome model open --onboarding
 EOF
   else
     cat <<'EOF'
 
 MODEL CTA — OPEN YOUR PERSONAL MODEL:
-  Keep Persome running for about 30 minutes, then explore the model it forms:
+  Open unified setup to finish importing history and building your model:
 
-      persome model open
+      persome model open --onboarding
 EOF
   fi
 

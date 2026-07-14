@@ -2969,6 +2969,11 @@ def model_open(
         min=0.0,
         hidden=True,
     ),
+    onboarding: bool = typer.Option(
+        False,
+        "--onboarding",
+        help="Open the unified setup experience instead of the model.",
+    ),
 ) -> None:
     """Open the local model viewer through a short-lived browser capability."""
     if after and scheduled_after_seconds:
@@ -3007,8 +3012,11 @@ def model_open(
         headers = auth_headers()
         for attempt in range(_MODEL_VIEWER_STARTUP_ATTEMPTS):
             try:
+                bootstrap_endpoint = f"{base_url}{BROWSER_BOOTSTRAP_PATH}"
+                if onboarding:
+                    bootstrap_endpoint += "?view=onboarding"
                 response = httpx.post(
-                    f"{base_url}{BROWSER_BOOTSTRAP_PATH}",
+                    bootstrap_endpoint,
                     headers=headers,
                     timeout=5.0,
                     trust_env=False,
@@ -3060,8 +3068,9 @@ def model_open(
         or parsed.netloc
         or parsed.path != BROWSER_BOOTSTRAP_PATH
         or parsed.fragment
-        or set(query) != {"nonce"}
+        or set(query) not in ({"nonce"}, {"nonce", "view"})
         or len(query["nonce"]) != 1
+        or ("view" in query and query["view"] != ["onboarding"])
     ):
         console.print("[red]The daemon returned an invalid browser capability.[/red]")
         raise typer.Exit(1)
@@ -3070,7 +3079,8 @@ def model_open(
     if not webbrowser.open(bootstrap_url, new=2):
         console.print("[red]The system browser could not be opened.[/red]")
         raise typer.Exit(1)
-    console.print("[green]Opened the authenticated local model viewer.[/green]")
+    destination = "onboarding" if onboarding else "model viewer"
+    console.print(f"[green]Opened the authenticated local {destination}.[/green]")
 
 
 @model_app.callback(invoke_without_command=True)

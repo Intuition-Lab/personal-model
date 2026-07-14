@@ -59,6 +59,11 @@ def model_build_manifest() -> Path:
     return root() / "model-build.json"
 
 
+def onboarding_state_file() -> Path:
+    """Owner-only progress receipt for resumable unified onboarding."""
+    return root() / ".onboarding-state.json"
+
+
 def human_file() -> Path:
     """Latest owner-only, human-readable projection of the personal model."""
     return root() / "HUMAN.md"

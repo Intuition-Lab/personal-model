@@ -37,6 +37,19 @@
         "summary": "Create Browser Bootstrap",
         "description": "Issue a short-lived URL that opens the authenticated local model viewer.\n\nThis POST itself requires the normal bearer token.  The returned URL holds\nonly a one-minute, single-use nonce — never the long-lived daemon token.",
         "operationId": "create_browser_bootstrap_auth_browser_bootstrap_post",
+        "parameters": [
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(model|onboarding)$",
+              "default": "model",
+              "title": "View"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -44,6 +57,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }

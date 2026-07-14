@@ -107,6 +107,11 @@ def _documents(root: Path) -> list[Path]:
     return sorted(found, key=lambda item: item.relative_to(root).as_posix().casefold())
 
 
+def count_documents(root: Path) -> int:
+    """Return the safely importable text-file count without reading contents."""
+    return len(_documents(root.expanduser().resolve(strict=True)))
+
+
 def _validate_source_root(root: Path) -> None:
     """Prevent generated Persome state from feeding back into its own model."""
     private_root = paths.root()

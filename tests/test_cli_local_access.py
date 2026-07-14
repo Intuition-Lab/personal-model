@@ -75,6 +75,38 @@ def test_model_open_exchanges_bearer_for_one_time_browser_url(ac_root: Path, mon
     assert token not in opened[0]
 
 
+def test_model_open_can_target_unified_onboarding(ac_root: Path, monkeypatch) -> None:
+    token = "t" * 48
+    monkeypatch.setenv(LOCAL_API_TOKEN_ENV, token)
+    requested: list[str] = []
+
+    def fake_post(url: str, **_kwargs):  # type: ignore[no-untyped-def]
+        requested.append(url)
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "bootstrap_url": "/auth/browser-bootstrap?nonce="
+                    + "n" * 43
+                    + "&view=onboarding"
+                },
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    opened: list[str] = []
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0: opened.append(url) or True)
+
+    result = CliRunner().invoke(cli.app, ["model", "open", "--onboarding"])
+
+    assert result.exit_code == 0, result.output
+    assert requested == ["http://127.0.0.1:8742/auth/browser-bootstrap?view=onboarding"]
+    assert opened[0].endswith("&view=onboarding")
+    assert "onboarding" in result.output
+
+
 def test_model_open_can_schedule_detached_one_shot_reminder(ac_root: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     launched: dict[str, object] = {}
 

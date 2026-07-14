@@ -58,6 +58,17 @@ _MODEL_GRAPH_CACHE_TTL_SECONDS = 15.0
 _model_graph_cache_lock = threading.Lock()
 _model_graph_cache: tuple[str, float, dict[str, Any]] | None = None
 
+_onboarding_task_lock = threading.Lock()
+_onboarding_task: dict[str, Any] = {
+    "stage": "idle",
+    "message": "",
+    "imported": 0,
+    "unchanged": 0,
+    "skipped": 0,
+    "error": "",
+}
+_onboarding_selected_paths: set[tuple[str, str]] = set()
+
 # Re-export config so it can be overridden during tests
 _cfg: Config | None = None
 
@@ -273,18 +284,24 @@ def health() -> ApiResponse:
 
 
 @router.post(BROWSER_BOOTSTRAP_PATH, response_model=ApiResponse, tags=["system"])
-def create_browser_bootstrap(response: Response) -> ApiResponse:
+def create_browser_bootstrap(
+    response: Response,
+    view: str = Query("model", pattern="^(model|onboarding)$"),
+) -> ApiResponse:
     """Issue a short-lived URL that opens the authenticated local model viewer.
 
     This POST itself requires the normal bearer token.  The returned URL holds
     only a one-minute, single-use nonce — never the long-lived daemon token.
     """
     nonce = issue_browser_bootstrap_nonce()
+    bootstrap_query = {"nonce": nonce}
+    if view == "onboarding":
+        bootstrap_query["view"] = view
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
     return ApiResponse(
         data={
-            "bootstrap_url": f"{BROWSER_BOOTSTRAP_PATH}?{urlencode({'nonce': nonce})}",
+            "bootstrap_url": f"{BROWSER_BOOTSTRAP_PATH}?{urlencode(bootstrap_query)}",
             "expires_in_seconds": BROWSER_BOOTSTRAP_TTL_SECONDS,
         }
     )
@@ -293,6 +310,7 @@ def create_browser_bootstrap(response: Response) -> ApiResponse:
 @router.get(BROWSER_BOOTSTRAP_PATH, include_in_schema=False)
 def consume_browser_bootstrap(
     nonce: str = Query(..., min_length=32, max_length=128),
+    view: str = Query("model", pattern="^(model|onboarding)$"),
 ) -> RedirectResponse:
     """Consume one browser nonce, set a model-only cookie, and redirect."""
     browser_session = consume_browser_bootstrap_nonce(nonce)
@@ -300,7 +318,8 @@ def consume_browser_bootstrap(
         raise HTTPException(status_code=410, detail="browser bootstrap expired or already used")
     session, path_token = browser_session
     viewer_path = f"/model/{path_token}"
-    response = RedirectResponse(url=f"{viewer_path}/", status_code=303)
+    suffix = "onboarding" if view == "onboarding" else ""
+    response = RedirectResponse(url=f"{viewer_path}/{suffix}", status_code=303)
     response.set_cookie(
         BROWSER_SESSION_COOKIE,
         session,
@@ -324,26 +343,21 @@ def permissions() -> ApiResponse:
     flow should poll this aggregate instead of creating another TCC identity.
     Fields are ``granted``, ``denied``, or mode-aware ``not_applicable``.
     """
+    return ApiResponse(data=_onboarding_permissions())
+
+
+def _onboarding_permissions() -> dict[str, str]:
     cfg = _get_cfg()
     if cfg.capture.source == "ingest":
-        return ApiResponse(
-            data={
-                "accessibility": "not_applicable",
-                "screen_recording": "not_applicable",
-            }
-        )
-    return ApiResponse(
-        data={
-            "accessibility": (
-                "granted"
-                if ax_capture.ax_trusted(include_watcher=cfg.capture.event_driven)
-                else "denied"
-            ),
-            "screen_recording": (
-                "granted" if screen_recording.has_screen_recording() else "denied"
-            ),
-        }
-    )
+        return {"accessibility": "not_applicable", "screen_recording": "not_applicable"}
+    return {
+        "accessibility": (
+            "granted"
+            if ax_capture.ax_trusted(include_watcher=cfg.capture.event_driven)
+            else "denied"
+        ),
+        "screen_recording": ("granted" if screen_recording.has_screen_recording() else "denied"),
+    }
 
 
 @router.get("/status", response_model=ApiResponse, tags=["system"])
@@ -478,6 +492,201 @@ def ingest_capture(body: CaptureIngestBody) -> ApiResponse:
 # ─── Personal model ───────────────────────────────────────────────────────
 
 
+def _set_onboarding_task(**changes: Any) -> None:
+    with _onboarding_task_lock:
+        _onboarding_task.update(changes)
+        paths.atomic_write_private_text(
+            paths.onboarding_state_file(),
+            __import__("json").dumps(_onboarding_task, ensure_ascii=False) + "\n",
+        )
+
+
+def _load_onboarding_task() -> dict[str, Any]:
+    with _onboarding_task_lock:
+        if _onboarding_task["stage"] != "idle":
+            return dict(_onboarding_task)
+        try:
+            stored = __import__("json").loads(
+                paths.onboarding_state_file().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError):
+            return dict(_onboarding_task)
+        if not isinstance(stored, dict):
+            return dict(_onboarding_task)
+        allowed = {"stage", "message", "imported", "unchanged", "skipped", "error"}
+        restored = {key: stored[key] for key in allowed if key in stored}
+        if restored.get("stage") in {"importing", "building"}:
+            restored.update(
+                stage="failed",
+                message="Setup was interrupted safely.",
+                error="Choose the same sources to resume from the last completed document.",
+            )
+        _onboarding_task.update(restored)
+        return dict(_onboarding_task)
+
+
+def _run_onboarding_import(sources: list[tuple[str, Path]]) -> None:
+    from .. import source_import
+
+    try:
+        results = []
+        for source_type, root in sources:
+            _set_onboarding_task(
+                stage="importing",
+                message=f"Reading {root.name} without changing source files…",
+            )
+            results.append(source_import.import_folder(root, source_type=source_type))
+        imported = sum(result.imported for result in results)
+        unchanged = sum(result.unchanged for result in results)
+        skipped = sum(result.skipped for result in results)
+        if any(result.session_ids for result in results):
+            _set_onboarding_task(
+                stage="building",
+                message="Forming durable memories and relationships…",
+                imported=imported,
+                unchanged=unchanged,
+                skipped=skipped,
+            )
+            source_import.build_imported_model(_get_cfg())
+        _set_onboarding_task(
+            stage="complete",
+            message="Your personal model is ready.",
+            imported=imported,
+            unchanged=unchanged,
+            skipped=skipped,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced as a resumable UI task
+        logger.warning("onboarding import failed: %s", exc, exc_info=True)
+        _set_onboarding_task(stage="failed", error=str(exc), message="Import paused safely.")
+
+
+@router.get("/model/onboarding", response_class=HTMLResponse, include_in_schema=False)
+def onboarding_view(request: Request) -> HTMLResponse:
+    from .onboarding_view import render_onboarding_view
+
+    base_path = str(request.scope.get("persome.viewer_base_path") or "/model/")
+    return HTMLResponse(render_onboarding_view(base_path))
+
+
+@router.get("/model/onboarding/state", response_model=ApiResponse, include_in_schema=False)
+def onboarding_state() -> ApiResponse:
+    from .. import source_import
+
+    sources: list[dict[str, Any]] = []
+    vaults = source_import.discover_obsidian_vaults()
+    if vaults:
+        vault = vaults[0]
+        sources.append(
+            {
+                "type": "obsidian",
+                "label": f"Obsidian — {vault.name}",
+                "detail": f"{source_import.count_documents(vault)} notes detected",
+            }
+        )
+    if source_import.notion_is_installed():
+        sources.append(
+            {
+                "type": "notion",
+                "label": "Notion export",
+                "detail": "Choose an unpacked Markdown export",
+            }
+        )
+    sources.append(
+        {
+            "type": "folder",
+            "label": "Local folder",
+            "detail": "Choose Markdown or text files",
+        }
+    )
+    task = _load_onboarding_task()
+    return ApiResponse(
+        data={"permissions": _onboarding_permissions(), "sources": sources, "task": task}
+    )
+
+
+@router.post("/model/onboarding/open-settings", response_model=ApiResponse, include_in_schema=False)
+def onboarding_open_settings(
+    kind: str = Query(..., pattern="^(accessibility|screen_recording)$"),
+) -> ApiResponse:
+    from .. import onboarding as onboarding_mod
+
+    if kind == "accessibility":
+        ax_capture.request_accessibility_permission(include_watcher=_get_cfg().capture.event_driven)
+        onboarding_mod.open_accessibility_settings()
+    else:
+        screen_recording.request_screen_recording()
+        onboarding_mod.open_screen_recording_settings()
+    return ApiResponse(data={"opened": kind})
+
+
+@router.post("/model/onboarding/select-folder", response_model=ApiResponse, include_in_schema=False)
+def onboarding_select_folder(
+    source: str = Query(..., pattern="^(folder|notion)$"),
+) -> ApiResponse:
+    from ..onboarding import OnboardingUI
+
+    prompt = (
+        "Choose your unpacked Notion Markdown export folder"
+        if source == "notion"
+        else "Choose a local folder of Markdown or text files"
+    )
+    selected = OnboardingUI(gui=True).choose_folder(prompt)
+    resolved = str(selected.resolve()) if selected else None
+    if resolved is not None:
+        with _onboarding_task_lock:
+            _onboarding_selected_paths.add((source, resolved))
+    return ApiResponse(data={"path": resolved})
+
+
+@router.post("/model/onboarding/import", response_model=ApiResponse, include_in_schema=False)
+def onboarding_import(body: dict[str, Any]) -> ApiResponse:
+    from .. import source_import
+
+    with _onboarding_task_lock:
+        if _onboarding_task["stage"] in {"importing", "building"}:
+            raise HTTPException(status_code=409, detail="an onboarding import is already running")
+    requested = body.get("sources")
+    if not isinstance(requested, list) or len(requested) > 3:
+        raise HTTPException(status_code=422, detail="sources must be a list of up to three items")
+    resolved: list[tuple[str, Path]] = []
+    for item in requested:
+        if not isinstance(item, dict) or item.get("type") not in {"obsidian", "notion", "folder"}:
+            raise HTTPException(status_code=422, detail="invalid import source")
+        source_type = str(item["type"])
+        if source_type == "obsidian":
+            vaults = source_import.discover_obsidian_vaults()
+            if not vaults:
+                raise HTTPException(status_code=409, detail="no local Obsidian vault is available")
+            root = vaults[0]
+        else:
+            raw_path = item.get("path")
+            if not isinstance(raw_path, str) or not raw_path:
+                raise HTTPException(status_code=422, detail=f"{source_type} needs a chosen folder")
+            try:
+                root = Path(raw_path).expanduser().resolve(strict=True)
+            except OSError as exc:
+                raise HTTPException(status_code=422, detail="chosen folder is unavailable") from exc
+            with _onboarding_task_lock:
+                selection = (source_type, str(root))
+                if selection not in _onboarding_selected_paths:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="choose this folder from the onboarding page first",
+                    )
+                _onboarding_selected_paths.remove(selection)
+        resolved.append((source_type, root))
+    _set_onboarding_task(
+        stage="importing",
+        message="Preparing selected sources…",
+        imported=0,
+        unchanged=0,
+        skipped=0,
+        error="",
+    )
+    threading.Thread(target=_run_onboarding_import, args=(resolved,), daemon=True).start()
+    return ApiResponse(data={"started": True})
+
+
 @router.get("/model", response_class=HTMLResponse, tags=["model"])
 def model_view(request: Request) -> HTMLResponse:
     """Render the local Point/Line/Face/Volume/Root model explorer."""
@@ -489,6 +698,8 @@ def model_view(request: Request) -> HTMLResponse:
 
 _MODEL_ASSETS = {
     "evidence.mjs",
+    "onboarding.css",
+    "onboarding.js",
     "three.module.js",
     "layout.mjs",
     "share.mjs",
