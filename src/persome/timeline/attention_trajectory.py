@@ -60,7 +60,10 @@ def build_attention_trajectory(
             return
         first, last = run[0], run[-1]
         rep = max(run, key=lambda b: b.attention_confidence)
-        dwell = int((last.end_time - first.start_time).total_seconds())
+        # A short missing interval may remain in one trajectory run so the path
+        # does not fragment, but it is not observed attention. Sum only the
+        # durations of blocks that actually exist instead of the run envelope.
+        dwell = sum(max(0, int((b.end_time - b.start_time).total_seconds())) for b in run)
         spans.append(
             AttentionSpan(
                 surface=first.attention_surface,

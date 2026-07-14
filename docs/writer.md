@@ -34,6 +34,12 @@ call appends the trailing entry and marks the session reduced. An empty terminal
 window is a successful no-write reduction because earlier flushes may already
 cover it.
 
+When timeline blocks carry attention-locus metadata, the reducer prompt adds up
+to 12 dwell-ranked surface titles. Dwell sums only observed block duration;
+tolerated gaps keep the trajectory readable but never add time. Raw titles are
+whitespace-normalized, limited to 240 characters, JSON-quoted, and explicitly
+marked as untrusted data rather than instructions.
+
 Malformed output enters the persisted reducer retry queue. After five attempts,
 the deterministic heuristic writes one coarse subtask per observed app, tagged
 `heuristic`. Event files are reducer-owned; other writers may read but cannot
