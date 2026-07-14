@@ -95,6 +95,12 @@ Ollama, LM Studio, and vLLM. Presets describe endpoint defaults, not a blanket
 capability guarantee for every model. Use `custom-openai` or
 `custom-anthropic` for another compatible gateway.
 
+OpenAI and Azure OpenAI requests prefer the current `max_completion_tokens`
+output limit, while other compatible providers prefer `max_tokens`. If the
+selected endpoint explicitly rejects its preferred parameter, Persome retries
+once when it returns a recognized parameter-rejection error, then remembers the
+accepted choice for the process lifetime.
+
 During onboarding, Persome can discover common provider-specific variables such
 as keys exported by provider CLIs or existing shell profiles. They are import
 sources only; the saved Runtime profile always references `PERSOME_LLM_API_KEY`.

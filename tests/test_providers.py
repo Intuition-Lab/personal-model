@@ -70,6 +70,20 @@ def test_selected_provider_routing_prefix_is_removed(monkeypatch) -> None:
     assert profile.wire_model == "gpt-4.1-mini"
 
 
+def test_explicit_provider_id_is_case_insensitive(monkeypatch) -> None:
+    _clear_provider_env(monkeypatch)
+    profile = resolve_profile(
+        ModelConfig(
+            provider="OpenAI",
+            protocol="openai",
+            model="openai/gpt-4.1-mini",
+            api_key_env=LLM_API_KEY_ENV,
+        )
+    )
+    assert profile.provider == "openai"
+    assert profile.wire_model == "gpt-4.1-mini"
+
+
 def test_local_provider_does_not_require_a_key(monkeypatch) -> None:
     _clear_provider_env(monkeypatch)
     profile = resolve_profile(

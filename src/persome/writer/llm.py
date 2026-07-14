@@ -18,7 +18,7 @@ from typing import Any, cast
 
 from ..config import Config, ModelConfig
 from ..logger import get
-from ..providers import ResolvedLLMProfile, resolve_profile
+from ..providers import ResolvedLLMProfile, create_openai_chat_completion, resolve_profile
 
 logger = get("persome.writer")
 
@@ -318,13 +318,17 @@ def call_llm(
         openai_kwargs: dict[str, Any] = {
             "model": profile.wire_model,
             "messages": _to_openai_messages(messages),
-            "max_tokens": model_cfg.max_tokens or _DEFAULT_MAX_TOKENS,
         }
         if tools:
             openai_kwargs["tools"] = _to_openai_tools(tools)
         # ``extra`` contains Anthropic-specific controls in existing callers.
         # Do not leak those unsupported fields into compatible gateways.
-        resp = _openai_client(profile).chat.completions.create(**openai_kwargs)
+        resp = create_openai_chat_completion(
+            profile,
+            _openai_client(profile).chat.completions.create,
+            limit=model_cfg.max_tokens or _DEFAULT_MAX_TOKENS,
+            **openai_kwargs,
+        )
     if json_mode and resp.choices and resp.choices[0].message.content:
         resp.choices[0].message.content = _unfence_json(resp.choices[0].message.content)
     return resp
@@ -424,10 +428,12 @@ def ping_stage(cfg: Config, stage: str, *, timeout: float = 5.0) -> PingResult:
                 base_url=profile.base_url,
                 timeout=timeout,
             )
-            client.chat.completions.create(
+            create_openai_chat_completion(
+                profile,
+                client.chat.completions.create,
+                limit=4,
                 model=profile.wire_model,
                 messages=[{"role": "user", "content": "Reply with 'ok'."}],
-                max_tokens=4,
             )
     except Exception as exc:  # noqa: BLE001
         label = type(exc).__name__
