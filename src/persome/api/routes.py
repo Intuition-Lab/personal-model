@@ -541,7 +541,7 @@ def model_graph() -> dict[str, Any]:
         if cached is not None:
             return cached
 
-        with fts_store.cursor() as conn:
+        with fts_store.canonical_read_cursor() as conn:
             # This bearer/capability-protected loopback route is the owner's raw
             # inspection surface. MCP and CLI exports retain redaction by default.
             snapshot = build_live_snapshot(conn, redact=False)
@@ -576,7 +576,7 @@ def model_evidence(
     from ..evidence import resolve_evidence
     from ..store import fts as fts_store
 
-    with fts_store.cursor() as conn:
+    with fts_store.canonical_read_cursor() as conn:
         return resolve_evidence(conn, ref)
 
 
@@ -599,7 +599,7 @@ def model_node(
     raw: list[dict[str, Any]] = []
     source = ""
     try:
-        with fts_store.cursor() as conn:
+        with fts_store.canonical_read_cursor() as conn:
             conn.row_factory = sqlite3.Row
             if id != "self":
                 try:

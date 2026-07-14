@@ -60,6 +60,19 @@ def _save_point(
 
 
 class TestGraphJson:
+    def test_graph_does_not_initialize_unrelated_fts_indexes(self, ac_root, monkeypatch):
+        _save_point(node_id="point-runtime", content="Canonical model remains readable.")
+
+        def fail_fts_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("derived FTS is malformed")
+
+        monkeypatch.setattr(fts, "connect", fail_fts_connect)
+
+        graph = routes.model_graph()
+
+        assert graph["model"]["stats"]["points"] == 1
+        assert graph["model"]["points"][0]["id"] == "point-runtime"
+
     def test_graph_uses_transactionally_stable_live_reader(self, ac_root, monkeypatch):
         sentinel = {"schema_version": 1, "source": "live-reader"}
         calls = []

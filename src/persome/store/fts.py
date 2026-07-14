@@ -961,6 +961,44 @@ def cursor(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
             conn.close()
 
 
+@contextmanager
+def canonical_read_cursor(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
+    """Read canonical tables without initializing derived FTS projections.
+
+    Model/evidence inspection must remain available when a rebuildable FTS5
+    index is damaged.  ``cursor()`` intentionally enforces secure FTS setup on
+    every ordinary connection, so it is the wrong boundary for routes that do
+    not query either virtual table.  This read-only connection still uses the
+    shared database-activity lock, path/symlink validation, WAL visibility, and
+    SQLite page-one probe; it simply cannot write or instantiate FTS tables.
+    """
+    database_path = db_path or paths.index_db()
+    _prepare_database_path(database_path)
+    if not database_path.exists():
+        # Preserve first-run behavior: an absent database still needs normal
+        # schema initialization. It cannot contain a corrupt derived index yet.
+        with cursor(database_path) as conn:
+            yield conn
+        return
+
+    with database_activity(database_path):
+        conn = sqlite3.connect(
+            f"{database_path.absolute().as_uri()}?mode=ro",
+            uri=True,
+            isolation_level=None,
+            timeout=10.0,
+            check_same_thread=False,
+        )
+        try:
+            _disable_checkpoint_on_close(conn)
+            conn.row_factory = sqlite3.Row
+            conn.create_function("persome_epoch", 1, capture_timestamp_epoch)
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+            yield conn
+        finally:
+            conn.close()
+
+
 def open_runtime_owner() -> sqlite3.Connection:
     """Open and fully initialize the daemon's transaction-free owner handle."""
     if _CLIENT_PROCESS:
