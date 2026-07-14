@@ -228,6 +228,31 @@ CREATE TABLE memory_contradictions (
     resolved_at TEXT
 );
 
+-- ---- store/health_events.py ----
+
+CREATE TABLE health_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    timezone TEXT,
+    device TEXT,
+    device_id TEXT,
+    metadata_json TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    UNIQUE(provider, external_id)
+);
+
+CREATE INDEX idx_health_events_metric_time
+    ON health_events(metric, started_at DESC);
+
+CREATE INDEX idx_health_events_provider_time
+    ON health_events(provider, started_at DESC);
+
 -- ---- store/memory_deltas.py ----
 
 CREATE TABLE memory_deltas (

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -13,6 +14,8 @@ MAX_CAPTURE_JSON_BYTES = 12 * 1024 * 1024
 MAX_CAPTURE_IMAGE_B64_CHARS = 8 * 1024 * 1024
 MAX_CAPTURE_METADATA_BYTES = 128 * 1024
 MAX_CAPTURE_AX_TREE_BYTES = 8 * 1024 * 1024
+MAX_HEALTH_EVENTS_PER_REQUEST = 1000
+MAX_HEALTH_METADATA_BYTES = 64 * 1024
 
 
 def _json_size(value: Any) -> int:
@@ -108,3 +111,47 @@ class CaptureIngestBody(BaseModel):
         if _json_size(self.model_dump()) > MAX_CAPTURE_JSON_BYTES:
             raise ValueError(f"capture payload exceeds {MAX_CAPTURE_JSON_BYTES} bytes")
         return self
+
+
+class HealthEventSource(BaseModel):
+    """Device/provider identity attached to a health event."""
+
+    provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    device: str | None = Field(default=None, max_length=160)
+    device_id: str | None = Field(default=None, max_length=256)
+
+
+class HealthEvent(BaseModel):
+    """One normalized observation produced by HealthKit or another connector."""
+
+    event_id: str = Field(min_length=1, max_length=512)
+    source: HealthEventSource
+    metric: str = Field(min_length=1, max_length=96, pattern=r"^[a-z][a-z0-9_.-]*$")
+    value: float | str
+    unit: str = Field(default="", max_length=32)
+    started_at: datetime
+    ended_at: datetime | None = None
+    timezone: str | None = Field(default=None, max_length=64)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _valid_event(self) -> HealthEvent:
+        if self.started_at.tzinfo is None:
+            raise ValueError("started_at must include a timezone offset")
+        if self.ended_at is not None:
+            if self.ended_at.tzinfo is None:
+                raise ValueError("ended_at must include a timezone offset")
+            if self.ended_at < self.started_at:
+                raise ValueError("ended_at must not precede started_at")
+        if isinstance(self.value, str) and not self.value.strip():
+            raise ValueError("string value must not be empty")
+        if _json_size(self.metadata) > MAX_HEALTH_METADATA_BYTES:
+            raise ValueError(f"metadata exceeds {MAX_HEALTH_METADATA_BYTES} bytes")
+        return self
+
+
+class HealthEventsImportBody(BaseModel):
+    """Bounded batch of normalized health events."""
+
+    schema_version: Literal[1] = 1
+    events: list[HealthEvent] = Field(min_length=1, max_length=MAX_HEALTH_EVENTS_PER_REQUEST)

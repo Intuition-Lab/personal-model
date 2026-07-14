@@ -81,6 +81,15 @@ is degraded or stale, its JSON payload carries an `index_health` object
 capture index raises an actionable tool error rather than returning silently
 partial results.
 
+## Wearable tools
+
+| Tool | Purpose |
+|---|---|
+| `query_health_metrics` | Query owner-authorized wearable observations by metric, provider, time range, and limit. |
+
+Wearable results are raw consumer-device observations with source and import
+timestamps. Clients must not present them as medical diagnoses.
+
 `resolve_evidence` returns explicit stored lineage in `sources` and
 time-adjacent capture clues in `context`. Consumers must not present `context`
 as direct proof. Display `label` as the human-readable card title and keep

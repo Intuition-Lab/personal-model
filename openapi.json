@@ -182,6 +182,48 @@
         }
       }
     },
+    "/health-events/import": {
+      "post": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Import Health Events",
+        "description": "Import a normalized, idempotent batch from a trusted local connector.",
+        "operationId": "import_health_events_health_events_import_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HealthEventsImportBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/model": {
       "get": {
         "tags": [
@@ -498,6 +540,153 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "HealthEvent": {
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id"
+          },
+          "source": {
+            "$ref": "#/components/schemas/HealthEventSource"
+          },
+          "metric": {
+            "type": "string",
+            "maxLength": 96,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_.-]*$",
+            "title": "Metric"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Value"
+          },
+          "unit": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Unit",
+            "default": ""
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "event_id",
+          "source",
+          "metric",
+          "value",
+          "started_at"
+        ],
+        "title": "HealthEvent",
+        "description": "One normalized observation produced by HealthKit or another connector."
+      },
+      "HealthEventSource": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9_-]*$",
+            "title": "Provider"
+          },
+          "device": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device"
+          },
+          "device_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "provider"
+        ],
+        "title": "HealthEventSource",
+        "description": "Device/provider identity attached to a health event."
+      },
+      "HealthEventsImportBody": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Schema Version",
+            "default": 1
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/HealthEvent"
+            },
+            "type": "array",
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Events"
+          }
+        },
+        "type": "object",
+        "required": [
+          "events"
+        ],
+        "title": "HealthEventsImportBody",
+        "description": "Bounded batch of normalized health events."
       },
       "ValidationError": {
         "properties": {

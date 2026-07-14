@@ -37,8 +37,8 @@ from ..security.auth import (
     consume_browser_bootstrap_nonce,
     issue_browser_bootstrap_nonce,
 )
-from ..store import fts
-from .models import ApiResponse, CaptureIngestBody, ModelPing
+from ..store import fts, health_events
+from .models import ApiResponse, CaptureIngestBody, HealthEventsImportBody, ModelPing
 
 logger = get("persome.api")
 
@@ -487,6 +487,14 @@ def ingest_capture(body: CaptureIngestBody) -> ApiResponse:
     """
     result = scheduler.ingest_capture(_get_cfg(), body.model_dump())
     return ApiResponse(data=result)
+
+
+@router.post("/health-events/import", response_model=ApiResponse, tags=["health"])
+def import_health_events(body: HealthEventsImportBody) -> ApiResponse:
+    """Import a normalized, idempotent batch from a trusted local connector."""
+    with fts.cursor() as conn:
+        result = health_events.import_events(conn, [event.model_dump() for event in body.events])
+    return ApiResponse(data={"schema_version": body.schema_version, **result})
 
 
 # ─── Personal model ───────────────────────────────────────────────────────
