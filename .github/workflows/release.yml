@@ -108,7 +108,7 @@ jobs:
         run: |
           uv export --format requirements-txt --all-extras --no-dev --locked \
             --no-emit-project --quiet --output-file /tmp/persome-runtime.txt
-          uv venv /tmp/persome-wheel --python 3.11
+          uv venv /tmp/persome-wheel --python 3.12
           uv pip install --python /tmp/persome-wheel/bin/python --require-hashes \
             --no-build --requirement /tmp/persome-runtime.txt
           uv pip install --python /tmp/persome-wheel/bin/python --no-deps \
@@ -147,7 +147,7 @@ jobs:
 
       - name: Smoke-test PyPI wheel
         run: |
-          uv venv /tmp/personal-model-wheel --python 3.11
+          uv venv /tmp/personal-model-wheel --python 3.12
           uv pip install --python /tmp/personal-model-wheel/bin/python --require-hashes \
             --no-build --requirement /tmp/persome-runtime.txt
           uv pip install --python /tmp/personal-model-wheel/bin/python --no-deps \

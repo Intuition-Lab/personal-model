@@ -88,6 +88,11 @@ CREATE TABLE projection_state (
     projected_at TEXT NOT NULL
 );
 
+CREATE TABLE runtime_metadata (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     start_time TEXT NOT NULL,

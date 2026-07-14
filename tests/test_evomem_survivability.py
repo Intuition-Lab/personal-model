@@ -370,9 +370,9 @@ def test_structural_only_snapshot_tolerates_alert_only_findings(
 ) -> None:
     alert_only = [integrity.Violation("projection_reconciliation", "count drift", False)]
     monkeypatch.setattr(integrity, "verify_snapshot", lambda path: list(alert_only))
-    # Default (daily-tick) semantics: any violation rejects the snapshot.
+    # Default semantics: any violation rejects the snapshot.
     assert backup.create_snapshot() is None
-    # Pre-change (backfill) semantics: alert-only findings alert but don't reject.
+    # Daily-tick/backfill semantics: alert-only findings alert but don't reject.
     dest = backup.create_snapshot(structural_only=True)
     assert dest is not None and dest.exists()
     assert any(
@@ -387,6 +387,35 @@ def test_structural_only_snapshot_tolerates_alert_only_findings(
     before = dest.read_bytes()
     assert backup.create_snapshot(structural_only=True) is None
     assert dest.read_bytes() == before  # good snapshot preserved
+
+
+def test_daily_backup_not_blocked_by_alert_only_findings(
+    ac_root: Path, alerts: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #68: a 12-row projection_reconciliation drift (logical, pre-existing)
+    # silently vetoed every daily snapshot; when page 1 was destroyed hours
+    # later the newest usable backup was two days old. The daily tick must
+    # keep the physical snapshot and merely alert on logical drift.
+    monkeypatch.setattr(
+        integrity,
+        "verify_snapshot",
+        lambda path: [integrity.Violation("projection_reconciliation", "count drift", False)],
+    )
+    dest = backup.run_daily_backup(Config())
+    assert dest is not None and dest.exists()
+    assert any(
+        t == "integrity_alert" and p["check"] == "snapshot_verification" for _, t, p in alerts
+    )
+
+    # Structural corruption still discards the snapshot from the daily tick.
+    monkeypatch.setattr(
+        integrity,
+        "verify_snapshot",
+        lambda path: [integrity.Violation("quick_check", "corrupt", True)],
+    )
+    before = dest.read_bytes()
+    assert backup.run_daily_backup(Config()) is None
+    assert dest.read_bytes() == before
 
 
 def test_same_day_snapshot_refresh_cannot_replay_stale_destination_wal(ac_root: Path) -> None:
@@ -524,10 +553,6 @@ async def _run_one_tick(
 
     monkeypatch.setattr(tick_mod, "_seconds_until_next_local", lambda h, m: 0.001)
 
-    def fake_checkpoint(mode: str = "TRUNCATE") -> tuple[int, int, int]:
-        calls["checkpoint"] += 1
-        return (0, 0, 0)
-
     def fake_backup(cfg_, **kw) -> None:  # noqa: ANN003, ARG001
         calls["backup"] += 1
 
@@ -535,28 +560,27 @@ async def _run_one_tick(
         calls["integrity"] += 1
         return []
 
-    monkeypatch.setattr(tick_mod.fts, "checkpoint", fake_checkpoint)
     monkeypatch.setattr(tick_mod.evo_backup, "run_daily_backup", fake_backup)
     monkeypatch.setattr(tick_mod.evo_integrity, "check_and_handle", fake_check)
 
     task = asyncio.create_task(tick_mod.run_daily_safety_net(cfg, _FakeManager()))
     for _ in range(300):
         await asyncio.sleep(0.01)
-        if calls["checkpoint"] >= 2:
+        if calls["backup"] >= 2 or calls["integrity"] >= 2:
             break
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
 
 
-async def test_daily_tick_runs_checkpoint_snapshot_and_check(
+async def test_daily_tick_runs_snapshot_and_check_without_checkpoint(
     ac_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = Config()
     cfg.reducer.enabled = False  # skip the reducer catch-up sleep
     calls = {"checkpoint": 0, "backup": 0, "integrity": 0}
     await _run_one_tick(cfg, monkeypatch, calls)
-    assert calls["checkpoint"] >= 1
+    assert calls["checkpoint"] == 0
     assert calls["backup"] >= 1
     assert calls["integrity"] >= 1
 
@@ -570,7 +594,7 @@ async def test_daily_tick_p0_byte_equivalent_when_disabled(
     cfg.evomem.integrity_check_enabled = False
     calls = {"checkpoint": 0, "backup": 0, "integrity": 0}
     await _run_one_tick(cfg, monkeypatch, calls)
-    assert calls["checkpoint"] >= 1
+    assert calls["checkpoint"] == 0
     assert calls["backup"] == 0
     assert calls["integrity"] == 0
 

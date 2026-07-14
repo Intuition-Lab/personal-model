@@ -3,7 +3,7 @@ name = "persome-core"
 version = "0.3.2"
 description = "Local-first macOS Runtime for screen-context memory, personal modeling, and MCP."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES"]
 authors = [{ name = "Persome contributors" }]
@@ -14,7 +14,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Utilities",

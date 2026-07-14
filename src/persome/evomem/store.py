@@ -87,6 +87,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(f"ALTER TABLE evo_nodes ADD COLUMN {name} {decl}")
 
 
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create/migrate the canonical node store in an owner process only."""
+    if fts.is_client_process():
+        return
+    conn.executescript(_CREATE_SQL)
+    _migrate(conn)
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -194,8 +202,7 @@ class NodeStore:
         self.user_id = user_id
         self.agent_id = agent_id
         with fts.cursor() as conn:
-            conn.executescript(_CREATE_SQL)
-            _migrate(conn)
+            ensure_schema(conn)
 
     def save(self, node: MemoryNode) -> None:
         integrity.ensure_writes_allowed()

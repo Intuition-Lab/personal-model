@@ -45,6 +45,10 @@ def maybe_enqueue(conn: sqlite3.Connection, entry_id: str, *, ts: str) -> None:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the vector table + pending queue (idempotent; called from fts.connect)."""
+    from . import fts
+
+    if fts.is_client_process():
+        return
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS entry_vectors (

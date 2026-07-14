@@ -122,6 +122,31 @@ def test_private_file_tolerates_sqlite_sidecar_disappearing_during_validation(
     assert not sidecar.exists()
 
 
+def test_private_file_retries_lstat_inode_already_unlinked_by_sqlite(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sidecar = ac_root / "index.db-shm"
+    sidecar.write_bytes(b"ephemeral SQLite pages")
+    real_lstat = Path.lstat
+    calls = 0
+
+    def zero_link_once(path: Path):  # noqa: ANN202
+        nonlocal calls
+        metadata = real_lstat(path)
+        if path == sidecar and calls == 0:
+            calls += 1
+            values = list(metadata)
+            values[3] = 0  # st_nlink: inode was unlinked after path lookup
+            return os.stat_result(values)
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", zero_link_once)
+
+    assert paths.ensure_private_file(sidecar) == sidecar
+    assert calls == 1
+    assert sidecar.exists()
+
+
 def test_permission_migration_refuses_hard_link_without_chmodding_victim(ac_root: Path) -> None:
     (ac_root / ".permissions-v1").unlink()
     victim = ac_root.parent / "migration-victim.txt"
@@ -249,6 +274,9 @@ def test_internal_sqlite_rejects_symlink_escape(tmp_path: Path, ac_root: Path) -
     with pytest.raises(RuntimeError, match="escapes PERSOME_ROOT"):
         fts.connect()
 
+    with pytest.raises(RuntimeError, match="escapes PERSOME_ROOT"), fts.cursor():
+        pass
+
 
 def test_internal_sqlite_rejects_symlink_within_root(ac_root: Path) -> None:
     target = ac_root / "other.db"
@@ -268,6 +296,9 @@ def test_internal_sqlite_rejects_preexisting_sidecar_symlink(ac_root: Path) -> N
 
     with pytest.raises(RuntimeError, match="must not be a symlink"):
         fts.connect()
+
+    with pytest.raises(RuntimeError, match="must not be a symlink"), fts.cursor():
+        pass
 
     assert victim.read_text(encoding="utf-8") == "ORIGINAL"
     assert _mode(victim) == 0o644

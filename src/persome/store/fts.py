@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import sqlite3
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -18,9 +21,26 @@ from ..logger import get
 
 logger = get("persome.store")
 
+
+class CorruptDatabaseError(sqlite3.DatabaseError):
+    """The index database file itself is damaged (bad header / malformed image).
+
+    Subclasses ``sqlite3.DatabaseError`` so every existing handler still
+    matches; the message adds the recovery path so an MCP client or a log
+    reader sees what to do instead of a bare ``file is not a database``.
+    """
+
+
+_CORRUPTION_SIGNATURES = ("file is not a database", "database disk image is malformed")
+
 _MIN_SECURE_FTS_SQLITE = (3, 42, 0)
 _FTS_TABLES = ("entries", "captures_fts")
 _SECURE_FTS_MIGRATION_VERSION = 20260711
+# Bump whenever a daemon-owned schema step changes. This is deliberately
+# independent from PRAGMA user_version, which already tracks the secure-FTS
+# migration. Clients require an exact match: an older binary must not assume a
+# future schema is backward compatible.
+_RUNTIME_SCHEMA_REVISION = "2026-07-14.1"
 _ENTRIES_FTS_OBJECTS = (
     "entries",
     "entries_data",
@@ -73,6 +93,165 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _schema_fingerprint(conn: sqlite3.Connection) -> str:
+    """Hash the exact stored schema, including legacy objects retained in place."""
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE sql IS NOT NULL ORDER BY type, name"
+    ).fetchall()
+    payload = "\n".join("\x1f".join(str(value or "") for value in row) for row in rows)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# Editor-spawned stdio MCP servers share index.db with the daemon — one such
+# process per editor session, all long-lived. Until #68 they carried full
+# owner semantics: eligible to auto-checkpoint the WAL and running connect-time
+# DDL/migrations. That amplified the number of processes performing maintenance
+# during the #68 crash storm. The exact corruption mechanism remains a
+# hypothesis, so this boundary removes the avoidable concurrency without
+# claiming that normal SQLite multi-process WAL access is itself unsafe. A
+# *client* process keeps row-level DML but leaves WAL maintenance, schema
+# creation, and migrations to the daemon — the single owner of those duties.
+_CLIENT_PROCESS = False
+
+# Maintenance can call helpers that normally open ``cursor()`` connections.
+# Keep the exclusive-gate state thread-local so those nested calls reuse the
+# outer boundary instead of deadlocking on a second file descriptor. Other
+# threads/processes still see the file lock and wait normally.
+_MAINTENANCE_STATE = threading.local()
+_ACTIVITY_STATE = threading.local()
+
+_CLIENT_FORBIDDEN_SQLITE_ACTIONS = frozenset(
+    action
+    for name in (
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_ANALYZE",
+        "SQLITE_ATTACH",
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER",
+        "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_CREATE_VTABLE",
+        "SQLITE_DETACH",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_DROP_VTABLE",
+        "SQLITE_REINDEX",
+    )
+    if (action := getattr(sqlite3, name, None)) is not None
+)
+
+
+def _client_authorizer(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    _database: str | None,
+    _trigger: str | None,
+) -> int:
+    """Reject shared-schema maintenance missed by a future client code path."""
+    if action in _CLIENT_FORBIDDEN_SQLITE_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_PRAGMA:
+        pragma = str(arg1 or "").lower()
+        if pragma == "wal_checkpoint" or (
+            arg2 is not None
+            and pragma
+            in {
+                "auto_vacuum",
+                "journal_mode",
+                "locking_mode",
+                "page_size",
+                "schema_version",
+                "secure_delete",
+                "synchronous",
+                "user_version",
+                "wal_autocheckpoint",
+                "writable_schema",
+            }
+        ):
+            return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def declare_client_process() -> None:
+    """Mark this whole process as a shared-database client (stdio MCP).
+
+    Every later ``connect()`` disables auto-checkpoint and refuses to create
+    or migrate schema; ``checkpoint()`` raises. Call once at process startup,
+    before the first connection. There is deliberately no undo: a process is
+    either the runtime owner or a client for its whole life.
+    """
+    global _CLIENT_PROCESS
+    _CLIENT_PROCESS = True
+
+
+def is_client_process() -> bool:
+    """Whether this process declared shared-database client semantics."""
+    return _CLIENT_PROCESS
+
+
+def initialize_runtime_schema(conn: sqlite3.Connection | None = None) -> str:
+    """Apply every daemon-owned lazy schema step and publish its schema receipt.
+
+    The registry is shared with the committed whole-database schema dump, so a
+    newly added lazy table cannot silently fall outside this initialization
+    boundary. Stdio clients may perform row DML only after this succeeds.
+    """
+    if _CLIENT_PROCESS:
+        raise RuntimeError("shared-database clients cannot initialize runtime schema")
+    if conn is None:
+        # ``cursor()`` holds the application-level WAL activity lock while
+        # these schema writes run.  The daemon passes its already-open owner
+        # connection while holding the exclusive startup variant instead.
+        with cursor() as owned:
+            return initialize_runtime_schema(owned)
+
+    from . import schema_dump
+
+    owned = conn
+    schema_dump.apply_index_db_steps(owned)
+    fingerprint = _schema_fingerprint(owned)
+    desired = {
+        "schema_revision": _RUNTIME_SCHEMA_REVISION,
+        "schema_fingerprint": fingerprint,
+    }
+    current = {
+        str(row[0]): str(row[1])
+        for row in owned.execute(
+            "SELECT key, value FROM runtime_metadata"
+            " WHERE key IN ('schema_revision', 'schema_fingerprint')"
+        ).fetchall()
+    }
+    if current == desired:
+        return _RUNTIME_SCHEMA_REVISION
+    # Publish the revision and fingerprint together, and only after every
+    # schema step succeeded. If a process dies mid-migration, the old receipt
+    # remains and clients reject the now-mismatched schema.
+    owned.execute("BEGIN IMMEDIATE")
+    try:
+        owned.executemany(
+            "INSERT INTO runtime_metadata(key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            tuple(desired.items()),
+        )
+        owned.commit()
+    except Exception:
+        owned.rollback()
+        raise
+    return _RUNTIME_SCHEMA_REVISION
 
 
 _CAPTURES_FTS_STATEMENTS = tuple(
@@ -183,6 +362,13 @@ CREATE TABLE IF NOT EXISTS projection_state (
     file_name    TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
     projected_at TEXT NOT NULL
+);
+
+-- Daemon-owned schema publication receipt. Stdio clients compare both the
+-- exact revision and a fingerprint of sqlite_master before accepting row DML.
+CREATE TABLE IF NOT EXISTS runtime_metadata (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 """
 )
@@ -329,6 +515,44 @@ def entry_metadata_map(
     }
 
 
+def _disable_checkpoint_on_close(conn: sqlite3.Connection) -> None:
+    """Make every Persome connection close without an implicit WAL checkpoint."""
+    option = sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
+    conn.setconfig(option, True)
+    if not conn.getconfig(option):
+        raise RuntimeError("SQLite refused to disable checkpoint-on-close")
+
+
+def _prepare_database_path(db_path: Path) -> bool:
+    """Validate a SQLite target before any library open; return root ownership."""
+    try:
+        db_path.absolute().relative_to(paths.root().absolute())
+    except ValueError:
+        # Explicit external DB paths are supported by verification/restore
+        # helpers; do not chmod an arbitrary caller-owned parent directory.
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        return False
+
+    try:
+        db_path.resolve().relative_to(paths.root().resolve())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"database path escapes PERSOME_ROOT through a symlink: {db_path}"
+        ) from exc
+    paths.ensure_private_dir(db_path.parent)
+    # SQLite opens predictable sidecar names itself. Reject any pre-existing
+    # link/special file before the library can follow it outside the private
+    # data root or block on a FIFO.
+    for artifact in (
+        db_path,
+        db_path.with_name(f"{db_path.name}-wal"),
+        db_path.with_name(f"{db_path.name}-shm"),
+        db_path.with_name(f"{db_path.name}-journal"),
+    ):
+        paths.ensure_private_file(artifact)
+    return True
+
+
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
     db_path = db_path or paths.index_db()
     if sqlite3.sqlite_version_info < _MIN_SECURE_FTS_SQLITE:
@@ -336,49 +560,132 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
         raise RuntimeError(
             f"Persome requires SQLite {required}+ so deleted FTS5 text cannot be reconstructed"
         )
+    within_data_root = _prepare_database_path(db_path)
+    if _CLIENT_PROCESS and not db_path.exists():
+        raise RuntimeError(
+            "index database is missing; start the Persome daemon (`persome start`) "
+            "once to create and migrate it before connecting MCP clients"
+        )
+    # ``mode=rw`` is important for clients: plain sqlite3.connect() creates a
+    # missing database before the schema check below can reject it. A client
+    # must not leave behind a new, empty index that later looks like damage.
+    target: str | Path = db_path
+    connect_kwargs: dict[str, bool] = {}
+    if _CLIENT_PROCESS:
+        target = f"{db_path.absolute().as_uri()}?mode=rw"
+        connect_kwargs["uri"] = True
+    conn = sqlite3.connect(
+        target,
+        isolation_level=None,
+        timeout=10.0,
+        check_same_thread=False,
+        **connect_kwargs,
+    )
     try:
-        db_path.absolute().relative_to(paths.root().absolute())
-    except ValueError:
-        # Explicit external DB paths are supported by verification/restore
-        # helpers; do not chmod an arbitrary caller-owned parent directory.
-        within_data_root = False
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        try:
-            db_path.resolve().relative_to(paths.root().resolve())
-        except ValueError as exc:
-            raise RuntimeError(
-                f"database path escapes PERSOME_ROOT through a symlink: {db_path}"
-            ) from exc
-        within_data_root = True
-        paths.ensure_private_dir(db_path.parent)
-        # SQLite opens predictable sidecar names itself. Reject any pre-existing
-        # link/special file before the library can follow it outside the private
-        # data root or block on a FIFO.
-        for artifact in (
-            db_path,
-            db_path.with_name(f"{db_path.name}-wal"),
-            db_path.with_name(f"{db_path.name}-shm"),
-            db_path.with_name(f"{db_path.name}-journal"),
-        ):
-            paths.ensure_private_file(artifact)
-    conn = sqlite3.connect(db_path, isolation_level=None, timeout=10.0, check_same_thread=False)
+        # wal_autocheckpoint=0 does not suppress SQLite's implicit checkpoint
+        # when a connection believes it is the last WAL handle. Disable that
+        # separate close behavior before the first database access.
+        _disable_checkpoint_on_close(conn)
+    except Exception:
+        conn.close()
+        raise
     conn.row_factory = sqlite3.Row
+    # sqlite3.connect is lazy: a damaged header only surfaces on first use,
+    # as a bare "file is not a database" with no recovery path — which MCP
+    # agents and tick logs then repeat verbatim for hours. Probe page 1 now
+    # and turn corruption into one actionable, still-DatabaseError signal.
+    try:
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        if any(sig in str(exc) for sig in _CORRUPTION_SIGNATURES):
+            if db_path.resolve() == paths.index_db().resolve():
+                recovery = (
+                    "Run `persome stop` if the daemon is running, then `persome start` "
+                    "to quarantine it and restore from the latest verified snapshot plus "
+                    "Markdown replay; memory Markdown files are unaffected."
+                )
+            else:
+                recovery = (
+                    "Replace or rebuild this database from a verified source; automatic "
+                    "daemon-start recovery applies only to the live index.db."
+                )
+            raise CorruptDatabaseError(f"{db_path.name} is damaged ({exc}). {recovery}") from exc
+        raise
     # SQLite's built-in date parser does not understand every ISO form Python's
     # historical ingest accepted (notably basic ISO), and interprets naive
     # values as UTC instead of local wall time. Keep one shared parser for all
     # ordering/filtering without rewriting evidence IDs on upgrade.
     conn.create_function("persome_epoch", 1, capture_timestamp_epoch)
+    if _CLIENT_PROCESS:
+        # Query rather than set journal_mode. WAL mode is persistent, so a
+        # daemon-initialized database is already in WAL; changing it here would
+        # make the supposed client perform a database-header write.
+        current = conn.execute("PRAGMA journal_mode").fetchone()
+        if current is None or str(current[0]).lower() != "wal":
+            conn.close()
+            raise RuntimeError(
+                "index database is not initialized for shared WAL access; start "
+                "the Persome daemon (`persome start`) once before connecting MCP clients"
+            )
+        # Personal text must not survive ordinary DELETE operations in free
+        # pages. These settings are connection-local and do not migrate schema.
+        conn.execute("PRAGMA secure_delete=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        # A client never auto-checkpoints. ``NO_CKPT_ON_CLOSE`` above also
+        # disables SQLite's separate last-close checkpoint, so WAL maintenance
+        # belongs to the daemon scheduler even when stdio clients outlive it.
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        # Schema creation and migrations are likewise daemon-only. A missing
+        # schema means the daemon has never run against this root — creating
+        # it here would just re-introduce N racing DDL writers.
+        if not (_table_exists(conn, "entries") and _table_exists(conn, "files")):
+            conn.close()
+            raise RuntimeError(
+                "index database schema is missing; start the Persome daemon "
+                "(`persome start`) to create and migrate it before connecting "
+                "MCP clients"
+            )
+        receipt_rows = (
+            conn.execute(
+                "SELECT key, value FROM runtime_metadata"
+                " WHERE key IN ('schema_revision', 'schema_fingerprint')"
+            ).fetchall()
+            if _table_exists(conn, "runtime_metadata")
+            else []
+        )
+        receipt = {str(row[0]): str(row[1]) for row in receipt_rows}
+        if receipt.get("schema_revision") != _RUNTIME_SCHEMA_REVISION:
+            conn.close()
+            raise RuntimeError(
+                "index database schema is not initialized for this Persome version; "
+                "run `persome start` once to apply daemon-owned migrations before "
+                "connecting MCP clients"
+            )
+        if receipt.get("schema_fingerprint") != _schema_fingerprint(conn):
+            conn.close()
+            raise RuntimeError(
+                "index database schema no longer matches its daemon publication receipt; "
+                "run `persome start` to repair or diagnose it before connecting MCP clients"
+            )
+        # Every known ensure_schema path is a no-op in client role. Keep this
+        # connection-level guard as a fail-closed backstop for future code that
+        # accidentally attempts DDL or maintenance outside those helpers.
+        conn.set_authorizer(_client_authorizer)
+        if within_data_root:
+            paths.ensure_private_file(db_path)
+        return conn
     # Personal text must not survive ordinary DELETE operations in free pages.
     # Explicit wipe paths additionally VACUUM + truncate WAL below.
     conn.execute("PRAGMA secure_delete=ON")
     _ensure_wal_mode(conn)
     conn.execute("PRAGMA synchronous=NORMAL")
-    # Make the auto-checkpoint pages explicit (this is also the SQLite default).
-    # Auto-checkpoint resets the WAL pointer but never shrinks the file —
-    # the daemon calls ``checkpoint()`` from the daily tick so the
-    # ``.db-wal`` and ``.db-shm`` sidecars don't drift unbounded.
-    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    # Disable per-connection checkpoints everywhere, not only in stdio MCP.
+    # The bundled SQLite can predate the WAL-reset race fix. One daemon task
+    # owns every scheduled checkpoint, the application-level activity gate
+    # prevents each checkpoint from overlapping a transaction, and the
+    # connection db-config above disables the separate close-time checkpoint.
+    conn.execute("PRAGMA wal_autocheckpoint=0")
     had_entries_fts = _table_exists(conn, "entries")
     had_captures_fts = _table_exists(conn, "captures_fts")
     # A new DB has neither source table. An interrupted FTS reset keeps at
@@ -442,12 +749,164 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _in_exclusive_maintenance() -> bool:
+    return bool(getattr(_MAINTENANCE_STATE, "depth", 0))
+
+
+@contextmanager
+def exclusive_database_maintenance(*, blocking: bool = True) -> Iterator[bool]:
+    """Exclude every cooperating DB transaction for raw maintenance work.
+
+    The yielded value is false only for a non-blocking attempt that found a
+    live ``cursor()``. Nested calls on the owning thread reuse the boundary.
+    """
+    depth = int(getattr(_MAINTENANCE_STATE, "depth", 0))
+    if depth:
+        _MAINTENANCE_STATE.depth = depth + 1
+        try:
+            yield True
+        finally:
+            _MAINTENANCE_STATE.depth = depth
+        return
+
+    if int(getattr(_ACTIVITY_STATE, "depth", 0)):
+        if blocking:
+            raise RuntimeError(
+                "cannot start exclusive database maintenance inside database_activity; "
+                "finish the active cursor first"
+            )
+        yield False
+        return
+
+    with paths.open_private_lock_file(paths.wal_checkpoint_lock()) as lock:
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(lock.fileno(), flags)
+        except BlockingIOError:
+            yield False
+            return
+        _MAINTENANCE_STATE.depth = 1
+        try:
+            yield True
+        finally:
+            _MAINTENANCE_STATE.depth = 0
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _requires_exclusive_connect_setup(db_path: Path) -> bool:
+    """Whether ``connect()`` may run its legacy double-checkpoint migration."""
+    # This preflight runs before the full connection, so it must apply the same
+    # root/symlink/sidecar validation first. Otherwise even a read-only probe
+    # could follow an attacker-positioned live-DB link before ``connect()`` has
+    # a chance to reject it.
+    _prepare_database_path(db_path)
+    if not db_path.exists():
+        return True
+    probe: sqlite3.Connection | None = None
+    try:
+        probe = sqlite3.connect(
+            f"{db_path.absolute().as_uri()}?mode=ro",
+            uri=True,
+            isolation_level=None,
+            timeout=10.0,
+        )
+        _disable_checkpoint_on_close(probe)
+        row = probe.execute("PRAGMA user_version").fetchone()
+        return row is None or int(row[0]) < _SECURE_FTS_MIGRATION_VERSION
+    except sqlite3.Error:
+        # Let the full connection produce the actionable corruption/setup
+        # error, but do so only after excluding every cooperating transaction.
+        return True
+    finally:
+        if probe is not None:
+            probe.close()
+
+
+@contextmanager
+def database_activity(db_path: Path | None = None) -> Iterator[None]:
+    """Coordinate one logical DB/filesystem operation against maintenance.
+
+    The ordinary mode is shared, so independent reads/writes retain SQLite WAL
+    concurrency. A missing or legacy owner database upgrades only this first
+    setup to exclusive because ``connect()`` may run explicit migration
+    checkpoints. The context is thread-reentrant so cross-resource operations
+    such as capture JSON + its index row can wrap an inner ``cursor()``.
+    """
+    depth = int(getattr(_ACTIVITY_STATE, "depth", 0))
+    if _in_exclusive_maintenance() or depth:
+        _ACTIVITY_STATE.depth = depth + 1
+        try:
+            yield
+        finally:
+            _ACTIVITY_STATE.depth = depth
+        return
+
+    database_path = db_path or paths.index_db()
+    with paths.open_private_lock_file(paths.wal_checkpoint_lock()) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        if not _CLIENT_PROCESS and _requires_exclusive_connect_setup(database_path):
+            # Never upgrade SH->EX in place: two first-use processes could each
+            # hold SH while waiting forever for the other to upgrade.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _ACTIVITY_STATE.depth = 1
+        try:
+            yield
+        finally:
+            _ACTIVITY_STATE.depth = 0
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def cursor(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
-    conn = connect(db_path)
-    try:
-        yield conn
-    finally:
+    """Open a connection whose whole lifetime excludes a WAL checkpoint.
+
+    SQLite's WAL-reset bug can corrupt affected releases when a commit resets
+    the WAL while another connection starts a checkpoint. Normal setup and the
+    complete connection lifetime use a shared lock, preserving concurrent
+    readers and SQLite's single writer. Only a missing/legacy owner database is
+    promoted to exclusive setup because ``connect()`` can then run explicit
+    secure-purge checkpoints.
+    """
+    if _in_exclusive_maintenance() or int(getattr(_ACTIVITY_STATE, "depth", 0)):
+        conn = connect(db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+        return
+
+    with database_activity(db_path):
+        conn = connect(db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+
+def open_runtime_owner() -> sqlite3.Connection:
+    """Open and fully initialize the daemon's transaction-free owner handle."""
+    if _CLIENT_PROCESS:
+        raise RuntimeError("shared-database clients cannot own the runtime database")
+    with exclusive_database_maintenance() as acquired:
+        if not acquired:  # blocking=True makes this unreachable
+            raise RuntimeError("could not acquire database maintenance ownership")
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = connect()
+            initialize_runtime_schema(conn)
+            return conn
+        except Exception:
+            if conn is not None:
+                conn.close()
+            raise
+
+
+def close_runtime_owner(conn: sqlite3.Connection) -> None:
+    """Close the daemon owner while excluding new transactions/checkpoints."""
+    with exclusive_database_maintenance() as acquired:
+        if not acquired:  # blocking=True makes this unreachable
+            raise RuntimeError("could not acquire database maintenance ownership")
         conn.close()
 
 
@@ -524,6 +983,11 @@ def purge_deleted_content(conn: sqlite3.Connection) -> None:
     Callers should stop the daemon first so an active reader cannot keep the WAL
     checkpoint busy.
     """
+    if not _in_exclusive_maintenance():
+        raise RuntimeError(
+            "secure purge requires exclusive_database_maintenance() so its "
+            "checkpoints cannot overlap a live transaction"
+        )
     conn.execute("PRAGMA secure_delete=ON")
     for table in _FTS_TABLES:
         exists = conn.execute(
@@ -543,23 +1007,39 @@ def purge_deleted_content(conn: sqlite3.Connection) -> None:
         raise sqlite3.OperationalError("WAL remained busy after secure purge")
 
 
-def checkpoint(mode: str = "TRUNCATE") -> tuple[int, int, int]:
+def checkpoint(mode: str = "TRUNCATE", *, wait: bool = True) -> tuple[int, int, int]:
     """Run ``PRAGMA wal_checkpoint(<mode>)`` and return (busy, log, checkpointed).
 
     ``TRUNCATE`` is the form that actually shrinks the ``.db-wal`` sidecar;
     ``PASSIVE`` (default in auto-checkpoint) only advances the read pointer
-    without touching the file. Best invoked from a periodic tick when the
-    daemon is otherwise quiet so we don't fight active readers.
+    without touching the file. The exclusive application lock waits for every
+    current ``cursor()`` to finish and prevents a commit from racing the WAL
+    reset on SQLite releases affected by the WAL-reset bug.
     """
+    if _CLIENT_PROCESS:
+        raise RuntimeError(
+            "refusing to checkpoint from a shared-database client process; "
+            "WAL maintenance belongs to the daemon"
+        )
     valid = ("PASSIVE", "FULL", "RESTART", "TRUNCATE")
     mode = mode.upper()
     if mode not in valid:
         raise ValueError(f"invalid checkpoint mode {mode!r}; expected one of {valid}")
-    with cursor() as conn:
-        row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
-        if row is None:
-            return (0, 0, 0)
-        return (int(row[0]), int(row[1]), int(row[2]))
+    with exclusive_database_maintenance(blocking=wait) as acquired:
+        if not acquired:
+            # Match SQLite's first return field: a busy checkpointer made no
+            # progress. Negative page counts distinguish our preflight skip.
+            return (1, -1, -1)
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = connect()
+            row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            if row is None:
+                return (0, 0, 0)
+            return (int(row[0]), int(row[1]), int(row[2]))
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 # ─── files table ───────────────────────────────────────────────────────────

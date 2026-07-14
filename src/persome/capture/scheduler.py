@@ -491,8 +491,14 @@ def _write_capture(out: dict[str, Any]) -> Path:
         out["ocr_submitted"] = True
 
     path = paths.capture_buffer_dir() / f"{_safe_filename(ts)}.json"
-    paths.atomic_write_private_text(path, json.dumps(out, ensure_ascii=False))
-    _index_capture(path.stem, out)
+    # The JSON authority and its searchable SQLite projection are one logical
+    # operation relative to secure clean/full wipe. The shared activity gate
+    # preserves normal capture concurrency, while maintenance waits until both
+    # writes finish instead of deleting one side and letting the other appear
+    # after a false-successful wipe.
+    with fts_store.database_activity():
+        paths.atomic_write_private_text(path, json.dumps(out, ensure_ascii=False))
+        _index_capture(path.stem, out)
     meta = out.get("window_meta") or {}
     logger.info(
         "capture ok: %s trigger=%s app=%r title=%r ax=%s screenshot=%s",

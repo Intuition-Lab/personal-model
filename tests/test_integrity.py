@@ -15,7 +15,7 @@ from persome import integrity, paths
 from persome.evomem import backup
 from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.evomem.store import NodeStore
-from persome.model import create_build_manifest, load_live_manifest
+from persome.model import create_build_manifest, load_live_manifest, sync_live_human_markdown
 from persome.store import entries, fts, relation_edges, schema_faces
 from persome.store import files as files_mod
 
@@ -115,12 +115,15 @@ def test_corrupt_db_replays_memory_and_invalidates_stale_model_build(ac_root: Pa
         paths.model_build_manifest(),
         json.dumps({"status": "complete", "build_id": "stale-build"}),
     )
+    sync_live_human_markdown()
+    assert paths.human_file().exists()
     paths.index_db().write_bytes(b"not-a-sqlite-database" * 100)
 
     recovered = integrity.check_and_recover()
 
     assert [item.kind for item in recovered] == ["database"]
     assert not paths.model_build_manifest().exists()
+    assert not paths.human_file().exists()
     with fts.cursor() as conn:
         row = conn.execute(
             "SELECT content FROM entries WHERE id=?",
@@ -640,11 +643,14 @@ def test_unknown_authority_invalidates_completed_model_manifest(ac_root: Path) -
         completed_at="2026-07-12T09:01:00+08:00",
     )
     paths.atomic_write_private_text(paths.model_build_manifest(), json.dumps(manifest))
+    unknown_human = "# My hand-authored HUMAN.md\n\nDo not replace this file.\n"
+    paths.atomic_write_private_text(paths.human_file(), unknown_human)
     paths.config_file().write_text("[[[ corrupt config", encoding="utf-8")
 
     integrity.check_and_recover()
 
     assert not paths.model_build_manifest().exists()
+    assert paths.human_file().read_text(encoding="utf-8") == unknown_human
     assert load_live_manifest()["status"] == "not_built"
     database = json.loads(paths.integrity_recovery_marker().read_text())["database_recovery"]
     assert database["status"] == "partial"
@@ -1900,6 +1906,42 @@ def test_derived_captures_fts_repair_defers_instead_of_quarantining(
     assert list(ac_root.glob("index.db.corrupt.*")) == []
 
 
+@pytest.mark.parametrize(
+    "repair_error",
+    [
+        sqlite3.OperationalError("database is locked"),
+        sqlite3.OperationalError("database or disk is full"),
+    ],
+)
+def test_derived_fts_repair_defers_environmental_failures(
+    ac_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repair_error: sqlite3.DatabaseError,
+) -> None:
+    _make_healthy_db()
+    with fts.cursor() as conn:
+        fts.insert_capture(
+            conn,
+            id="capture-repair-error-classification",
+            timestamp="2026-07-12T00:00:00+00:00",
+            app_name="Test App",
+            bundle_id="com.persome.test",
+            window_title="Repair classification",
+            focused_role="AXTextArea",
+            focused_value="needle",
+            visible_text="classify a derived repair failure",
+            url="https://example.test/repair-classification",
+        )
+        conn.execute("DELETE FROM captures_fts_data WHERE id > 1")
+
+    def fail_rebuild(_db_path: Path) -> None:
+        raise repair_error
+
+    monkeypatch.setattr(integrity, "_rebuild_captures_fts_via_schema_reset", fail_rebuild)
+
+    assert integrity._try_rebuild_derived_fts(paths.index_db()) is None
+
+
 def test_derived_fts_vtable_constructor_error_is_rebuildable() -> None:
     assert integrity._derived_fts_vtable_failure(
         sqlite3.DatabaseError("vtable constructor failed: captures_fts")
@@ -2021,21 +2063,49 @@ def test_both_db_and_config_corrupt_recovers_both(ac_root: Path) -> None:
         )
 
 
-def test_no_stale_wal_sidecars_survive_next_to_rebuilt_db(ac_root: Path) -> None:
-    # The safety property: after recovering a corrupt DB, no stale WAL/SHM
-    # sidecar may sit next to the freshly rebuilt index.db (a half-written WAL
-    # could otherwise resurrect corruption). SQLite itself may drop the
-    # sidecars while we probe the garbage file; whatever the mechanism, they
-    # must not remain at the live paths.
+def test_no_stale_wal_sidecars_survive_next_to_rebuilt_db(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The safety property: after recovering a corrupt DB, its stale WAL/SHM
+    # sidecars are quarantined with that database and cannot sit next to the
+    # freshly rebuilt index.db. The replacement may have its own healthy WAL:
+    # Runtime connections intentionally disable checkpoint-on-close.
     db = paths.index_db()
-    db.write_bytes(b"garbage-not-sqlite" * 100)
-    db.with_name(f"{db.name}-wal").write_bytes(b"stale-wal")
-    db.with_name(f"{db.name}-shm").write_bytes(b"stale-shm")
+    with fts.cursor() as conn:
+        conn.execute(
+            "INSERT INTO entry_retrieval_stats(entry_id, retrieval_count) VALUES (?, ?)",
+            ("retained-wal-before-corruption", 1),
+        )
+    wal = db.with_name(f"{db.name}-wal")
+    shm = db.with_name(f"{db.name}-shm")
+    assert wal.exists() and wal.stat().st_size > 0
+    stale_wal = wal.read_bytes()
+    stale_shm = shm.read_bytes() if shm.exists() else None
+    with db.open("r+b") as handle:
+        handle.write(b"not-sqlite-head!")
+    assert integrity._db_corruption_reason(db) == "invalid SQLite database header"
 
-    integrity.check_and_recover()
+    attempted_derived_repair = False
 
-    assert not db.with_name(f"{db.name}-wal").exists()
-    assert not db.with_name(f"{db.name}-shm").exists()
+    def unexpected_derived_repair(_db_path: Path) -> bool | None:
+        nonlocal attempted_derived_repair
+        attempted_derived_repair = True
+        return None
+
+    monkeypatch.setattr(integrity, "_try_rebuild_derived_fts", unexpected_derived_repair)
+
+    recovered = integrity.check_and_recover()
+
+    assert not attempted_derived_repair
+    quarantined = next(item for item in recovered if item.kind == "database")
+    quarantine = Path(quarantined.quarantine_path)
+    assert quarantine.with_name(f"{quarantine.name}.wal").read_bytes() == stale_wal
+    if stale_shm is not None:
+        assert quarantine.with_name(f"{quarantine.name}.shm").read_bytes() == stale_shm
+    live_wal = db.with_name(f"{db.name}-wal")
+    live_shm = db.with_name(f"{db.name}-shm")
+    assert not live_wal.exists() or live_wal.read_bytes() != stale_wal
+    assert stale_shm is None or not live_shm.exists() or live_shm.read_bytes() != stale_shm
     # And the rebuilt DB is healthy.
     with fts.cursor() as conn:
         rows = conn.execute("PRAGMA integrity_check").fetchall()

@@ -72,6 +72,10 @@ def build_plist(binary: str) -> dict[str, object]:
         "ProgramArguments": [binary, "start", "--foreground"],
         "RunAtLoad": True,
         "KeepAlive": True,
+        # Damp crash loops: without a throttle, launchd relaunched a crashing
+        # daemon within seconds, piling new writer generations onto a database
+        # whose sibling processes were still dying mid-transaction (#68).
+        "ThrottleInterval": 30,
         # launchd otherwise inherits the user session's commonly permissive
         # 022 umask. Runtime state contains raw screen context and must be born
         # owner-only even before the explicit chmod defense runs.

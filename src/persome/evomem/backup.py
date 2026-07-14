@@ -314,7 +314,12 @@ def run_daily_backup(
     cfg: Config, *, db_path: Path | None = None, now: datetime | None = None
 ) -> Path | None:
     """The daily-tick entry point: snapshot (verified) + retention. Never raises."""
-    dest = create_snapshot(db_path=db_path, now=now)
+    # Structural violations (real corruption) still discard the snapshot;
+    # alert-only findings such as projection_reconciliation drift must not.
+    # Blocking on them left #68 with no fresh snapshot for two days — a
+    # logical 12-row drift silently vetoed every physical backup while the
+    # database itself was still perfectly copyable.
+    dest = create_snapshot(db_path=db_path, now=now, structural_only=True)
     try:
         apply_retention(
             keep_daily=cfg.evomem.snapshot_keep_daily,

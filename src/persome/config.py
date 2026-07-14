@@ -417,6 +417,8 @@ class MCPConfig:
 
     read_receipt_enabled: bool = True
     entity_graph_enabled: bool = True
+    # Entry → surrounding-events association read (timeline blocks + captures):
+    related_events_enabled: bool = True
 
 
 @dataclass
@@ -443,8 +445,13 @@ class Config:
     # Entity and reusable-case enrichment inside the shared model build.
     person_graph_enabled: bool = True
     case_extraction_enabled: bool = True
+    # Deterministic daily attention-dwell digest → durable user- fact (no LLM).
+    # Opt-in: attention surfaces are raw window/pane titles and the digest extends
+    # their lifetime into durable memory + schema-miner input.
+    attention_digest_enabled: bool = False
     # Graph-memory P0-2 (#428): deterministic + LLM relation-edge extraction → SHADOW.
-    # Default OFF (shadow-first: prove extraction quality before edges can reach retrieval).
+    # This is a compatibility enrichment beside the primary memory-delta writer. Keep
+    # it opt-in; promotion runs in the same build and may activate proven history.
     relation_extraction_enabled: bool = False
 
     edge_promote_fanout: int = 20
@@ -555,6 +562,7 @@ def load(path: Path | None = None) -> Config:
         api_require_local_origin=bool(raw.get("api_require_local_origin", True)),
         person_graph_enabled=bool(raw.get("person_graph_enabled", True)),
         case_extraction_enabled=bool(raw.get("case_extraction_enabled", True)),
+        attention_digest_enabled=bool(raw.get("attention_digest_enabled", False)),
         relation_extraction_enabled=bool(raw.get("relation_extraction_enabled", False)),
         edge_promote_fanout=int(raw.get("edge_promote_fanout", 20)),
     )
@@ -578,6 +586,7 @@ DEFAULT_CONFIG_TEMPLATE = """# Persome configuration
 api_require_local_origin = true
 person_graph_enabled = true
 case_extraction_enabled = true
+attention_digest_enabled = false
 relation_extraction_enabled = false
 edge_promote_fanout = 20
 
@@ -716,6 +725,7 @@ recency_decay_floor = 0.2          # Minimum age-decay factor for durable old fa
 auto_start = true                 # run an always-on MCP server inside the daemon
 read_receipt_enabled = true       # Register receipt dereference with capture breadcrumbs
 entity_graph_enabled = true       # Register direct entity-graph reads
+related_events_enabled = true     # Register entry → surrounding-events association reads
 transport = "streamable-http"     # "streamable-http" | "sse" (deprecated 2026-04-01) | "stdio"
 host = "127.0.0.1"                # bind address; loopback only (non-loopback is rejected)
 port = 8742

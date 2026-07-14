@@ -98,10 +98,6 @@ def _index_db_steps() -> list[tuple[str, Callable[[sqlite3.Connection], None]]]:
         schema_faces,
     )
 
-    def _evomem(conn: sqlite3.Connection) -> None:
-        conn.executescript(evo_store._CREATE_SQL)
-        evo_store._migrate(conn)
-
     return [
         ("store/relation_edges.py", relation_edges.ensure_schema),
         ("store/contradictions.py", contradictions.ensure_schema),
@@ -109,9 +105,20 @@ def _index_db_steps() -> list[tuple[str, Callable[[sqlite3.Connection], None]]]:
         ("store/owner_aliases.py", owner_aliases.ensure_schema),
         ("store/parser_ticks.py", parser_ticks.ensure_schema),
         ("store/schema_faces.py", schema_faces.ensure_schema),
-        ("evomem/store.py", _evomem),
+        ("evomem/store.py", evo_store.ensure_schema),
         ("evomem/integrity.py", evo_integrity.ensure_check_runs_schema),
     ]
+
+
+def apply_index_db_steps(conn: sqlite3.Connection) -> None:
+    """Apply every lazy ``index.db`` schema step in registry order.
+
+    The daemon calls this once before it advertises a current schema marker;
+    the schema renderer uses the same registry, keeping runtime ownership and
+    the committed database contract from drifting apart.
+    """
+    for _title, apply in _index_db_steps():
+        apply(conn)
 
 
 def render_schema_sql() -> str:

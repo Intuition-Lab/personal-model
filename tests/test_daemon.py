@@ -30,6 +30,7 @@ from persome.daemon import (
     _on_task_done,
     _run,
     _shutdown_tasks,
+    _sync_human_after_update_commit,
 )
 
 
@@ -61,6 +62,7 @@ class TestRegistryEnabledPredicates:
             "session",
             "reducer-retry",
             "daily-safety-net",
+            "wal-checkpoint",
             "timeline",
             "flush",
             "mcp",
@@ -72,6 +74,7 @@ class TestRegistryEnabledPredicates:
             "session",
             "reducer-retry",
             "daily-safety-net",
+            "wal-checkpoint",
             "mcp",
         }
 
@@ -115,6 +118,10 @@ class TestRegistryEnabledPredicates:
         assert "reducer-retry" not in _enabled_names(
             Config(reducer=ReducerConfig(enabled=False)), capture_only=True
         )
+
+    def test_wal_checkpoint_is_always_daemon_owned(self) -> None:
+        assert "wal-checkpoint" in _enabled_names(Config())
+        assert "wal-checkpoint" in _enabled_names(Config(), capture_only=True)
 
 
 class TestCreateTasksFromRegistry:
@@ -160,6 +167,31 @@ class TestCreateTasksFromRegistry:
 
         mock_cb.assert_called_once()
         assert mock_cb.call_args[0][0].get_name() == "test-task"
+
+
+async def test_wal_checkpoint_tick_owns_daily_truncate_and_passive_modes(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from persome.session import tick as tick_mod
+
+    modes: list[str] = []
+
+    def fake_checkpoint(mode: str, *, wait: bool = True) -> tuple[int, int, int]:
+        assert wait is False
+        modes.append(mode)
+        return (0, 2, 2)
+
+    monkeypatch.setattr(tick_mod.fts, "checkpoint", fake_checkpoint)
+    task = asyncio.create_task(tick_mod.run_wal_checkpoint_tick(interval_seconds=0.01))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if len(modes) >= 2:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert modes[:2] == ["TRUNCATE", "PASSIVE"]
 
 
 class TestOnTaskDone:
@@ -288,6 +320,61 @@ class TestMcpLoop:
         sleep.assert_awaited_once()
         assert calls["n"] == 2
 
+    async def test_uvicorn_systemexit_wrapping_eaddrinuse_retries(self) -> None:
+        # uvicorn converts bind failures into SystemExit(3); letting it escape
+        # took down the whole daemon and left launchd crash-looping into the
+        # still-bound port. The loop must unwrap it and back off like a plain
+        # EADDRINUSE.
+        calls = {"n": 0}
+
+        async def run_async(cfg: Config) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                try:
+                    raise OSError(errno.EADDRINUSE, "address in use")
+                except OSError:
+                    # mirrors uvicorn's sys.exit(STARTUP_FAILURE): __context__
+                    # carries the bind error even with display suppressed
+                    raise SystemExit(3) from None
+            return
+
+        with (
+            patch("persome.mcp.server.run_async", side_effect=run_async),
+            patch("persome.daemon.asyncio.sleep") as sleep,
+        ):
+            await _mcp_loop(Config())
+        sleep.assert_awaited_once()
+        assert calls["n"] == 2
+
+    async def test_uvicorn_systemexit_other_bind_error_returns_immediately(self) -> None:
+        async def run_async(cfg: Config) -> None:
+            try:
+                raise PermissionError(1, "operation not permitted")
+            except PermissionError:
+                raise SystemExit(3) from None
+
+        with (
+            patch("persome.mcp.server.run_async", side_effect=run_async),
+            patch("persome.daemon.asyncio.sleep") as sleep,
+            patch("persome.daemon.logger") as log,
+        ):
+            await _mcp_loop(Config())
+        # Hard failure: log + return with the daemon still alive, no backoff.
+        log.error.assert_called_once()
+        sleep.assert_not_awaited()
+
+    @pytest.mark.parametrize("code", [0, 3])
+    async def test_non_uvicorn_systemexit_propagates(self, code: int) -> None:
+        async def run_async(cfg: Config) -> None:
+            raise SystemExit(code)
+
+        with (
+            patch("persome.mcp.server.run_async", side_effect=run_async),
+            pytest.raises(SystemExit) as raised,
+        ):
+            await _mcp_loop(Config())
+        assert raised.value.code == code
+
     async def test_cancellation_propagates(self) -> None:
         async def run_async(cfg: Config) -> None:
             raise asyncio.CancelledError
@@ -345,10 +432,59 @@ class TestRunLifecycle:
 
         await driver()
 
+    async def test_holds_database_owner_connection_for_runtime_lifetime(
+        self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from persome import daemon as daemon_mod
+
+        owner = MagicMock()
+        open_owner = MagicMock(return_value=owner)
+        close_owner = MagicMock()
+        entered = False
+
+        async def fake_run_owned(*args: object, **kwargs: object) -> None:
+            nonlocal entered
+            entered = True
+            owner.close.assert_not_called()
+
+        monkeypatch.setattr("persome.store.fts.open_runtime_owner", open_owner)
+        monkeypatch.setattr("persome.store.fts.close_runtime_owner", close_owner)
+        monkeypatch.setattr(daemon_mod, "_run_owned", fake_run_owned)
+
+        await daemon_mod._run(self._no_task_cfg(), capture_only=True)
+
+        assert entered is True
+        open_owner.assert_called_once_with()
+        close_owner.assert_called_once_with(owner)
+
+    async def test_schema_initialization_failure_closes_owner_before_serving(
+        self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from persome import daemon as daemon_mod
+
+        open_owner = MagicMock(side_effect=RuntimeError("migration snapshot failed"))
+        close_owner = MagicMock()
+        served = False
+
+        async def fake_run_owned(*args: object, **kwargs: object) -> None:
+            nonlocal served
+            served = True
+
+        monkeypatch.setattr("persome.store.fts.open_runtime_owner", open_owner)
+        monkeypatch.setattr("persome.store.fts.close_runtime_owner", close_owner)
+        monkeypatch.setattr(daemon_mod, "_run_owned", fake_run_owned)
+
+        with pytest.raises(RuntimeError, match="migration snapshot failed"):
+            await daemon_mod._run(self._no_task_cfg(), capture_only=True)
+
+        assert served is False
+        close_owner.assert_not_called()
+
     async def test_clean_shutdown_removes_pid_file(
         self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from persome import paths
+        from persome.model import human as human_mod
 
         # All tasks return immediately; FIRST_COMPLETED then unblocks _run and
         # it proceeds through the normal (non-cancelled) shutdown path.
@@ -361,12 +497,103 @@ class TestRunLifecycle:
         monkeypatch.setattr(
             "persome.daemon._build_task_registry", lambda _receipt=None: stub_registry
         )
+        sync_human = MagicMock(return_value=paths.human_file())
+        monkeypatch.setattr(human_mod, "sync_live_human_markdown", sync_human)
 
         await _run(self._no_task_cfg(), capture_only=True)
 
+        sync_human.assert_called_once_with()
         # Health invariant: a cleanly stopped daemon leaves no pid file behind.
         assert not paths.pid_file().exists()
         assert not paths.runtime_state_file().exists()
+
+    async def test_human_projection_failure_does_not_crash_startup(
+        self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from persome.model import human as human_mod
+
+        async def returns() -> None:
+            return
+
+        stub_registry = [
+            replace(td, create=lambda c, sm: returns()) for td in _build_task_registry()
+        ]
+        monkeypatch.setattr(
+            "persome.daemon._build_task_registry", lambda _receipt=None: stub_registry
+        )
+        sync_human = MagicMock(side_effect=RuntimeError("synthetic HUMAN.md failure"))
+        monkeypatch.setattr(human_mod, "sync_live_human_markdown", sync_human)
+
+        with patch("persome.daemon.logger") as logger:
+            await _run(self._no_task_cfg(), capture_only=True)
+
+        sync_human.assert_called_once_with()
+        logger.exception.assert_any_call("HUMAN.md startup projection failed")
+
+    async def test_candidate_runtime_creates_no_human_artifacts_before_update_commit(
+        self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from persome import paths
+        from persome.model import human as human_mod
+
+        async def returns() -> None:
+            return
+
+        stub_registry = [
+            replace(td, create=lambda c, sm: returns()) for td in _build_task_registry()
+        ]
+        monkeypatch.setattr(
+            "persome.daemon._build_task_registry", lambda _receipt=None: stub_registry
+        )
+        paths.update_state_file().write_text("pending\n", encoding="utf-8")
+        sync_human = MagicMock(return_value=paths.human_file())
+        monkeypatch.setattr(human_mod, "sync_live_human_markdown", sync_human)
+
+        await _run(self._no_task_cfg(), capture_only=True)
+
+        sync_human.assert_not_called()
+        assert not paths.human_file().exists()
+        assert list(ac_root.glob(".HUMAN.md.*")) == []
+
+    async def test_human_projection_waits_for_update_commit(
+        self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from persome import paths
+        from persome.model import human as human_mod
+
+        paths.update_state_file().write_text("pending\n", encoding="utf-8")
+        sync_human = MagicMock(return_value=paths.human_file())
+        monkeypatch.setattr(human_mod, "sync_live_human_markdown", sync_human)
+        monkeypatch.setattr("persome.daemon._HUMAN_UPDATE_POLL_SECONDS", 0.001)
+
+        task = asyncio.create_task(_sync_human_after_update_commit())
+        await asyncio.sleep(0.01)
+        sync_human.assert_not_called()
+
+        paths.update_state_file().unlink()
+        await asyncio.wait_for(task, timeout=1)
+        sync_human.assert_called_once_with()
+
+    async def test_rollback_cancels_deferred_human_projection(
+        self, ac_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from persome import paths
+        from persome.model import human as human_mod
+
+        paths.update_state_file().write_text("pending\n", encoding="utf-8")
+        sync_human = MagicMock(return_value=paths.human_file())
+        monkeypatch.setattr(human_mod, "sync_live_human_markdown", sync_human)
+        monkeypatch.setattr("persome.daemon._HUMAN_UPDATE_POLL_SECONDS", 0.001)
+
+        task = asyncio.create_task(_sync_human_after_update_commit())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        paths.update_state_file().unlink()
+        await asyncio.sleep(0.01)
+        sync_human.assert_not_called()
 
     async def test_force_end_failure_does_not_crash_shutdown(
         self, ac_root: Path, monkeypatch: pytest.MonkeyPatch

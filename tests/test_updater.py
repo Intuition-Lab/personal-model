@@ -453,6 +453,8 @@ def test_cli_update_runs_download_stop_install_and_restore(
     assert "Persome update complete" in result.output
     assert "personal data were" in result.output
     assert "preserved" in result.output
+    assert "Restart every editor/client connected to Persome" in result.output
+    assert "previous release" in result.output
     assert "Checking for an interrupted update" in result.output
     assert "Downloading the latest official main revision" in result.output
 

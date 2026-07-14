@@ -356,16 +356,21 @@ find_compatible_system_python() {
   local version
   version="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null || true)"
   [[ -n "${version}" ]] || return 1
-  # paddlepaddle ships wheels for CPython 3.11-3.13 only. Persome also needs
-  # SQLite 3.42+ so FTS5 secure-delete can remove sensitive shadow-table text.
-  # Treat either mismatch as incompatible and fall through to uv-managed Python.
-  if version_ge "${version}" "3.11" && ! version_ge "${version}" "3.14" \
+  # paddlepaddle ships wheels for CPython 3.11-3.13, while Persome requires
+  # Python 3.12's sqlite3 db-config API to disable implicit close checkpoints.
+  # SQLite 3.42+ is also required so FTS5 secure-delete can remove sensitive
+  # shadow-table text. Treat any mismatch as incompatible and fall through to
+  # uv-managed Python 3.12.
+  if version_ge "${version}" "3.12" && ! version_ge "${version}" "3.14" \
     && python3 - <<'PY' >/dev/null 2>&1
 import sqlite3
 
 if sqlite3.sqlite_version_info < (3, 42, 0):
     raise SystemExit(1)
 conn = sqlite3.connect(":memory:")
+conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+if not conn.getconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE):
+    raise SystemExit(1)
 conn.execute("CREATE VIRTUAL TABLE probe USING fts5(body)")
 conn.execute("INSERT INTO probe(probe, rank) VALUES('secure-delete', 1)")
 PY
@@ -464,6 +469,9 @@ if match and sys.version_info[:2] != (int(match.group(1)), int(match.group(2))):
 if sqlite3.sqlite_version_info < (3, 42, 0):
     raise SystemExit(f"SQLite 3.42+ required, got {sqlite3.sqlite_version}")
 conn = sqlite3.connect(":memory:")
+conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+if not conn.getconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE):
+    raise SystemExit("SQLite refused SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE")
 conn.execute("CREATE VIRTUAL TABLE probe USING fts5(body)")
 conn.execute("INSERT INTO probe(probe, rank) VALUES('secure-delete', 1)")
 PY

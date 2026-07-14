@@ -679,7 +679,7 @@ def test_project_file_evidences_self_participates_in(ac_root):
                 layer=MemoryLayer.L2_FACT,
                 file_name="project-Acme.md",
                 memory_at=datetime(2026, 6, day, tzinfo=UTC),
-                occurred_at=datetime(2026, 6, day, tzinfo=UTC),
+                occurred_at=datetime(2026, 6, day, tzinfo=UTC).isoformat(),
             )
         )
     rx.run_relation_extraction(_on(), memory=mem, llm_call=_empty_llm, conn_factory=fts.cursor)

@@ -48,6 +48,10 @@ CREATE INDEX IF NOT EXISTS idx_memory_deltas_created ON memory_deltas(created_at
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    from . import fts
+
+    if fts.is_client_process():
+        return
     conn.executescript(SCHEMA)
     columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_deltas)")}
     if "apply_status" not in columns:

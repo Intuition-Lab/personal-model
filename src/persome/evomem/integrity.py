@@ -52,6 +52,10 @@ CREATE INDEX IF NOT EXISTS idx_integrity_check_runs_day ON integrity_check_runs(
 
 
 def ensure_check_runs_schema(conn: sqlite3.Connection) -> None:
+    from ..store import fts
+
+    if fts.is_client_process():
+        return
     conn.executescript(_CHECK_RUNS_SCHEMA)
 
 

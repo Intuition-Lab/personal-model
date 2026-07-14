@@ -54,7 +54,9 @@ def _write_aged(out: dict, *, hours_old: float) -> Path:
 def _cleanup(**kw) -> dict:
     defaults = dict(
         retention_hours=168,
-        processed_before_ts="9999-12-31T00:00:00",  # everything absorbed
+        # Use an aware value so converting a naive year-9999 local timestamp
+        # cannot overflow into year 10000 in positive-offset time zones.
+        processed_before_ts="9999-12-31T00:00:00+00:00",  # everything absorbed
         screenshot_retention_hours=24,
         screenshot_thumbnail_hours=6,
     )

@@ -20,6 +20,19 @@ def isolate_runtime_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _reset_client_process_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo ``fts.declare_client_process()`` between tests.
+
+    The flag is deliberately one-way in production (a process is a client for
+    its whole life), but tests that exercise the stdio MCP entrypoint share
+    one interpreter with tests that expect owner semantics.
+    """
+    from persome.store import fts
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", False)
+
+
+@pytest.fixture(autouse=True)
 def _sandbox_persome_root(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

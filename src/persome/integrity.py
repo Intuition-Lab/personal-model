@@ -40,6 +40,7 @@ _log = get("persome.daemon")
 # Cap the integrity_check work so a huge DB can't blow the <500ms startup
 # budget. The first N problems are enough to decide "corrupt".
 _INTEGRITY_CHECK_LIMIT = 100
+_SQLITE_DATABASE_HEADER = b"SQLite format 3\x00"
 _DERIVED_FTS_INTEGRITY_ERRORS = {
     "malformed inverted index for FTS5 table main.entries": "entries",
     "malformed inverted index for FTS5 table main.captures_fts": "captures_fts",
@@ -216,6 +217,31 @@ def _quarantine(path: Path, *, destination: Path | None = None) -> Path:
     return dest
 
 
+def _db_header_corruption_reason(db_path: Path) -> str | None:
+    """Classify authority-file damage before SQLite can consult a stale WAL."""
+    if not db_path.exists():
+        return None
+    # A retained WAL can contain enough old schema state for SQLite to report
+    # a destroyed main-file header as a virtual-table constructor failure.
+    # Classify the authority file itself before opening SQLite so whole-file
+    # damage is never mistaken for a retryable derived-FTS repair. A zero-byte
+    # file remains SQLite's valid representation of a brand-new empty DB.
+    try:
+        if db_path.stat().st_size:
+            with db_path.open("rb") as handle:
+                header = handle.read(len(_SQLITE_DATABASE_HEADER))
+            if header != _SQLITE_DATABASE_HEADER:
+                return "invalid SQLite database header"
+    except FileNotFoundError:
+        # Another maintenance path completed an atomic replace between the
+        # existence/stat/open checks. Treat the vanished old inode as missing;
+        # a replacement is checked on the next pass.
+        return None
+    except OSError as exc:
+        return f"header read failed: {exc}"
+    return None
+
+
 def _db_corruption_reason(db_path: Path) -> str | None:
     """Return a reason string if the DB is corrupt, else ``None``.
 
@@ -223,6 +249,9 @@ def _db_corruption_reason(db_path: Path) -> str | None:
     single ``"ok"`` row for a healthy DB (including a brand-new empty one);
     anything else — or a ``DatabaseError`` on open — means damage.
     """
+    header_reason = _db_header_corruption_reason(db_path)
+    if header_reason is not None:
+        return header_reason
     if not db_path.exists():
         return None
     conn: sqlite3.Connection | None = None
@@ -346,10 +375,16 @@ def _try_rebuild_derived_fts(db_path: Path) -> bool | None:
     """Repair malformed derived FTS indexes without touching user data.
 
     ``captures_fts`` is derived from ``captures`` and ``entries`` from the
-    Markdown/evo_nodes projection. ``None`` means the data is intact but the
-    rebuild must be retried (for example, another local reader owns the
-    database); ``False`` means the failure was not limited to these indexes.
+    Markdown/evo_nodes projection. ``None`` means a derived repair could not be
+    completed safely and must be retried (for example, contention, disk-full,
+    or read-only storage); ``False`` means the observed damage was not limited
+    to these indexes.
     """
+    # Do not let retained WAL schema frames disguise whole-file authority
+    # damage as a virtual-table-only failure. Full quarantine must preserve
+    # the corrupt main file and its sidecars together for recovery/analysis.
+    if _db_header_corruption_reason(db_path) is not None:
+        return False
     conn: sqlite3.Connection | None = None
     damaged_fts: set[str] | None = None
     requires_full_schema_reset = False
@@ -414,6 +449,11 @@ def _try_rebuild_derived_fts(db_path: Path) -> bool | None:
             "integrity: derived FTS repair failed",
             extra={"path": str(db_path), "error": str(exc)},
         )
+        # Once canonical tables passed the derived-damage preflight, an
+        # environmental repair failure (BUSY, FULL, READONLY, IOERR, etc.) is
+        # not evidence that the authority DB should be quarantined. Defer it.
+        # Whole-file header damage is classified before this function opens
+        # SQLite and therefore cannot reach this conservative branch.
         return None if damaged_fts else False
     finally:
         if conn is not None:
@@ -1301,17 +1341,29 @@ def _reconcile_resolved_write_authority(authority: str) -> dict[str, object]:
 
 
 def _invalidate_model_manifest() -> bool:
-    """Remove build metadata that belongs to the quarantined database."""
+    """Remove derived model views that belong to the quarantined database."""
     manifest = paths.model_build_manifest()
+    manifest_invalidated = True
     try:
         manifest.unlink(missing_ok=True)
-        return True
     except OSError as exc:
+        manifest_invalidated = False
         _log.warning(
             "integrity: failed to invalidate stale model build manifest",
             extra={"path": str(manifest), "error": str(exc)},
         )
-        return False
+    try:
+        from .model.human import HumanMarkdownConflict, remove_managed_human_markdown
+
+        remove_managed_human_markdown()
+    except HumanMarkdownConflict as exc:
+        _log.warning("integrity: preserving user-owned HUMAN.md", extra={"error": str(exc)})
+    except (OSError, RuntimeError) as exc:
+        _log.warning(
+            "integrity: failed to remove stale HUMAN.md projection",
+            extra={"path": str(paths.human_file()), "error": str(exc)},
+        )
+    return manifest_invalidated
 
 
 def _capture_buffer_replay_available() -> bool:
@@ -1526,8 +1578,18 @@ def check_and_recover() -> list[QuarantinedFile]:
     loaded or the DB is opened, so a corrupt file is moved aside before any
     code path trips over it. Returns the list of quarantined files (empty when
     everything was healthy). Never raises — a check that itself fails degrades
-    to "assume healthy" and logs the failure.
+    to "assume healthy" and logs the failure. The operation owns the exclusive
+    database-maintenance boundary so raw quarantine, restore, VACUUM, and
+    projection replay cannot overlap a cooperating stdio transaction.
     """
+    from .store import fts
+
+    with fts.exclusive_database_maintenance():
+        return _check_and_recover_locked()
+
+
+def _check_and_recover_locked() -> list[QuarantinedFile]:
+    """Implementation for :func:`check_and_recover` under the exclusive gate."""
     started = time.perf_counter()
     quarantined: list[QuarantinedFile] = []
 
@@ -1772,7 +1834,14 @@ def check_and_recover() -> list[QuarantinedFile]:
             db_reason = None
             _log.warning("integrity: DB check errored, assuming healthy", extra={"error": str(e)})
         if db_reason is not None:
-            derived_fts_repair = _try_rebuild_derived_fts(db_path)
+            # Never open SQLite's derived-repair path when the main authority
+            # file itself is invalid. A retained WAL can otherwise supply old
+            # schema frames and make full-file damage look FTS-only.
+            derived_fts_repair = (
+                False
+                if _db_header_corruption_reason(db_path) is not None
+                else _try_rebuild_derived_fts(db_path)
+            )
             if derived_fts_repair is True:
                 rebuilt_derived_fts = True
                 database_safe_to_finalize = True

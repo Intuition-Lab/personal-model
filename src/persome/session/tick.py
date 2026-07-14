@@ -11,6 +11,9 @@ The daemon tasks wired here include:
     where the process was offline across midnight.
   * ``run_reducer_retry_tick`` — retries due failed reductions once per minute
     and sends terminal success or heuristic fallback through model finalization.
+  * ``run_wal_checkpoint_tick`` — owns every scheduled WAL checkpoint; it
+    truncates after daemon start and at each local-day rollover, then otherwise
+    runs PASSIVE maintenance.
   * ``build_manager`` — factory that wires ``on_session_end`` to
     persist a ``sessions`` row and spawn the S2 reducer thread.
 """
@@ -39,6 +42,8 @@ from . import store as session_store
 from .manager import SessionManager
 
 logger = get("persome.session")
+
+_WAL_CHECKPOINT_INTERVAL_SECONDS = 60
 
 
 def _prune_telemetry_tables() -> dict[str, int]:
@@ -347,6 +352,44 @@ def _seconds_until_next_local(hour: int, minute: int) -> float:
     return (target - now).total_seconds()
 
 
+async def run_wal_checkpoint_tick(
+    *, interval_seconds: float = _WAL_CHECKPOINT_INTERVAL_SECONDS
+) -> None:
+    """Run the daemon's sole scheduled checkpoint entrance.
+
+    The first successful pass after daemon start and the first pass after each
+    local-day rollover use TRUNCATE to bound the WAL sidecar; later passes use
+    PASSIVE. Keeping every truncate here avoids two independent schedulers
+    issuing the consecutive checkpoints required by SQLite's WAL-reset bug.
+    """
+    interval = max(0.01, float(interval_seconds))
+    logger.info("WAL checkpoint loop started (every %.0fs)", interval)
+    last_truncate_day: str | None = None
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            today = datetime.now().astimezone().date().isoformat()
+            mode = "TRUNCATE" if today != last_truncate_day else "PASSIVE"
+            busy, log_pages, ckpt_pages = await asyncio.to_thread(
+                fts.checkpoint,
+                mode,
+                wait=False,
+            )
+            if mode == "TRUNCATE" and busy == 0:
+                last_truncate_day = today
+            logger.debug(
+                "periodic wal_checkpoint(%s): busy=%d log=%d checkpointed=%d",
+                mode,
+                busy,
+                log_pages,
+                ckpt_pages,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — checkpoint failure must not kill Runtime
+            logger.warning("periodic WAL checkpoint failed: %s", exc)
+
+
 def _reproject_entries_from_evomem() -> tuple[int, int]:
     from ..store import entries as entries_mod
 
@@ -443,21 +486,6 @@ async def run_daily_safety_net(cfg: Config, manager: SessionManager) -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("daily orphan reap failed: %s", exc)
-            # Truncate the WAL sidecar after the heavy daily writes settle —
-            # auto-checkpoint resets the WAL pointer but never shrinks the
-            # file, so without this the sidecar drifts unbounded. It also
-            # guarantees the snapshot below reads a fresh main DB (evomem
-            # SSOT switch design §3.2: checkpoint BEFORE snapshot).
-            try:
-                busy, log_pages, ckpt_pages = await asyncio.to_thread(fts.checkpoint)
-                logger.info(
-                    "daily wal_checkpoint(TRUNCATE): busy=%d log=%d checkpointed=%d",
-                    busy,
-                    log_pages,
-                    ckpt_pages,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("daily wal_checkpoint failed: %s", exc)
             # Retention for parser-tick telemetry (#508): the table defines a
             # bounded `prune` that previously had no caller. Run it once per day so the
             # advertised bound actually holds. Pure side channel — failures
@@ -612,11 +640,12 @@ def _run_evomem_enrichment_once(
     *,
     raise_on_error: bool = False,
 ) -> dict[str, object]:
-    """One enrichment pass: person-graph ingest (#1) + case extraction (#2).
+    """One enrichment pass: person-graph ingest, case extraction, attention digest.
 
-    Both layers gate INTERNALLY on their own flags and no-op when off, so this is
-    safe to call whenever the tick fires. Person-graph ingest is deterministic (no
-    LLM); case extraction makes one LLM pass over the last 24h of timeline blocks.
+    Every layer gates INTERNALLY on its own flag and no-ops when off, so this is
+    safe to call whenever the tick fires. Person-graph ingest and the attention
+    digest are deterministic (no LLM); case extraction makes one LLM pass over
+    the last 24h of timeline blocks.
     Extracted so the wiring is unit-testable without driving the daily loop. Each
     layer is isolated in its own try so one failure never blocks the others.
     Scheduled callers stay fail-open; the model build passes ``raise_on_error``
@@ -627,7 +656,12 @@ def _run_evomem_enrichment_once(
     from ..model.entity_source import MemoryPersonNameSource
     from ..writer import case_extractor
 
-    report: dict[str, object] = {"person_updates": 0, "case_cards": 0, "relation_edges": 0}
+    report: dict[str, object] = {
+        "person_updates": 0,
+        "case_cards": 0,
+        "relation_edges": 0,
+        "attention_digest": 0,
+    }
     errors: list[str] = []
 
     if getattr(cfg, "person_graph_enabled", False):
@@ -653,8 +687,26 @@ def _run_evomem_enrichment_once(
             logger.error("evomem enrichment: case extraction failed: %s", exc, exc_info=True)
             errors.append(f"case_extraction: {type(exc).__name__}: {exc}")
 
-    # Graph-memory P0-2 (#428): relation-edge extraction → SHADOW. Gates internally on
-    # relation_extraction_enabled (default off) + fully fail-open, like the two layers above.
+    # Deterministic dwell digest (no LLM): today's attention loci → one durable
+    # user-attention.md fact, so dwell regularities can reach the schema miner.
+    if getattr(cfg, "attention_digest_enabled", False):
+        try:
+            from ..writer import attention_digest
+
+            digest = attention_digest.run_attention_digest(cfg)
+            report["attention_digest"] = 1 if digest.committed else 0
+            if digest.committed:
+                logger.info(
+                    "evomem enrichment: attention digest covers %d surface(s)",
+                    len(digest.surfaces),
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort enrichment, never crash the tick
+            logger.error("evomem enrichment: attention digest failed: %s", exc, exc_info=True)
+            errors.append(f"attention_digest: {type(exc).__name__}: {exc}")
+
+    # Optional compatibility relation extractor → SHADOW. The primary Line writer is
+    # windowed memory-delta; this second entrance stays behind its explicit opt-in.
+    # Eligible history can still become ACTIVE in the promotion pass below.
     if getattr(cfg, "relation_extraction_enabled", False):
         try:
             from ..evomem import relation_extractor

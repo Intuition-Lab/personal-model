@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -63,6 +64,39 @@ def test_write_capture_indexes_into_fts(ac_root: Path) -> None:
         assert len(hits) == 1
         assert hits[0].id == path.stem
         assert hits[0].app_name == "Cursor"
+
+
+def test_capture_json_and_index_wait_together_for_exclusive_clean(ac_root: Path) -> None:
+    fts.initialize_runtime_schema()
+    out = _capture_dict(
+        ts="2026-07-14T12:00:00+08:00",
+        app="Cursor",
+        title="atomic-clean.py",
+        value="capture clean boundary",
+        text="capture clean boundary",
+    )
+    started = threading.Event()
+    finished = threading.Event()
+    written: list[Path] = []
+
+    def write() -> None:
+        started.set()
+        written.append(scheduler_mod._write_capture(out))
+        finished.set()
+
+    with fts.exclusive_database_maintenance():
+        writer = threading.Thread(target=write)
+        writer.start()
+        assert started.wait(1)
+        assert not finished.wait(0.1)
+        assert list(paths.capture_buffer_dir().glob("*.json")) == []
+
+    writer.join(timeout=5)
+    assert not writer.is_alive()
+    assert finished.is_set()
+    assert len(written) == 1 and written[0].exists()
+    with fts.cursor() as conn:
+        assert conn.execute("SELECT 1 FROM captures WHERE id=?", (written[0].stem,)).fetchone()
 
 
 def test_restore_capture_index_sanitizes_legacy_placeholder(ac_root: Path) -> None:

@@ -29,7 +29,24 @@ TEXT_SUFFIXES = {
     ".yml",
 }
 TEXT_NAMES = {".gitignore", ".python-version", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES"}
-SKIP_PARTS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
+# Agent worktrees under `.claude/worktrees` embed full repository copies (OCR
+# dictionary included). Root `.claude` configuration remains human-authored
+# repository text and must still pass this gate.
+SKIP_PARTS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+}
+
+
+def _skip_path(root: Path, path: Path) -> bool:
+    relative = path.relative_to(root)
+    if SKIP_PARTS.intersection(relative.parts):
+        return True
+    return relative.parts[:2] == (".claude", "worktrees")
 
 
 def _text_files(root: Path) -> list[Path]:
@@ -37,7 +54,7 @@ def _text_files(root: Path) -> list[Path]:
         path
         for path in root.rglob("*")
         if path.is_file()
-        and not SKIP_PARTS.intersection(path.parts)
+        and not _skip_path(root, path)
         and (path.suffix.lower() in TEXT_SUFFIXES or path.name in TEXT_NAMES)
     )
 

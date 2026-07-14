@@ -1,10 +1,16 @@
+import fcntl
 import os
+import sqlite3
+import subprocess
+import sys
+import textwrap
 import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from persome import paths
 from persome.store import entries as entries_mod
 from persome.store import files as files_mod
 from persome.store import fts, index_md
@@ -50,6 +56,31 @@ def test_memory_discovery_does_not_traverse_symlinked_external_directory(
 def test_make_id_uniqueness() -> None:
     ids = {entries_mod.make_id("2026-04-21T10:30") for _ in range(200)}
     assert len(ids) == 200
+
+
+def test_connect_names_recovery_path_on_corrupt_header(ac_root: Path) -> None:
+    # A live incident shape: page 1 of index.db overwritten, so every fresh
+    # connection failed with a bare "file is not a database" that MCP clients
+    # retried verbatim for hours. The probe must convert it into one
+    # actionable, still-catchable DatabaseError naming the recovery path.
+    db = ac_root / "index.db"
+    db.write_bytes(b"\x0d\x00\x00\x00" + b"\x00" * 4092)
+
+    with pytest.raises(fts.CorruptDatabaseError, match="persome start") as raised:
+        fts.connect(db)
+    assert "persome stop" in str(raised.value)
+
+
+def test_connect_does_not_claim_startup_recovery_for_external_database(ac_root: Path) -> None:
+    db = ac_root / "exports" / "damaged-snapshot.db"
+    db.parent.mkdir()
+    db.write_bytes(b"\x0d\x00\x00\x00" + b"\x00" * 4092)
+
+    with pytest.raises(fts.CorruptDatabaseError) as raised:
+        fts.connect(db)
+    message = str(raised.value)
+    assert "persome start" not in message
+    assert "automatic daemon-start recovery applies only to the live index.db" in message
 
 
 def test_create_append_search(ac_root: Path) -> None:
@@ -619,3 +650,413 @@ def test_concurrent_supersede_then_append_serializes(ac_root: Path) -> None:
         f"expected 3 entries, got {len(parsed.entries)} — interleaved writes "
         f"likely lost or corrupted one"
     )
+
+
+# ─── shared-database client mode (#68) ───────────────────────────────────────
+
+
+def test_client_connect_disables_autocheckpoint_and_skips_ddl(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The daemon (owner semantics) creates and migrates the schema first.
+    fts.initialize_runtime_schema()
+    with fts.cursor() as conn:
+        assert int(conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]) == 0
+        entries_mod.create_file(conn, name="project-a.md", description="d", tags=[])
+        entries_mod.append_entry(conn, name="project-a.md", content="seed row", tags=[])
+        schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    conn = fts.connect()
+    try:
+        # A client must never auto-checkpoint; WAL maintenance is daemon-only.
+        assert int(conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]) == 0
+        # No connect-time DDL/migration: the schema cookie is untouched.
+        assert int(conn.execute("PRAGMA schema_version").fetchone()[0]) == schema_version
+        # Reads and row-level DML both still work.
+        assert fts.search(conn, query="seed") != []
+        entries_mod.append_entry(conn, name="project-a.md", content="client row", tags=[])
+        assert int(conn.execute("PRAGMA schema_version").fetchone()[0]) == schema_version
+    finally:
+        conn.close()
+
+
+def test_runtime_schema_publication_is_idempotent_without_wal_write(ac_root: Path) -> None:
+    owner = fts.connect()
+    try:
+        fts.initialize_runtime_schema(owner)
+        owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        wal = paths.index_db().with_name(f"{paths.index_db().name}-wal")
+        before_size = wal.stat().st_size if wal.exists() else 0
+        before_changes = owner.total_changes
+
+        fts.initialize_runtime_schema(owner)
+
+        after_size = wal.stat().st_size if wal.exists() else 0
+        assert owner.total_changes == before_changes
+        assert after_size == before_size
+    finally:
+        owner.close()
+
+
+def test_client_connect_requires_daemon_created_schema(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    with pytest.raises(RuntimeError, match="start the Persome daemon"):
+        fts.connect()
+    assert not paths.index_db().exists()
+
+
+def test_client_connect_requires_current_runtime_schema(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Core fts.connect alone is intentionally not the daemon's complete lazy
+    # schema pass. A client must fail before it can opportunistically finish it.
+    with fts.cursor() as conn:
+        before = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    with pytest.raises(RuntimeError, match="not initialized for this Persome version"):
+        fts.connect()
+    raw = sqlite3.connect(paths.index_db())
+    try:
+        assert int(raw.execute("PRAGMA schema_version").fetchone()[0]) == before
+    finally:
+        raw.close()
+
+
+def test_client_connect_rejects_schema_receipt_mismatch(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fts.initialize_runtime_schema()
+    with fts.cursor() as conn:
+        conn.execute("DROP TABLE schema_faces")
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    with pytest.raises(RuntimeError, match="publication receipt"):
+        fts.connect()
+
+
+def test_client_connect_does_not_enable_wal_mode(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Owner initialization creates the complete schema in WAL mode.
+    fts.initialize_runtime_schema()
+    raw = sqlite3.connect(paths.index_db())
+    try:
+        assert raw.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    finally:
+        raw.close()
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    with pytest.raises(RuntimeError, match="shared WAL access"):
+        fts.connect()
+
+    raw = sqlite3.connect(paths.index_db())
+    try:
+        assert raw.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        raw.close()
+
+
+def test_every_runtime_connection_disables_checkpoint_on_close(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fts.initialize_runtime_schema()
+    option = sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
+    owner = fts.connect()
+    assert owner.getconfig(option) is True
+    owner.close()
+    fts.checkpoint("TRUNCATE")
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    client = fts.connect()
+    try:
+        assert client.getconfig(option) is True
+        client.execute(
+            "INSERT INTO entry_retrieval_stats(entry_id, retrieval_count) VALUES (?, ?)",
+            ("client-write", 1),
+        )
+    finally:
+        client.close()
+
+    # This was the final live connection. Its db-config must still leave the
+    # committed frame for the daemon-owned explicit scheduler.
+    wal = paths.index_db().with_name(f"{paths.index_db().name}-wal")
+    assert wal.exists() and wal.stat().st_size > 0
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", False)
+    busy, _log_pages, _checkpointed = fts.checkpoint("TRUNCATE")
+    assert busy == 0
+    assert not wal.exists() or wal.stat().st_size == 0
+
+
+def test_checkpoint_waits_until_live_transaction_releases_activity_lock(
+    ac_root: Path,
+) -> None:
+    fts.initialize_runtime_schema()
+    transaction_open = threading.Event()
+    release_transaction = threading.Event()
+    checkpoint_started = threading.Event()
+    checkpoint_done = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            with fts.cursor() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO entry_retrieval_stats(entry_id, retrieval_count) VALUES (?, ?)",
+                    ("locked-writer", 1),
+                )
+                transaction_open.set()
+                assert release_transaction.wait(5)
+                conn.commit()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def checkpointer() -> None:
+        try:
+            checkpoint_started.set()
+            fts.checkpoint("PASSIVE")
+            checkpoint_done.set()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    writer_thread = threading.Thread(target=writer)
+    checkpoint_thread = threading.Thread(target=checkpointer)
+    writer_thread.start()
+    assert transaction_open.wait(5)
+    checkpoint_thread.start()
+    assert checkpoint_started.wait(5)
+    assert not checkpoint_done.wait(0.1)
+
+    release_transaction.set()
+    writer_thread.join(timeout=5)
+    checkpoint_thread.join(timeout=5)
+
+    assert not writer_thread.is_alive()
+    assert not checkpoint_thread.is_alive()
+    assert checkpoint_done.is_set()
+    assert errors == []
+
+
+def test_migrated_database_allows_nested_and_concurrent_cursors(ac_root: Path) -> None:
+    fts.initialize_runtime_schema()
+    second_open = threading.Event()
+    release_second = threading.Event()
+    errors: list[BaseException] = []
+
+    def second_reader() -> None:
+        try:
+            with fts.cursor() as conn:
+                conn.execute("SELECT 1").fetchone()
+                second_open.set()
+                assert release_second.wait(5)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    with fts.cursor() as first:
+        first.execute("SELECT 1").fetchone()
+        with fts.cursor() as nested:
+            nested.execute("SELECT 1").fetchone()
+        reader_thread = threading.Thread(target=second_reader)
+        reader_thread.start()
+        assert second_open.wait(1), "a migrated DB read must not request the exclusive gate"
+        release_second.set()
+
+    reader_thread.join(timeout=5)
+    assert not reader_thread.is_alive()
+    assert errors == []
+
+
+def test_legacy_migration_waits_for_exclusive_activity_gate(ac_root: Path) -> None:
+    fts.initialize_runtime_schema()
+    raw = sqlite3.connect(paths.index_db())
+    try:
+        raw.execute("PRAGMA user_version=0")
+    finally:
+        raw.close()
+
+    migration_done = threading.Event()
+    errors: list[BaseException] = []
+
+    def migrate() -> None:
+        try:
+            with fts.cursor() as conn:
+                conn.execute("SELECT 1").fetchone()
+            migration_done.set()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    with paths.open_private_lock_file(paths.wal_checkpoint_lock()) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        migration_thread = threading.Thread(target=migrate)
+        migration_thread.start()
+        assert not migration_done.wait(0.1)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    migration_thread.join(timeout=10)
+    assert not migration_thread.is_alive()
+    assert migration_done.is_set()
+    assert errors == []
+
+
+def test_nonblocking_checkpoint_skips_live_cursor_without_stranding_worker(
+    ac_root: Path,
+) -> None:
+    fts.initialize_runtime_schema()
+    with fts.cursor() as conn:
+        conn.execute("SELECT 1").fetchone()
+        with pytest.raises(RuntimeError, match="finish the active cursor first"):
+            fts.checkpoint("PASSIVE")
+        assert fts.checkpoint("PASSIVE", wait=False) == (1, -1, -1)
+
+    busy, log_pages, checkpointed = fts.checkpoint("PASSIVE", wait=False)
+    assert busy == 0
+    assert log_pages >= 0
+    assert checkpointed >= 0
+
+
+def test_secure_purge_requires_reentrant_exclusive_maintenance(ac_root: Path) -> None:
+    with (
+        fts.cursor() as conn,
+        pytest.raises(RuntimeError, match="exclusive_database_maintenance"),
+    ):
+        fts.purge_deleted_content(conn)
+
+    with fts.exclusive_database_maintenance(), fts.cursor() as conn:
+        fts.purge_deleted_content(conn)
+
+
+def test_multi_process_clients_keep_wal_safe_and_writable(ac_root: Path) -> None:
+    fts.initialize_runtime_schema()
+    env = os.environ.copy()
+    env["PERSOME_ROOT"] = str(ac_root)
+    env["PYTHONUNBUFFERED"] = "1"
+    owner_code = textwrap.dedent(
+        """
+        import sys
+        from persome.store import fts
+
+        owner = fts.open_runtime_owner()
+        print("ready", flush=True)
+        sys.stdin.readline()
+        fts.close_runtime_owner(owner)
+        """
+    )
+    client_code = textwrap.dedent(
+        """
+        import sys
+        from persome.store import fts
+
+        fts.declare_client_process()
+        entry_id = f"subprocess-{sys.argv[1]}"
+        for _ in range(100):
+            with fts.cursor() as conn:
+                conn.execute(
+                    "INSERT INTO entry_retrieval_stats(entry_id, retrieval_count) "
+                    "VALUES (?, 1) ON CONFLICT(entry_id) DO UPDATE SET "
+                    "retrieval_count=retrieval_count+1",
+                    (entry_id,),
+                )
+        """
+    )
+    owner = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", owner_code],
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert owner.stdout is not None
+        assert owner.stdout.readline().strip() == "ready"
+        clients = [
+            subprocess.Popen(  # noqa: S603
+                [sys.executable, "-c", client_code, str(index)],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for index in range(4)
+        ]
+        failures: list[str] = []
+        for index, client in enumerate(clients):
+            stdout, stderr = client.communicate(timeout=30)
+            if client.returncode != 0:
+                failures.append(f"client {index}: rc={client.returncode} {stdout=} {stderr=}")
+        assert failures == []
+    finally:
+        if owner.stdin is not None:
+            owner.stdin.write("stop\n")
+            owner.stdin.flush()
+        try:
+            _stdout, owner_stderr = owner.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            owner.kill()
+            _stdout, owner_stderr = owner.communicate(timeout=5)
+        assert owner.returncode == 0, owner_stderr
+
+    with fts.cursor() as conn:
+        rows = conn.execute(
+            "SELECT entry_id, retrieval_count FROM entry_retrieval_stats "
+            "WHERE entry_id LIKE 'subprocess-%' ORDER BY entry_id"
+        ).fetchall()
+        assert [(row["entry_id"], row["retrieval_count"]) for row in rows] == [
+            (f"subprocess-{index}", 100) for index in range(4)
+        ]
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = paths.index_db().with_name(f"{paths.index_db().name}{suffix}")
+        assert sidecar.exists()
+        assert sidecar.stat().st_nlink == 1
+
+
+def test_client_checkpoint_refuses(ac_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fts.initialize_runtime_schema()
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    with pytest.raises(RuntimeError, match="client process"):
+        fts.checkpoint()
+
+
+def test_declare_client_process_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", False)
+    assert not fts.is_client_process()
+    fts.declare_client_process()
+    assert fts.is_client_process()
+
+
+def test_client_mcp_read_cannot_mutate_schema(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from persome.mcp import server as mcp_server
+
+    fts.initialize_runtime_schema()
+    with fts.cursor() as conn:
+        before = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_faces'"
+        ).fetchone()
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    client = fts.connect()
+    try:
+        assert mcp_server._behavior_patterns(client) == {
+            "root": None,
+            "faces": [],
+            "rendered": "",
+        }
+        assert int(client.execute("PRAGMA schema_version").fetchone()[0]) == before
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            client.execute("CREATE TABLE client_must_not_create(value TEXT)")
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            client.execute("PRAGMA wal_autocheckpoint=1000")
+        assert int(client.execute("PRAGMA wal_autocheckpoint").fetchone()[0]) == 0
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            client.execute("PRAGMA user_version=99999999")
+    finally:
+        client.close()

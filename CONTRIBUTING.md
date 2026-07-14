@@ -3,7 +3,7 @@
 ## Dev setup
 
 Requirements: macOS 13+ (for the full capture stack; the Python daemon and its
-offline tests also run on Linux), Python 3.11, [uv](https://docs.astral.sh/uv/).
+offline tests also run on Linux), Python 3.12, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/Intuition-Lab/personal-model.git

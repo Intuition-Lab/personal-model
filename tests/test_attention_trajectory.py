@@ -67,6 +67,15 @@ def test_time_gap_splits_same_surface_run() -> None:
     assert all(s.dwell_seconds == 60 for s in spans)  # gap not counted as dwell
 
 
+def test_tolerated_gap_keeps_run_but_does_not_inflate_dwell() -> None:
+    # A 120s missing interval is tolerated for trajectory continuity, but only
+    # the two observed 60s blocks count as dwell.
+    spans = build_attention_trajectory([_blk(0, "A"), _blk(3, "A")])
+    assert len(spans) == 1
+    assert spans[0].start.minute == 0 and spans[0].end.minute == 4
+    assert spans[0].dwell_seconds == 120
+
+
 def test_unsorted_input_is_sorted() -> None:
     spans = build_attention_trajectory([_blk(2, "A"), _blk(0, "A"), _blk(1, "A")])
     assert len(spans) == 1

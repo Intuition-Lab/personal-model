@@ -9,7 +9,9 @@ are not listed here.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Literal
 
 LLMProtocol = Literal["anthropic", "openai"]
@@ -271,6 +273,9 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 )
 
 _BY_ID = {provider.id: provider for provider in PROVIDERS}
+_COMPLETION_TOKEN_LIMIT_PROVIDERS = frozenset({"openai", "azure-openai"})
+_TOKEN_LIMIT_PARAMETER_BY_ROUTE: dict[tuple[str, str, str], str] = {}
+_TOKEN_LIMIT_CACHE_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -317,6 +322,77 @@ class ResolvedLLMProfile:
         if not self.key_required:
             return "persome-local"
         raise RuntimeError(f"{self.api_key_env} is not set for {self.provider_label}")
+
+
+def openai_token_limit_kwargs(profile: ResolvedLLMProfile, limit: int) -> dict[str, int]:
+    """Map Persome's provider-neutral output limit to the provider's wire parameter."""
+    cache_key = (profile.provider.lower(), profile.base_url.rstrip("/"), profile.wire_model)
+    with _TOKEN_LIMIT_CACHE_LOCK:
+        parameter = _TOKEN_LIMIT_PARAMETER_BY_ROUTE.get(cache_key)
+    if parameter is None:
+        parameter = (
+            "max_completion_tokens"
+            if profile.provider.lower() in _COMPLETION_TOKEN_LIMIT_PROVIDERS
+            else "max_tokens"
+        )
+    return {parameter: limit}
+
+
+def _completion_token_limit_is_unsupported(exc: Exception, parameter: str) -> bool:
+    """Return whether a 400 response explicitly rejects the attempted parameter."""
+    if getattr(exc, "status_code", None) != 400:
+        return False
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        body = body["error"]
+    code = getattr(exc, "code", None)
+    rejected_parameter = getattr(exc, "param", None)
+    message = ""
+    if isinstance(body, dict):
+        code = code or body.get("code")
+        rejected_parameter = rejected_parameter or body.get("param")
+        message = str(body.get("message", ""))
+    if code == "unsupported_parameter" and rejected_parameter == parameter:
+        return True
+
+    # Older Azure deployments return neither code nor param, but use this
+    # exact error shape for an unknown request argument.
+    if code is not None or rejected_parameter is not None:
+        return False
+    normalized = " ".join(message.lower().split())
+    return normalized == f"unrecognized request argument supplied: {parameter}"
+
+
+def create_openai_chat_completion(
+    profile: ResolvedLLMProfile,
+    create: Callable[..., Any],
+    *,
+    limit: int,
+    **kwargs: Any,
+) -> Any:
+    """Create a chat completion with a narrow token-limit compatibility fallback.
+
+    Official OpenAI profiles prefer ``max_completion_tokens`` and compatible
+    gateways prefer ``max_tokens``. Either can point at a model with the opposite
+    requirement, so retry once only when the endpoint explicitly rejects the
+    attempted parameter. Cache the accepted choice per route for this process.
+    """
+    token_limit = openai_token_limit_kwargs(profile, limit)
+    parameter = next(iter(token_limit))
+    try:
+        return create(**kwargs, **token_limit)
+    except Exception as exc:
+        if not _completion_token_limit_is_unsupported(exc, parameter):
+            raise
+        alternate = (
+            "max_tokens" if parameter == "max_completion_tokens" else "max_completion_tokens"
+        )
+        response = create(**kwargs, **{alternate: limit})
+        cache_key = (profile.provider.lower(), profile.base_url.rstrip("/"), profile.wire_model)
+        with _TOKEN_LIMIT_CACHE_LOCK:
+            _TOKEN_LIMIT_PARAMETER_BY_ROUTE[cache_key] = alternate
+        return response
 
 
 def provider_spec(provider: str) -> ProviderSpec | None:
@@ -410,7 +486,7 @@ def resolve_profile(model_cfg: Any) -> ResolvedLLMProfile:
         return legacy
 
     model = str(getattr(model_cfg, "model", "") or "")
-    provider = str(getattr(model_cfg, "provider", "") or "") or infer_provider(model)
+    provider = (str(getattr(model_cfg, "provider", "") or "") or infer_provider(model)).lower()
     spec = provider_spec(provider)
     if spec is None:
         spec = _BY_ID["custom-openai"]
@@ -454,6 +530,7 @@ def make_profile(
     protocol: LLMProtocol | None = None,
 ) -> ResolvedLLMProfile:
     """Build a profile from onboarding inputs before they are persisted."""
+    provider = provider.lower()
     spec = provider_spec(provider) or _BY_ID["custom-openai"]
     return ResolvedLLMProfile(
         provider=provider,

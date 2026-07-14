@@ -112,17 +112,30 @@ def test_watchdog_arms_a_daemon_thread_when_a_client_is_watchable(
 def test_run_stdio_starts_the_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     started: list[bool] = []
     build_args: list[dict[str, bool]] = []
-    monkeypatch.setattr(mcp_server, "_start_parent_watchdog", lambda: started.append(True))
+    order: list[str] = []
+    monkeypatch.setattr(
+        mcp_server.fts,
+        "declare_client_process",
+        lambda: order.append("client-role"),
+    )
+
+    def _start_watchdog() -> None:
+        order.append("watchdog")
+        started.append(True)
+
+    monkeypatch.setattr(mcp_server, "_start_parent_watchdog", _start_watchdog)
 
     class _FakeServer:
         def run(self) -> None:  # pragma: no cover - trivial
             pass
 
     def _build_server(**kwargs: bool) -> _FakeServer:
+        order.append("build-server")
         build_args.append(kwargs)
         return _FakeServer()
 
     monkeypatch.setattr(mcp_server, "build_server", _build_server)
     mcp_server.run_stdio()
     assert started == [True]
+    assert order == ["client-role", "watchdog", "build-server"]
     assert build_args == [{"auth_enabled": False, "include_http_routes": False}]

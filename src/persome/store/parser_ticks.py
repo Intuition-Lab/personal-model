@@ -26,6 +26,10 @@ CREATE INDEX IF NOT EXISTS idx_parser_ticks_ts ON parser_ticks(ts DESC);
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    from . import fts
+
+    if fts.is_client_process():
+        return
     conn.executescript(SCHEMA)
 
 

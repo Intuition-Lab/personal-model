@@ -87,6 +87,9 @@ def test_build_plist_core_fields(ac_root: Path) -> None:
     assert pl["ProgramArguments"] == [binary, "start", "--foreground"]
     assert pl["KeepAlive"] is True
     assert pl["RunAtLoad"] is True
+    # Crash-loop damping (#68): abnormal exits get a cool-down, not an
+    # instant relaunch onto a database siblings are still dying against.
+    assert pl["ThrottleInterval"] == 30
     assert pl["Umask"] == 0o077
     # Logs route under the data root so the diagnostic bundle collects them.
     assert pl["StandardOutPath"] == str(paths.launchd_stdout_log())

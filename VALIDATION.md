@@ -5,7 +5,7 @@ only synthetic data and does not require provider credentials.
 
 ## 1. Install the development environment
 
-Requirements: Python 3.11+, SQLite 3.42+ with FTS5, `uv`, and macOS 13+ for live
+Requirements: Python 3.12-3.13, SQLite 3.42+ with FTS5, `uv`, and macOS 13+ for live
 capture. The offline Runtime tests also run on Linux.
 
 ```bash
@@ -125,7 +125,7 @@ rm -rf /tmp/persome-wheel-venv /tmp/persome-wheel-root
 uv build --build-constraints build-constraints.txt --require-hashes
 uv export --format requirements-txt --all-extras --no-dev --locked \
   --no-emit-project --quiet --output-file /tmp/persome-runtime.txt
-uv venv /tmp/persome-wheel-venv --python 3.11
+uv venv /tmp/persome-wheel-venv --python 3.12
 uv pip install --python /tmp/persome-wheel-venv/bin/python \
   --require-hashes --no-build --requirement /tmp/persome-runtime.txt
 uv pip install --python /tmp/persome-wheel-venv/bin/python \
@@ -169,7 +169,7 @@ artifacts independently:
 ```bash
 rm -rf pypi-dist /tmp/personal-model-wheel
 uv run python scripts/build_pypi_dist.py --out-dir pypi-dist
-uv venv /tmp/personal-model-wheel --python 3.11
+uv venv /tmp/personal-model-wheel --python 3.12
 uv pip install --python /tmp/personal-model-wheel/bin/python \
   --require-hashes --no-build --requirement /tmp/persome-runtime.txt
 uv pip install --python /tmp/personal-model-wheel/bin/python \
@@ -184,7 +184,8 @@ PY
 ```
 
 PyPI installations are owned by their Python tool manager rather than
-`<PERSOME_ROOT>/venv`. Upgrade them with `uv tool upgrade personal-model` (or
+`<PERSOME_ROOT>/venv`. Upgrade them with
+`uv tool upgrade --python 3.12 personal-model` (or
 the corresponding pipx/pip command), then run `persome onboard` to restart and
 re-prove the Runtime. `persome update` detects this shape and exits with those
 instructions instead of attempting the source installer's atomic venv exchange.

@@ -45,6 +45,28 @@ def test_init_skips_mutable_integrity_recovery_while_daemon_is_running(
     assert cfg is not None
 
 
+def test_init_runs_recovery_inside_reentrant_exclusive_database_gate(
+    ac_root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_read_pid", lambda: None)
+    monkeypatch.setattr(cli, "_daemon_lock_is_held", lambda: False)
+    recovered: list[bool] = []
+
+    def fake_recovery() -> list[object]:
+        assert cli.fts._in_exclusive_maintenance()  # noqa: SLF001
+        # Real recovery uses fts.cursor in some rebuild branches. It must reuse
+        # this thread's exclusive boundary instead of self-deadlocking.
+        with cli.fts.cursor() as conn:
+            conn.execute("SELECT 1").fetchone()
+        recovered.append(True)
+        return []
+
+    monkeypatch.setattr(cli.integrity, "check_and_recover", fake_recovery)
+
+    assert cli._init() is not None
+    assert recovered == [True]
+
+
 def test_start_initialization_is_blocked_by_unresolved_authority(
     ac_root, monkeypatch: pytest.MonkeyPatch
 ) -> None:

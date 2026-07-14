@@ -95,6 +95,12 @@ Ollama, LM Studio, and vLLM. Presets describe endpoint defaults, not a blanket
 capability guarantee for every model. Use `custom-openai` or
 `custom-anthropic` for another compatible gateway.
 
+OpenAI and Azure OpenAI requests prefer the current `max_completion_tokens`
+output limit, while other compatible providers prefer `max_tokens`. If the
+selected endpoint explicitly rejects its preferred parameter, Persome retries
+once when it returns a recognized parameter-rejection error, then remembers the
+accepted choice for the process lifetime.
+
 During onboarding, Persome can discover common provider-specific variables such
 as keys exported by provider CLIs or existing shell profiles. They are import
 sources only; the saved Runtime profile always references `PERSOME_LLM_API_KEY`.
@@ -258,13 +264,21 @@ Additional top-level enrichment flags:
 ```toml
 person_graph_enabled = true
 case_extraction_enabled = true
+attention_digest_enabled = false
 relation_extraction_enabled = false
 edge_promote_fanout = 20
 ```
 
 Person-graph ingest is deterministic. Case extraction distills reusable
-problem/solution evidence. Experimental relation extraction remains off; the
-memory-delta relation path is already active.
+problem/solution evidence. Attention digest is opt-in because attention
+surfaces are raw window, pane, tab, or document titles: enabling it extends
+those values into independently retained `user-attention.md` memory (which
+survives timeline cleanup) and makes them schema-miner input. Same-day re-runs
+supersede that day's digest in place. Relation extraction is also opt-in: it is
+a compatibility enrichment beside the primary windowed memory-delta path. It
+writes shadow edges first, but the same model build promotes edges that already
+meet the evidence floor and shared per-source fan-out cap; enabling it can
+therefore change retrieval and Line output immediately on an existing history.
 
 ## Higher geometry
 
@@ -401,6 +415,7 @@ host = "127.0.0.1"
 port = 8742
 read_receipt_enabled = true
 entity_graph_enabled = true
+related_events_enabled = true
 ```
 
 The daemon HTTP transport hosts MCP, REST routes, and `/model` on the same

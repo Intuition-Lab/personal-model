@@ -21,7 +21,7 @@ This repository owns:
 It does not own product dashboards, notification/task lifecycles, computer-use
 actuation, meeting audio, or evaluation datasets and runners.
 
-- macOS 13+ for live capture; Python 3.11+ via `uv`.
+- macOS 13+ for live capture; Python 3.12-3.13 via `uv`.
 - Package: `src/persome/`; CLI: `persome = "persome.cli:app"`.
 - Default data root: `~/.persome`.
 

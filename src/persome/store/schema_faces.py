@@ -92,6 +92,10 @@ _EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    from . import fts
+
+    if fts.is_client_process():
+        return
     conn.executescript(SCHEMA)
     cols = {row[1] for row in conn.execute("PRAGMA table_info(schema_faces)")}
     for name, decl in _EXTRA_COLUMNS:

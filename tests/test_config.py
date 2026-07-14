@@ -11,6 +11,8 @@ def test_defaults_when_no_file(tmp_path: Path) -> None:
     assert cfg.session.gap_minutes == 5
     assert cfg.reducer.enabled is True
     assert cfg.timeline.max_parallel_windows == 4
+    assert cfg.attention_digest_enabled is False
+    assert cfg.relation_extraction_enabled is False
     default = cfg.model_for("reducer")
     assert default.model == "deepseek-v4-flash"
 
@@ -127,6 +129,8 @@ def test_write_default_creates_file(tmp_path: Path) -> None:
     assert "[models.default]" in text
     assert "persome llm setup" in text
     assert "PERSOME_LLM_API_KEY" in text
+    assert "attention_digest_enabled = false" in text
+    assert "relation_extraction_enabled = false" in text
     # idempotent
     assert not config.write_default_if_missing(p)
 

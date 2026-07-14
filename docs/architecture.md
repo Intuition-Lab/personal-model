@@ -139,7 +139,8 @@ The registry in `src/persome/daemon.py` is the authoritative task list.
 | `capture` | Continuous AX watcher or trusted ingest runner; writes deduplicated S1 captures and updates session activity. |
 | `session` | Every `session.tick_seconds`; evaluates idle, soft-cut, and timeout boundaries. |
 | `reducer-retry` | Every 60 seconds; consumes `next_retry_at`, then sends reduced or heuristic terminal results through the shared finalizer. |
-| `daily-safety-net` | At 23:55 by default; force-ends the open session, catches all stranded reduction/modeling work, reprojects, checkpoints, snapshots, prunes telemetry, and runs enabled maintenance. |
+| `daily-safety-net` | At 23:55 by default; force-ends the open session, catches all stranded reduction/modeling work, reprojects, snapshots, prunes telemetry, and runs enabled maintenance. |
+| `wal-checkpoint` | Every 60 seconds; owns all scheduled WAL checkpoints (`TRUNCATE` after daemon start and at each local-day rollover, otherwise `PASSIVE`). Per-connection auto-checkpointing stays disabled. |
 | `timeline` | Every 60 seconds; materializes closed timeline windows and applies capture retention. |
 | `flush` | Every `session.flush_minutes`; reduces and models the new active-session window as Points/Lines. |
 | `classifier-tick` | Legacy-only: every `classifier.interval_minutes` when delta apply is disabled. |

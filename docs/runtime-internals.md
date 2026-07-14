@@ -51,6 +51,13 @@ is recoverable from the candidate marker. The updater pins both `PERSOME_ROOT`
 and the installer's `PERSOME_INSTALL_HOME` to the active data root so an isolated
 profile cannot be redirected to `~/.persome`.
 
+Model builds materialize `<PERSOME_ROOT>/HUMAN.md` after producing the current
+raw snapshot. Daemon startup and `persome onboard` also reconcile it, which
+backfills a valid existing Root after `persome update` or after
+`uv tool upgrade --python 3.12 personal-model` plus onboarding without recapture or an LLM
+call. Reconciliation emits a forming placeholder when no Root exists and
+refuses to replace an unmarked file at that path.
+
 `start` holds `<PERSOME_ROOT>/.daemon.lock` from preflight through the entire
 foreground or double-forked daemon lifetime. This prevents two concurrent
 starters from both passing the PID check. The daemon writes a numeric `.pid` for
@@ -107,6 +114,7 @@ labels, ports, and data roots do not belong in core.
 | `model-build.lock` | cross-process build lock |
 | `session-model.lock` | cross-process terminal-session finalization lock |
 | `model-build.json` | last build manifest |
+| `HUMAN.md` | Persome-managed raw model reading view; owner-only mode `0600` |
 | `.integrity-recovery.pending.json` | resumable full-database recovery phase journal |
 | `.integrity-config-recovery.pending.json` | pre-quarantine config intent and authority guard |
 | `.integrity-recovery.json` | last completed quarantine/recovery report |
@@ -175,5 +183,42 @@ persome launchagent status
 tail -f ~/.persome/logs/launchd.err.log
 ```
 
-The SQLite store uses WAL mode. Integrity checks and rebuild commands are
-documented in [`troubleshooting.md`](troubleshooting.md).
+The generated LaunchAgent applies a 30-second throttle between rapid exits and
+relaunches so a crash loop cannot immediately stack a new Runtime generation
+onto failing SQLite siblings.
+
+The SQLite store uses WAL mode. Every Runtime connection disables both
+per-connection auto-checkpointing and SQLite's independent checkpoint-on-close
+path (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`). Stdio connections also skip schema
+creation/migration. One daemon task
+owns all scheduled maintenance: it runs every 60 seconds, using `TRUNCATE` on
+its first successful pass after daemon start and again after each local-day
+rollover, with `PASSIVE` otherwise. Every
+`fts.cursor()` holds the shared side of a cross-process reader/writer gate for
+its complete connection lifetime; checkpoint and startup migration take the
+exclusive side. This prevents a transaction commit from racing a WAL reset on
+affected SQLite releases while still allowing normal concurrent readers and
+SQLite's single writer. A scheduled checkpoint skips a busy gate and retries
+on the next tick, so task cancellation cannot strand a worker waiting to reopen
+the database after shutdown. Startup integrity recovery and explicit secure
+clean operations use the same reentrant exclusive boundary. The daemon
+initializes the complete registered schema before atomically publishing
+its exact revision and schema fingerprint; clients reject mismatched receipts
+and fail closed on attempted DDL,
+while explicit row-level memory writes remain supported. Integrity checks and
+rebuild commands are documented in [`troubleshooting.md`](troubleshooting.md). Daily
+snapshots reject structural corruption; logical projection drift is alerted but
+does not discard an otherwise recoverable physical backup.
+
+Stdio row writes remain supported while the daemon is stopped. In that mode no
+process opportunistically checkpoints on close, so committed WAL frames remain
+pending and the sidecar can grow until the daemon's checkpoint task runs again.
+This trades bounded offline-write storage for a single, coordinated checkpoint
+entrance instead of reintroducing racing client maintenance.
+
+The gate coordinates processes running this release. After upgrading, restart
+editor-hosted stdio MCP servers (normally by restarting the editor) before
+resuming Runtime writes: an already-running older process neither observes the
+gate nor has automatic checkpointing disabled. This transition requirement is
+especially important on SQLite versions affected by the documented
+[WAL-reset bug](https://www.sqlite.org/wal.html#the_wal_reset_bug).

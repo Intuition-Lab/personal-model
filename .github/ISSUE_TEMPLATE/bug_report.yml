@@ -43,7 +43,7 @@ body:
     attributes:
       label: Python version
       description: Output of `python3 --version` in the environment running Persome.
-      placeholder: "e.g. Python 3.11.9"
+      placeholder: "e.g. Python 3.12.13"
     validations:
       required: true
   - type: textarea

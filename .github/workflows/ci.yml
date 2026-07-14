@@ -37,7 +37,7 @@ jobs:
         with:
           version: "0.10.9"
           enable-cache: true
-          # Python version is pinned by .python-version (3.11).
+          # Python version is pinned by .python-version (3.12).
 
       - name: Sync dependencies
         run: uv sync --all-extras --locked --no-install-project --no-build
@@ -132,7 +132,7 @@ jobs:
         run: |
           uv export --format requirements-txt --all-extras --no-dev --locked \
             --no-emit-project --quiet --output-file /tmp/persome-runtime.txt
-          uv venv /tmp/persome-wheel --python 3.11
+          uv venv /tmp/persome-wheel --python 3.12
           uv pip install --python /tmp/persome-wheel/bin/python --require-hashes \
             --no-build --requirement /tmp/persome-runtime.txt
           uv pip install --python /tmp/persome-wheel/bin/python --no-deps \

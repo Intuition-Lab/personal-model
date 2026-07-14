@@ -10,9 +10,19 @@ copying a long-lived bearer token into another configuration file.
 persome doctor
 ```
 
-The stdio installers below launch `persome mcp` on demand; the daemon does not
-need to be running. For the HTTP transport or model viewer, start it and check
-the only public route:
+The stdio installers below launch `persome mcp` on demand; after onboarding has
+initialized the local database, the daemon does not need to be running. Stdio
+clients do not create or migrate schema, so a brand-new or externally upgraded
+data root must run `persome start` once first. For the HTTP transport or model
+viewer, start it and check the only public route:
+
+Writes still work while the daemon is stopped, but automatic and close-time
+checkpoints remain disabled. Restart the daemon periodically in that mode so
+its coordinated checkpoint task can bound the WAL sidecar.
+
+After upgrading Persome, restart the editor/client before resuming Runtime
+writes. This reconnects any long-lived stdio process so it participates in the
+current release's SQLite maintenance gate.
 
 ```bash
 persome start
@@ -133,7 +143,8 @@ Official references:
 ## Troubleshooting
 
 1. Use an absolute `persome` path if GUI apps do not inherit the shell `PATH`.
-2. Prefer stdio; it needs neither the daemon nor a copied bearer.
+2. Prefer stdio; after database initialization it needs neither a live daemon
+   nor a copied bearer.
 3. For HTTP, confirm `/health`, then regenerate the authenticated config rather
    than copying a token by hand.
 4. Do not expose `8742` through a tunnel; remote hosting is unsupported.

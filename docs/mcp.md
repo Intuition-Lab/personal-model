@@ -21,6 +21,17 @@ REST/Chat application and never runs database recovery, keeping per-client cold
 starts bounded to MCP tools. Integrity recovery remains a daemon-start and
 maintenance responsibility.
 
+Stdio processes are shared-database clients: they can read and apply explicit
+row-level memory writes, but they do not create or migrate schema and they
+disable per-connection WAL auto-checkpoints. Onboarding normally initializes
+the database already; for a brand-new or externally upgraded data root, run
+`persome start` once before connecting stdio clients. While the daemon is live,
+it pre-initializes every registered store schema, publishes an exact revision
+and schema fingerprint, keeps the schema-owner connection, and performs WAL
+maintenance. A stdio client rejects a missing, stale, future, or mismatched
+receipt, and its SQLite authorizer rejects any schema-changing statement that
+escapes the client-safe store helpers.
+
 Example stdio client configuration:
 
 ```json
@@ -42,6 +53,7 @@ Example stdio client configuration:
 | `read_memory` | Read one memory file with time, tag, and tail filters. |
 | `search` | Search durable memory with BM25 and optional dense retrieval. |
 | `read_receipt` | Resolve a memory entry to its provenance. |
+| `related_events` | Retrieve time-adjacent context around one memory entry: overlapping timeline blocks plus nearest captures, anchored on parseable `occurred_at` else write time. Context is observed data, not evidence for the entry. |
 | `resolve_evidence` | Resolve model, memory, activity, and capture references through one progressive evidence contract. |
 | `recent_activity` | Read recent durable event entries. |
 | `behavior_patterns` | Read modeled behavioral patterns and their support. |
