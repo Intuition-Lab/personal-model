@@ -1,0 +1,13 @@
+{
+  "name": "persome-companion",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bridge": "node Bridge/cli.js",
+    "test:bridge": "node --test Bridge/test/*.test.js",
+    "test": "npm run test:bridge"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

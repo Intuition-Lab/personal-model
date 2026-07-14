@@ -38,7 +38,13 @@ from ..security.auth import (
     issue_browser_bootstrap_nonce,
 )
 from ..store import fts, health_events
-from .models import ApiResponse, CaptureIngestBody, HealthEventsImportBody, ModelPing
+from .models import (
+    ApiResponse,
+    CaptureIngestBody,
+    HealthEventsImportBody,
+    MobileEventIngestBody,
+    ModelPing,
+)
 
 logger = get("persome.api")
 
@@ -499,6 +505,18 @@ def import_health_events(body: HealthEventsImportBody) -> ApiResponse:
             [deletion.model_dump() for deletion in body.deleted_events],
         )
     return ApiResponse(data={"schema_version": body.schema_version, **result})
+
+
+@router.post("/mobile/events/ingest", response_model=ApiResponse, tags=["capture"])
+def ingest_mobile_event(body: MobileEventIngestBody) -> ApiResponse:
+    """Ingest one high-signal observation from a paired mobile companion.
+
+    Pairing and transport terminate in an owner-controlled desktop bridge. This
+    Runtime endpoint remains bearer-authenticated and loopback-only; the bridge
+    forwards the validated event into the canonical capture pipeline.
+    """
+    result = scheduler.ingest_mobile_event(_get_cfg(), body.model_dump())
+    return ApiResponse(data=result)
 
 
 # ─── Personal model ───────────────────────────────────────────────────────

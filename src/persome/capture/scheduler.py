@@ -412,15 +412,25 @@ def _sanitize_ingest_timestamp(raw: Any) -> str:
     return _now_iso()
 
 
-def build_ingest_capture(cfg: CaptureConfig, payload: dict[str, Any]) -> dict[str, Any] | None:
+def build_ingest_capture(
+    cfg: CaptureConfig,
+    payload: dict[str, Any],
+    *,
+    respect_screen_lock: bool = True,
+) -> dict[str, Any] | None:
     """Build a capture dict from a Swift-pushed ingest payload (no OS capture).
 
     The header / window_meta / ax_tree / screenshot come from ``payload`` (the
     Swift "Persome" process captured them); the daemon runs the SAME enrich → OCR
     tail as `_build_capture`. Returns None when capture is paused / screen locked.
     """
-    if _should_skip_capture(cfg):
+    if respect_screen_lock and _should_skip_capture(cfg):
         return None
+    if not respect_screen_lock:
+        paths.ensure_dirs()
+        if paths.paused_flag().exists():
+            logger.info("capture skipped (paused)")
+            return None
 
     out: dict[str, Any] = {
         "timestamp": _sanitize_ingest_timestamp(payload.get("timestamp")),
@@ -475,6 +485,103 @@ def ingest_capture(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
         return {"id": stem, "deduped": stem is None, "skipped": False}
     path = _write_capture(out)
     return {"id": path.stem, "deduped": False, "skipped": False}
+
+
+def build_mobile_event_capture(
+    cfg: CaptureConfig, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Convert a mobile observation into the canonical S1 capture shape.
+
+    Mobile platforms cannot provide a macOS AX tree. The paired companion sends
+    an explicit, owner-initiated semantic event instead; a small synthetic tree
+    lets the existing S1 parser, timeline, sessions, receipts, and model writer
+    remain the only production path.
+    """
+    device = payload.get("device") or {}
+    source_app = str(payload.get("source_app") or "Persome Mobile")
+    title = str(payload.get("title") or payload.get("kind") or "Mobile capture")
+    text_parts = [
+        str(value).strip()
+        for value in (payload.get("text"), payload.get("note"))
+        if value and str(value).strip()
+    ]
+    url = str(payload.get("url") or "").strip()
+    elements: list[dict[str, Any]] = []
+    if url:
+        elements.append({"role": "AXTextField", "value": url})
+    elements.extend({"role": "AXStaticText", "value": value} for value in text_parts)
+    if not elements:
+        elements.append({"role": "AXStaticText", "value": title})
+
+    capture = build_ingest_capture(
+        cfg,
+        {
+            "timestamp": payload.get("captured_at"),
+            "trigger": {
+                "event_type": "MobileEvent",
+                "event_id": payload.get("event_id"),
+                "kind": payload.get("kind"),
+                "device_id": device.get("id"),
+            },
+            "window_meta": {
+                "app_name": source_app,
+                "title": title,
+                "bundle_id": f"app.persome.mobile.{device.get('platform') or 'unknown'}",
+            },
+            "ax_tree": {
+                "apps": [
+                    {
+                        "name": source_app,
+                        "bundle_id": f"app.persome.mobile.{device.get('platform') or 'unknown'}",
+                        "is_frontmost": True,
+                        "windows": [{"title": title, "focused": True, "elements": elements}],
+                    }
+                ]
+            },
+            "ax_metadata": {"synthetic": True, "producer": "mobile-companion"},
+        },
+        respect_screen_lock=False,
+    )
+    if capture is None:
+        return None
+    capture["capture_source"] = "mobile"
+    if url:
+        # Mobile share sheets provide the canonical URL explicitly. Preserve it
+        # rather than asking desktop browser heuristics to rediscover it from a
+        # synthetic accessibility tree.
+        capture["url"] = url
+    capture["mobile_event"] = {
+        "schema_version": payload.get("schema_version", 1),
+        "event_id": payload.get("event_id"),
+        "kind": payload.get("kind"),
+        "device": {
+            "id": device.get("id"),
+            "platform": device.get("platform"),
+            "name": device.get("name"),
+        },
+        "source_app": payload.get("source_app"),
+        "sensitivity": payload.get("sensitivity", "private"),
+        "owner_initiated": True,
+    }
+    return capture
+
+
+def ingest_mobile_event(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist one mobile event through the same runner used by screen capture."""
+    out = build_mobile_event_capture(cfg.capture, payload)
+    if out is None:
+        return {"id": None, "deduped": False, "skipped": True, "source": "mobile"}
+    runner = _active_runner
+    if runner is not None:
+        stem = runner.commit_prebuilt(out)
+        return {
+            "id": stem,
+            "deduped": stem is None,
+            "skipped": False,
+            "source": "mobile",
+        }
+    path = _write_capture(out)
+    return {"id": path.stem, "deduped": False, "skipped": False, "source": "mobile"}
 
 
 def _write_capture(out: dict[str, Any]) -> Path:

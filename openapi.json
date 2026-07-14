@@ -224,6 +224,48 @@
         }
       }
     },
+    "/mobile/events/ingest": {
+      "post": {
+        "tags": [
+          "capture"
+        ],
+        "summary": "Ingest Mobile Event",
+        "description": "Ingest one high-signal observation from a paired mobile companion.\n\nPairing and transport terminate in an owner-controlled desktop bridge. This\nRuntime endpoint remains bearer-authenticated and loopback-only; the bridge\nforwards the validated event into the canonical capture pipeline.",
+        "operationId": "ingest_mobile_event_mobile_events_ingest_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MobileEventIngestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/model": {
       "get": {
         "tags": [
@@ -715,6 +757,151 @@
         "type": "object",
         "title": "HealthEventsImportBody",
         "description": "Bounded atomic batch of normalized health changes."
+      },
+      "MobileDevice": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "platform": {
+            "type": "string",
+            "pattern": "^(ios|android)$",
+            "title": "Platform"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "platform"
+        ],
+        "title": "MobileDevice",
+        "description": "Stable, non-secret identity attached to a mobile observation."
+      },
+      "MobileEventIngestBody": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "maximum": 1.0,
+            "minimum": 1.0,
+            "title": "Schema Version",
+            "default": 1
+          },
+          "event_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Event Id"
+          },
+          "captured_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Captured At"
+          },
+          "device": {
+            "$ref": "#/components/schemas/MobileDevice"
+          },
+          "kind": {
+            "type": "string",
+            "pattern": "^(share|text|url|voice|photo|file|location|usage)$",
+            "title": "Kind",
+            "description": "How the mobile observation was produced"
+          },
+          "source_app": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source App"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 8192
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4096
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "sensitivity": {
+            "type": "string",
+            "pattern": "^(private|sensitive)$",
+            "title": "Sensitivity",
+            "default": "private"
+          }
+        },
+        "type": "object",
+        "required": [
+          "event_id",
+          "device",
+          "kind"
+        ],
+        "title": "MobileEventIngestBody",
+        "description": "One owner-initiated observation from a paired Persome companion."
       },
       "ValidationError": {
         "properties": {

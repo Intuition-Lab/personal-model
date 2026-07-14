@@ -8,9 +8,10 @@ task dashboards, and evaluation harnesses are outside this repository.
 ## Data flow
 
 ```text
-macOS AX watcher ─┐
-optional local OCR├─> capture buffer -> timeline blocks -> sessions
-trusted ingest API┘                              |
+macOS AX watcher ───────┐
+optional local OCR──────┤
+trusted ingest API──────┼─> capture buffer -> timeline blocks -> sessions
+mobile companion bridge┘                                      |
                                                    v
                                 five-minute reducer -> event memory
                                                    |
@@ -28,8 +29,9 @@ trusted ingest API┘                              |
                      model snapshot              MCP                 /model
 ```
 
-The capture path is macOS-only. The storage, model projection, and offline
-tests can run on Linux with macOS-marked tests deselected.
+Native screen capture is macOS-only. Explicit mobile observations join at S1;
+storage, model projection, and offline tests can run on Linux with macOS-marked
+tests deselected.
 
 ## State formation
 
@@ -40,6 +42,9 @@ tests can run on Linux with macOS-marked tests deselected.
    Supported Apple Silicon installs can enable bundled, subprocess-isolated
    PP-OCRv6 as a fallback when an app exposes no usable AX text; AX remains the
    primary daemon-mode signal.
+   Owner-initiated mobile events arrive through the loopback companion bridge
+   and are normalized into the same S1 capture contract with explicit device,
+   source-app, event-kind, sensitivity, and evidence provenance.
 2. `parsers/` normalizes app-specific structures into capture records.
 3. `timeline/` groups records into one-minute blocks and preserves authored
    evidence.

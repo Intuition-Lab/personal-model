@@ -1,0 +1,52 @@
+name: PersomeCompanion
+options:
+  bundleIdPrefix: app.persome
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  PersomeCompanionCore:
+    path: .
+targets:
+  PersomeCompanion:
+    type: application
+    platform: iOS
+    sources:
+      - App
+    dependencies:
+      - package: PersomeCompanionCore
+        product: PersomeCompanionCore
+      - target: PersomeShare
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.persome.companion
+        CODE_SIGN_ENTITLEMENTS: App/PersomeCompanion.entitlements
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSCameraUsageDescription: Scan the pairing code shown by Persome on your Mac.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connect securely to your Personal Model on your Mac.
+        INFOPLIST_KEY_UIBackgroundModes:
+          - fetch
+        INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers:
+          - app.persome.companion.sync
+        SWIFT_VERSION: 6.0
+  PersomeShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - ShareExtension
+    info:
+      path: ShareExtension/Info.plist
+    dependencies:
+      - package: PersomeCompanionCore
+        product: PersomeCompanionCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.persome.companion.share
+        CODE_SIGN_ENTITLEMENTS: ShareExtension/PersomeShare.entitlements
+        SWIFT_VERSION: 6.0
+schemes:
+  PersomeCompanion:
+    build:
+      targets:
+        PersomeCompanion: all
+        PersomeShare: all

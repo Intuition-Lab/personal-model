@@ -132,6 +132,7 @@ def test_rest_requires_the_exact_bearer_token(monkeypatch: pytest.MonkeyPatch) -
     client = TestClient(build_api_app(), headers={"host": "127.0.0.1:8742"})
 
     assert client.get("/openapi.json").status_code == 401
+    assert client.post("/mobile/events/ingest", json={}).status_code == 401
     wrong = client.get("/openapi.json", headers={"authorization": "Bearer wrong"})
     assert wrong.status_code == 401
     assert wrong.headers["www-authenticate"] == "Bearer"
