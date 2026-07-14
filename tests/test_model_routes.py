@@ -318,8 +318,9 @@ class TestViewPage:
         assert "Points" in body and "Volumes" in body and "Root" in body
         assert "The shape" in body and "of you." in body
         assert "Local only" in body
-        assert 'id="share-x"' in body
-        assert 'title="Share your constellation to X" disabled>' in body
+        assert 'id="human-card"' in body
+        assert 'title="Export your HUMAN.md Card" disabled>' in body
+        assert "Private source content was not included." in body
         assert 'id="share-notice"' in body
         assert 'aria-label="Zoom controls"' in body
         assert 'id="zoom-out"' in body
@@ -344,7 +345,7 @@ class TestViewPage:
         assert b"class WebGLRenderer" in three.body
         assert b"computeClusterLayout" in layout.body
         assert b"nodeEvidenceCards" in evidence.body
-        assert b"buildXIntentUrl" in share.body
+        assert b"humanCard" in share.body
         assert b"drawShareCard" in share.body
         assert b'from "./layout.mjs"' in viewer.body
         assert b'from "./share.mjs"' in viewer.body
@@ -386,8 +387,9 @@ class TestViewPage:
         assert b"controls.zoomToCursor = true" in viewer.body
         assert b"downloadShareCard" in viewer.body
         assert b"shareReady = Boolean" in viewer.body
-        assert b"window.open" in viewer.body
-        assert b"my-persome-constellation.png" in share.body
+        assert b"my-human-card.png" in share.body
+        assert b"private source content" in share.body
+        assert b"Built locally with Persome \xc2\xb7 Build yours" in share.body
         assert b"window.__persomeZoomState" in viewer.body
         assert b"if (!REDUCED_MOTION)" in viewer.body
         assert b'event.key === "+"' in viewer.body

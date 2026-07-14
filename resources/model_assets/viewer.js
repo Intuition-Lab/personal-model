@@ -14,7 +14,6 @@ import {
   SHARE_CARD_HEIGHT,
   SHARE_CARD_WIDTH,
   SHARE_FILE_NAME,
-  buildXIntentUrl,
   drawShareCard,
 } from "./share.mjs";
 
@@ -49,7 +48,7 @@ const sliderLabel = document.getElementById("as-of-label");
 const zoomOutButton = document.getElementById("zoom-out");
 const zoomResetButton = document.getElementById("zoom-reset");
 const zoomInButton = document.getElementById("zoom-in");
-const shareButton = document.getElementById("share-x");
+const shareButton = document.getElementById("human-card");
 const shareNoticeEl = document.getElementById("share-notice");
 const lineExplorerEl = document.getElementById("line-explorer");
 const lineSelectEl = document.getElementById("line-select");
@@ -768,7 +767,7 @@ function showShareNotice(title, message, failed = false) {
 function setShareBusy(busy) {
   shareButton.disabled = busy || !shareReady;
   shareButton.setAttribute("aria-busy", String(busy));
-  shareButton.querySelector("b").textContent = busy ? "Preparing…" : "Share";
+  shareButton.querySelector("b").textContent = busy ? "Preparing…" : "Card";
 }
 
 function createShareCardBlob() {
@@ -778,7 +777,7 @@ function createShareCardBlob() {
   canvas.height = SHARE_CARD_HEIGHT;
   const context = canvas.getContext("2d");
   if (!context) return Promise.reject(new Error("Canvas export is unavailable"));
-  drawShareCard(context, renderer.domElement, model);
+  drawShareCard(context, model);
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) resolve(blob);
@@ -798,46 +797,18 @@ function downloadShareCard(blob) {
   window.setTimeout(() => URL.revokeObjectURL(href), 1000);
 }
 
-function paintShareHandoff(popup) {
-  if (!popup) return;
-  popup.document.title = "Preparing your Persome constellation";
-  popup.document.body.innerHTML = `
-    <main style="min-height:100vh;display:grid;place-items:center;margin:0;background:#070610;color:#f7f4ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-      <section style="width:min(440px,calc(100vw - 48px));padding:38px;border:1px solid rgba(255,255,255,.12);border-radius:24px;background:linear-gradient(145deg,rgba(255,100,214,.11),rgba(119,152,255,.08));box-shadow:0 30px 100px rgba(0,0,0,.45)">
-        <p style="margin:0 0 18px;color:#ff83cf;font-size:11px;font-weight:750;letter-spacing:.16em">PERSOME · SHARE TO X</p>
-        <h1 style="margin:0;font-size:34px;line-height:1.05;letter-spacing:-.045em">Your constellation is downloading.</h1>
-        <p style="margin:18px 0 24px;color:#b8b1c7;font-size:15px;line-height:1.65">In X, click the image button and choose <strong style="color:#fff">${SHARE_FILE_NAME}</strong>. Your copy and tags are already filled in.</p>
-        <div style="height:3px;overflow:hidden;border-radius:99px;background:rgba(255,255,255,.08)"><i style="display:block;width:100%;height:100%;transform-origin:left;background:linear-gradient(90deg,#ff64d6,#7798ff);animation:load 1.8s ease forwards"></i></div>
-        <style>@keyframes load{from{transform:scaleX(0)}to{transform:scaleX(1)}}</style>
-      </section>
-    </main>`;
-}
-
-async function shareToX() {
-  const popup = window.open("about:blank", "_blank");
-  paintShareHandoff(popup);
+async function exportHumanCard() {
   setShareBusy(true);
   pauseAutoRotate();
   try {
     const blob = await createShareCardBlob();
     downloadShareCard(blob);
     showShareNotice(
-      "Constellation downloaded",
-      `Add ${SHARE_FILE_NAME} with the image button in X.`,
+      "HUMAN.md Card downloaded",
+      "Private source content was not included.",
     );
-    const intentUrl = buildXIntentUrl();
-    window.setTimeout(() => {
-      if (popup && !popup.closed) {
-        popup.opener = null;
-        popup.location.replace(intentUrl);
-        popup.focus();
-      } else {
-        window.location.assign(intentUrl);
-      }
-      setShareBusy(false);
-    }, 1800);
+    setShareBusy(false);
   } catch (error) {
-    if (popup && !popup.closed) popup.close();
     showShareNotice("Share image failed", error.message || String(error), true);
     setShareBusy(false);
   }
@@ -1520,7 +1491,7 @@ controls.addEventListener("start", () => {
 });
 document.getElementById("reset").addEventListener("click", resetCamera);
 document.getElementById("close-detail").addEventListener("click", clearSelection);
-shareButton.addEventListener("click", shareToX);
+shareButton.addEventListener("click", exportHumanCard);
 
 slider.addEventListener("input", () => {
   updateCutoff();

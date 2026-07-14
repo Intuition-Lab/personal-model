@@ -50,8 +50,8 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       </div>
       <div class="view-actions">
         <span class="privacy-badge"><i aria-hidden="true"></i>Local only</span>
-        <button id="share-x" class="share-button" type="button" aria-label="Share your constellation to X" title="Share your constellation to X" disabled>
-          <span aria-hidden="true">X</span><b>Share</b>
+        <button id="human-card" class="share-button" type="button" aria-label="Export your HUMAN.md Card" title="Export your HUMAN.md Card" disabled>
+          <span aria-hidden="true">H</span><b>Card</b>
         </button>
         <div class="zoom-controls" role="group" aria-label="Zoom controls">
           <button id="zoom-out" class="icon-button" type="button" aria-label="Zoom out" title="Zoom out (−)">−</button>
@@ -114,7 +114,7 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
 
     <div id="share-notice" class="share-notice" role="status" aria-live="polite" hidden>
       <span aria-hidden="true">↓</span>
-      <div><strong>Constellation downloaded</strong><small>Add my-persome-constellation.png in X.</small></div>
+      <div><strong>HUMAN.md Card downloaded</strong><small>Private source content was not included.</small></div>
     </div>
 
     <footer class="timeline">
