@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 DEFAULT_MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024
+HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_CONCURRENT_REQUESTS = 16
 
 
@@ -22,11 +24,22 @@ class RequestBodyLimitMiddleware:
     before doing useful work.
     """
 
-    def __init__(self, app: ASGIApp, *, max_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+        path_limits: Mapping[str, int] | None = None,
+        strict_json_paths: Sequence[str] = (),
+    ) -> None:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
+        if any(limit <= 0 for limit in (path_limits or {}).values()):
+            raise ValueError("path limits must be positive")
         self.app = app
         self.max_bytes = int(max_bytes)
+        self.path_limits = {path: int(limit) for path, limit in (path_limits or {}).items()}
+        self.strict_json_paths = frozenset(strict_json_paths)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -34,6 +47,7 @@ class RequestBodyLimitMiddleware:
             return
 
         headers = Headers(scope=scope)
+        max_bytes = self.path_limits.get(scope["path"], self.max_bytes)
         content_lengths = headers.getlist("content-length")
         if len(content_lengths) > 1:
             await self._reject(scope, receive, send, 400, "ambiguous Content-Length")
@@ -48,7 +62,7 @@ class RequestBodyLimitMiddleware:
             if declared < 0:
                 await self._reject(scope, receive, send, 400, "invalid Content-Length")
                 return
-            if declared > self.max_bytes:
+            if declared > max_bytes:
                 await self._reject(scope, receive, send, 413, "request body too large")
                 return
 
@@ -62,11 +76,26 @@ class RequestBodyLimitMiddleware:
             if message["type"] != "http.request":
                 continue
             total += len(message.get("body", b""))
-            if total > self.max_bytes:
+            if total > max_bytes:
                 await self._reject(scope, receive, send, 413, "request body too large")
                 return
             if not message.get("more_body", False):
                 break
+
+        if scope["path"] in self.strict_json_paths:
+            try:
+                json.loads(
+                    b"".join(message.get("body", b"") for message in buffered),
+                    parse_constant=_reject_nonfinite_constant,
+                )
+            except _NonFiniteJSONNumber:
+                await self._reject(scope, receive, send, 400, "non-finite JSON number")
+                return
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # FastAPI owns ordinary JSON syntax diagnostics.  This early
+                # pass exists only because its validation error echo cannot
+                # safely serialize NaN/Infinity back into standards JSON.
+                pass
 
         replay = _ReplayReceive(buffered, receive)
         await self.app(scope, replay, send)
@@ -100,6 +129,14 @@ class _ReplayReceive:
             # immediate synthetic empty request here would create a hot loop
             # and starve the response producer.
             return await self._fallback()
+
+
+class _NonFiniteJSONNumber(ValueError):
+    pass
+
+
+def _reject_nonfinite_constant(value: str) -> None:
+    raise _NonFiniteJSONNumber(value)
 
 
 class RequestConcurrencyLimitMiddleware:

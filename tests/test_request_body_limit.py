@@ -12,6 +12,7 @@ from persome.api import build_api_app
 from persome.config import Config
 from persome.security.body_limit import (
     DEFAULT_MAX_REQUEST_BODY_BYTES,
+    HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES,
     RequestBodyLimitMiddleware,
     RequestConcurrencyLimitMiddleware,
 )
@@ -115,6 +116,18 @@ def test_api_app_enforces_body_limit_before_json_parsing(ac_root) -> None:
         "/captures/ingest",
         content=b"{}",
         headers={"content-length": str(DEFAULT_MAX_REQUEST_BODY_BYTES + 1)},
+    )
+
+    assert response.status_code == 413
+
+
+def test_api_app_enforces_stricter_health_import_body_limit(ac_root) -> None:
+    client = TestClient(build_api_app(Config(), auth_enabled=False))
+
+    response = client.post(
+        "/health-events/import",
+        content=b"{}",
+        headers={"content-length": str(HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES + 1)},
     )
 
     assert response.status_code == 413

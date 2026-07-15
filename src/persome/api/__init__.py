@@ -22,6 +22,7 @@ from ..config import Config
 from ..logger import get as _get_logger
 from ..security.auth import LocalAPIAuthMiddleware
 from ..security.body_limit import (
+    HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES,
     RequestBodyLimitMiddleware,
     RequestConcurrencyLimitMiddleware,
 )
@@ -226,7 +227,11 @@ def build_api_app(cfg: Config | None = None, *, auth_enabled: bool = True) -> Fa
     )
     app.add_middleware(_AccessLogMiddleware)
     app.add_middleware(_TraceIdMiddleware)
-    app.add_middleware(RequestBodyLimitMiddleware)
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        path_limits={"/health-events/import": HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES},
+        strict_json_paths=("/health-events/import",),
+    )
     app.add_middleware(RequestConcurrencyLimitMiddleware)
     if auth_enabled:
         app.add_middleware(LocalAPIAuthMiddleware)

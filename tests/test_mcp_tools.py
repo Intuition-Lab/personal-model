@@ -10,7 +10,7 @@ from persome.mcp import captures as captures_mod
 from persome.mcp import server as mcp_server
 from persome.model import ModelBuildCoordinator, create_build_manifest
 from persome.store import entries as entries_mod
-from persome.store import fts
+from persome.store import fts, health_events
 from persome.timeline import store as timeline_store
 
 BUILD_KEYS = {
@@ -85,6 +85,45 @@ def test_pending_model_work_is_empty_on_fresh_root(ac_root: Path) -> None:
     with fts.cursor() as conn:
         out = mcp_server._pending_model_work(conn)
     assert out == {"pending_reduction": 0, "pending_modeling": 0, "total": 0}
+
+
+def test_query_health_events_filters_and_orders(ac_root: Path) -> None:
+    fts.initialize_runtime_schema()
+    with fts.cursor() as conn:
+        health_events.import_events(
+            conn,
+            [
+                {
+                    "event_id": "older",
+                    "source": {"provider": "apple_health", "device": "Watch"},
+                    "metric": "heart_rate",
+                    "value": 68.0,
+                    "unit": "bpm",
+                    "started_at": "2026-07-15T09:00:00+08:00",
+                    "metadata": {},
+                },
+                {
+                    "event_id": "newer",
+                    "source": {"provider": "apple_health", "device": "Watch"},
+                    "metric": "heart_rate",
+                    "value": 72.0,
+                    "unit": "bpm",
+                    "started_at": "2026-07-15T09:30:00+08:00",
+                    "metadata": {},
+                },
+            ],
+        )
+    # Stdio MCP is a shared-database client and must never attempt lazy DDL.
+    # Runtime startup owns schema initialization before clients connect.
+    fts.declare_client_process()
+    with fts.cursor() as conn:
+        out = health_events.query_events(
+            conn,
+            metric="heart_rate",
+            since="2026-07-15T09:10:00+08:00",
+        )
+    assert [event["event_id"] for event in out] == ["newer"]
+    assert out[0]["value"] == 72.0
 
 
 def test_get_model_snapshot_uses_versioned_contract(ac_root: Path) -> None:

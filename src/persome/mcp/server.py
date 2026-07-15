@@ -10,6 +10,8 @@ depending on `[mcp] transport`. Exposes:
     related_events, recent_activity
   Raw captures (S1 buffer):
     current_context, search_captures, read_recent_capture
+  Wearable observations:
+    query_health_metrics
   Reference:
     get_schema
 """
@@ -31,7 +33,7 @@ from ..config import load as load_config
 from ..logger import get
 from ..prompts import load as load_prompt
 from ..store import files as files_mod
-from ..store import fts
+from ..store import fts, health_events
 from ..timeline import attention_trajectory as attention_traj
 from ..timeline import store as timeline_store
 from . import captures as captures_mod
@@ -1565,6 +1567,37 @@ def build_server(
             timeline_limit=timeline_limit,
         )
         return json.dumps(result, ensure_ascii=False)
+
+    @server.tool()
+    def query_health_metrics(
+        metric: str | None = None,
+        provider: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+    ) -> str:
+        """Query owner-authorized wearable and health observations.
+
+        Use for questions about imported steps, heart rate, resting heart rate,
+        active energy, sleep stages, or workouts. Results are raw device
+        observations, not medical conclusions. Filters are exact for `metric`
+        and `provider`; time bounds are ISO 8601 and form [since, until).
+        """
+        metric = bounded_optional_text("metric", metric, maximum=96)
+        provider = bounded_optional_text("provider", provider, maximum=64)
+        since = bounded_optional_text("since", since, maximum=64)
+        until = bounded_optional_text("until", until, maximum=64)
+        limit = bounded_int(limit, minimum=1, maximum=1_000)
+        with fts.cursor() as conn:
+            events = health_events.query_events(
+                conn,
+                metric=metric,
+                provider=provider,
+                since=since,
+                until=until,
+                limit=limit,
+            )
+        return json.dumps({"count": len(events), "events": events}, ensure_ascii=False)
 
     @server.tool()
     def get_schema() -> str:

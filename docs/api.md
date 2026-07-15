@@ -23,10 +23,30 @@ runtime schema.
 | GET | `/permissions` | macOS Accessibility and Screen Recording state. |
 | GET | `/status` | Daemon, capture, OCR, session, memory, and provider status. |
 | POST | `/captures/ingest` | Ingest one bearer-authenticated capture from a trusted local producer. |
+| POST | `/health-events/import` | Atomically import up to 1,000 normalized wearable/health changes from a trusted local connector. |
 | GET | `/model` | Open the offline Point/Line/Face/Volume/Root explorer. |
 | GET | `/model/graph` | Read the canonical versioned model snapshot. |
 | GET | `/model/evidence?ref=...` | Resolve a model ID or receipt into direct sources and separately labeled nearby context. |
 | GET | `/model/node?id=...` | Resolve a snapshot Point ID or relation endpoint to receipts and its relation tree. |
+
+### Wearable and health event import
+
+`POST /health-events/import` is the local connector boundary for Apple HealthKit,
+Health Connect, vendor APIs, and file/BLE adapters. Every event needs a stable
+provider `event_id`; repeated imports are accepted and counted as duplicates.
+If the same provider ID arrives with changed normalized content, it corrects the
+existing observation and is counted as `corrected`; an identical replay remains
+a `duplicate`. `deleted_events` contains provider-scoped IDs removed by an
+anchored source query. Deletions and new/corrected events commit in one SQLite
+transaction, so a connector can persist its next source anchor only after this
+request succeeds without leaving stale observations behind.
+Times must be ISO 8601 values with an explicit offset. The Runtime stores raw
+normalized observations and provenance locally; it does not treat consumer
+device measurements as medical diagnoses.
+
+The route has a 2 MiB HTTP and semantic payload ceiling, a combined 1,000-change
+limit, 4 KiB UTF-8 string-value limit, and 64 KiB metadata limit per event.
+NaN and infinities are rejected before FastAPI validation can echo invalid JSON.
 
 The model page renders snapshot Points and Lines directly, then derives the
 Face, Volume, and Root hierarchy from their declared `members`. It loads its
