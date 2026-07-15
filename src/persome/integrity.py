@@ -30,6 +30,7 @@ import tomllib
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from . import config as config_mod
 from . import paths
@@ -134,6 +135,71 @@ class QuarantinedFile:
 
 class _WriteAuthorityUnresolved(RuntimeError):
     """Recovery found multiple intact sources but no unique canonical one."""
+
+
+def _semantic_sequence(value: object) -> tuple[object, ...]:
+    """Normalize persisted JSON lists and live list values for comparison."""
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return ()
+    return tuple(parsed) if isinstance(parsed, list) else ()
+
+
+def _node_geometry_semantics(node: Any) -> tuple[object, ...]:
+    """Fields whose change makes retained Face/Volume/Root output stale.
+
+    ``memory_at`` and ``gmt_created`` are intentionally excluded: Markdown
+    headings normalize timestamp precision during a round trip. Explicit
+    occurrence/validity fields remain semantic and are compared below.
+    """
+    return (
+        str(node.content or ""),
+        str(node.layer),
+        _semantic_sequence(node.supersedes),
+        _semantic_sequence(node.superseded_by),
+        bool(node.is_latest),
+        str(node.status),
+        str(node.file_name or ""),
+        str(node.tags or ""),
+        node.refined_from,
+        _semantic_sequence(node.abstracted_from),
+        node.confidence,
+        bool(node.conflicted),
+        node.occurred_at,
+        node.schema_summary,
+        _semantic_sequence(node.schema_inferences),
+        node.schema_confidence,
+        node.valid_from,
+        node.valid_until,
+    )
+
+
+def _stored_node_geometry_semantics(row: sqlite3.Row) -> tuple[object, ...]:
+    return (
+        str(row["content"] or ""),
+        str(row["layer"]),
+        _semantic_sequence(row["supersedes"]),
+        _semantic_sequence(row["superseded_by"]),
+        bool(row["is_latest"]),
+        str(row["status"]),
+        str(row["file_name"] or ""),
+        str(row["tags"] or ""),
+        row["refined_from"],
+        _semantic_sequence(row["abstracted_from"]),
+        row["confidence"],
+        bool(row["conflicted"]),
+        row["occurred_at"],
+        row["schema_summary"],
+        _semantic_sequence(row["schema_inferences"]),
+        row["schema_confidence"],
+        row["valid_from"],
+        row["valid_until"],
+    )
 
 
 def _timestamp_suffix() -> str:
@@ -1138,6 +1204,7 @@ def _repopulate_after_quarantine(
             "cannot resolve write authority while unsupported Markdown memory files are present"
         )
     current_node_keys = {(node.node_id, node.user_id, node.agent_id) for node in nodes}
+    nodes_by_key = {(node.node_id, node.user_id, node.agent_id): node for node in nodes}
     if len(current_node_keys) != len(nodes):
         seen: set[tuple[str, str, str]] = set()
         duplicates: set[tuple[str, str, str]] = set()
@@ -1149,6 +1216,7 @@ def _repopulate_after_quarantine(
         sample = ", ".join(key[0] for key in sorted(duplicates)[:5])
         raise ValueError(f"duplicate Markdown memory node id(s): {sample}")
     stale_node_keys: list[tuple[str, str, str]] = []
+    changed_node_keys: list[tuple[str, str, str]] = []
     direct_nodes_removed = 0
     derived_geometry_rows_invalidated = 0
     NodeStore()  # create/migrate the canonical node table before one recovery transaction
@@ -1183,6 +1251,21 @@ def _repopulate_after_quarantine(
                 "DELETE FROM evo_nodes WHERE user_id='default' AND agent_id='default' "
                 "AND (file_name LIKE 'event-%' OR instr(file_name, '/') > 0)"
             ).rowcount
+            if snapshot_restored and restore_nodes_from_markdown:
+                stored_nodes = {
+                    (str(row["node_id"]), str(row["user_id"]), str(row["agent_id"])): row
+                    for row in conn.execute(
+                        "SELECT * FROM evo_nodes WHERE user_id='default' AND agent_id='default'"
+                    ).fetchall()
+                }
+                changed_node_keys = sorted(
+                    key
+                    for key, node in nodes_by_key.items()
+                    if key in stored_nodes
+                    and key[1:] == ("default", "default")
+                    and _node_geometry_semantics(node)
+                    != _stored_node_geometry_semantics(stored_nodes[key])
+                )
             # A verified snapshot can be older than the Markdown projection.
             # Under Markdown authority, remove only snapshot nodes that were
             # previously exposed through the non-event retrieval projection
@@ -1217,15 +1300,16 @@ def _repopulate_after_quarantine(
             # source for that evidence while its durable Point set remains compatible
             # with the current Markdown authority.  Discard geometry only when no
             # verified snapshot exists or Markdown proves that canonical Points were
-            # removed.  Newer/additional Points are safe: the next build incrementally
-            # refreshes the retained geometry.  Direct event/nested-memory cleanup is
-            # likewise irrelevant because Faces are mined from durable fact prefixes.
+            # removed or changed semantically. Newer/additional Points are safe: the
+            # next build incrementally refreshes the retained geometry. Direct
+            # event/nested-memory cleanup is likewise irrelevant because Faces are
+            # mined from durable fact prefixes.
             #
             # The old unconditional delete caused a recovered model to keep thousands
             # of Points and Lines but permanently fall back to zero Faces, Volumes,
             # and Root: one rebuild cannot replay the historical resampling gate.
             tables_to_invalidate: list[str] = []
-            if not snapshot_restored or stale_node_keys:
+            if not snapshot_restored or stale_node_keys or changed_node_keys:
                 tables_to_invalidate.extend(["schema_faces", "cross_domain_probe_state"])
             # Relation edges are retained for a known evomem snapshot, but must
             # be cleared when current Markdown/direct sources removed or changed
@@ -1301,6 +1385,7 @@ def _repopulate_after_quarantine(
         "projection_files": projection_files,
         "projection_entries": projection_entries,
         "stale_projected_nodes_removed": len(stale_node_keys),
+        "semantically_changed_projected_nodes": len(changed_node_keys),
         "legacy_direct_nodes_removed": direct_nodes_removed,
         "derived_geometry_rows_invalidated": derived_geometry_rows_invalidated,
         "index_md_rebuilt": index_rebuilt,

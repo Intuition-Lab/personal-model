@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ from persome.api.model_view import render_memory_view
 from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.evomem.store import NodeStore
 from persome.model import ActivitySource, ModelBuildCoordinator, create_build_manifest
-from persome.store import fts
+from persome.store import entries, fts, schema_faces
 from persome.store import relation_edges as edges_store
 
 BUILD_KEYS = {
@@ -72,6 +73,66 @@ class TestGraphJson:
 
         assert graph["model"]["stats"]["points"] == 1
         assert graph["model"]["points"][0]["id"] == "point-runtime"
+
+    def test_graph_survives_genuinely_corrupt_entries_fts(self, ac_root):
+        _save_point(node_id="point-corrupt-fts", content="Canonical model remains readable.")
+        signature = "Stable recovery behavior"
+        with fts.cursor() as conn:
+            entries.create_file(
+                conn,
+                name="schema-corrupt-fts.md",
+                description="Legacy schema alias",
+                tags=[],
+            )
+            entries.append_entry(
+                conn,
+                name="schema-corrupt-fts.md",
+                content=f"Central: {signature}",
+                tags=[],
+            )
+            face_id = schema_faces.record_face(
+                conn,
+                source=schema_faces.PROVENANCE_MINED,
+                signature=signature,
+                members=["point-corrupt-fts"],
+            )
+            schema_faces.record_face(
+                conn,
+                source=schema_faces.PROVENANCE_EMERGENT,
+                signature=signature,
+                members=["point-corrupt-fts"],
+            )
+            assert schema_faces.maybe_promote(conn, face_id)
+            assert conn.execute("DELETE FROM entries_data WHERE id > 1").rowcount > 0
+
+        broken = sqlite3.connect(paths.index_db())
+        try:
+            try:
+                findings = [str(row[0]) for row in broken.execute("PRAGMA integrity_check")]
+            except sqlite3.DatabaseError as exc:
+                # SQLite builds disagree on whether corrupt FTS construction is
+                # returned as an integrity finding or raised immediately.
+                findings = [str(exc)]
+            assert any(
+                "entries" in finding
+                and any(
+                    marker in finding
+                    for marker in ("corrupt", "malformed", "vtable constructor failed")
+                )
+                for finding in findings
+            )
+            with pytest.raises(sqlite3.DatabaseError):
+                broken.execute(
+                    "SELECT path, content FROM entries WHERE prefix = 'schema' AND superseded = 0"
+                ).fetchall()
+        finally:
+            broken.close()
+
+        graph = routes.model_graph()
+
+        assert any(point["id"] == "point-corrupt-fts" for point in graph["model"]["points"])
+        assert graph["model"]["stats"]["faces"] == 1
+        assert graph["model"]["faces"][0]["id"] == face_id
 
     def test_graph_uses_transactionally_stable_live_reader(self, ac_root, monkeypatch):
         sentinel = {"schema_version": 1, "source": "live-reader"}

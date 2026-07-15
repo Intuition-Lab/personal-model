@@ -209,9 +209,18 @@ def _schema_member_aliases(
     if not by_signature or not _table_exists(conn, "entries"):
         return {}
     aliases: dict[str, dict[str, Any]] = {}
-    for row in conn.execute(
-        "SELECT path, content FROM entries WHERE prefix = 'schema' AND superseded = 0"
-    ).fetchall():
+    try:
+        rows = conn.execute(
+            "SELECT path, content FROM entries WHERE prefix = 'schema' AND superseded = 0"
+        ).fetchall()
+    except sqlite3.Error:
+        # ``entries`` is a rebuildable FTS projection. Canonical Points and
+        # geometry live in ordinary tables and must remain inspectable while a
+        # damaged inverted index is awaiting repair. The aliases only propagate
+        # Face receipts through legacy ``schema-*.md`` member keys, so omitting
+        # them is the honest degraded result.
+        return {}
+    for row in rows:
         central = ""
         for line in str(row["content"] or "").splitlines():
             if line.strip().casefold().startswith("central:"):

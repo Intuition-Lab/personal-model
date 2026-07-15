@@ -18,6 +18,7 @@ from persome.evomem.store import NodeStore
 from persome.model import create_build_manifest, load_live_manifest, sync_live_human_markdown
 from persome.store import entries, fts, relation_edges, schema_faces
 from persome.store import files as files_mod
+from persome.store import projector as projector_mod
 
 
 def _make_healthy_db() -> Path:
@@ -25,6 +26,13 @@ def _make_healthy_db() -> Path:
     with fts.cursor() as conn:
         conn.execute("SELECT 1")
     return paths.index_db()
+
+
+def _save_markdown_projection_as_canonical(name: str) -> MemoryNode:
+    parsed = files_mod.read_file(files_mod.memory_path(name)).entries
+    (node,) = projector_mod.rebuild_nodes_from_projection([(name, parsed)])
+    NodeStore(user_id=node.user_id, agent_id=node.agent_id).save(node)
+    return node
 
 
 def _pending_payload(db: Path, quarantine: Path, *, reason: str) -> dict[str, object]:
@@ -911,14 +919,7 @@ def test_markdown_recovery_retains_verified_geometry_when_points_are_compatible(
             content="DURABLE POINT REMAINS PRESENT",
             tags=[],
         )
-    NodeStore().save(
-        MemoryNode(
-            node_id=entry_id,
-            content="DURABLE POINT REMAINS PRESENT",
-            layer=MemoryLayer.L2_FACT,
-            file_name="project-retained.md",
-        )
-    )
+    assert _save_markdown_projection_as_canonical("project-retained.md").node_id == entry_id
     with fts.cursor() as conn:
         schema_faces.upsert_root(
             conn,
@@ -951,7 +952,65 @@ def test_markdown_recovery_retains_verified_geometry_when_points_are_compatible(
     assert probe is not None and tuple(probe) == (2, 1)
     database = json.loads(paths.integrity_recovery_marker().read_text())["database_recovery"]
     assert database["stale_projected_nodes_removed"] == 0
+    assert database["semantically_changed_projected_nodes"] == 0
     assert database["derived_geometry_rows_invalidated"] == 0
+
+
+def test_markdown_recovery_invalidates_geometry_when_same_id_point_changes(
+    ac_root: Path,
+) -> None:
+    config_mod.write_default_if_missing()
+    original = "ORIGINAL POINT USED BY VERIFIED GEOMETRY"
+    corrected = "CORRECTED POINT MUST INVALIDATE VERIFIED GEOMETRY"
+    with fts.cursor() as conn:
+        entries.create_file(
+            conn,
+            name="project-corrected.md",
+            description="Same-ID correction proof",
+            tags=[],
+        )
+        entry_id = entries.append_entry(
+            conn,
+            name="project-corrected.md",
+            content=original,
+            tags=[],
+        )
+    assert _save_markdown_projection_as_canonical("project-corrected.md").node_id == entry_id
+    with fts.cursor() as conn:
+        schema_faces.upsert_root(
+            conn,
+            signature="Root derived from the original Point",
+            members=[entry_id],
+        )
+        conn.execute(
+            "INSERT INTO cross_domain_probe_state"
+            " (pair_key, last_probed_at, probe_count, detected) VALUES (?, ?, 2, 1)",
+            ('["corrected-a","corrected-b"]', "2026-07-12T00:00:00+00:00"),
+        )
+    snapshot = backup.create_snapshot(
+        now=datetime(2026, 7, 12, 9, 0, tzinfo=UTC),
+        structural_only=True,
+    )
+    assert snapshot is not None
+    memory_path = files_mod.memory_path("project-corrected.md")
+    markdown = memory_path.read_text(encoding="utf-8")
+    assert markdown.count(original) == 1
+    files_mod.atomic_write_text(memory_path, markdown.replace(original, corrected, 1))
+    paths.index_db().write_bytes(b"markdown-database-corruption" * 100)
+
+    integrity.check_and_recover()
+
+    with fts.cursor() as conn:
+        point = conn.execute(
+            "SELECT content FROM evo_nodes WHERE node_id=?", (entry_id,)
+        ).fetchone()
+        assert conn.execute("SELECT count(*) FROM schema_faces").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM cross_domain_probe_state").fetchone()[0] == 0
+    assert point is not None and point[0] == corrected
+    database = json.loads(paths.integrity_recovery_marker().read_text())["database_recovery"]
+    assert database["stale_projected_nodes_removed"] == 0
+    assert database["semantically_changed_projected_nodes"] == 1
+    assert database["derived_geometry_rows_invalidated"] >= 2
 
 
 def test_incomplete_strict_markdown_discovery_never_deletes_snapshot_node(
