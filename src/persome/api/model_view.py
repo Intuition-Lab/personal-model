@@ -50,7 +50,10 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       </div>
       <div class="view-actions">
         <span class="privacy-badge"><i aria-hidden="true"></i>Local only</span>
-        <button id="share-x" class="share-button" type="button" aria-label="Share your constellation to X" title="Share your constellation to X" disabled>
+        <button id="human-card" class="share-button" type="button" aria-label="Export your HUMAN.md Card" title="Export your HUMAN.md Card" disabled>
+          <span aria-hidden="true">H</span><b>Card</b>
+        </button>
+        <button id="share-x" class="share-button" type="button" aria-label="Share your HUMAN.md Card to X" title="Share your HUMAN.md Card to X" disabled>
           <span aria-hidden="true">X</span><b>Share</b>
         </button>
         <div class="zoom-controls" role="group" aria-label="Zoom controls">
@@ -114,7 +117,7 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
 
     <div id="share-notice" class="share-notice" role="status" aria-live="polite" hidden>
       <span aria-hidden="true">↓</span>
-      <div><strong>Constellation downloaded</strong><small>Add my-persome-constellation.png in X.</small></div>
+      <div><strong>HUMAN.md Card downloaded</strong><small>Detected secrets, PII, paths, IDs, and evidence receipts were excluded. Review summaries before sharing.</small></div>
     </div>
 
     <footer class="timeline">
