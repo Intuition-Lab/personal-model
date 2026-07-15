@@ -36,7 +36,11 @@ dependencies = [
     "uvicorn>=0.30",
     "httpx[socks]>=0.27",
     "certifi>=2024.2",
-    "cryptography>=42.0",
+    # cryptography 49 dropped macOS x86_64/universal wheels. Keep Intel on the
+    # newest line that still ships a binary so locked `--no-build` installs stay
+    # reproducible; other platforms continue receiving the current release.
+    "cryptography>=42.0,<49; platform_system == 'Darwin' and platform_machine == 'x86_64'",
+    "cryptography>=42.0; platform_system != 'Darwin' or platform_machine != 'x86_64'",
     "anthropic>=0.50",
     "openai>=1.75,<3",
     "tomlkit>=0.13,<1",

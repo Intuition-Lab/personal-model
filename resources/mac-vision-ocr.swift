@@ -26,7 +26,14 @@ if CommandLine.arguments.dropFirst().contains("--check") {
     exit(0)
 }
 
-let input = FileHandle.standardInput.readDataToEndOfFile()
+let input: Data
+do {
+    // Read one byte past the contract limit so oversized input is rejected
+    // without first allocating an unbounded stdin payload.
+    input = try FileHandle.standardInput.read(upToCount: maxInputBytes + 1) ?? Data()
+} catch {
+    fail("could not read image input")
+}
 guard !input.isEmpty else {
     fail("empty image input")
 }

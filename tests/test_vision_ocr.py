@@ -17,6 +17,12 @@ def test_available_requires_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
     assert vision_ocr.available() is False
 
 
+def test_available_requires_intel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vision_ocr.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(vision_ocr.platform, "machine", lambda: "arm64")
+    assert vision_ocr.available() is False
+
+
 def test_available_reuses_compiled_helper_without_swiftc(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -26,6 +32,7 @@ def test_available_reuses_compiled_helper_without_swiftc(
     helper.write_text("binary", encoding="utf-8")
     helper.chmod(0o700)
     monkeypatch.setattr(vision_ocr.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(vision_ocr.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(vision_ocr, "_source_candidates", lambda: [source])
     monkeypatch.setattr(vision_ocr, "_native_binary_path", lambda *args: helper)
     monkeypatch.setattr(vision_ocr.shutil, "which", lambda name: None)

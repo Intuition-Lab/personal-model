@@ -23,7 +23,16 @@ logger = get("persome.capture.ocr.vision")
 
 _HELPER_NAME = "mac-vision-ocr"
 _SOURCE_NAME = f"{_HELPER_NAME}.swift"
-_TIMEOUT_SECONDS = 30
+# The parent worker's normal deadline is 20 seconds. Keep the child helper's
+# deadline shorter so it is reaped here rather than surviving a worker timeout.
+_TIMEOUT_SECONDS = 15
+
+
+def _supported_host() -> bool:
+    return platform.system() == "Darwin" and platform.machine().lower() in {
+        "x86_64",
+        "amd64",
+    }
 
 
 def _source_candidates() -> list[Path]:
@@ -46,7 +55,7 @@ def available() -> bool:
     installer already requires Xcode Command Line Tools for the AX helpers, so
     an Intel install with the packaged source should satisfy it.
     """
-    if platform.system() != "Darwin":
+    if not _supported_host():
         return False
     override = os.environ.get("PERSOME_VISION_OCR")
     if override:
@@ -62,7 +71,7 @@ def available() -> bool:
 
 def resolve_helper_path() -> Path | None:
     """Resolve or compile the architecture-native Vision OCR executable."""
-    if platform.system() != "Darwin":
+    if not _supported_host():
         return None
     override = os.environ.get("PERSOME_VISION_OCR")
     if override:
