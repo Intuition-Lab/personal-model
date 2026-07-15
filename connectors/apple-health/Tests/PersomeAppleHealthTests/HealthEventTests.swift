@@ -99,3 +99,28 @@ import Testing
     }
     #expect(!persisted)
 }
+
+@Test func refusesToLoopWhenAFullPageHasNoNextAnchor() async {
+    await #expect(throws: HealthSyncError.missingPaginationAnchor) {
+        _ = try await synchronizeAnchoredHealthPages(
+            initialAnchor: nil as String?,
+            fetch: { _ in
+                AnchoredHealthPage(
+                    events: [],
+                    deletedEvents: [HealthEventDeletion(eventID: "deleted-1")],
+                    nextAnchor: nil,
+                    hasMore: true
+                )
+            },
+            upload: { _, _ in .zero },
+            persist: { _ in }
+        )
+    }
+}
+
+@Test func directRuntimeClientAcceptsIPv6Loopback() throws {
+    _ = try PersomeHealthClient(
+        runtimeURL: try #require(URL(string: "http://[::1]:8742")),
+        bearerToken: "test-token"
+    )
+}

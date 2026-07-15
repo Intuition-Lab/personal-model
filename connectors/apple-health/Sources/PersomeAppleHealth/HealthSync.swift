@@ -7,6 +7,10 @@ struct AnchoredHealthPage<Anchor> {
     let hasMore: Bool
 }
 
+enum HealthSyncError: Error {
+    case missingPaginationAnchor
+}
+
 @MainActor
 func synchronizeAnchoredHealthPages<Anchor>(
     initialAnchor: Anchor?,
@@ -19,6 +23,9 @@ func synchronizeAnchoredHealthPages<Anchor>(
 
     while true {
         let page = try await fetch(anchor)
+        if page.hasMore, page.nextAnchor == nil {
+            throw HealthSyncError.missingPaginationAnchor
+        }
         if !page.events.isEmpty || !page.deletedEvents.isEmpty {
             let result = try await upload(page.events, page.deletedEvents)
             totals = totals.adding(result)

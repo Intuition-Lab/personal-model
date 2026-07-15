@@ -62,6 +62,6 @@ public actor PersomeHealthClient: HealthEventUploader {
 
     private static func isLoopback(_ host: String?) -> Bool {
         guard let host else { return false }
-        return ["127.0.0.1", "localhost", "::1"].contains(host.lowercased())
+        return ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host.lowercased())
     }
 }
