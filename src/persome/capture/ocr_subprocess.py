@@ -6,7 +6,7 @@ stdout, the client reads EOF, **fails open (returns ``None``)**, reaps the corps
 respawns on the next call. The daemon process itself never imports paddle/cv2, so a native
 OCR fault can never take it down.
 
-The subprocess isolates native OCR failures from the daemon.
+The subprocess isolates native OCR failures from the daemon on both architectures.
 """
 
 from __future__ import annotations
