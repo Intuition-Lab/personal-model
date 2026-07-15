@@ -11,11 +11,15 @@ import {
   relationLabel,
 } from "./evidence.mjs";
 import {
-  SHARE_CARD_HEIGHT,
-  SHARE_CARD_WIDTH,
-  SHARE_FILE_NAME,
+  CONSTELLATION_CARD_HEIGHT,
+  CONSTELLATION_CARD_WIDTH,
+  CONSTELLATION_FILE_NAME,
+  HUMAN_CARD_HEIGHT,
+  HUMAN_CARD_WIDTH,
+  HUMAN_CARD_FILE_NAME,
   buildXIntentUrl,
-  drawShareCard,
+  drawConstellationCard,
+  drawHumanCard,
 } from "./share.mjs";
 
 const COLORS = {
@@ -776,7 +780,7 @@ function setShareBusy(busy) {
   shareButton.querySelector("b").textContent = busy ? "Preparing…" : "Share";
 }
 
-async function loadShareCardModel() {
+async function loadShareProjection() {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), SHARE_CARD_TIMEOUT_MS);
   try {
@@ -786,7 +790,13 @@ async function loadShareCardModel() {
     });
     if (!response.ok) throw new Error(`Share endpoint returned HTTP ${response.status}`);
     const payload = await response.json();
-    if (!payload.model || !Array.isArray(payload.model.faces)) {
+    if (
+      !payload.model
+      || !Array.isArray(payload.model.faces)
+      || !Array.isArray(payload.model.volumes)
+      || !payload.model.stats
+      || typeof payload.model.stats !== "object"
+    ) {
       throw new Error("Share endpoint returned an invalid projection");
     }
     return payload.model;
@@ -795,13 +805,29 @@ async function loadShareCardModel() {
   }
 }
 
-function createShareCardBlob(shareModel) {
+function createHumanCardBlob(shareModel) {
   const canvas = document.createElement("canvas");
-  canvas.width = SHARE_CARD_WIDTH;
-  canvas.height = SHARE_CARD_HEIGHT;
+  canvas.width = HUMAN_CARD_WIDTH;
+  canvas.height = HUMAN_CARD_HEIGHT;
   const context = canvas.getContext("2d");
   if (!context) return Promise.reject(new Error("Canvas export is unavailable"));
-  drawShareCard(context, shareModel);
+  drawHumanCard(context, shareModel);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("The HUMAN.md Card could not be encoded"));
+    }, "image/png");
+  });
+}
+
+function createConstellationBlob(shareModel) {
+  renderer.render(scene, camera);
+  const canvas = document.createElement("canvas");
+  canvas.width = CONSTELLATION_CARD_WIDTH;
+  canvas.height = CONSTELLATION_CARD_HEIGHT;
+  const context = canvas.getContext("2d");
+  if (!context) return Promise.reject(new Error("Canvas export is unavailable"));
+  drawConstellationCard(context, renderer.domElement, shareModel);
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) resolve(blob);
@@ -810,52 +836,68 @@ function createShareCardBlob(shareModel) {
   });
 }
 
-function downloadShareCard(blob) {
+function downloadShareImage(blob, fileName) {
   const href = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = href;
-  anchor.download = SHARE_FILE_NAME;
+  anchor.download = fileName;
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
   window.setTimeout(() => URL.revokeObjectURL(href), 1000);
 }
 
-function paintShareHandoff(popup) {
+function paintConstellationHandoff(popup) {
   if (!popup) return;
-  popup.document.title = "Preparing your Persome HUMAN.md Card";
+  popup.document.title = "Preparing your Persome constellation";
   popup.document.body.innerHTML = `
-    <main style="min-height:100vh;display:grid;place-items:center;margin:0;background:#f3f0e9;color:#1f1d1b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-      <section style="width:min(440px,calc(100vw - 48px));padding:38px;border:1px solid rgba(31,29,27,.16);background:#fff;box-shadow:0 30px 100px rgba(31,29,27,.12)">
-        <p style="margin:0 0 18px;color:#cf4f36;font-size:11px;font-weight:750;letter-spacing:.16em">PERSOME · SHARE TO X</p>
-        <h1 style="margin:0;font-size:34px;line-height:1.05;letter-spacing:-.045em">Your HUMAN.md Card is downloading.</h1>
-        <p style="margin:18px 0 0;color:#6d6861;font-size:15px;line-height:1.65">In X, add <strong style="color:#1f1d1b">${SHARE_FILE_NAME}</strong> with the image button. Review the card before posting.</p>
+    <main style="min-height:100vh;display:grid;place-items:center;margin:0;background:#070610;color:#f7f4ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+      <section style="width:min(440px,calc(100vw - 48px));padding:38px;border:1px solid rgba(255,255,255,.12);border-radius:24px;background:linear-gradient(145deg,rgba(255,100,214,.11),rgba(119,152,255,.08));box-shadow:0 30px 100px rgba(0,0,0,.45)">
+        <p style="margin:0 0 18px;color:#ff83cf;font-size:11px;font-weight:750;letter-spacing:.16em">PERSOME · SHARE TO X</p>
+        <h1 style="margin:0;font-size:34px;line-height:1.05;letter-spacing:-.045em">Your constellation is downloading.</h1>
+        <p style="margin:18px 0 0;color:#b8b1c7;font-size:15px;line-height:1.65">In X, add <strong style="color:#fff">${CONSTELLATION_FILE_NAME}</strong> with the image button. Review the image before posting.</p>
       </section>
     </main>`;
 }
 
-async function exportHumanCard({ toX = false } = {}) {
-  const popup = toX ? window.open("about:blank", "_blank") : null;
-  if (toX) paintShareHandoff(popup);
+async function exportHumanCard() {
   setShareBusy(true);
   pauseAutoRotate();
   try {
-    const shareModel = await loadShareCardModel();
-    const blob = await createShareCardBlob(shareModel);
-    downloadShareCard(blob);
+    const shareModel = await loadShareProjection();
+    const blob = await createHumanCardBlob(shareModel);
+    downloadShareImage(blob, HUMAN_CARD_FILE_NAME);
     showShareNotice(
       "HUMAN.md Card downloaded",
       "Detected secrets, PII, paths, IDs, and evidence receipts were excluded. Review summaries before sharing.",
     );
-    if (toX) {
-      const intentUrl = buildXIntentUrl();
-      if (popup && !popup.closed) {
-        popup.opener = null;
-        popup.location.replace(intentUrl);
-        popup.focus();
-      } else {
-        window.location.assign(intentUrl);
-      }
+    setShareBusy(false);
+  } catch (error) {
+    showShareNotice("Share image failed", error.message || String(error), true);
+    setShareBusy(false);
+  }
+}
+
+async function shareConstellationToX() {
+  const popup = window.open("about:blank", "_blank");
+  paintConstellationHandoff(popup);
+  setShareBusy(true);
+  pauseAutoRotate();
+  try {
+    const shareModel = await loadShareProjection();
+    const blob = await createConstellationBlob(shareModel);
+    downloadShareImage(blob, CONSTELLATION_FILE_NAME);
+    showShareNotice(
+      "Constellation downloaded",
+      `Add ${CONSTELLATION_FILE_NAME} with the image button in X.`,
+    );
+    const intentUrl = buildXIntentUrl();
+    if (popup && !popup.closed) {
+      popup.opener = null;
+      popup.location.replace(intentUrl);
+      popup.focus();
+    } else {
+      window.location.assign(intentUrl);
     }
     setShareBusy(false);
   } catch (error) {
@@ -1542,8 +1584,8 @@ controls.addEventListener("start", () => {
 });
 document.getElementById("reset").addEventListener("click", resetCamera);
 document.getElementById("close-detail").addEventListener("click", clearSelection);
-cardButton.addEventListener("click", () => exportHumanCard());
-shareButton.addEventListener("click", () => exportHumanCard({ toX: true }));
+cardButton.addEventListener("click", exportHumanCard);
+shareButton.addEventListener("click", shareConstellationToX);
 
 slider.addEventListener("input", () => {
   updateCutoff();

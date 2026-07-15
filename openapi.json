@@ -331,7 +331,7 @@
           "model"
         ],
         "summary": "Model Share Card",
-        "description": "Return the minimal, canonically scrubbed HUMAN.md Card projection.",
+        "description": "Return the minimal, canonically scrubbed public share projection.",
         "operationId": "model_share_card_model_share_card_get",
         "responses": {
           "200": {
