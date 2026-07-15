@@ -85,9 +85,10 @@ and removes its worker isolation.
 The AX helper, watcher, and Intel Vision OCR helper are compiled into immutable
 `<PERSOME_ROOT>/native/<source-digest>/` directories keyed by a format version,
 architecture, and Swift source bytes. A same-version reinstall returns the exact
-existing executables, preserving their macOS TCC identity. Changed helper source
-uses a new digest path and therefore requires a deliberate new Accessibility
-grant; rollback resolves the old wheel source and old binary again.
+existing executables. For the AX helper and watcher, this preserves their macOS
+TCC identity; changed AX source uses a new digest path and therefore requires a
+deliberate new Accessibility grant. The Vision helper does not request AX access.
+Rollback resolves the old wheel source and old binaries again.
 
 ```bash
 persome onboard            # permissions + OCR + daemon + health + fresh capture

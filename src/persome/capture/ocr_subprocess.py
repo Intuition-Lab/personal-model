@@ -76,6 +76,10 @@ class OCRWorkerClient:
         self._startup_timeout = timeout if startup_timeout is None else startup_timeout
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        # The default worker owns a private POSIX process group. Record that
+        # group while the leader is alive so cleanup can still kill native
+        # descendants after the worker itself has crashed or exited.
+        self._proc_group: int | None = None
         self._state: WorkerState = "not_started"
         self._state_lock = threading.Lock()
 
@@ -159,14 +163,27 @@ class OCRWorkerClient:
             self._kill_worker_locked()
         try:
             self._proc = self._spawn()
+            self._proc_group = self._owned_process_group(self._proc)
             self._set_state("warming")
             logger.info("spawned ocr worker (pid=%s)", self._proc.pid)
             return self._proc, True
         except Exception as exc:  # noqa: BLE001
             logger.warning("ocr worker spawn failed: %s; OCR degrades to none", exc)
             self._proc = None
+            self._proc_group = None
             self._set_state("failed")
             return None, False
+
+    @staticmethod
+    def _owned_process_group(proc: subprocess.Popen) -> int | None:
+        """Return the worker's private POSIX process group, if it owns one."""
+        if os.name != "posix":
+            return None
+        try:
+            group = os.getpgid(proc.pid)
+        except (AttributeError, OSError):
+            return None
+        return group if group == proc.pid else None
 
     def _send(self, proc: subprocess.Popen, tier: str, image_bytes: bytes) -> None:
         req = ocr_protocol.encode_request(tier, image_bytes)
@@ -216,20 +233,25 @@ class OCRWorkerClient:
 
     def _kill_worker_locked(self) -> None:
         proc = self._proc
+        group = self._proc_group
         self._proc = None
+        self._proc_group = None
         if proc is None:
             return
-        if proc.poll() is None:
-            killed_group = False
-            if os.name == "posix":
-                with contextlib.suppress(Exception):
-                    group = os.getpgid(proc.pid)
-                    if group == proc.pid:
-                        os.killpg(group, signal.SIGKILL)
-                        killed_group = True
-            if not killed_group:
-                with contextlib.suppress(Exception):
-                    proc.kill()
+        killed_group = False
+        if os.name == "posix" and group is not None:
+            try:
+                # Do this even when the worker leader has already exited: its
+                # compiler/Vision child may still be alive in the owned group.
+                os.killpg(group, signal.SIGKILL)
+                killed_group = True
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                logger.warning("failed to kill OCR worker process group %s: %s", group, exc)
+        if proc.poll() is None and not killed_group:
+            with contextlib.suppress(Exception):
+                proc.kill()
         for stream in (proc.stdin, proc.stdout):
             if stream is not None:
                 with contextlib.suppress(Exception):

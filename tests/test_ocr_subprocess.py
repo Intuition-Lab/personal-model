@@ -8,8 +8,11 @@ No paddle, hermetic, default gate.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +59,14 @@ import sys, time
 from persome.capture import ocr_protocol as p
 p.read_frame(sys.stdin.buffer)
 time.sleep(3600)
+"""
+
+# Starts a child in the worker's process group, publishes its PID, then exits.
+# Cleanup must still kill that child after the group leader is already dead.
+_EXIT_WITH_LIVE_CHILD = """
+import subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+print(child.pid, flush=True)
 """
 
 _JPEG = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
@@ -163,6 +174,7 @@ class TestCrashContainment:
         )
         client = ocr_subprocess.OCRWorkerClient(spawn=lambda: proc)
         client._proc = proc
+        client._proc_group = 43210
         monkeypatch.setattr(ocr_subprocess.os, "getpgid", lambda pid: pid)
         monkeypatch.setattr(
             ocr_subprocess.os,
@@ -174,6 +186,52 @@ class TestCrashContainment:
 
         assert killed_groups == [(43210, ocr_subprocess.signal.SIGKILL)]
         assert client._proc is None
+        assert client._proc_group is None
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group regression")
+    def test_dead_worker_cleanup_kills_live_group_child(self) -> None:
+        def _spawn() -> subprocess.Popen:
+            return subprocess.Popen(
+                [sys.executable, "-c", _EXIT_WITH_LIVE_CHILD],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+                close_fds=True,
+                start_new_session=True,
+            )
+
+        client = ocr_subprocess.OCRWorkerClient(spawn=_spawn, timeout=1)
+        proc: subprocess.Popen | None = None
+        child_pid: int | None = None
+        try:
+            proc, _ = client._ensure_worker_locked()
+            assert proc is not None and proc.stdout is not None
+            child_pid = int(proc.stdout.readline())
+            proc.wait(timeout=5)
+            assert proc.poll() is not None
+            assert client._proc_group == proc.pid
+            os.kill(child_pid, 0)  # the descendant is alive after its leader exits
+
+            client._kill_worker_locked()
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail("worker process-group child survived cleanup")
+        finally:
+            client._kill_worker_locked()
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, ocr_subprocess.signal.SIGKILL)
+            if child_pid is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(child_pid, ocr_subprocess.signal.SIGKILL)
 
 
 class TestWarm:
