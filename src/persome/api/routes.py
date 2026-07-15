@@ -823,7 +823,7 @@ def model_graph() -> dict[str, Any]:
 
 
 def _share_card_projection(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Keep only scrubbed summaries needed to render a share card.
+    """Keep only scrubbed summaries and counts needed by public share artifacts.
 
     The owner viewer intentionally receives an unredacted graph. Sharing must
     cross a separate server-side boundary so raw receipts, identifiers, paths,
@@ -848,12 +848,29 @@ def _share_card_projection(snapshot: dict[str, Any]) -> dict[str, Any]:
         for item in snapshot.get("faces") or []
         if (projected := summary(item)) is not None
     ]
-    return {"root": root, "faces": faces}
+    volumes = [
+        projected
+        for item in snapshot.get("volumes") or []
+        if (projected := summary(item)) is not None
+    ]
+    raw_stats = snapshot.get("stats") if isinstance(snapshot.get("stats"), dict) else {}
+    stats = {
+        key: int(raw_stats.get(key) or 0)
+        for key in (
+            "points",
+            "evolution_lines",
+            "relation_lines",
+            "faces",
+            "volumes",
+            "roots",
+        )
+    }
+    return {"root": root, "faces": faces, "volumes": volumes, "stats": stats}
 
 
 @router.get("/model/share-card", tags=["model"])
 def model_share_card() -> dict[str, Any]:
-    """Return the minimal, canonically scrubbed HUMAN.md Card projection."""
+    """Return the minimal, canonically scrubbed public share projection."""
     from ..store import fts as fts_store
 
     with fts_store.cursor() as conn:

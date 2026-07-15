@@ -101,6 +101,9 @@ Persome branding, downloads it, and opens an X composer with one of three standa
 each carrying the Personal Model tag and official account mention. Individual
 Point labels, receipts, source names, timestamps, and viewer credentials are excluded from the share
 artifact; the owner attaches the downloaded image and confirms the post in X.
+Both share actions take their written summaries and aggregate counts from the canonically scrubbed
+`/model/share-card` projection rather than the owner-only graph. The adjacent `Card` action remains
+a separate renderer that downloads the portrait `my-human-card.png` without opening X.
 
 Visible node labels and their Point, Face, Volume, Root, or context meshes open the same provenance
 detail panel. Overview summarizes the evidence footprint, Evidence presents human-readable source

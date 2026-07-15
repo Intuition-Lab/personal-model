@@ -248,7 +248,18 @@ class TestGraphJson:
                     f"Uses alice@example.com from /Users/alice/private with {test_api_key}",
                     4,
                 ),
-                ("root-private-id", 3, "Evidence-backed systems builder", 7),
+                (
+                    "volume-private-id",
+                    2,
+                    "Coordinates alice@example.com work from /Users/alice/private",
+                    5,
+                ),
+                (
+                    "root-private-id",
+                    3,
+                    f"Evidence-backed systems builder for alice@example.com with {test_api_key}",
+                    7,
+                ),
             ):
                 conn.execute(
                     """
@@ -271,15 +282,31 @@ class TestGraphJson:
         projection = routes.model_share_card()["model"]
         serialized = json.dumps(projection)
 
-        assert set(projection) == {"root", "faces"}
+        assert set(projection) == {"root", "faces", "volumes", "stats"}
         assert set(projection["root"]) == {"signature", "observations", "confidence"}
         assert set(projection["faces"][0]) == {"signature", "observations", "confidence"}
+        assert set(projection["volumes"][0]) == {
+            "signature",
+            "observations",
+            "confidence",
+        }
+        assert "[REDACTED]" in projection["root"]["signature"]
         assert "[REDACTED]" in projection["faces"][0]["signature"]
+        assert "[REDACTED]" in projection["volumes"][0]["signature"]
+        assert projection["stats"] == {
+            "points": 0,
+            "evolution_lines": 0,
+            "relation_lines": 0,
+            "faces": 1,
+            "volumes": 1,
+            "roots": 1,
+        }
         for private_value in (
             "alice@example.com",
             "/Users/alice",
             test_api_key,
             "face-private-id",
+            "volume-private-id",
             "root-private-id",
             "receipt",
         ):
@@ -370,7 +397,7 @@ class TestViewPage:
         assert 'id="human-card"' in body
         assert 'title="Export your HUMAN.md Card" disabled>' in body
         assert 'id="share-x"' in body
-        assert 'title="Share your HUMAN.md Card to X" disabled>' in body
+        assert 'title="Share your constellation to X" disabled>' in body
         assert "Detected secrets, PII, paths, IDs, and evidence receipts were excluded." in body
         assert 'id="share-notice"' in body
         assert 'aria-label="Zoom controls"' in body
@@ -398,7 +425,8 @@ class TestViewPage:
         assert b"nodeEvidenceCards" in evidence.body
         assert b"humanCard" in share.body
         assert b"buildXIntentUrl" in share.body
-        assert b"drawShareCard" in share.body
+        assert b"drawHumanCard" in share.body
+        assert b"drawConstellationCard" in share.body
         assert b'from "./layout.mjs"' in viewer.body
         assert b'from "./share.mjs"' in viewer.body
         assert b"model.points" in viewer.body
@@ -438,10 +466,17 @@ class TestViewPage:
         assert b"--build-color: var(--root)" in css.body
         assert b"--build-color: var(--point)" in css.body
         assert b"controls.zoomToCursor = true" in viewer.body
-        assert b"downloadShareCard" in viewer.body
+        assert b"downloadShareImage" in viewer.body
         assert b"shareReady = Boolean" in viewer.body
         assert b"window.open" in viewer.body
         assert b"my-human-card.png" in share.body
+        assert b"my-persome-constellation.png" in share.body
+        assert b'cardButton.addEventListener("click", exportHumanCard)' in viewer.body
+        assert b'shareButton.addEventListener("click", shareConstellationToX)' in viewer.body
+        assert b"exportHumanCard({ toX: true })" not in viewer.body
+        assert viewer.body.count(b"await loadShareProjection()") == 2
+        assert b"drawConstellationCard(context, renderer.domElement, shareModel)" in viewer.body
+        assert b"drawConstellationCard(context, renderer.domElement, model)" not in viewer.body
         assert b"private source content" in share.body
         assert b"Built locally with Persome \xc2\xb7 Build yours" in share.body
         assert b"window.__persomeZoomState" in viewer.body
