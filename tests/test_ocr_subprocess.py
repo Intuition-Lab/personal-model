@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -148,6 +149,32 @@ class TestCrashContainment:
         assert client.recognize_detailed(_JPEG, "tiny") is None
         assert client.warm("tiny") is False  # warm also fails open, never raises
 
+    def test_timeout_kills_isolated_worker_process_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        killed_groups: list[tuple[int, int]] = []
+        proc = SimpleNamespace(
+            pid=43210,
+            stdin=None,
+            stdout=None,
+            poll=lambda: None,
+            kill=lambda: pytest.fail("group leader must be killed through killpg"),
+            wait=lambda timeout: 0,
+        )
+        client = ocr_subprocess.OCRWorkerClient(spawn=lambda: proc)
+        client._proc = proc
+        monkeypatch.setattr(ocr_subprocess.os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            ocr_subprocess.os,
+            "killpg",
+            lambda group, sig: killed_groups.append((group, sig)),
+        )
+
+        client._kill_worker_locked()
+
+        assert killed_groups == [(43210, ocr_subprocess.signal.SIGKILL)]
+        assert client._proc is None
+
 
 class TestWarm:
     def test_warm_spawns_worker(self) -> None:
@@ -164,6 +191,12 @@ class TestWarm:
         client = ocr_subprocess.OCRWorkerClient(timeout=20, startup_timeout=120)
         assert client._timeout == 20
         assert client._startup_timeout == 120
+
+    def test_default_cold_start_covers_intel_compile_and_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("PERSOME_OCR_WORKER_STARTUP_TIMEOUT", raising=False)
+        assert ocr_subprocess._startup_timeout_from_env() == 180.0
 
 
 class TestRouting:

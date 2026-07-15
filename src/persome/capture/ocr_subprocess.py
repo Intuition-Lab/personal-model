@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import os
 import select
+import signal
 import struct
 import subprocess
 import sys
@@ -55,6 +56,9 @@ def _default_spawn() -> subprocess.Popen:
         env=env,
         bufsize=0,
         close_fds=True,
+        # A worker may compile or invoke a native OCR helper. Give it a private
+        # process group so timeout teardown also reaps those descendants.
+        start_new_session=os.name == "posix",
     )
 
 
@@ -216,8 +220,16 @@ class OCRWorkerClient:
         if proc is None:
             return
         if proc.poll() is None:
-            with contextlib.suppress(Exception):
-                proc.kill()
+            killed_group = False
+            if os.name == "posix":
+                with contextlib.suppress(Exception):
+                    group = os.getpgid(proc.pid)
+                    if group == proc.pid:
+                        os.killpg(group, signal.SIGKILL)
+                        killed_group = True
+            if not killed_group:
+                with contextlib.suppress(Exception):
+                    proc.kill()
         for stream in (proc.stdin, proc.stdout):
             if stream is not None:
                 with contextlib.suppress(Exception):
@@ -274,6 +286,8 @@ def _timeout_from_env() -> float:
 
 def _startup_timeout_from_env() -> float:
     try:
-        return float(os.environ.get("PERSOME_OCR_WORKER_STARTUP_TIMEOUT", "120"))
+        # First-run Intel warm-up may compile the Swift helper (120s bound) and
+        # then probe Vision (15s bound). Keep margin for process startup and I/O.
+        return float(os.environ.get("PERSOME_OCR_WORKER_STARTUP_TIMEOUT", "180"))
     except ValueError:
-        return 120.0
+        return 180.0
