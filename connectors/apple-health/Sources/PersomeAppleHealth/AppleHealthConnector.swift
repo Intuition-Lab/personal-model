@@ -97,7 +97,9 @@ public final class AppleHealthConnector {
         let quantityIDs: [HKQuantityTypeIdentifier] = [
             .stepCount, .heartRate, .restingHeartRate, .activeEnergyBurned,
         ]
-        var types = quantityIDs.compactMap(HKObjectType.quantityType(forIdentifier:))
+        var types: [HKSampleType] = quantityIDs.compactMap(
+            HKObjectType.quantityType(forIdentifier:)
+        )
         if let sleep = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.append(sleep) }
         types.append(HKObjectType.workoutType())
         return types

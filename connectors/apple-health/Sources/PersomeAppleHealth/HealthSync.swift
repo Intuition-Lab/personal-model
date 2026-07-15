@@ -7,11 +7,12 @@ struct AnchoredHealthPage<Anchor> {
     let hasMore: Bool
 }
 
+@MainActor
 func synchronizeAnchoredHealthPages<Anchor>(
     initialAnchor: Anchor?,
-    fetch: (Anchor?) async throws -> AnchoredHealthPage<Anchor>,
-    upload: ([HealthEvent], [HealthEventDeletion]) async throws -> HealthImportResult,
-    persist: (Anchor?) throws -> Void
+    fetch: @MainActor (Anchor?) async throws -> AnchoredHealthPage<Anchor>,
+    upload: @MainActor ([HealthEvent], [HealthEventDeletion]) async throws -> HealthImportResult,
+    persist: @MainActor (Anchor?) throws -> Void
 ) async throws -> HealthImportResult {
     var anchor = initialAnchor
     var totals = HealthImportResult.zero
