@@ -346,3 +346,57 @@ def test_active_model_resumes_failed_apply_before_new_tail(ac_root: Path, fake_l
         (middle.isoformat(), end.isoformat()),
     ]
     assert all(item["apply_status"] == "applied" for item in windows)
+
+
+def test_active_model_does_not_advance_watermark_on_apply_result_errors(
+    ac_root: Path,
+    fake_llm,
+    monkeypatch,
+) -> None:
+    from persome.writer import delta_apply
+
+    start = datetime(2026, 7, 10, 12, 0, tzinfo=_TZ)
+    end = start + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=["[Feishu] 和张三确认了评审结论"],
+                apps_used=["Feishu"],
+                capture_count=1,
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(id="sess_apply_error", start_time=start, status="active"),
+        )
+        session_store.set_flush_end(conn, "sess_apply_error", end)
+        deltas_store.insert(
+            conn,
+            session_id="sess_apply_error",
+            payload={"entities": [], "assertions": [], "relations": [], "events": []},
+            apply_status="failed",
+            window_start=start,
+            window_end=end,
+            is_final=False,
+        )
+    monkeypatch.setattr(
+        delta_apply,
+        "apply_delta",
+        lambda *args, **kwargs: delta_apply.ApplyResult(errors=["synthetic apply failure"]),
+    )
+
+    cfg = config_mod.load(ac_root / "config.toml")
+    result = agent.model_active_session(cfg, session_id="sess_apply_error")
+
+    assert not result.completed
+    assert result.delta.skipped_reason == "apply_failed"
+    assert result.errors == ["memory_delta: apply_failed"]
+    assert fake_llm.calls == []
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_apply_error")
+        delta = deltas_store.latest_for_session(conn, "sess_apply_error")
+    assert row is not None and row.delta_end is None
+    assert delta is not None and delta["apply_status"] == "failed"

@@ -366,6 +366,78 @@ def test_no_blocks_skips_without_llm(ac_root, fake_llm) -> None:
     assert result.skipped_reason == "no_blocks" and fake_llm.calls == []
 
 
+def test_short_session_reads_the_containing_timeline_block(ac_root, fake_llm) -> None:
+    block_start = datetime(2026, 7, 2, 9, 0).astimezone()
+    with fts.cursor() as conn:
+        timeline_store.insert(conn, _block(block_start, [SESSION_ENTRY], ["Feishu"]))
+    fake_llm.set_default(delta_mod.STAGE, _payload())
+
+    result = delta_mod.run_after_session(
+        _cfg(),
+        session_id="short-session",
+        start_time=block_start + timedelta(seconds=20),
+        end_time=block_start + timedelta(seconds=40),
+    )
+
+    assert result.written
+    assert len(fake_llm.calls) == 1
+
+
+def test_session_window_uses_strict_overlap_at_both_boundaries(ac_root, fake_llm) -> None:
+    session_start = datetime(2026, 7, 2, 9, 0, 30).astimezone()
+    session_end = session_start + timedelta(minutes=1)
+    blocks = (
+        _block(session_start - timedelta(minutes=1), ["touches before"], ["Feishu"]),
+        _block(session_start.replace(second=0), ["overlaps start"], ["Feishu"]),
+        _block(session_end.replace(second=0), ["overlaps end"], ["Feishu"]),
+        _block(session_end, ["touches after"], ["Feishu"]),
+    )
+    with fts.cursor() as conn:
+        for block in blocks:
+            timeline_store.insert(conn, block)
+    fake_llm.set_default(
+        delta_mod.STAGE,
+        _payload(entities=[], assertions=[], relations=[], events=[]),
+    )
+
+    result = delta_mod.run_after_session(
+        _cfg(),
+        session_id="boundary-session",
+        start_time=session_start,
+        end_time=session_end,
+    )
+
+    assert result.written
+    sent = "".join(block["text"] for block in fake_llm.calls[0]["messages"][1]["content"])
+    assert "overlaps start" in sent
+    assert "overlaps end" in sent
+    assert "touches before" not in sent
+    assert "touches after" not in sent
+
+
+def test_apply_result_errors_leave_delta_failed(ac_root, fake_llm, monkeypatch) -> None:
+    from persome.writer import delta_apply
+
+    start, end = _seed_session_blocks([SESSION_ENTRY])
+    fake_llm.set_default(delta_mod.STAGE, _payload())
+    monkeypatch.setattr(
+        delta_apply,
+        "apply_delta",
+        lambda *args, **kwargs: delta_apply.ApplyResult(errors=["synthetic apply failure"]),
+    )
+
+    result = delta_mod.run_after_session(
+        _cfg(), session_id="failed-apply", start_time=start, end_time=end
+    )
+
+    assert result.written
+    assert not result.applied
+    assert result.skipped_reason == "apply_failed"
+    with fts.cursor() as conn:
+        row = deltas_store.latest_for_session(conn, "failed-apply")
+    assert row is not None and row["apply_status"] == "failed"
+
+
 def test_stats_aggregates_latest_per_session(ac_root, fake_llm) -> None:
     start, end = _seed_session_blocks([SESSION_ENTRY])
     fake_llm.set_default(delta_mod.STAGE, _payload())

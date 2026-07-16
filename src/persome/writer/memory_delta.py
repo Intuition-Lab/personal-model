@@ -422,10 +422,14 @@ def run_after_session(
     max_blocks = int(getattr(cfg.memory_delta, "max_blocks", 120))
     try:
         with fts.cursor() as conn:
-            # newest-first + limit gives the window's most recent max_blocks;
-            # reversed back to chronological order for the event log.
-            blocks = list(
-                reversed(tl_store.query_range(conn, start_time, end_time, limit=max_blocks))
+            # Session boundaries are event timestamps while timeline blocks are
+            # minute-aligned. Strict overlap keeps the partial first/last minute
+            # without admitting blocks that only touch either boundary.
+            blocks = tl_store.query_overlapping(
+                conn,
+                start_time,
+                end_time,
+                limit=max_blocks,
             )
     except Exception:  # noqa: BLE001 — fail-open, never disturb the writer chain
         logger.warning("memory_delta %s: block read failed", session_id, exc_info=True)
@@ -530,6 +534,8 @@ def run_after_session(
 
             with fts.cursor() as conn:
                 ar = delta_apply.apply_delta(conn, cfg, clean)
+                if ar.errors:
+                    raise RuntimeError(f"delta apply reported {len(ar.errors)} item error(s)")
                 deltas_store.set_apply_status(conn, delta_id, "applied")
             logger.info(
                 "memory_delta %s: applied (entities +%d/=%d, edges +%d~%d closed %d, events %d)",
@@ -545,6 +551,7 @@ def run_after_session(
         except Exception:  # noqa: BLE001 — apply
             with fts.cursor() as conn:
                 deltas_store.set_apply_status(conn, delta_id, "failed")
+            result.skipped_reason = "apply_failed"
             logger.warning("memory_delta %s: apply failed", session_id, exc_info=True)
 
     result.written = True
@@ -662,7 +669,9 @@ def _ensure_window(
         from . import delta_apply
 
         with fts.cursor() as conn:
-            delta_apply.apply_delta(conn, cfg, payload)
+            applied = delta_apply.apply_delta(conn, cfg, payload)
+            if applied.errors:
+                raise RuntimeError(f"delta apply reported {len(applied.errors)} item error(s)")
             deltas_store.set_apply_status(conn, result.delta_id, "applied")
         result.applied = True
         result.skipped_reason = "resumed_apply"
