@@ -734,7 +734,7 @@ def run_after_session(
             from . import delta_apply
 
             with fts.cursor() as conn:
-                ar = delta_apply.apply_delta(conn, cfg, clean)
+                ar = delta_apply.apply_delta(conn, cfg, clean, delta_id=delta_id)
                 deltas_store.set_apply_status(conn, delta_id, "applied")
             logger.info(
                 "memory_delta %s: applied (entities +%d/=%d, edges +%d~%d closed %d, events %d)",
@@ -867,7 +867,7 @@ def _ensure_window(
         from . import delta_apply
 
         with fts.cursor() as conn:
-            delta_apply.apply_delta(conn, cfg, payload)
+            delta_apply.apply_delta(conn, cfg, payload, delta_id=result.delta_id)
             deltas_store.set_apply_status(conn, result.delta_id, "applied")
         result.applied = True
         result.skipped_reason = "resumed_apply"

@@ -269,6 +269,14 @@ CREATE INDEX idx_health_events_provider_time
 
 -- ---- store/memory_deltas.py ----
 
+CREATE TABLE memory_delta_apply_receipts (
+    delta_id INTEGER NOT NULL REFERENCES memory_deltas(id) ON DELETE CASCADE,
+    effect_key TEXT NOT NULL,
+    target_observations INTEGER NOT NULL CHECK(target_observations >= 1),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(delta_id, effect_key)
+);
+
 CREATE TABLE memory_delta_evidence_claims (
     evidence_id TEXT PRIMARY KEY,
     delta_id INTEGER NOT NULL REFERENCES memory_deltas(id) ON DELETE CASCADE,
@@ -289,6 +297,9 @@ CREATE TABLE memory_deltas (
     window_end TEXT NOT NULL DEFAULT '',
     is_final INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE INDEX idx_memory_delta_apply_effect
+    ON memory_delta_apply_receipts(effect_key, target_observations DESC);
 
 CREATE INDEX idx_memory_deltas_created ON memory_deltas(created_at DESC);
 

@@ -106,11 +106,16 @@ The finalizer runs:
 5. deterministic apply into current/historical Points and relation Lines.
 
 Each memory-delta window is persisted before apply. `apply_status` allows a
-crashed apply to resume without another LLM call. Apply mutations and the status
-update are not yet atomic, so a crash between them can repeat additive relation
-reinforcement; a follow-up idempotency change is required. `delta_end` advances
-after successful active apply; the session receives `modeled_at` only after all
-terminal stages finish. A kernel
+crashed apply to resume without another LLM call. Point, assertion, event-edge,
+semantic-relation, and closure writes in a persisted memory-delta payload are
+naturally content-keyed, MAX-based, or monotone idempotent. Before either
+additive attention-floor or co-occurrence
+reinforcement, a durable delta/edge-generation receipt freezes its absolute
+observation target; retry applies `MAX(target)` instead of another increment.
+A crash after model mutations but before `apply_status=applied` is therefore
+safe to resume.
+`delta_end` advances after successful active apply; the session receives
+`modeled_at` only after all terminal stages finish. A kernel
 `session-model.lock` coordinates daemon, retry, CLI, and model-build callers.
 Reducer, classifier, pattern detector, and memory delta share one half-open
 timeline selector: full wall blocks remain compact, boundary straddlers are

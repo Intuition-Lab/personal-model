@@ -951,12 +951,12 @@ def test_apply_failure_keeps_claim_and_retry_does_not_reextract(
     original_apply = delta_apply.apply_delta
     apply_calls = 0
 
-    def flaky_apply(conn, cfg, payload):
+    def flaky_apply(conn, cfg, payload, **kwargs):
         nonlocal apply_calls
         apply_calls += 1
         if apply_calls == 1:
             raise RuntimeError("apply interrupted")
-        return original_apply(conn, cfg, payload)
+        return original_apply(conn, cfg, payload, **kwargs)
 
     monkeypatch.setattr(delta_apply, "apply_delta", flaky_apply)
     fake_llm.set_default(delta_mod.STAGE, _payload(entities=[], assertions=[]))
@@ -1002,6 +1002,107 @@ def test_apply_failure_keeps_claim_and_retry_does_not_reextract(
             (failed.delta_id, adjacent.delta_id),
         ).fetchall()
     assert [row["apply_status"] for row in statuses] == ["applied", "applied"]
+
+
+def test_retry_after_mutations_before_apply_status_does_not_double_add(
+    ac_root,
+    fake_llm,
+    monkeypatch,
+) -> None:
+    minute = datetime(2026, 7, 2, 16, 30).astimezone()
+    quote = "\u5f20\u4e09\u548c\u674e\u56db\u4e00\u8d77\u53c2\u52a0\u8bc4\u5ba1"
+    block = _block(minute, [f"[Editor] {quote}"], ["Editor"])
+    with fts.cursor() as conn:
+        timeline_store.insert(conn, block)
+
+    fake_llm.set_default(
+        delta_mod.STAGE,
+        _payload(
+            entities=[
+                {
+                    "new_entity": "\u5f20\u4e09",
+                    "kind": "person",
+                    "quote": quote,
+                    "confidence": 0.9,
+                },
+                {
+                    "new_entity": "\u674e\u56db",
+                    "kind": "person",
+                    "quote": quote,
+                    "confidence": 0.9,
+                },
+            ],
+            assertions=[],
+            relations=[],
+        ),
+    )
+
+    original_set_status = deltas_store.set_apply_status
+    interrupted = False
+
+    def interrupt_before_applied(conn, delta_id, status):  # type: ignore[no-untyped-def]
+        nonlocal interrupted
+        if status == "applied" and not interrupted:
+            interrupted = True
+            raise RuntimeError("crash after mutations before apply_status")
+        return original_set_status(conn, delta_id, status)
+
+    monkeypatch.setattr(deltas_store, "set_apply_status", interrupt_before_applied)
+    cfg = _cfg()
+    failed = delta_mod.ensure_active_window(
+        cfg,
+        session_id="post-mutation-retry",
+        start_time=minute,
+        end_time=minute + timedelta(minutes=1),
+    )
+
+    with fts.cursor() as conn:
+        before = {
+            (row["predicate"], row["dst_identity"]): row["observations"]
+            for row in conn.execute(
+                "SELECT predicate, dst_identity, observations FROM relation_edges"
+                " WHERE predicate IN ('engaged_with','knows')"
+            )
+        }
+        failed_status = conn.execute(
+            "SELECT apply_status FROM memory_deltas WHERE id=?",
+            (failed.delta_id,),
+        ).fetchone()[0]
+        receipt_targets = [
+            row[0]
+            for row in conn.execute(
+                "SELECT target_observations FROM memory_delta_apply_receipts"
+                " WHERE delta_id=? ORDER BY effect_key",
+                (failed.delta_id,),
+            )
+        ]
+
+    retried = delta_mod.ensure_active_window(
+        cfg,
+        session_id="post-mutation-retry",
+        start_time=minute,
+        end_time=minute + timedelta(minutes=1),
+    )
+
+    with fts.cursor() as conn:
+        after = {
+            (row["predicate"], row["dst_identity"]): row["observations"]
+            for row in conn.execute(
+                "SELECT predicate, dst_identity, observations FROM relation_edges"
+                " WHERE predicate IN ('engaged_with','knows')"
+            )
+        }
+        final_status = conn.execute(
+            "SELECT apply_status FROM memory_deltas WHERE id=?",
+            (failed.delta_id,),
+        ).fetchone()[0]
+
+    assert failed.written and not failed.applied and failed_status == "failed"
+    assert len(before) == 3 and set(before.values()) == {1}
+    assert receipt_targets == [1, 1, 1]
+    assert retried.applied and retried.skipped_reason == "resumed_apply"
+    assert after == before and final_status == "applied"
+    assert len(fake_llm.calls) == 1
 
 
 def test_block_claim_collision_rolls_back_new_delta_row(ac_root) -> None:
@@ -1116,6 +1217,7 @@ def test_evidence_claim_ids_must_be_nonempty_strings(ac_root, invalid_evidence_i
 
 def test_ensure_schema_adds_claim_table_without_rewriting_legacy_deltas(ac_root) -> None:
     with fts.cursor() as conn:
+        conn.execute("DROP TABLE IF EXISTS memory_delta_apply_receipts")
         conn.execute("DROP TABLE IF EXISTS memory_delta_evidence_claims")
         conn.execute("DROP TABLE IF EXISTS memory_deltas")
         conn.execute(
@@ -1145,12 +1247,17 @@ def test_ensure_schema_adds_claim_table_without_rewriting_legacy_deltas(ac_root)
             "SELECT name FROM sqlite_master WHERE type='table'"
             " AND name='memory_delta_evidence_claims'"
         ).fetchone()
+        apply_receipt_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='memory_delta_apply_receipts'"
+        ).fetchone()
         legacy = conn.execute(
             "SELECT session_id, apply_status, window_start, window_end, is_final FROM memory_deltas"
         ).fetchone()
 
     assert {"apply_status", "window_start", "window_end", "is_final"} <= columns
     assert claim_table is not None
+    assert apply_receipt_table is not None
     assert tuple(legacy) == ("legacy-session", "unknown", "", "", 1)
 
 

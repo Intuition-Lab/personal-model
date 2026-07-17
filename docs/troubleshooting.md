@@ -216,7 +216,9 @@ reasons. Unsupported quotes, unknown
 identity references, off-vocabulary predicates, and confidence below the floor
 are deliberately dropped. An LLM/store failure leaves `modeled_at` empty so
 recovery can retry. An `apply_status=failed` row is resumed without a second
-LLM extraction.
+LLM extraction. Additive attention and co-occurrence weights are protected by
+delta/edge receipts, so a retry after model mutation does not increment them a
+second time.
 
 Under the default `[memory_delta] apply_enabled = true`, the classifier reports
 `classifier retired (delta apply)` and its periodic daemon task is not started.

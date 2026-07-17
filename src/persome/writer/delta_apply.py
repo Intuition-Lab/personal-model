@@ -15,6 +15,7 @@ from ..evomem.models import MemoryLayer
 from ..evomem.person_graph import _slug as _entity_slug
 from ..logger import get
 from ..store import entries as entries_store
+from ..store import memory_deltas as deltas_store
 from ..store import relation_edges as edges_store
 from ..store.relation_edges import EntityKind, Predicate
 
@@ -175,8 +176,73 @@ def _apply_assertions(
             r.errors.append(f"assertion: {exc}")
 
 
+def _additive_effect_key(src: str, dst: str, predicate: Predicate) -> str:
+    """Stable receipt key for one logical edge, including undirected ordering."""
+    edge_key = rex._edge_key(src, dst, predicate.value)  # noqa: SLF001
+    material = "\x1f".join(edge_key).encode("utf-8")
+    return f"edge:{hashlib.sha256(material).hexdigest()}"
+
+
+def _upsert_receipted_additive(
+    conn: sqlite3.Connection,
+    seen: dict[tuple[str, str, str], str],
+    tally: Any,
+    *,
+    delta_id: int,
+    src: str,
+    dst: str,
+    predicate: Predicate,
+    confidence: float,
+    quote: str,
+    label: str | None,
+    src_kind: str,
+    dst_kind: str,
+    polarity: str = "0",
+    status: str = "shadow",
+) -> None:
+    """Apply one additive edge exactly once for a persisted memory delta.
+
+    The receipt store first freezes and commits an absolute observation target.
+    Mutation then uses ordinary MAX semantics. A retry after any crash therefore
+    converges on the same value instead of executing another ``+= 1``.
+    """
+    target, current_edge_id = deltas_store.reserve_additive_target(
+        conn,
+        delta_id=delta_id,
+        effect_key=_additive_effect_key(src, dst, predicate),
+        src_identity=src,
+        dst_identity=dst,
+        predicate=predicate.value,
+    )
+    key = rex._edge_key(src, dst, predicate.value)  # noqa: SLF001
+    if current_edge_id is not None:
+        seen[key] = current_edge_id
+    rex._upsert_shadow(  # noqa: SLF001
+        conn,
+        seen,
+        tally,
+        src=src,
+        dst=dst,
+        predicate=predicate,
+        confidence=confidence,
+        quote=quote,
+        label=label,
+        observations=target,
+        src_kind=src_kind,
+        dst_kind=dst_kind,
+        polarity=polarity,
+        additive=False,
+        status=status,
+    )
+
+
 def _apply_relations(
-    conn: sqlite3.Connection, clean: dict, kinds: dict[str, str], r: ApplyResult
+    conn: sqlite3.Connection,
+    clean: dict,
+    kinds: dict[str, str],
+    r: ApplyResult,
+    *,
+    delta_id: int | None,
 ) -> None:
     seen = rex._open_edges(conn)  # noqa: SLF001
     tally = rex._Tally()  # noqa: SLF001
@@ -195,22 +261,39 @@ def _apply_relations(
             dst_kind = _endpoint_kind(dst, kinds)
             before = tally.new
             try:
-                rex._upsert_shadow(  # noqa: SLF001
-                    conn,
-                    seen,
-                    tally,
-                    src=src,
-                    dst=dst,
-                    predicate=predicate,
-                    confidence=float(rel.get("confidence", 0.5)),
-                    quote=str(rel.get("quote") or ""),
-                    label=rel.get("label"),
-                    observations=1,
-                    src_kind=src_kind,
-                    dst_kind=dst_kind,
-                    polarity=_norm_polarity(rel.get("polarity")),
-                    additive=bool(rel.get("cooccurrence")),
-                )
+                if bool(rel.get("cooccurrence")) and delta_id is not None:
+                    _upsert_receipted_additive(
+                        conn,
+                        seen,
+                        tally,
+                        delta_id=delta_id,
+                        src=src,
+                        dst=dst,
+                        predicate=predicate,
+                        confidence=float(rel.get("confidence", 0.5)),
+                        quote=str(rel.get("quote") or ""),
+                        label=rel.get("label"),
+                        src_kind=src_kind,
+                        dst_kind=dst_kind,
+                        polarity=_norm_polarity(rel.get("polarity")),
+                    )
+                else:
+                    rex._upsert_shadow(  # noqa: SLF001
+                        conn,
+                        seen,
+                        tally,
+                        src=src,
+                        dst=dst,
+                        predicate=predicate,
+                        confidence=float(rel.get("confidence", 0.5)),
+                        quote=str(rel.get("quote") or ""),
+                        label=rel.get("label"),
+                        observations=1,
+                        src_kind=src_kind,
+                        dst_kind=dst_kind,
+                        polarity=_norm_polarity(rel.get("polarity")),
+                        additive=bool(rel.get("cooccurrence")),
+                    )
             except ValueError:
                 continue
             if tally.new > before:
@@ -224,6 +307,11 @@ def _apply_relations(
                 if eid and edges_store.close_edge(conn, edge_id=eid, at=now):
                     r.edges_closed += 1
         except Exception as exc:  # noqa: BLE001
+            if delta_id is not None and isinstance(rel, dict) and bool(rel.get("cooccurrence")):
+                # A durable receipt with no edge mutation must leave the delta
+                # retryable; swallowing a transient write failure here would
+                # let apply_status advance and permanently lose the evidence.
+                raise
             r.errors.append(f"relation: {exc}")
 
 
@@ -267,7 +355,12 @@ def _apply_events(
 
 
 def _apply_floor(
-    conn: sqlite3.Connection, clean: dict, kinds: dict[str, str], r: ApplyResult
+    conn: sqlite3.Connection,
+    clean: dict,
+    kinds: dict[str, str],
+    r: ApplyResult,
+    *,
+    delta_id: int | None,
 ) -> None:
     seen = rex._open_edges(conn)  # noqa: SLF001
     tally = rex._Tally()  # noqa: SLF001
@@ -278,22 +371,39 @@ def _apply_floor(
         if not canonical or canonical == SELF_IDENTITY:
             continue
         try:
-            rex._upsert_shadow(  # noqa: SLF001
-                conn,
-                seen,
-                tally,
-                src=SELF_IDENTITY,
-                dst=canonical,
-                predicate=Predicate.ENGAGED_WITH,
-                confidence=1.0,
-                quote=str(e.get("quote") or ""),
-                label="engaged",
-                observations=1,
-                src_kind=EntityKind.SELF.value,
-                dst_kind=_endpoint_kind(canonical, kinds),
-                additive=True,
-                status="active",  # direct observed attention, not an inferred semantic claim
-            )
+            if delta_id is not None:
+                _upsert_receipted_additive(
+                    conn,
+                    seen,
+                    tally,
+                    delta_id=delta_id,
+                    src=SELF_IDENTITY,
+                    dst=canonical,
+                    predicate=Predicate.ENGAGED_WITH,
+                    confidence=1.0,
+                    quote=str(e.get("quote") or ""),
+                    label="engaged",
+                    src_kind=EntityKind.SELF.value,
+                    dst_kind=_endpoint_kind(canonical, kinds),
+                    status="active",
+                )
+            else:
+                rex._upsert_shadow(  # noqa: SLF001
+                    conn,
+                    seen,
+                    tally,
+                    src=SELF_IDENTITY,
+                    dst=canonical,
+                    predicate=Predicate.ENGAGED_WITH,
+                    confidence=1.0,
+                    quote=str(e.get("quote") or ""),
+                    label="engaged",
+                    observations=1,
+                    src_kind=EntityKind.SELF.value,
+                    dst_kind=_endpoint_kind(canonical, kinds),
+                    additive=True,
+                    status="active",  # direct observed attention, not an inferred semantic claim
+                )
         except ValueError:
             continue
     r.floor_edges = tally.new + tally.reinforced
@@ -336,6 +446,7 @@ def apply_delta(
     clean: dict,
     *,
     memory: EvoMemory | None = None,
+    delta_id: int | None = None,
 ) -> ApplyResult:
     r = ApplyResult()
     if not clean:
@@ -348,8 +459,8 @@ def apply_delta(
 
     if getattr(getattr(cfg, "memory_delta", None), "apply_assertions", False):
         _apply_assertions(conn, mem, clean, kinds, r)
-    _apply_floor(conn, clean, kinds, r)
-    _apply_relations(conn, clean, kinds, r)
+    _apply_floor(conn, clean, kinds, r, delta_id=delta_id)
+    _apply_relations(conn, clean, kinds, r, delta_id=delta_id)
     _apply_events(conn, clean, kinds, r)
     return r
 
