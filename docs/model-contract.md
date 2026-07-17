@@ -47,6 +47,8 @@ atomically replaces that receipt with `complete`, `skipped`, `failed`, or
 and a process crash preserves the last atomic state (`running` when it exited
 inside a stage); neither can reuse an older success. This sidecar does not
 change the public snapshot or `model-build.json` schema.
+It records the causal `evidence_as_of` cutoff as canonical UTC without
+backdating its processing timestamps.
 
 ## Geometry
 

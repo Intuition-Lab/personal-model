@@ -680,6 +680,7 @@ def run_model_build(
             trigger=trigger,
             pipeline_kind=pipeline_kind,
             started_at=_processing_timestamp(),
+            evidence_as_of=cutoff.astimezone(UTC).isoformat(),
         )
         _write_json_owner_only(paths.model_build_stage_receipt(), artifact)
         recorder = _StageReceiptRecorder(artifact)

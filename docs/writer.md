@@ -343,7 +343,8 @@ selected projections and preserve receipts/history.
   receipts in `model-build-stages.json`. A receipt carries only stable
   status/error codes, processing timestamps, counters/digests, and hashes;
   caller-returned stage reports and exception text are never accepted as
-  evidence.
+  evidence. The sidecar also binds the canonical-UTC `evidence_as_of` cutoff,
+  distinct from processing time.
 
 ## Logs and recovery
 

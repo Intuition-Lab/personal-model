@@ -140,6 +140,7 @@ schema 1. Canonical Core builds contain exactly this ordered stage set:
   "manifest_digest": "sha256:...",
   "trigger_label": "cli",
   "trigger_digest": "sha256:...",
+  "evidence_as_of": "2026-07-13T13:46:00+00:00",
   "started_at": "...",
   "completed_at": "...",
   "failure_code": null,
@@ -170,6 +171,9 @@ retain a safe subset. The fixed error codes are `disabled_by_config`,
 The final sidecar is bound to the exact manifest by `build_id`, a safe
 `core_commit` label plus its digest, `config_hash`, a full canonical
 `manifest_digest`, and a digest of `trigger`.
+`evidence_as_of` is the canonical-UTC causal read cutoff used by historical
+enrichment. It is deliberately separate from the real processing timestamps
+in this sidecar and in the build manifest.
 The callback test seam is labeled `pipeline_kind: override`; callback-returned
 stage dictionaries are ignored, so they cannot impersonate the canonical Core
 stage list. Its manifest digest still binds the callback-driven legacy manifest,

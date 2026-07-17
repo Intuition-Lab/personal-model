@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .manifest import is_valid_build_manifest
@@ -76,6 +76,7 @@ _ARTIFACT_KEYS = frozenset(
         "manifest_digest",
         "trigger_label",
         "trigger_digest",
+        "evidence_as_of",
         "started_at",
         "completed_at",
         "failure_code",
@@ -148,6 +149,18 @@ def _processing_datetime(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
+
+
+def _canonical_utc_datetime(value: Any) -> datetime | None:
+    parsed = _processing_datetime(value)
+    if (
+        parsed is None
+        or parsed.utcoffset() != timedelta(0)
+        or not isinstance(value, str)
+        or not value.endswith("+00:00")
+    ):
+        return None
+    return parsed if parsed.isoformat() == value else None
 
 
 def _safe_metrics(value: Any) -> bool:
@@ -247,12 +260,15 @@ def create_build_stage_artifact(
     trigger: str,
     pipeline_kind: str,
     started_at: str,
+    evidence_as_of: str,
 ) -> dict[str, Any]:
     """Create the initial unbound artifact written before any stage enters."""
     if pipeline_kind not in _PIPELINE_KINDS:
         raise ValueError(f"unsupported stage-receipt pipeline kind: {pipeline_kind!r}")
     if _processing_datetime(started_at) is None:
         raise ValueError("stage-receipt processing timestamp must be timezone-aware")
+    if _canonical_utc_datetime(evidence_as_of) is None:
+        raise ValueError("stage-receipt evidence cutoff must be canonical UTC")
     trigger_label, trigger_digest = trigger_binding(trigger)
     artifact: dict[str, Any] = {
         "schema_version": STAGE_RECEIPT_SCHEMA_VERSION,
@@ -265,6 +281,7 @@ def create_build_stage_artifact(
         "manifest_digest": None,
         "trigger_label": trigger_label,
         "trigger_digest": trigger_digest,
+        "evidence_as_of": evidence_as_of,
         "started_at": started_at,
         "completed_at": None,
         "failure_code": None,
@@ -375,6 +392,7 @@ def is_valid_build_stage_artifact(
         or artifact.get("trigger_label") is None
         or _SAFE_TRIGGER.fullmatch(str(artifact["trigger_label"])) is None
         or _SAFE_DIGEST.fullmatch(str(artifact.get("trigger_digest"))) is None
+        or _canonical_utc_datetime(artifact.get("evidence_as_of")) is None
         or not isinstance(artifact.get("degraded_stages"), list)
     ):
         return False

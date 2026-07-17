@@ -509,6 +509,7 @@ def test_stage_recorder_preserves_legacy_failure_and_skip_result_shape(ac_root) 
         trigger="shape-test",
         pipeline_kind="core",
         started_at=datetime.now(UTC).isoformat(),
+        evidence_as_of=datetime.now(UTC).isoformat(),
     )
     recorder = model_build_mod._StageReceiptRecorder(artifact)
     outcome = PipelineOutcome()
@@ -659,6 +660,9 @@ def test_model_build_separates_historical_evidence_from_processing_clock(
     assert seen == [(processing_started, evidence_as_of)]
     assert result.manifest["started_at"] == processing_started.isoformat()
     assert result.manifest["completed_at"] == processing_completed.isoformat()
+    artifact = _load_stage_artifact()
+    assert artifact["evidence_as_of"] == evidence_as_of.isoformat()
+    assert artifact["started_at"] != evidence_as_of.isoformat()
 
 
 def test_default_pipeline_forwards_evidence_clock_to_enrichment(
@@ -708,6 +712,7 @@ def test_default_pipeline_forwards_evidence_clock_to_enrichment(
         trigger="test-default-pipeline-evidence-clock",
         pipeline_kind="core",
         started_at=datetime.now(UTC).isoformat(),
+        evidence_as_of=evidence_as_of.isoformat(),
     )
     recorder = model_build_mod._StageReceiptRecorder(artifact)
     outcome = model_build_mod._run_pipeline(
@@ -939,6 +944,23 @@ def test_stage_artifact_rejects_rehashed_personal_text_without_affecting_snapsho
     assert is_valid_build_stage_artifact(artifact) is False
     assert artifact_matches_manifest(artifact, result.manifest) is False
     assert load_live_manifest() == result.manifest
+
+
+def test_stage_artifact_rejects_noncanonical_evidence_cutoff(ac_root) -> None:
+    cfg = config_mod.load(ac_root / "config.toml")
+    result = run_model_build(
+        cfg,
+        pipeline_runner=lambda _cfg: PipelineOutcome(),
+        evidence_as_of=datetime(2026, 7, 10, 16, 0, tzinfo=UTC),
+    )
+    artifact = _load_stage_artifact()
+    artifact["evidence_as_of"] = "2026-07-11T00:00:00+08:00"
+    artifact["artifact_id"] = content_digest(
+        {key: value for key, value in artifact.items() if key != "artifact_id"}
+    )
+
+    assert is_valid_build_stage_artifact(artifact) is False
+    assert artifact_matches_manifest(artifact, result.manifest) is False
 
 
 def test_model_build_lock_no_wait_reports_busy(ac_root) -> None:
