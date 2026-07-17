@@ -10,7 +10,8 @@ from persome import cli, paths
 from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.evomem.store import NodeStore
 from persome.store import entries as entries_mod
-from persome.store import fts, schema_faces
+from persome.store import fts, memory_deltas, schema_faces
+from persome.timeline import store as timeline_store
 
 
 def _seed_capture() -> None:
@@ -70,6 +71,57 @@ def test_clean_captures_removes_files_and_index_rows(ac_root) -> None:
     assert not capture_file.exists()
     with fts.cursor() as conn:
         assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 0
+
+
+def test_clean_timeline_removes_block_claims_before_timeline_rows(ac_root) -> None:
+    start = datetime(2026, 7, 10, 8, 0, tzinfo=UTC)
+    block = timeline_store.TimelineBlock(
+        start_time=start,
+        end_time=start.replace(minute=1),
+        entries=["private timeline evidence"],
+        apps_used=["PrivateApp"],
+        capture_count=1,
+    )
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            block,
+            source_capture_ids=["capture:2026-07-10T08-00-00p00-00"],
+        )
+        delta_id = memory_deltas.insert(
+            conn,
+            session_id="private-session",
+            payload={},
+            window_start=block.start_time,
+            window_end=block.end_time,
+            evidence_ids=[block.id],
+        )
+
+    assert cli._clean_timeline() == 1
+    with fts.cursor() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM timeline_blocks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM timeline_block_sources").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memory_delta_evidence_claims").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM memory_deltas WHERE id=?", (delta_id,)).fetchone()[0]
+            == 1
+        )
+
+
+def test_clean_memory_removes_delta_claim_children(ac_root) -> None:
+    with fts.cursor() as conn:
+        memory_deltas.insert(
+            conn,
+            session_id="private-session",
+            payload={},
+            evidence_ids=["tlb-20260710-0800-private"],
+        )
+
+    cli._clean_memory()
+
+    with fts.cursor() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM memory_delta_evidence_claims").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memory_deltas").fetchone()[0] == 0
 
 
 def test_clean_memory_removes_canonical_model_exports_and_backups(ac_root, monkeypatch) -> None:

@@ -25,10 +25,10 @@ Why 1-minute blocks? Two reasons:
 
 `timeline/tick.py::run_forever` fires every 60s inside the daemon. Each tick:
 
-1. Loads `get_latest_end()` from `timeline_blocks`.
-2. Iterates closed windows from that boundary (or `cold_lookback_minutes` ago on first run) up to *now minus one window*.
+1. Loads `get_latest_end()` and scans raw captures for the earliest closed occupied window whose block is missing.
+2. Iterates closed windows from the earlier safe boundary (or `cold_lookback_minutes` ago on first run) up to *now minus one window*.
 3. For each window without an existing block, calls `produce_block_for_window`.
-4. After the scan, cleans buffer files older than the newest block's `end_time` AND older than `capture.buffer_retention_hours` — captures covered by a closed block are safe to drop.
+4. After the scan, cleans buffer files older than both retention and the continuous safe watermark; a missing occupied gap moves that watermark back so its raw/FTS evidence survives retry.
 
 Only closed windows are produced. The current half-formed window sits as "trailing captures" in the buffer until it closes.
 
@@ -42,7 +42,14 @@ Only closed windows are produced. The current half-formed window sits as "traili
 - When capture JSON has no AX text and `ocr_submitted=true`, the aggregator
   consults the OCR backfill in `captures` FTS before declaring the window empty.
 
-Up to `_MAX_EVENTS_PER_WINDOW = 30` events per window (rarely hit at 1-min granularity). The prompts (`prompts/timeline_block.system.md` and `timeline_block.user.md`) command the model to emit normalized activity records, one per distinct conversation / context / tab / file. Each record follows this shape:
+Up to `_MAX_EVENTS_PER_WINDOW = 30` newest events per window are eligible
+(rarely hit at 1-min granularity). That exact bounded subset is shared by the
+prompt, heuristic fallback, `capture_count`, focus excerpt/structured parser,
+attention locus, skills, and action trace; no whole-block derivative can depend
+on an unreceipted 31st capture. The prompts
+(`prompts/timeline_block.system.md` and `timeline_block.user.md`) command the
+model to emit normalized activity records, one per distinct conversation /
+context / tab / file. Each record follows this shape:
 
 ```
 [<app name>] <context (title/URL/file)>: <what happened>. <Authored text verbatim, in quotes, if any>. Involving: <people/topics/files named in this conversation>.
@@ -86,11 +93,25 @@ CREATE TABLE timeline_blocks (
   attention_rung TEXT NOT NULL DEFAULT '',
   UNIQUE(start_time, end_time)
 );
+
+CREATE TABLE timeline_block_sources (
+  block_id TEXT NOT NULL,
+  capture_id TEXT NOT NULL,
+  captured_at TEXT NOT NULL DEFAULT '',
+  ordinal INTEGER NOT NULL,
+  PRIMARY KEY (block_id, capture_id),
+  UNIQUE (block_id, ordinal)
+);
 ```
 
 Stored in the same `index.db` as the FTS tables. It is not FTS-indexed; reducer,
 memory-delta, case, and attention stages query it by time range. Structured
 focus and raw excerpts preserve evidence that the normalized entry may omit.
+`timeline_block_sources` is written atomically with each production block and
+records the ID and aware event timestamp of the exact newest-30-or-fewer capture
+subset used by the prompt and every whole-block derivative. Upgraded legacy
+manifest rows with `captured_at=''` remain usable for whole-block ownership but
+fail closed for partial replay because their exact slice position is unknown.
 
 ## CLI
 
@@ -101,17 +122,41 @@ persome timeline list -n 24   # last 24 blocks, oldest → newest
 
 Production is idempotent — manual ticks are always safe.
 
-## Interaction with the S2 reducer
+## Exact-slice downstream reads
 
-Both the flush tick and the terminal reduce query:
+Reducer, classifier, pattern detector, and memory delta all use
+`timeline.aggregator.exact_timeline_slice` for a half-open evidence range. A
+complete wall window reuses its compact persisted block. A first or last block
+that straddles the range is rebuilt only from raw captures inside the exact
+slice and carries none of the whole-minute focus, attention, action, or skill
+fields. For blocks with a durable source manifest, every manifested capture
+whose timestamp belongs to the partial slice must still be present and match
+the bounded raw projection; a surviving subset is never treated as complete.
+Pre-manifest legacy blocks retain the historical best-effort raw behavior.
 
-```sql
-SELECT * FROM timeline_blocks
- WHERE end_time > :start_bound AND start_time < :end_bound
- ORDER BY start_time ASC
-```
+A terminal off-minute read waits for the closing wall block only when its exact
+closing slice contains durable capture occupancy; an empty slice never waits
+for a block the aggregator cannot create. The block proves an occupied minute
+is closed but its whole summary is never treated as cutoff-safe. If raw boundary
+provenance is unavailable, the stage remains retryable. The selector also
+refuses to cross an occupied closed minute whose block is missing, so
+`flush_end`, `classified_end`, and `delta_end` cannot jump over a crash gap.
+Active reads ignore only the current not-yet-closed trailing window.
 
-Where `:start_bound` is `flush_end` (or `session.start` on the first flush) and `:end_bound` is `now` (flush) or `session.end` (terminal). All overlapping blocks are fed to the reducer LLM along with the window's wall-clock range. Earlier entries from the same daily file are deliberately not included: `flush_end` already prevents overlap, while replaying old task bodies biases later same-day summaries toward stale work. The reducer emits per-window-range sub_tasks like `[13:25-13:30, Cursor] edited tick.py; "fixed _stem_to_dt for negative offsets"; involving persome/timeline/aggregator.py`.
+Each tick scans the raw buffer for the earliest closed occupied window without
+a block and moves backlog processing back to that gap, even if a later parallel
+window already succeeded. Cleanup uses the earlier of that gap and the latest
+block end as its absorbed watermark, preserving the gap's JSON and searchable
+capture row for retry. The configured hard disk cap remains the explicit final
+boundary and may evict unabsorbed data with a degraded warning.
+
+For the reducer, `:start_bound` is `flush_end` (or `session.start` on the first
+flush) and `:end_bound` is the latest closed window (flush) or exact
+`session.end` (terminal). Earlier entries from the same daily file are
+deliberately not replayed: the watermark already prevents overlap, while old
+task bodies bias later same-day summaries toward stale work. The reducer emits
+per-window-range sub_tasks like `[13:25-13:30, Cursor] edited tick.py; "fixed
+_stem_to_dt for negative offsets"; involving persome/timeline/aggregator.py`.
 
 ## Tuning
 

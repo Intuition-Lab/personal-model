@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from persome import config as config_mod
+from persome import paths
 from persome.api import build_api_app
 from persome.api import routes as routes_mod
 from persome.capture import scheduler, screen_state
@@ -17,6 +18,7 @@ from persome.model import export_snapshot, run_model_build
 from persome.session import store as session_store
 from persome.session.manager import SessionManager
 from persome.store import fts
+from persome.timeline import store as timeline_store
 from persome.timeline import tick as timeline_tick
 
 FIXTURE = Path(__file__).parent / "fixtures" / "runtime_model" / "captures.json"
@@ -111,6 +113,7 @@ def test_fresh_root_ingest_build_export_contract(ac_root, monkeypatch, fake_llm)
     cfg.search.hybrid_enabled = False
     cfg.timeline.cold_lookback_minutes = 5
     cfg.timeline.max_parallel_windows = 1
+    post_cutoff_secret = "POST_CUTOFF_SECRET_RUNTIME_E2E"
 
     clock_state = [datetime(2026, 7, 10, 9, 0, tzinfo=TZ)]
     manager = _wire_session_manager(clock_state)
@@ -123,12 +126,30 @@ def test_fresh_root_ingest_build_export_contract(ac_root, monkeypatch, fake_llm)
         clock_state[0] = datetime(2026, 7, 10, 9, 2, tzinfo=TZ)
         assert client.post("/captures/ingest", json=captures[1]).status_code == 200
         assert manager.force_end(reason="runtime-fixture") is not None
+        post_cutoff = json.loads(json.dumps(captures[1]))
+        post_cutoff["timestamp"] = "2026-07-10T09:01:40+08:00"
+        post_cutoff["ax_tree"]["timestamp"] = post_cutoff["timestamp"]
+        post_cutoff["ax_tree"]["apps"][0]["windows"][0]["elements"][0]["value"] = post_cutoff_secret
+        scheduler._set_active_runner(
+            scheduler._CaptureRunner(cfg.capture, provider=None, pre_capture_hook=None)
+        )
+        assert client.post("/captures/ingest", json=post_cutoff).status_code == 200
     finally:
         scheduler._set_active_runner(None)
         routes_mod.set_config(None)
 
     monkeypatch.setattr(timeline_tick, "_now", lambda: datetime(2026, 7, 10, 9, 3, tzinfo=TZ))
     assert timeline_tick.tick_now(cfg) == 2
+    with fts.cursor() as conn:
+        [session] = session_store.list_pending_reduction(conn)
+        session_blocks = timeline_store.query_overlapping(
+            conn,
+            session.start_time,
+            session.end_time,
+        )
+    assert session.start_time == datetime(2026, 7, 10, 1, 0, 10, tzinfo=UTC)
+    assert session.end_time == datetime(2026, 7, 10, 1, 1, 10, 1, tzinfo=UTC)
+    assert len(session_blocks) == 2
 
     fake_llm.add_script("classifier", _classifier_script())
     schema_responses = [
@@ -169,6 +190,20 @@ def test_fresh_root_ingest_build_export_contract(ac_root, monkeypatch, fake_llm)
     )
     first = run_model_build(cfg, trigger="runtime-fixture", now=lambda: next(moments))
     second = run_model_build(cfg, trigger="runtime-fixture", now=lambda: next(moments))
+    reducer_call = next(call for call in fake_llm.calls if call["stage"] == "reducer")
+    reducer_prompt = "".join(block["text"] for block in reducer_call["messages"][1]["content"])
+    assert "(2 timeline blocks, 2 raw capture records)" in reducer_prompt
+    assert post_cutoff_secret not in reducer_prompt
+    downstream_calls = [call for call in fake_llm.calls if call["stage"] != "timeline"]
+    assert post_cutoff_secret not in json.dumps(
+        downstream_calls,
+        ensure_ascii=False,
+        default=str,
+    )
+    event_memory = "\n".join(
+        path.read_text(encoding="utf-8") for path in paths.memory_dir().glob("event-*.md")
+    )
+    assert post_cutoff_secret not in event_memory
     assert first.status == "degraded"
     with fts.cursor() as conn:
         face_debug = [
@@ -209,6 +244,7 @@ def test_fresh_root_ingest_build_export_contract(ac_root, monkeypatch, fake_llm)
             generated_at="2026-07-10T09:06:00+00:00",
         )
     snapshot = json.loads(exported.read_text(encoding="utf-8"))
+    assert post_cutoff_secret not in json.dumps(snapshot, ensure_ascii=False)
     assert snapshot["stats"]["points"] >= 8
     assert snapshot["stats"]["evolution_lines"] + snapshot["stats"]["relation_lines"] >= 1
     assert snapshot["stats"]["faces"] >= 2
@@ -229,6 +265,7 @@ def test_fresh_root_ingest_build_export_contract(ac_root, monkeypatch, fake_llm)
     assert live["volumes"]
     assert live["root"] is not None
     assert live["root"]["source_receipts"]
+    assert post_cutoff_secret not in json.dumps(live["root"], ensure_ascii=False)
 
     page = client.get("/model")
     assert page.status_code == 200

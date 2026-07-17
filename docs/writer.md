@@ -34,6 +34,14 @@ call appends the trailing entry and marks the session reduced. An empty terminal
 window is a successful no-write reduction because earlier flushes may already
 cover it.
 
+All timeline-backed writers share one exact-slice selector. Complete wall
+windows reuse persisted blocks; boundary straddlers are rebuilt from raw
+captures strictly inside the half-open range with whole-minute focus and
+attention fields cleared. A terminal call with occupied closing evidence waits
+for its closing block and raw boundary provenance; an empty closing slice does
+not wait for a block that cannot be produced. An occupied closed minute without
+a block is retryable, so no reducer or model watermark can skip a crash gap.
+
 When timeline blocks carry attention-locus metadata, the reducer prompt adds up
 to 12 dwell-ranked surface titles. Dwell sums only observed block duration;
 tolerated gaps keep the trajectory readable but never add time. Raw titles are
@@ -88,9 +96,44 @@ per-identity fan-out cap.
 
 Persist-before-apply is deliberate. `apply_status` is `pending`, `applied`, or
 `failed`; a retry reuses the stored window payload and only resumes apply.
-`sessions.delta_end` advances only after success, keeping cost and
-relation-observation counts idempotent. Terminal finalization processes only
-the remaining tail.
+`sessions.delta_end` advances only after success, so retries avoid another LLM
+extraction. Apply mutations and the final status update are not yet one atomic
+transaction; a crash between them can repeat additive relation reinforcement,
+which requires a follow-up idempotency fix. Terminal finalization processes
+only the remaining tail. Session timestamps are capture instants while timeline
+blocks are closed, minute-aligned windows. A complete minute keeps its compact
+normalized TimelineBlock. A minute that crosses an active/session boundary is
+instead reconstructed from source captures inside the exact half-open slice;
+whole-minute entries and focus fields never cross that cutoff. Session end is
+stored as an exclusive instant just after its final event, so the terminal
+capture remains in the slice while later heartbeat captures do not.
+
+Terminal off-minute modeling waits until the closing TimelineBlock exists only
+when that exact terminal slice contains durable capture occupancy. That block is
+a completion barrier proving the source minute has closed, not evidence that its
+whole summary is cutoff-safe. An empty slice does not wait for an impossible
+block. If the source capture provenance needed to slice occupied evidence is
+unavailable, finalization remains incomplete and retryable: `sessions.delta_end`
+and `modeled_at` do not advance.
+
+Every persisted delta atomically writes evidence receipts in
+`memory_delta_evidence_claims`: complete windows claim the timeline block ID,
+plus every ID in its durable bounded-source manifest, while clipped boundaries
+claim only their source capture IDs. If an earlier clipped claim overlaps a
+whole block, only a provably complete raw residual may be rendered; retention,
+an incomplete partial manifest, or an opaque legacy claim with an overlapping
+delta window fails closed without an LLM call. Adjacent windows and sessions
+therefore consume disjoint captures regardless of replay order.
+LLM/persistence failure leaves evidence unclaimed for retry; apply failure keeps
+the claims attached to the stored payload that retry resumes. When a window
+exceeds `max_blocks`, the newest configured number still wins and the selected
+subset is rendered chronologically.
+
+The final evidence-ownership recheck, owner-alias mutations, deterministic
+gate, delta row, and evidence claims run under one `BEGIN IMMEDIATE`
+transaction. A competing direct replay therefore either wins before the
+recheck or waits for commit; a uniqueness collision rolls back alias evidence
+with the delta and claims.
 
 When `apply_enabled=false`, the delta remains an audit artifact and the legacy
 classifier regains the terminal durable-fact role. This is a compatibility and
@@ -103,7 +146,10 @@ The bounded tool loop in `writer/classifier.py` can read/search memory and use
 `event-*`. Under default delta apply it returns the deliberate skip
 `classifier retired (delta apply)` and the periodic classifier task is not
 started. The code remains reachable for old stores that explicitly disable
-delta apply.
+delta apply. Terminal focus entries may be written after the nominal session
+end, so their read bound can extend to the current wall clock, but timeline
+evidence remains separately capped at the exact session end. The active tick
+only advances its bookmark through a closed wall boundary.
 
 ## Behavioral memory
 
@@ -115,6 +161,9 @@ minute blocks inside one continuous episode count as one observation. MCP
 `behavior_patterns` exposes the latest active evidence-backed playbooks beside
 the resident Root and Faces. The stage models a person's recurring behavior; it
 does not propose scripts, grant permission, or execute automation.
+Both structured and raw modes use the same cutoff-safe timeline slice. The
+structured frequency scan retains the full configured lookback; only raw prompt
+mode keeps its 200-block token cap.
 
 ## Higher-level build
 
@@ -222,6 +271,8 @@ selected projections and preserve receipts/history.
   This override is request-scoped and does not enable unattended daemon calls.
 - Terminal finalization sets `sessions.modeled_at` only after every enabled
   stage completes or reports a deliberate benign skip.
+- Minute recovery retries only a persisted closing-block wait that has become
+  eligible; generic semantic-stage errors wait for boot/daily/manual recovery.
 - Semantic-stage errors degrade the model and remain retryable; they do not
   fabricate geometry.
 - Explicit model build records stage failures, model names, prompt hashes,

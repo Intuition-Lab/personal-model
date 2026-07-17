@@ -16,7 +16,14 @@ from . import integrity
 _log = get("persome.evomem")
 
 _SNAPSHOT_RE = re.compile(r"^evo-(\d{8})\.db$")
-_SCRUBBABLE_TABLES = frozenset({"captures", "timeline_blocks"})
+_SCRUBBABLE_TABLES = frozenset(
+    {
+        "captures",
+        "memory_delta_evidence_claims",
+        "timeline_block_sources",
+        "timeline_blocks",
+    }
+)
 
 
 def _local_today(now: datetime | None = None) -> date:

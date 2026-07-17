@@ -3621,17 +3621,32 @@ def _clean_timeline() -> int:
 def _clean_timeline_locked() -> int:
     from .evomem import backup as evo_backup
 
-    evo_backup.scrub_snapshots(("timeline_blocks",))
-    evo_backup.scrub_database_copies(("timeline_blocks",), _quarantined_index_db_mains())
+    timeline_tables = (
+        "memory_delta_evidence_claims",
+        "timeline_block_sources",
+        "timeline_blocks",
+    )
+    evo_backup.scrub_snapshots(timeline_tables)
+    evo_backup.scrub_database_copies(timeline_tables, _quarantined_index_db_mains())
     _remove_quarantined_index_sidecars()
     with fts.cursor() as conn:
         n: int = conn.execute("SELECT COUNT(*) FROM timeline_blocks").fetchone()[0]
+        # Evidence keys embed block/capture timestamps and are meaningless once
+        # their source timeline is erased. Foreign keys are intentionally off on
+        # shared runtime connections, so delete children explicitly first.
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_delta_evidence_claims'"
+        ).fetchone():
+            conn.execute("DELETE FROM memory_delta_evidence_claims")
+        conn.execute("DELETE FROM timeline_block_sources")
         conn.execute("DELETE FROM timeline_blocks")
         fts.purge_deleted_content(conn)
     return n
 
 
 _MODEL_TABLES = (
+    # Child receipts first: runtime connections do not enable foreign_keys.
+    "memory_delta_evidence_claims",
     "memory_deltas",
     "memory_contradictions",
     "relation_edges",

@@ -158,6 +158,121 @@ def test_produce_block_records_calls_with_json_mode(ac_root: Path, fake_llm) -> 
     assert system_block["cache_control"] == {"type": "ephemeral"}
 
 
+def test_noisy_minute_uses_same_last_30_captures_for_every_derivative(
+    ac_root: Path,
+    fake_llm,
+) -> None:
+    start = datetime(2026, 4, 21, 17, 20, tzinfo=_TZ)
+    for index in range(31):
+        marker = "EXCLUDED_OLDEST" if index == 0 else f"included-{index:02d}"
+        path = _write_capture(
+            start + timedelta(seconds=index),
+            value=marker,
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["visible_text"] = marker
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    fake_llm.set_default("timeline", json.dumps({"entries": ["[WeChat] bounded minute"]}))
+    block = aggregator.produce_block_for_window(
+        config_mod.load(ac_root / "config.toml"),
+        start=start,
+        end=start + timedelta(minutes=1),
+    )
+
+    assert block is not None and block.capture_count == 30
+    sent = str(fake_llm.calls[0]["messages"][1]["content"])
+    assert "EXCLUDED_OLDEST" not in sent
+    assert "included-01" in sent and "included-30" in sent
+    assert "EXCLUDED_OLDEST" not in block.focus_excerpt
+    assert "included-30" in block.focus_excerpt
+    with fts.cursor() as conn:
+        source_ids = timeline_store.source_capture_ids(conn, block.id)
+    assert source_ids == [
+        f"capture:{_stem(start + timedelta(seconds=index))}" for index in range(1, 31)
+    ]
+
+
+def test_exact_slice_normalizes_legacy_naive_capture_occupancy(ac_root: Path) -> None:
+    start = datetime(2026, 7, 17, 10, 0).astimezone()
+    end = start + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        fts.insert_capture(
+            conn,
+            id="legacy-naive-occupancy",
+            timestamp=(start + timedelta(seconds=10)).replace(tzinfo=None).isoformat(),
+            app_name="LegacyApp",
+            bundle_id="legacy.app",
+            window_title="Legacy",
+            focused_role="AXStaticText",
+            focused_value="",
+            visible_text="legacy occupied minute",
+            url="",
+        )
+        missing = aggregator.exact_timeline_slice(
+            config_mod.load(ac_root / "config.toml"),
+            conn,
+            start=start,
+            end=end,
+        )
+        assert missing.skipped_reason == "awaiting_timeline_block"
+
+        block = timeline_store.TimelineBlock(
+            start_time=start,
+            end_time=end,
+            entries=["[LegacyApp] occupied minute"],
+            apps_used=["LegacyApp"],
+            capture_count=1,
+        )
+        timeline_store.insert(conn, block)
+        complete = aggregator.exact_timeline_slice(
+            config_mod.load(ac_root / "config.toml"),
+            conn,
+            start=start,
+            end=end,
+        )
+
+    assert complete.skipped_reason == ""
+    assert [item.persisted_block_id for item in complete.evidence] == [block.id]
+
+
+def test_same_timestamp_opaque_sources_have_stable_manifest_and_partial_order(
+    ac_root: Path,
+    fake_llm,
+) -> None:
+    start = datetime(2026, 7, 17, 10, 10, tzinfo=_TZ)
+    captured_at = start + timedelta(seconds=10)
+    later_name = _write_capture(captured_at, value="OPAQUE_B")
+    later_name.rename(paths.capture_buffer_dir() / "evt_b.json")
+    earlier_name = _write_capture(captured_at, value="OPAQUE_A")
+    earlier_name.rename(paths.capture_buffer_dir() / "evt_a.json")
+    fake_llm.set_default("timeline", json.dumps({"entries": ["[WeChat] stable order"]}))
+
+    block = aggregator.produce_block_for_window(
+        config_mod.load(ac_root / "config.toml"),
+        start=start,
+        end=start + timedelta(minutes=1),
+    )
+    assert block is not None
+    with fts.cursor() as conn:
+        manifest = timeline_store.source_manifest(conn, block.id)
+        partial = aggregator.exact_timeline_slice(
+            config_mod.load(ac_root / "config.toml"),
+            conn,
+            start=start,
+            end=captured_at + timedelta(microseconds=1),
+        )
+
+    assert [source.capture_id for source in manifest] == [
+        "capture:evt_a",
+        "capture:evt_b",
+    ]
+    assert [path.stem for path, _ in partial.evidence[0].parsed_captures] == [
+        "evt_a",
+        "evt_b",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # produce_block_for_window — parser-hit telemetry (Phase 3)
 # ---------------------------------------------------------------------------

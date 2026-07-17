@@ -16,8 +16,9 @@ The manager is driven by two callbacks:
     detected even when no new events come in.
 
 On session end, ``on_session_end(session_id, start, end)`` is fired
-synchronously. The daemon hooks this to spawn the S2 reducer thread
-and persist the session row.
+synchronously. ``end`` is an exclusive bound one microsecond after the final
+event instant, so the last capture belongs to ``[start, end)``. The daemon hooks
+this to spawn the S2 reducer thread and persist the session row.
 """
 
 from __future__ import annotations
@@ -38,6 +39,18 @@ _RECENT_SWITCH_WINDOW = timedelta(minutes=2)
 
 def _local_now() -> datetime:
     return datetime.now().astimezone()
+
+
+def _event_time(trigger: dict[str, Any], clock: Callable[[], datetime]) -> datetime:
+    """Use the durable capture timestamp injected by the capture runner."""
+    raw = trigger.get("_persome_capture_timestamp")
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = datetime.fromisoformat(raw)
+            return parsed if parsed.tzinfo is not None else parsed.astimezone()
+        except (OverflowError, ValueError):
+            pass
+    return clock()
 
 
 class SessionManager:
@@ -90,7 +103,7 @@ class SessionManager:
 
     def on_event(self, trigger: dict[str, Any]) -> None:
         """Called for every capture-worthy event from the dispatcher."""
-        now_dt = self._clock()
+        now_dt = _event_time(trigger, self._clock)
         bundle_id = str(trigger.get("bundle_id") or "")
 
         with self._lock:
@@ -181,6 +194,11 @@ class SessionManager:
             return None
         session_id = self.current_session_id
         start_time = self.session_start
+        # Store sessions as half-open intervals without dropping the event that
+        # caused the terminal boundary. Capture commit invokes ``on_event`` only
+        # after its JSON is durable, so this epsilon includes that final capture
+        # and still excludes every genuinely later heartbeat/capture.
+        exclusive_end = end_time + timedelta(microseconds=1)
 
         self.is_active = False
         self.current_session_id = None
@@ -191,12 +209,12 @@ class SessionManager:
             "session ended: %s (%s → %s)",
             session_id,
             start_time.isoformat() if start_time else "?",
-            end_time.isoformat(),
+            exclusive_end.isoformat(),
         )
 
         if self._on_session_end and session_id and start_time is not None:
             try:
-                self._on_session_end(session_id, start_time, end_time)
+                self._on_session_end(session_id, start_time, exclusive_end)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("on_session_end callback failed: %s", exc)
 

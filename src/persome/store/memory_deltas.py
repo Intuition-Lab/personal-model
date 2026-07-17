@@ -13,20 +13,48 @@ payload column stores
 the POST-GATE delta (after the deterministic quote/roster/predicate/confidence
 gates in ``writer/memory_delta.py``), plus a ``dropped`` audit count so gate
 strictness stays observable.
+
+``memory_delta_evidence_claims`` is the durable consumption receipt for the evidence
+actually sent to the model. Complete wall-clock windows use their timeline
+block ID plus the bounded source-capture IDs recorded in the block's durable
+source manifest.
+A boundary window that must be clipped to an exact session cutoff uses only its
+source capture IDs, so adjacent off-minute windows consume disjoint evidence
+without sending text beyond either cutoff. The receipts and delta row commit
+atomically: extraction or persistence failure leaves evidence retryable, while
+apply failure keeps the receipts attached to the payload.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import cast
 
+from ..capture.timestamps import parse_capture_path_timestamp, parse_capture_timestamp
 from ..logger import get
 
 logger = get("persome.store.memory_deltas")
 
 STATUS_SHADOW = "shadow"
+_REQUIRED_DELTA_COLUMNS = frozenset(
+    {
+        "id",
+        "session_id",
+        "created_at",
+        "model",
+        "status",
+        "payload",
+        "dropped",
+        "apply_status",
+        "window_start",
+        "window_end",
+        "is_final",
+    }
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_deltas (
@@ -44,7 +72,28 @@ CREATE TABLE IF NOT EXISTS memory_deltas (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_deltas_session ON memory_deltas(session_id);
 CREATE INDEX IF NOT EXISTS idx_memory_deltas_created ON memory_deltas(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS memory_delta_evidence_claims (
+    evidence_id TEXT PRIMARY KEY,
+    delta_id INTEGER NOT NULL REFERENCES memory_deltas(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    UNIQUE(delta_id, ordinal)
+);
 """
+
+
+def _schema_ready(conn: sqlite3.Connection) -> bool:
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name IN ('memory_deltas', 'memory_delta_evidence_claims')"
+        ).fetchall()
+    }
+    if tables != {"memory_deltas", "memory_delta_evidence_claims"}:
+        return False
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_deltas)")}
+    return columns >= _REQUIRED_DELTA_COLUMNS
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -52,6 +101,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
     if fts.is_client_process():
         return
+    if conn.in_transaction:
+        # sqlite3.executescript() implicitly commits. Never run it inside a
+        # caller-owned transaction: either the daemon initialized this schema
+        # already, or the caller must do so before BEGIN.
+        if _schema_ready(conn):
+            return
+        raise RuntimeError(
+            "memory_delta schema is not initialized; call ensure_schema before BEGIN"
+        )
     conn.executescript(SCHEMA)
     columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_deltas)")}
     if "apply_status" not in columns:
@@ -81,8 +139,95 @@ def insert(
     window_start: datetime | None = None,
     window_end: datetime | None = None,
     is_final: bool = True,
+    evidence_ids: Sequence[str] = (),
 ) -> int:
+    """Insert one delta and atomically claim its consumed evidence IDs.
+
+    ``evidence_id`` is either a timeline block ID or a cutoff-safe source-capture
+    ID. It is globally unique. A collision
+    rolls back the new delta row as well as all of its claims, which is the DB
+    backstop for callers that bypass the process-wide session-model lock.
+    """
     ensure_schema(conn)
+    ordered_evidence_ids = tuple(evidence_ids)
+    if any(
+        not isinstance(evidence_id, str) or not evidence_id.strip()
+        for evidence_id in ordered_evidence_ids
+    ):
+        raise ValueError("memory_delta evidence_ids must be non-empty strings")
+    if len(ordered_evidence_ids) != len(set(ordered_evidence_ids)):
+        raise ValueError("memory_delta evidence_ids must be unique")
+
+    if not ordered_evidence_ids:
+        return _insert_row(
+            conn,
+            session_id=session_id,
+            payload=payload,
+            model=model,
+            dropped=dropped,
+            status=status,
+            apply_status=apply_status,
+            created_at=created_at,
+            window_start=window_start,
+            window_end=window_end,
+            is_final=is_final,
+        )
+
+    nested = conn.in_transaction
+    if nested:
+        conn.execute("SAVEPOINT memory_delta_with_evidence")
+    else:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        delta_id = _insert_row(
+            conn,
+            session_id=session_id,
+            payload=payload,
+            model=model,
+            dropped=dropped,
+            status=status,
+            apply_status=apply_status,
+            created_at=created_at,
+            window_start=window_start,
+            window_end=window_end,
+            is_final=is_final,
+        )
+        conn.executemany(
+            "INSERT INTO memory_delta_evidence_claims"
+            " (evidence_id, delta_id, ordinal) VALUES (?, ?, ?)",
+            (
+                (evidence_id, delta_id, ordinal)
+                for ordinal, evidence_id in enumerate(ordered_evidence_ids)
+            ),
+        )
+        if nested:
+            conn.execute("RELEASE SAVEPOINT memory_delta_with_evidence")
+        else:
+            conn.commit()
+        return delta_id
+    except Exception:
+        if nested:
+            conn.execute("ROLLBACK TO SAVEPOINT memory_delta_with_evidence")
+            conn.execute("RELEASE SAVEPOINT memory_delta_with_evidence")
+        else:
+            conn.rollback()
+        raise
+
+
+def _insert_row(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    payload: dict,
+    model: str,
+    dropped: int,
+    status: str,
+    apply_status: str,
+    created_at: datetime | None,
+    window_start: datetime | None,
+    window_end: datetime | None,
+    is_final: bool,
+) -> int:
     ts = (created_at or datetime.now().astimezone()).isoformat()
     cur = conn.execute(
         "INSERT INTO memory_deltas"
@@ -103,6 +248,101 @@ def insert(
         ),
     )
     return int(cur.lastrowid or 0)
+
+
+def evidence_ids_for_delta(conn: sqlite3.Connection, delta_id: int) -> list[str]:
+    """Return one delta's consumed evidence IDs in prompt order."""
+    ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT evidence_id FROM memory_delta_evidence_claims"
+        " WHERE delta_id=? ORDER BY ordinal ASC",
+        (delta_id,),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def claimed_evidence_ids(conn: sqlite3.Connection, evidence_ids: Sequence[str]) -> set[str]:
+    """Return the requested evidence IDs that already have a durable receipt."""
+    ensure_schema(conn)
+    wanted = tuple(dict.fromkeys(str(evidence_id) for evidence_id in evidence_ids if evidence_id))
+    claimed: set[str] = set()
+    # Stay below SQLite's host-parameter limit even for 200 windows with many
+    # source captures each.
+    for offset in range(0, len(wanted), 400):
+        chunk = wanted[offset : offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT evidence_id FROM memory_delta_evidence_claims"
+            f" WHERE evidence_id IN ({placeholders})",  # noqa: S608
+            chunk,
+        ).fetchall()
+        claimed.update(str(row[0]) for row in rows)
+    return claimed
+
+
+def claimed_capture_evidence_times(
+    conn: sqlite3.Connection,
+    *,
+    start: datetime,
+    end: datetime,
+) -> dict[str, datetime]:
+    """Return capture receipts whose durable ID timestamp falls in ``[start,end)``.
+
+    Legacy timeline blocks predate ``timeline_block_sources``. Parsing the
+    timestamp-bearing capture ID lets cutoff logic detect an older partial
+    claim even after its raw JSON was retained away.
+    """
+    ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT evidence_id FROM memory_delta_evidence_claims WHERE evidence_id LIKE 'capture:%'"
+    ).fetchall()
+    matches: dict[str, datetime] = {}
+    for row in rows:
+        evidence_id = str(row[0] or "")
+        stem = evidence_id.removeprefix("capture:")
+        timestamp = parse_capture_path_timestamp(Path(f"{stem}.json"))
+        if timestamp is not None and start <= timestamp < end:
+            matches[evidence_id] = timestamp
+    return matches
+
+
+def unparseable_capture_claim_windows(
+    conn: sqlite3.Connection,
+    *,
+    start: datetime,
+    end: datetime,
+) -> tuple[tuple[datetime, datetime] | None, ...]:
+    """Return overlapping delta windows for capture claims with opaque IDs.
+
+    Old/manual receipts may not carry a reversible timestamp in the capture ID.
+    Their owning delta window is the only durable location signal. ``None``
+    means even that window is absent or malformed, so callers must treat the
+    claim as potentially overlapping every legacy block.
+    """
+    ensure_schema(conn)
+    start_utc = parse_capture_timestamp(start.isoformat())
+    end_utc = parse_capture_timestamp(end.isoformat())
+    if start_utc is None or end_utc is None:
+        return (None,)
+    rows = conn.execute(
+        "SELECT c.evidence_id, d.window_start, d.window_end"
+        " FROM memory_delta_evidence_claims c"
+        " JOIN memory_deltas d ON d.id=c.delta_id"
+        " WHERE c.evidence_id LIKE 'capture:%'"
+    ).fetchall()
+    windows: list[tuple[datetime, datetime] | None] = []
+    for row in rows:
+        evidence_id = str(row[0] or "")
+        stem = evidence_id.removeprefix("capture:")
+        if parse_capture_path_timestamp(Path(f"{stem}.json")) is not None:
+            continue
+        window_start = parse_capture_timestamp(str(row[1] or ""))
+        window_end = parse_capture_timestamp(str(row[2] or ""))
+        if window_start is None or window_end is None:
+            windows.append(None)
+        elif window_end > start_utc and window_start < end_utc:
+            windows.append((window_start, window_end))
+    return tuple(windows)
 
 
 def recent(conn: sqlite3.Connection, *, limit: int = 20) -> list[sqlite3.Row]:

@@ -38,6 +38,7 @@ from ..session import store as session_store
 from ..store import entries as entries_mod
 from ..store import files as files_mod
 from ..store import fts
+from ..timeline import aggregator as timeline_aggregator
 from ..timeline import store as timeline_store
 from ..timeline.attention_trajectory import build_attention_trajectory
 from . import llm as llm_mod
@@ -67,6 +68,7 @@ class ReduceResult:
     # terminal reduction at session end (or the catch-up path). Drives
     # whether the caller should run terminal person-model finalization.
     is_final: bool = True
+    skipped_reason: str = ""
 
 
 def reduce_session(
@@ -192,7 +194,37 @@ def _reduce_window_locked(
             is_final=is_final,
         )
 
-    blocks = _blocks_for_session(conn, window_start, window_end)
+    timeline_slice = timeline_aggregator.exact_timeline_slice(
+        cfg,
+        conn,
+        start=window_start,
+        end=window_end,
+        require_closing_block=is_final,
+    )
+    if timeline_slice.skipped_reason:
+        if is_final:
+            delay_minutes = 1 if timeline_slice.skipped_reason == "awaiting_closing_block" else 5
+            session_store.defer_reduction(
+                conn,
+                session_id,
+                reason=timeline_slice.skipped_reason,
+                next_retry_at=datetime.now().astimezone() + timedelta(minutes=delay_minutes),
+            )
+        logger.warning(
+            "session %s: cutoff-safe timeline unavailable (%s)",
+            session_id,
+            timeline_slice.skipped_reason,
+        )
+        return ReduceResult(
+            session_id=session_id,
+            succeeded=False,
+            written=False,
+            start_time=session_start,
+            end_time=session_end,
+            is_final=is_final,
+            skipped_reason=timeline_slice.skipped_reason,
+        )
+    blocks = timeline_slice.blocks
     if not blocks:
         if is_final:
             logger.info(
@@ -217,11 +249,12 @@ def _reduce_window_locked(
             is_final=is_final,
         )
 
+    processed_end = window_end if is_final else blocks[-1].end_time
     payload = _call_reducer_llm(
         cfg,
         blocks,
         window_start,
-        window_end,
+        processed_end,
     )
 
     if payload is None:
@@ -289,16 +322,14 @@ def _reduce_window_locked(
         conn,
         session_id=session_id,
         start_time=window_start,
-        end_time=window_end,
+        end_time=processed_end,
         summary=summary,
         sub_tasks=sub_tasks,
         heuristic=not succeeded,
         is_final=is_final,
     )
 
-    last_block_end = blocks[-1].end_time
-    new_flush_end = max(window_end, last_block_end)
-    session_store.set_flush_end(conn, session_id, new_flush_end)
+    session_store.set_flush_end(conn, session_id, processed_end)
 
     if is_final:
         session_store.mark_reduced(conn, session_id)
@@ -311,7 +342,7 @@ def _reduce_window_locked(
         entry_id,
         len(sub_tasks),
         window_start.strftime("%H:%M"),
-        window_end.strftime("%H:%M"),
+        processed_end.strftime("%H:%M"),
         succeeded,
     )
     return ReduceResult(
@@ -410,22 +441,20 @@ def reduce_all_pending(cfg: Config, *, limit: int | None = None) -> list[ReduceR
 
 
 def _blocks_for_session(
-    conn: sqlite3.Connection, start: datetime, end: datetime
+    conn: sqlite3.Connection,
+    start: datetime,
+    end: datetime,
+    *,
+    cfg: Config | None = None,
 ) -> list[timeline_store.TimelineBlock]:
-    """Return timeline blocks whose window intersects ``[start, end)``."""
-    rows = conn.execute(
-        """
-        SELECT * FROM timeline_blocks
-         WHERE persome_epoch(end_time) > persome_epoch(?)
-           AND persome_epoch(start_time) < persome_epoch(?)
-         ORDER BY persome_epoch(start_time) ASC
-        """,
-        (start.isoformat(), end.isoformat()),
-    ).fetchall()
-    # The store's row parser is the single source of truth for column mapping;
-    # a hand-rolled constructor here silently drops columns added later
-    # (attention_* went missing exactly that way).
-    return [timeline_store._row_to_block(r) for r in rows]
+    """Compatibility wrapper around the shared exact-slice selector."""
+    runtime_cfg = cfg or Config()
+    return timeline_aggregator.exact_timeline_slice(
+        runtime_cfg,
+        conn,
+        start=start,
+        end=end,
+    ).blocks
 
 
 def _format_blocks(blocks: list[timeline_store.TimelineBlock]) -> str:

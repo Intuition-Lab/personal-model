@@ -15,7 +15,6 @@ formation. Disabling delta apply reactivates this compatibility writer.
 from __future__ import annotations
 
 import functools
-import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -28,6 +27,8 @@ from ..session import store as session_store
 from ..store import entries as entries_mod
 from ..store import files as files_mod
 from ..store import fts
+from ..timeline import aggregator as timeline_aggregator
+from ..timeline import store as timeline_store
 from . import llm as llm_mod
 from . import tools as tools_mod
 
@@ -52,6 +53,7 @@ class ClassifyResult:
     created_paths: list[str] = field(default_factory=list)
     iterations: int = 0
     skipped_reason: str = ""
+    retryable: bool = False
 
 
 def classify_window(
@@ -61,6 +63,8 @@ def classify_window(
     event_daily_path: str,
     start: datetime,
     end: datetime,
+    evidence_end: datetime | None = None,
+    require_closing_block: bool = False,
     include_prior_day: bool = False,
     on_event: llm_mod.OnEventFn | None = None,
 ) -> ClassifyResult:
@@ -99,7 +103,20 @@ def classify_window(
                 skipped_reason="no session entries in window",
             )
 
-        timeline_text = _render_timeline_blocks(conn, start, end)
+        timeline_slice = timeline_aggregator.exact_timeline_slice(
+            cfg,
+            conn,
+            start=start,
+            end=evidence_end or end,
+            require_closing_block=require_closing_block,
+        )
+        if timeline_slice.skipped_reason:
+            return ClassifyResult(
+                session_id=session_id,
+                skipped_reason=timeline_slice.skipped_reason,
+                retryable=True,
+            )
+        timeline_text = _render_timeline_blocks(timeline_slice.blocks)
         prior_day_text = _render_prior_day(start) if include_prior_day else ""
 
         context = _assemble_context(
@@ -177,6 +194,8 @@ def classify_after_reduce(
         event_daily_path=event_daily_path,
         start=effective_start,
         end=window_end,
+        evidence_end=session_end,
+        require_closing_block=True,
         include_prior_day=True,
         on_event=on_event,
     )
@@ -255,12 +274,18 @@ def _focus_entries_in_range(
 
 
 def _align_tz(ts: datetime, ref: datetime) -> datetime:
-    """Make ``ts`` comparable with ``ref`` — if one is naive, make the other naive too."""
+    """Make an entry timestamp comparable while preserving its local-time contract.
+
+    Markdown entry headings intentionally use offset-less local wall time. A
+    capture-backed session may use UTC, so attaching the session's timezone to
+    that naive heading would shift the entry by the local UTC offset. Resolve a
+    naive value through the machine's historical local timezone instead.
+    """
     if (ts.tzinfo is None) == (ref.tzinfo is None):
         return ts
     if ts.tzinfo is None and ref.tzinfo is not None:
-        return ts.replace(tzinfo=ref.tzinfo)
-    return ts.replace(tzinfo=None)
+        return ts.astimezone()
+    return ts.astimezone().replace(tzinfo=None)
 
 
 def _parse_entry_ts(text: str) -> datetime | None:
@@ -299,31 +324,14 @@ def _focus_entries(
     return [parsed.entries[-1]] if parsed.entries else []
 
 
-def _render_timeline_blocks(
-    conn: sqlite3.Connection,
-    start: datetime,
-    end: datetime,
-) -> str:
-    rows = conn.execute(
-        """
-        SELECT start_time, end_time, entries, apps_used
-          FROM timeline_blocks
-         WHERE persome_epoch(end_time) > persome_epoch(?)
-           AND persome_epoch(start_time) < persome_epoch(?)
-         ORDER BY persome_epoch(start_time) ASC
-        """,
-        (start.isoformat(), end.isoformat()),
-    ).fetchall()
-    if not rows:
+def _render_timeline_blocks(blocks: list[timeline_store.TimelineBlock]) -> str:
+    if not blocks:
         return "(no timeline blocks recorded for this session)"
     out: list[str] = []
-    for r in rows:
-        try:
-            s = datetime.fromisoformat(r["start_time"]).strftime("%H:%M")
-            e = datetime.fromisoformat(r["end_time"]).strftime("%H:%M")
-        except (TypeError, ValueError):
-            s, e = r["start_time"], r["end_time"]
-        entries = json.loads(r["entries"] or "[]")
+    for block in blocks:
+        s = block.start_time.strftime("%H:%M")
+        e = block.end_time.strftime("%H:%M")
+        entries = block.entries
         header = f"[{s}-{e}]"
         if not entries:
             out.append(f"{header} (no notable activity)")

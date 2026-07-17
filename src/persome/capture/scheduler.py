@@ -1002,7 +1002,13 @@ class _CaptureRunner:
         self._publish_receipt(path, reason)
         if self._pre_capture_hook is not None and trigger is not None:
             try:
-                self._pre_capture_hook(trigger)
+                # The durable capture timestamp is produced before AX/OCR/write,
+                # while a hook-local clock read happens afterwards. Bind the
+                # session's inclusive start to the evidence timestamp so its
+                # first capture cannot fall just before ``session_start``.
+                hook_trigger = dict(trigger)
+                hook_trigger["_persome_capture_timestamp"] = str(out.get("timestamp") or "")
+                self._pre_capture_hook(hook_trigger)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("pre_capture_hook failed: %s", exc)
         return path

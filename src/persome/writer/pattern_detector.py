@@ -10,7 +10,6 @@ Two-stage design:
 from __future__ import annotations
 
 import functools
-import json
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
@@ -22,6 +21,8 @@ from ..logger import get
 from ..prompts import load as load_prompt
 from ..session import store as session_store
 from ..store import fts
+from ..timeline import aggregator as timeline_aggregator
+from ..timeline import store as timeline_store
 from . import llm as llm_mod
 from . import tools as tools_mod
 
@@ -37,6 +38,7 @@ class DetectResult:
     created_paths: list[str] = field(default_factory=list)
     iterations: int = 0
     skipped_reason: str = ""
+    retryable: bool = False
 
 
 # ─── public entry point ────────────────────────────────────────────────────
@@ -66,14 +68,39 @@ def detect_after_classify(
         return DetectResult(session_id=session_id, skipped_reason="pattern window empty")
 
     lookback_start = window_end - timedelta(days=cfg.pattern_detector.lookback_days)
+    # The lookback edge is an analysis horizon, not a causal cutoff. Aligning it
+    # to a wall boundary avoids requiring expired raw captures for a harmless
+    # sub-minute sliver days in the past; the current session end remains exact.
+    timeline_start = timeline_store.floor_to_window(
+        lookback_start,
+        max(1, int(getattr(cfg.timeline, "window_minutes", 1))),
+    )
 
     with fts.cursor() as conn:
+        timeline_slice = timeline_aggregator.exact_timeline_slice(
+            cfg,
+            conn,
+            start=timeline_start,
+            end=window_end,
+            require_closing_block=session_end is not None,
+            # Structured frequency counts retain the full configured lookback.
+            # Only the token-heavy raw-context mode keeps its historical 200
+            # block prompt cap.
+            limit=None if cfg.pattern_detector.structured_filter else 200,
+        )
+        if timeline_slice.skipped_reason:
+            return DetectResult(
+                session_id=session_id,
+                skipped_reason=timeline_slice.skipped_reason,
+                retryable=True,
+            )
         if cfg.pattern_detector.structured_filter:
             candidates = _collect_candidates(
                 conn,
                 lookback_start=lookback_start,
                 window_end=window_end,
                 min_occurrences=cfg.pattern_detector.min_occurrences,
+                timeline_blocks=timeline_slice.blocks,
             )
             if not candidates:
                 return DetectResult(
@@ -91,6 +118,7 @@ def detect_after_classify(
                 window_end=window_end,
                 event_daily_path=event_daily_path,
                 session_id=session_id,
+                timeline_blocks=timeline_slice.blocks,
             )
 
         result = _run_validation_loop(
@@ -115,6 +143,7 @@ def _collect_candidates(
     lookback_start: datetime,
     window_end: datetime,
     min_occurrences: int,
+    timeline_blocks: list[timeline_store.TimelineBlock],
 ) -> dict[str, Any]:
     """Query the database for high-frequency candidate patterns.
 
@@ -128,7 +157,7 @@ def _collect_candidates(
     candidates: dict[str, Any] = {}
 
     # 1. App sequences from timeline_blocks
-    app_seqs = _find_repeated_app_sequences(conn, lookback_start, window_end, min_occurrences)
+    app_seqs = _find_repeated_app_sequences(timeline_blocks, min_occurrences)
     if app_seqs:
         candidates["app_sequences"] = app_seqs
 
@@ -191,9 +220,7 @@ def _render_event_memory_lines(events: list[dict[str, str]]) -> list[str]:
 
 
 def _find_repeated_app_sequences(
-    conn: sqlite3.Connection,
-    start: datetime,
-    end: datetime,
+    blocks: list[timeline_store.TimelineBlock],
     min_occurrences: int,
 ) -> list[dict[str, Any]]:
     """Find app combinations that appear in multiple timeline blocks.
@@ -206,29 +233,18 @@ def _find_repeated_app_sequences(
     This groups durable timeline co-occurrence rather than ordered raw-capture
     transitions.
     """
-    rows = conn.execute(
-        """
-        SELECT apps_used, start_time
-          FROM timeline_blocks
-         WHERE persome_epoch(start_time) >= persome_epoch(?)
-           AND persome_epoch(start_time) < persome_epoch(?)
-         ORDER BY persome_epoch(start_time) ASC
-        """,
-        (start.isoformat(), end.isoformat()),
-    ).fetchall()
-
-    if not rows:
+    if not blocks:
         return []
 
     # Count app-set occurrences (sorted tuple for dedup)
     seq_counts: Counter[tuple[str, ...]] = Counter()
     seq_examples: dict[tuple[str, ...], list[str]] = {}
-    for r in rows:
-        apps = tuple(sorted(json.loads(r["apps_used"] or "[]")))
+    for block in blocks:
+        apps = tuple(sorted(block.apps_used))
         if len(apps) < 2:
             continue
         seq_counts[apps] += 1
-        seq_examples.setdefault(apps, []).append(r["start_time"])
+        seq_examples.setdefault(apps, []).append(block.start_time.isoformat())
 
     results: list[dict[str, Any]] = []
     for apps, count in seq_counts.most_common(20):
@@ -359,6 +375,7 @@ def _assemble_raw_context(
     window_end: datetime,
     event_daily_path: str,
     session_id: str,
+    timeline_blocks: list[timeline_store.TimelineBlock],
 ) -> str:
     """Feed raw timeline blocks and captures directly to the LLM.
 
@@ -380,24 +397,14 @@ def _assemble_raw_context(
     ]
 
     # Timeline blocks
-    blocks = conn.execute(
-        """
-        SELECT start_time, end_time, apps_used, entries
-          FROM timeline_blocks
-         WHERE persome_epoch(start_time) >= persome_epoch(?)
-           AND persome_epoch(start_time) < persome_epoch(?)
-         ORDER BY persome_epoch(start_time) ASC
-         LIMIT 200
-        """,
-        (lookback_start.isoformat(), window_end.isoformat()),
-    ).fetchall()
-    if blocks:
+    if timeline_blocks:
         parts.append("### Timeline blocks")
-        for b in blocks:
-            apps = json.loads(b["apps_used"] or "[]")
-            entries = json.loads(b["entries"] or "[]")
-            parts.append(f"- {b['start_time']}–{b['end_time']} | apps: {', '.join(apps)}")
-            for e in entries[:2]:
+        for block in timeline_blocks:
+            parts.append(
+                f"- {block.start_time.isoformat()}–{block.end_time.isoformat()}"
+                f" | apps: {', '.join(block.apps_used)}"
+            )
+            for e in block.entries[:2]:
                 parts.append(f"  - {e}")
         parts.append("")
 

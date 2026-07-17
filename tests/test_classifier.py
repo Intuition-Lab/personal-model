@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,9 +10,21 @@ from persome import config as config_mod
 from persome import paths
 from persome.store import entries as entries_mod
 from persome.store import fts
+from persome.timeline import store as timeline_store
 from persome.writer import classifier as classifier_mod
 
 _TZ = timezone(timedelta(hours=8))
+
+
+def test_naive_entry_time_keeps_local_instant_against_utc_session() -> None:
+    local = datetime.now().astimezone().replace(second=0, microsecond=0)
+    naive_entry = local.replace(tzinfo=None)
+    utc_session = local.astimezone(UTC)
+
+    aligned = classifier_mod._align_tz(naive_entry, utc_session)
+
+    assert aligned.tzinfo is not None
+    assert aligned.timestamp() == utc_session.timestamp()
 
 
 def _tool_call(name: str, args: dict[str, Any], cid: str = "c0") -> Any:
@@ -49,6 +61,23 @@ def _seed_event_daily(day: str) -> tuple[str, str]:
             tags=["session", "sid:sess_abc"],
         )
     return name, entry_id
+
+
+def _write_capture(ts: datetime, text: str) -> None:
+    path = paths.capture_buffer_dir() / (
+        ts.isoformat().replace(":", "-").replace("+", "p") + ".json"
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": ts.isoformat(),
+                "window_meta": {"app_name": "Editor", "title": "cutoff test"},
+                "focused_element": {"role": "AXStaticText", "value": text},
+                "visible_text": text,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_classifier_appends_durable_preference(ac_root: Path, fake_llm) -> None:
@@ -113,6 +142,62 @@ def test_classifier_appends_durable_preference(ac_root: Path, fake_llm) -> None:
     # user-preferences.md got the new entry.
     pref = (paths.memory_dir() / "user-preferences.md").read_text()
     assert "Cursor over VSCode" in pref
+
+
+def test_terminal_classifier_uses_session_end_for_timeline_evidence(
+    ac_root: Path,
+    fake_llm,
+) -> None:
+    minute = datetime(2026, 4, 21, 11, 0, tzinfo=_TZ)
+    start = minute + timedelta(seconds=10)
+    end = minute + timedelta(seconds=30)
+    safe = "SAFE_CLASSIFIER_DECISION"
+    secret = "POST_CUTOFF_SECRET_CLASSIFIER"
+    _write_capture(minute + timedelta(seconds=20), safe)
+    _write_capture(minute + timedelta(seconds=50), secret)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=minute,
+                end_time=minute + timedelta(minutes=1),
+                entries=[f"[Editor] normalized {safe}; {secret}"],
+                apps_used=["Editor"],
+                capture_count=2,
+                focus_excerpt=secret,
+            ),
+        )
+        entries_mod.create_file(
+            conn,
+            name="event-2026-04-21.md",
+            description="Cutoff-safe classifier fixture",
+            tags=["event", "session"],
+        )
+        entry_id = entries_mod.append_entry(
+            conn,
+            name="event-2026-04-21.md",
+            content=f"**Session sess-classifier-cutoff**\n\n{safe}",
+            tags=["session", "sid:sess-classifier-cutoff"],
+        )
+    fake_llm.add_script(
+        "classifier",
+        [_response([_tool_call("commit", {"summary": "cutoff safe"}, cid="c1")])],
+    )
+    cfg = config_mod.load(ac_root / "config.toml")
+    cfg.memory_delta.apply_enabled = False
+
+    result = classifier_mod.classify_after_reduce(
+        cfg,
+        session_id="sess-classifier-cutoff",
+        event_daily_path="event-2026-04-21.md",
+        just_written_entry_id=entry_id,
+        session_start=start,
+        session_end=end,
+    )
+
+    assert result.committed and not result.retryable
+    sent = json.dumps(fake_llm.calls, ensure_ascii=False, default=str)
+    assert safe in sent and secret not in sent
 
 
 def test_classifier_rejects_event_write(ac_root: Path, fake_llm) -> None:

@@ -106,10 +106,17 @@ The finalizer runs:
 5. deterministic apply into current/historical Points and relation Lines.
 
 Each memory-delta window is persisted before apply. `apply_status` allows a
-crashed apply to resume without another LLM call or duplicate relation
-reinforcement. `delta_end` advances after successful active apply; the session
-receives `modeled_at` only after all terminal stages finish. A kernel
+crashed apply to resume without another LLM call. Apply mutations and the status
+update are not yet atomic, so a crash between them can repeat additive relation
+reinforcement; a follow-up idempotency change is required. `delta_end` advances
+after successful active apply; the session receives `modeled_at` only after all
+terminal stages finish. A kernel
 `session-model.lock` coordinates daemon, retry, CLI, and model-build callers.
+Reducer, classifier, pattern detector, and memory delta share one half-open
+timeline selector: full wall blocks remain compact, boundary straddlers are
+rebuilt from in-range raw captures, and occupied missing blocks stop every
+watermark. Terminal off-minute work waits for the closed-minute barrier rather
+than reading a whole block past the session cutoff.
 
 ### Higher geometry
 
@@ -192,9 +199,12 @@ audio, or evaluation runner.
   skips/failures and model status stays degraded.
 - OCR worker crash: the worker is restarted/fails open; the daemon survives.
 - Reducer failure: persisted exponential retry; final exhaustion writes an
-  auditable heuristic event, then still runs terminal modeling.
+  auditable heuristic event, then still runs terminal modeling. Timeline
+  readiness gaps defer without spending an LLM attempt.
 - Active model failure: `delta_end` does not advance, so the next flush retries a larger window.
-- Terminal model failure: `modeled_at` remains null and retry/recovery can resume.
+- Terminal model failure: `modeled_at` remains null and retry/recovery can
+  resume. The minute loop handles only a newly eligible closing-block wait;
+  generic stage failures wait for boot/daily/manual recovery.
 - Model build overlap: `model-build.lock` waits or reports busy.
 - Integrity/snapshot failure: structured error logs and optional write freeze;
   there is no removed SSE event bus.

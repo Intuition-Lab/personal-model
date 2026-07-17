@@ -16,7 +16,7 @@ capture loop. These tests pin the contract:
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from persome import paths
 from persome.api import build_api_app
 from persome.config import load as load_config
+from persome.session.manager import SessionManager
 
 
 def _client(cfg=None):
@@ -195,6 +196,31 @@ def test_ingest_through_runner_fires_session_hook_and_dedups(ac_root) -> None:
         assert seen[0]["event_type"] == "AXFocusedWindowChanged"
     finally:
         scheduler._set_active_runner(None)
+
+
+def test_session_start_uses_durable_capture_timestamp_not_late_hook_clock(ac_root) -> None:
+    from persome.capture import scheduler
+
+    _cap, payload = _payload()
+    cfg = load_config()
+    out = scheduler.build_ingest_capture(
+        cfg.capture,
+        payload,
+        respect_screen_lock=False,
+    )
+    assert out is not None
+    captured_at = datetime.fromisoformat(out["timestamp"])
+    manager = SessionManager(clock=lambda: captured_at + timedelta(seconds=5))
+    runner = scheduler._CaptureRunner(
+        cfg.capture,
+        provider=None,
+        pre_capture_hook=manager.on_event,
+    )
+
+    runner.commit_prebuilt(out)
+
+    assert manager.session_start == captured_at
+    assert manager.last_event_time == captured_at
 
 
 # ── Hardening (codex adversarial review findings) ────────────────────────────

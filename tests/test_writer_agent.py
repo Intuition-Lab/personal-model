@@ -144,6 +144,88 @@ def test_writer_run_limit_counts_existing_modeled_backlog_first(ac_root: Path, m
     assert finalized == ["already-reduced"]
 
 
+def test_retry_pending_modeling_only_selects_unmodeled_reduced_sessions(
+    ac_root: Path,
+    monkeypatch,
+) -> None:
+    minute = datetime(2026, 4, 21, 9, 0, tzinfo=_TZ)
+    start = minute + timedelta(seconds=5)
+    end = minute + timedelta(seconds=30)
+    with fts.cursor() as conn:
+        for session_id, status in (
+            ("pending-model", "reduced"),
+            ("stage-error", "reduced"),
+            ("still-reducing", "ended"),
+            ("already-modeled", "reduced"),
+        ):
+            session_store.insert(
+                conn,
+                session_store.SessionRow(
+                    id=session_id,
+                    start_time=start,
+                    end_time=end,
+                    status=status,
+                ),
+            )
+        session_store.set_model_retry_reason(conn, "pending-model", "awaiting_closing_block")
+        session_store.set_model_retry_reason(conn, "stage-error", "stage_error")
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=minute,
+                end_time=minute + timedelta(minutes=1),
+                entries=["[Editor] closing block now materialized"],
+                apps_used=["Editor"],
+                capture_count=1,
+            ),
+        )
+        session_store.mark_modeled(conn, "already-modeled", start + timedelta(minutes=2))
+
+    seen: list[str] = []
+
+    def fake_finalize(cfg, *, session_id, **_kwargs):  # type: ignore[no-untyped-def]
+        seen.append(session_id)
+        return agent.SessionModelResult(session_id=session_id, completed=True)
+
+    monkeypatch.setattr(agent, "finalize_session", fake_finalize)
+    cfg = config_mod.load(ac_root / "config.toml")
+    results = agent.retry_pending_modeling(cfg)
+
+    assert seen == ["pending-model"]
+    assert [result.session_id for result in results] == ["pending-model"]
+
+
+def test_retry_pending_modeling_never_hammers_stage_errors(
+    ac_root: Path,
+    monkeypatch,
+) -> None:
+    start = datetime(2026, 4, 21, 9, 0, tzinfo=_TZ)
+    with fts.cursor() as conn:
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="persistent-stage-error",
+                start_time=start,
+                end_time=start + timedelta(minutes=1),
+                status="reduced",
+            ),
+        )
+        session_store.set_model_retry_reason(conn, "persistent-stage-error", "stage_error")
+
+    calls: list[str] = []
+
+    def fake_finalize(cfg, *, session_id, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(session_id)
+        return agent.SessionModelResult(session_id=session_id)
+
+    monkeypatch.setattr(agent, "finalize_session", fake_finalize)
+    cfg = config_mod.load(ac_root / "config.toml")
+
+    assert agent.retry_pending_modeling(cfg) == []
+    assert agent.retry_pending_modeling(cfg) == []
+    assert calls == []
+
+
 def test_terminal_finalizer_applies_default_person_model(
     ac_root: Path,
     fake_llm,
@@ -210,6 +292,65 @@ def test_terminal_finalizer_applies_default_person_model(
         ).fetchone()
     assert row is not None and row.modeled_at is not None
     assert delta is not None and delta["apply_status"] == "applied"
+
+
+def test_terminal_missing_capture_provenance_does_not_advance_modeling(
+    ac_root: Path,
+    fake_llm,
+) -> None:
+    minute = datetime(2026, 7, 10, 9, 30, tzinfo=_TZ)
+    start = minute - timedelta(minutes=1)
+    end = minute + timedelta(seconds=30)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=minute,
+                entries=["[Editor] older complete evidence must not be consumed alone"],
+                apps_used=["Editor"],
+                capture_count=1,
+            ),
+        )
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=minute,
+                end_time=minute + timedelta(minutes=1),
+                entries=["[Editor] whole closing minute exists but raw provenance expired"],
+                apps_used=["Editor"],
+                capture_count=1,
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess_missing_cutoff_provenance",
+                start_time=start,
+                end_time=end,
+                status="reduced",
+            ),
+        )
+
+    cfg = config_mod.load(ac_root / "config.toml")
+    result = agent.finalize_session(cfg, session_id="sess_missing_cutoff_provenance")
+
+    assert not result.completed
+    assert result.delta.skipped_reason == "no_cutoff_safe_blocks"
+    assert result.errors == [
+        "pattern_detector: no_cutoff_safe_blocks",
+        "memory_delta: no_cutoff_safe_blocks",
+    ]
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_missing_cutoff_provenance")
+        delta_count = conn.execute("SELECT COUNT(*) FROM memory_deltas").fetchone()[0]
+    assert (
+        row is not None
+        and row.delta_end is None
+        and row.modeled_at is None
+        and row.model_retry_reason == "no_cutoff_safe_blocks"
+    )
+    assert delta_count == 0
 
 
 def test_active_session_flush_mints_model_before_session_end(

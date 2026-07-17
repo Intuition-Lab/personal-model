@@ -15,13 +15,16 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, tzinfo
+import sqlite3
+from bisect import bisect_left
+from dataclasses import dataclass
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
 from .. import paths
 from ..capture import s1_parser
 from ..capture.ax_models import ax_tree_to_markdown
-from ..capture.timestamps import parse_capture_path_timestamp
+from ..capture.timestamps import parse_capture_path_timestamp, parse_capture_timestamp
 from ..config import Config
 from ..logger import get
 from ..parsers import parser_for_capture
@@ -223,7 +226,7 @@ def captures_in_window(start: datetime, end: datetime) -> list[Path]:
         timestamp = parse_capture_path_timestamp(p)
         if timestamp is not None and start <= timestamp < end:
             timestamped.append((timestamp, p))
-    timestamped.sort(key=lambda item: item[0])
+    timestamped.sort(key=lambda item: (item[0], item[1].name))
     return [path for _, path in timestamped]
 
 
@@ -254,6 +257,25 @@ def _load_captures(capture_files: list[Path]) -> list[tuple[Path, dict]]:
     return parsed
 
 
+def bounded_prompt_captures(
+    parsed: list[tuple[Path, dict]],
+) -> list[tuple[Path, dict]]:
+    """Return the exact capture subset eligible for one timeline-style prompt."""
+    return parsed[-_MAX_EVENTS_PER_WINDOW:]
+
+
+def _timeline_source(path: Path, data: dict) -> store.TimelineBlockSource:
+    captured_at = parse_capture_timestamp(str(data.get("timestamp") or ""))
+    if captured_at is None:
+        captured_at = parse_capture_path_timestamp(path)
+    if captured_at is None:
+        raise ValueError(f"timeline source has no recoverable timestamp: {path.name}")
+    return store.TimelineBlockSource(
+        capture_id=f"capture:{path.stem}",
+        captured_at=captured_at,
+    )
+
+
 def _format_events(
     parsed: list[tuple[Path, dict]],
     *,
@@ -280,7 +302,7 @@ def _format_events(
     apps: set[str] = set()
     block_locus: AttentionLocus | None = None
 
-    files = parsed[-_MAX_EVENTS_PER_WINDOW:]
+    files = bounded_prompt_captures(parsed)
     for i, (p, data) in enumerate(files, 1):
         # Direct unit callers can pass pre-parsed captures without going
         # through ``_load_captures``. Keep this idempotent boundary guard.
@@ -385,6 +407,265 @@ def _format_events(
 
         lines.append("")
     return "\n".join(lines).strip(), sorted(apps), block_locus
+
+
+@dataclass(frozen=True)
+class ExactSliceBlock:
+    """One cutoff-safe block and the source receipts used to render it."""
+
+    block: store.TimelineBlock
+    persisted_block_id: str
+    parsed_captures: tuple[tuple[Path, dict], ...]
+    full_window: bool
+
+
+@dataclass(frozen=True)
+class ExactSliceResult:
+    """Cutoff-safe timeline evidence for one half-open interval."""
+
+    evidence: tuple[ExactSliceBlock, ...] = ()
+    skipped_reason: str = ""
+
+    @property
+    def blocks(self) -> list[store.TimelineBlock]:
+        return [item.block for item in self.evidence]
+
+
+def render_capture_slice(
+    cfg: Config,
+    *,
+    start: datetime,
+    end: datetime,
+    parsed: list[tuple[Path, dict]],
+    persisted_block_id: str = "",
+) -> store.TimelineBlock | None:
+    """Reconstruct an exact boundary slice without whole-minute metadata."""
+    bounded = bounded_prompt_captures(parsed)
+    if not bounded:
+        return None
+    events_text, apps_used, _ = _format_events(
+        bounded,
+        locus_enabled=bool(getattr(cfg.timeline, "attention_locus_enabled", True)),
+        display_tz=start.tzinfo,
+    )
+    if not events_text.strip():
+        return None
+    first_stem = bounded[0][0].stem
+    return store.TimelineBlock(
+        id=(f"slice:{persisted_block_id}:{first_stem}:{start.isoformat()}:{end.isoformat()}"),
+        start_time=start,
+        end_time=end,
+        entries=[events_text],
+        apps_used=apps_used,
+        capture_count=len(bounded),
+        created_at=end,
+        # Deliberately omit focus/attention/action/skill fields: all are
+        # whole-minute derivatives and may contain post-cutoff evidence.
+    )
+
+
+def _window_has_durable_occupancy(
+    conn: sqlite3.Connection,
+    *,
+    start: datetime,
+    end: datetime,
+) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM captures"
+            " WHERE persome_epoch(timestamp) >= persome_epoch(?)"
+            " AND persome_epoch(timestamp) < persome_epoch(?) LIMIT 1",
+            (start.isoformat(), end.isoformat()),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    return row is not None or bool(captures_in_window(start, end))
+
+
+def exact_timeline_slice(
+    cfg: Config,
+    conn: sqlite3.Connection,
+    *,
+    start: datetime,
+    end: datetime,
+    require_closing_block: bool = False,
+    limit: int | None = None,
+    include_full_captures: bool = False,
+) -> ExactSliceResult:
+    """Return timeline evidence that is causally bounded to ``[start, end)``.
+
+    Persisted blocks are safe only when the requested slice covers their whole
+    wall window. A straddling first or last block is reconstructed from raw
+    captures strictly inside the half-open interval. For terminal processing,
+    the closing wall block is a completion barrier: until it exists, the minute
+    is not known to be closed. Once it exists, missing raw boundary provenance
+    is a retryable failure rather than permission to expose whole-minute text.
+    """
+    if start >= end or (limit is not None and limit <= 0):
+        return ExactSliceResult()
+
+    window_minutes = max(1, int(getattr(cfg.timeline, "window_minutes", 1)))
+    step = timedelta(minutes=window_minutes)
+    closing_start = store.floor_to_window(end, window_minutes)
+    closing_partial = closing_start < end
+    if require_closing_block and closing_partial:
+        closing_end = closing_start + step
+        if store.get_window(conn, closing_start, closing_end) is None and (
+            _window_has_durable_occupancy(
+                conn,
+                start=max(start, closing_start),
+                end=end,
+            )
+        ):
+            return ExactSliceResult(skipped_reason="awaiting_closing_block")
+
+    # Scan the capture buffer once. Re-running captures_in_window for every
+    # persisted minute turns a multi-day pattern lookback into O(blocks*files).
+    timestamped_paths = [
+        (timestamp, path)
+        for path in captures_in_window(start, end)
+        if (timestamp := parse_capture_path_timestamp(path)) is not None
+    ]
+    capture_epochs = [timestamp.timestamp() for timestamp, _ in timestamped_paths]
+
+    def paths_between(slice_start: datetime, slice_end: datetime) -> list[Path]:
+        left = bisect_left(capture_epochs, slice_start.timestamp())
+        right = bisect_left(capture_epochs, slice_end.timestamp())
+        return [path for _, path in timestamped_paths[left:right]]
+
+    params: list[str | int] = [start.isoformat(), end.isoformat()]
+    limit_sql = ""
+    if limit is not None:
+        limit_sql = " LIMIT ?"
+        params.append(max(0, min(int(limit), 200)))
+    rows = conn.execute(
+        "SELECT * FROM timeline_blocks"
+        " WHERE persome_epoch(end_time) > persome_epoch(?)"
+        " AND persome_epoch(start_time) < persome_epoch(?)"
+        " ORDER BY persome_epoch(start_time) DESC, id DESC" + limit_sql,
+        params,
+    ).fetchall()
+    rows.reverse()
+    persisted_blocks = [store._row_to_block(row) for row in rows]
+
+    # A later materialized block must never let a reducer/model watermark jump
+    # over an occupied minute whose TimelineBlock is still missing (for example,
+    # after a crash between capture commit and timeline aggregation). Active
+    # callers may ignore only the not-yet-closed trailing wall window.
+    coverage_start = (
+        max(start, persisted_blocks[0].start_time)
+        if limit is not None and persisted_blocks
+        else start
+    )
+    coverage_end = end if require_closing_block else store.floor_to_window(end, window_minutes)
+    occupied_at: list[datetime] = []
+    if coverage_start < coverage_end:
+        try:
+            capture_rows = conn.execute(
+                "SELECT timestamp FROM captures"
+                " WHERE persome_epoch(timestamp) >= persome_epoch(?)"
+                " AND persome_epoch(timestamp) < persome_epoch(?)",
+                (coverage_start.isoformat(), coverage_end.isoformat()),
+            ).fetchall()
+        except sqlite3.Error:
+            capture_rows = []
+        for capture_row in capture_rows:
+            timestamp = parse_capture_timestamp(str(capture_row[0] or ""))
+            if timestamp is not None:
+                occupied_at.append(timestamp)
+        occupied_at.extend(
+            timestamp
+            for timestamp, _ in timestamped_paths
+            if coverage_start <= timestamp < coverage_end
+        )
+
+    checked_windows: set[tuple[float, float]] = set()
+    for timestamp in occupied_at:
+        local_timestamp = timestamp.astimezone(coverage_start.tzinfo)
+        wall_start = store.floor_to_window(local_timestamp, window_minutes)
+        wall_end = wall_start + step
+        key = (wall_start.timestamp(), wall_end.timestamp())
+        if key in checked_windows:
+            continue
+        checked_windows.add(key)
+        if wall_end > coverage_end and not require_closing_block:
+            continue
+        if store.get_window(conn, wall_start, wall_end) is None:
+            return ExactSliceResult(skipped_reason="awaiting_timeline_block")
+
+    evidence: list[ExactSliceBlock] = []
+    for persisted in persisted_blocks:
+        slice_start = max(start, persisted.start_time)
+        slice_end = min(end, persisted.end_time)
+        if slice_start >= slice_end:
+            continue
+        full_window = slice_start == persisted.start_time and slice_end == persisted.end_time
+        parsed = (
+            bounded_prompt_captures(_load_captures(paths_between(slice_start, slice_end)))
+            if include_full_captures or not full_window
+            else []
+        )
+        if full_window:
+            evidence.append(
+                ExactSliceBlock(
+                    block=persisted,
+                    persisted_block_id=persisted.id,
+                    parsed_captures=tuple(parsed),
+                    full_window=True,
+                )
+            )
+            continue
+
+        manifest = store.source_manifest(conn, persisted.id)
+        if manifest:
+            if any(source.captured_at is None for source in manifest):
+                return ExactSliceResult(skipped_reason="no_cutoff_safe_blocks")
+            manifest_ids = [source.capture_id for source in manifest]
+            expected_ids: list[str] = []
+            for source in manifest:
+                if slice_start <= source.captured_at < slice_end:
+                    expected_ids.append(source.capture_id)
+
+            manifest_set = set(manifest_ids)
+            raw_by_id = {f"capture:{path.stem}": (path, data) for path, data in parsed}
+            bounded_raw_manifest_ids = [
+                capture_id for capture_id in raw_by_id if capture_id in manifest_set
+            ]
+            if bounded_raw_manifest_ids != expected_ids:
+                # The durable manifest proves this slice originally contained
+                # source evidence that retention/corruption has since removed.
+                # Rebuilding from the surviving subset would silently change
+                # the question asked of every downstream model.
+                return ExactSliceResult(skipped_reason="no_cutoff_safe_blocks")
+            # A cutoff slice is a projection of the persisted block's exact
+            # bounded source set, not a fresh chance for a 31st raw capture that
+            # the whole-block prompt deliberately excluded to re-enter.
+            parsed = [raw_by_id[capture_id] for capture_id in expected_ids]
+            if not expected_ids:
+                # A modern manifest proves that none of this block's bounded
+                # evidence belongs to the requested partial slice. Treat that
+                # as an empty projection; legacy blocks cannot make this proof.
+                continue
+
+        clipped = render_capture_slice(
+            cfg,
+            start=slice_start,
+            end=slice_end,
+            parsed=parsed,
+            persisted_block_id=persisted.id,
+        )
+        if clipped is None:
+            return ExactSliceResult(skipped_reason="no_cutoff_safe_blocks")
+        evidence.append(
+            ExactSliceBlock(
+                block=clipped,
+                persisted_block_id=persisted.id,
+                parsed_captures=tuple(parsed),
+                full_window=False,
+            )
+        )
+
+    return ExactSliceResult(evidence=tuple(evidence))
 
 
 def _short_time(ts: str, *, display_tz: tzinfo | None = None) -> str:
@@ -535,15 +816,16 @@ def produce_block_for_window(
 
     # Parse capture JSON once; reused for prompt rendering AND the heuristic
     # fallback so an LLM miss doesn't trigger a second pass over the same files.
-    parsed = _load_captures(capture_files)
+    parsed = bounded_prompt_captures(_load_captures(capture_files))
     events_text, apps_used, block_locus = _format_events(
         parsed,
         locus_enabled=cfg.timeline.attention_locus_enabled,
         display_tz=start.tzinfo,
     )
-    # Use len(parsed) — capture_count must match what the LLM actually sees
-    # and what _heuristic_entries can group; len(capture_files) overcounts
-    # whenever _load_captures drops a corrupt or non-dict file.
+    # Every whole-block derivative shares this exact bounded subset: prompt,
+    # heuristic fallback, count, focus excerpt/structured parser, attention,
+    # skills, and action trace. This keeps source receipts complete even when a
+    # noisy minute contains more than _MAX_EVENTS_PER_WINDOW captures.
     capture_count = len(parsed)
 
     skill_rows: list = []
@@ -638,7 +920,11 @@ def produce_block_for_window(
         attention_rung=(block_locus.rung if block_locus else ""),
     )
     with fts_store.cursor() as conn:
-        store.insert(conn, block)
+        store.insert(
+            conn,
+            block,
+            source_captures=[_timeline_source(path, data) for path, data in parsed],
+        )
         # Parser-hit telemetry (general observability): one tick per window that
         # had something parseable. Records hit/miss/fallback bucketed by bundle
         # so we can prove the per-app parsers are firing and catch semantic-class

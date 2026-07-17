@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from persome import config as config_mod
 from persome import paths
 from persome.session import store as session_store
@@ -59,6 +61,27 @@ def _seed_blocks(start: datetime) -> list[timeline_store.TimelineBlock]:
     return bs
 
 
+def _write_capture(ts: datetime, text: str) -> None:
+    path = paths.capture_buffer_dir() / (
+        ts.isoformat().replace(":", "-").replace("+", "p") + ".json"
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": ts.isoformat(),
+                "window_meta": {
+                    "app_name": "Editor",
+                    "title": "cutoff test",
+                    "bundle_id": "test.editor",
+                },
+                "focused_element": {"role": "AXStaticText", "value": text},
+                "visible_text": text,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_reducer_happy_path_writes_event_daily(ac_root: Path, fake_llm) -> None:
     start = datetime(2026, 4, 21, 10, 0, tzinfo=_TZ)
     end = start + timedelta(minutes=15)
@@ -109,6 +132,63 @@ def test_reducer_happy_path_writes_event_daily(ac_root: Path, fake_llm) -> None:
         row = session_store.get_by_id(conn, _SID)
     assert row is not None
     assert row.status == "reduced"
+
+
+def test_reducer_clips_straddling_block_before_prompt_and_event_memory(
+    ac_root: Path,
+    fake_llm,
+) -> None:
+    minute = datetime(2026, 4, 21, 10, 30, tzinfo=_TZ)
+    start = minute + timedelta(seconds=10)
+    end = minute + timedelta(seconds=30)
+    safe = "SAFE_REDUCER_DECISION"
+    secret = "POST_CUTOFF_SECRET_REDUCER"
+    _write_capture(minute + timedelta(seconds=20), safe)
+    _write_capture(minute + timedelta(seconds=50), secret)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=minute,
+                end_time=minute + timedelta(minutes=1),
+                entries=[f"[Editor] normalized {safe}; {secret}"],
+                apps_used=["Editor"],
+                capture_count=2,
+                focus_excerpt=secret,
+                attention_surface=secret,
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess-reducer-cutoff",
+                start_time=start,
+                end_time=end,
+                status="ended",
+            ),
+        )
+    fake_llm.set_default(
+        "reducer",
+        json.dumps(
+            {
+                "summary": safe,
+                "sub_tasks": [f"[10:30-10:30, Editor] {safe}, involving —"],
+            }
+        ),
+    )
+
+    result = session_reducer.reduce_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id="sess-reducer-cutoff",
+        start_time=start,
+        end_time=end,
+    )
+
+    assert result.written
+    prompt = str(fake_llm.calls[0]["messages"][1]["content"])
+    assert safe in prompt and secret not in prompt
+    event_text = (paths.memory_dir() / "event-2026-04-21.md").read_text()
+    assert safe in event_text and secret not in event_text
 
 
 def test_reducer_prompt_does_not_replay_earlier_same_day_tasks(ac_root: Path, fake_llm) -> None:
@@ -190,6 +270,60 @@ def test_reducer_no_blocks_marks_reduced_no_write(ac_root: Path) -> None:
         row = session_store.get_by_id(conn, "sess_empty")
     assert row is not None
     assert row.status == "reduced"
+
+
+@pytest.mark.parametrize("missing_index", [0, 1], ids=["first-gap", "middle-gap"])
+def test_reducer_never_advances_across_occupied_missing_timeline_block(
+    ac_root: Path,
+    fake_llm,
+    missing_index: int,
+) -> None:
+    start = datetime(2026, 4, 21, 11, 30, tzinfo=_TZ)
+    end = start + timedelta(minutes=3)
+    with fts.cursor() as conn:
+        for index in range(3):
+            capture_at = start + timedelta(minutes=index, seconds=10)
+            conn.execute(
+                "INSERT INTO captures (id, timestamp, app_name, window_title, url)"
+                " VALUES (?, ?, 'Editor', 'gap test', '')",
+                (f"gap-capture-{missing_index}-{index}", capture_at.isoformat()),
+            )
+            if index == missing_index:
+                continue
+            timeline_store.insert(
+                conn,
+                timeline_store.TimelineBlock(
+                    start_time=start + timedelta(minutes=index),
+                    end_time=start + timedelta(minutes=index + 1),
+                    entries=[f"[Editor] minute {index}"],
+                    apps_used=["Editor"],
+                    capture_count=1,
+                ),
+            )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id=f"sess-gap-{missing_index}",
+                start_time=start,
+                end_time=end,
+                status="ended",
+            ),
+        )
+
+    result = session_reducer.reduce_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id=f"sess-gap-{missing_index}",
+        start_time=start,
+        end_time=end,
+    )
+
+    assert not result.written and result.skipped_reason == "awaiting_timeline_block"
+    assert fake_llm.calls == []
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, f"sess-gap-{missing_index}")
+    assert row is not None
+    assert row.status == "failed" and row.retry_count == 0
+    assert row.last_error == "awaiting_timeline_block" and row.flush_end is None
 
 
 def test_reducer_llm_failure_schedules_retry(ac_root: Path, fake_llm) -> None:

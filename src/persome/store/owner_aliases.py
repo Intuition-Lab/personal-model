@@ -88,6 +88,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
     if fts.is_client_process():
         return
+    if conn.in_transaction:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name IN ('owner_aliases', 'owner_alias_evidence')"
+            ).fetchall()
+        }
+        if tables == {"owner_aliases", "owner_alias_evidence"}:
+            return
+        raise RuntimeError("owner-alias schema is not initialized; call ensure_schema before BEGIN")
     conn.executescript(SCHEMA)
 
 

@@ -10,8 +10,8 @@ session alive.
 `session/manager.py` applies three deterministic rules on every written capture
 and every `session.tick_seconds` check:
 
-1. **Idle gap:** no meaningful capture for `gap_minutes` (default 5) closes at
-   the last event time.
+1. **Idle gap:** no meaningful capture for `gap_minutes` (default 5) closes just
+   after the last event time.
 2. **Single-app soft cut:** one unrelated app holds focus for
    `soft_cut_minutes` (default 3), unless at least two apps appeared in the
    preceding two minutes.
@@ -20,8 +20,15 @@ and every `session.tick_seconds` check:
 
 Shutdown and the 23:55 daily safety net also force-end an open session. If the
 process crashes before shutdown can run, the next daemon boot closes every
-stranded `active` row before accepting a new capture. Older rows close at the
-next session's start; the newest closes at boot time.
+stranded `active` row before accepting a new capture. Each recovered row ends
+one microsecond after its latest durable capture or timeline-source timestamp
+inside `[start, min(next_session_start, boot_time))`; the next session and boot
+clock are caps, not evidence that activity continued until those instants.
+
+Persisted session ranges are half-open: `[start_time, end_time)`. A normal cut
+binds `start_time` to the first durable capture timestamp and stores `end_time`
+one microsecond after the final event instant. This keeps both endpoint captures
+in exactly one terminal range without admitting a later heartbeat.
 
 ## State machine
 
@@ -45,10 +52,14 @@ marker shown separately in the diagram.
 ## Incremental flush
 
 Every `session.flush_minutes` (default 5, minimum 5), `run_flush_tick` reads
-closed timeline blocks since `flush_end`, reduces them, and appends a
-`[flush]` entry to `event-YYYY-MM-DD.md`. It advances `flush_end`; a failed flush
-waits for the next, larger window. The terminal reduce only covers the trailing
-range not already flushed.
+closed, cutoff-safe timeline slices since `flush_end`, reduces them, and appends
+a `[flush]` entry to `event-YYYY-MM-DD.md`. It advances `flush_end` only through
+the last closed block; a failed flush waits for the next, larger window. An
+occupied closed minute with no block is a retryable gap, never a watermark
+jump. The terminal reduce only covers the trailing range not already flushed
+and waits for an occupied off-minute closing block plus raw boundary provenance.
+An off-minute terminal slice with no durable occupancy does not wait for an
+empty closing block, so crash recovery cannot deadlock on the daemon boot minute.
 
 After each successful flush, `writer.agent.model_active_session` extracts and
 applies a memory delta over `[delta_end, flush_end)`. Successful apply advances
@@ -58,7 +69,8 @@ running throughout.
 
 Under the default memory-delta model path there is no active classifier tick.
 If an operator sets `memory_delta.apply_enabled=false`, the legacy classifier
-task runs every `classifier.interval_minutes` and advances `classified_end`.
+task runs every `classifier.interval_minutes` and advances `classified_end`
+only to a closed wall boundary.
 
 ## Reducer recovery
 
@@ -71,9 +83,13 @@ event entry and marks the session reduced. This is degraded state formation,
 not a silent loss. The same result still enters terminal modeling.
 
 The reducer task runs one unconditional catch-up pass at daemon boot, then
-checks due retries once per minute. The 23:55 safety net also ignores backoff
-and catches every stranded `ended` or `failed` row. `persome writer run` is the
-same manual recovery entrance.
+checks due reducer retries once per minute. Its minute-level model recovery is
+narrower: it retries only a reduced session whose persisted
+`model_retry_reason=awaiting_closing_block` has just become eligible. Generic
+classifier, pattern, store, or LLM errors are recovered at boot, by the daily
+safety net, or through `persome writer run`; they are not hammered every
+minute. The 23:55 safety net also ignores reducer backoff and catches every
+stranded `ended` or `failed` row.
 
 ## Shared terminal finalizer
 
@@ -107,13 +123,14 @@ unmodeled range.
 | Column | Meaning |
 |---|---|
 | `status` | `active`, `ended`, `failed`, or `reduced`. |
-| `start_time`, `end_time` | Bounded activity window. |
+| `start_time`, `end_time` | Half-open activity window, from the first durable capture through just after the final event. |
 | `flush_end` | End of the latest reduced subwindow. |
 | `classified_end` | Legacy classifier bookmark. |
 | `pattern_detected_end` | Pattern detector bookmark. |
 | `delta_end` | End of the latest successfully applied Point/Line window. |
 | `retry_count`, `next_retry_at`, `last_error` | Persisted reducer recovery. |
 | `modeled_at` | All terminal modeling stages completed. |
+| `model_retry_reason` | Persisted terminal-model wait class; the minute loop recognizes only a newly eligible closing-block wait. |
 
 Fresh schema is generated in `docs/db-schema.sql`; upgrades add new columns
 without dropping old product-era columns.

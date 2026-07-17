@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import fcntl
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .. import paths
@@ -21,6 +21,7 @@ from ..logger import get
 from ..session import store as session_store
 from ..store import fts
 from ..store import memory_deltas as deltas_store
+from ..timeline import store as timeline_store
 from . import classifier as classifier_mod
 from . import memory_delta as memory_delta_mod
 from . import pattern_detector as pattern_detector_mod
@@ -54,7 +55,13 @@ def _event_path(row: session_store.SessionRow) -> str:
 
 
 def _delta_completed(cfg: Config, delta: Any) -> bool:
-    benign = {"disabled", "no_blocks", "no_window", "already_processed", "resumed_apply"}
+    benign = {
+        "disabled",
+        "no_blocks",
+        "no_window",
+        "already_processed",
+        "resumed_apply",
+    }
     complete = bool(delta.written or delta.skipped_reason in benign)
     if getattr(cfg.memory_delta, "apply_enabled", False):
         complete = complete and bool(
@@ -198,10 +205,17 @@ def finalize_session(
                     session_end=row.end_time,
                     window_start=row.classified_end,
                 )
-                classify_ok = bool(result.classifier.committed or result.classifier.skipped_reason)
+                classify_ok = bool(
+                    not getattr(result.classifier, "retryable", False)
+                    and (result.classifier.committed or result.classifier.skipped_reason)
+                )
                 if classify_ok:
                     with fts.cursor() as conn:
                         session_store.set_classified_end(conn, session_id, row.end_time)
+                elif getattr(result.classifier, "retryable", False):
+                    result.errors.append(
+                        f"classifier: {result.classifier.skipped_reason or 'evidence unavailable'}"
+                    )
                 else:
                     result.errors.append("classifier ended without commit")
             except Exception as exc:  # noqa: BLE001
@@ -216,10 +230,18 @@ def finalize_session(
                     session_start=row.start_time,
                     session_end=row.end_time,
                 )
-                pattern_ok = bool(result.pattern.committed or result.pattern.skipped_reason)
+                pattern_ok = bool(
+                    not getattr(result.pattern, "retryable", False)
+                    and (result.pattern.committed or result.pattern.skipped_reason)
+                )
                 if pattern_ok:
                     with fts.cursor() as conn:
                         session_store.set_pattern_detected_end(conn, session_id, row.end_time)
+                elif getattr(result.pattern, "retryable", False):
+                    result.errors.append(
+                        "pattern_detector: "
+                        f"{result.pattern.skipped_reason or 'evidence unavailable'}"
+                    )
                 else:
                     result.errors.append("pattern detector ended without commit")
             except Exception as exc:  # noqa: BLE001
@@ -244,6 +266,14 @@ def finalize_session(
                 with fts.cursor() as conn:
                     session_store.mark_modeled(conn, session_id, datetime.now().astimezone())
                 result.completed = True
+            else:
+                delta_reason = str(getattr(result.delta, "skipped_reason", "") or "")
+                exact_delta_error = bool(delta_reason) and all(
+                    error.endswith(f": {delta_reason}") for error in result.errors
+                )
+                retry_reason = delta_reason if exact_delta_error else "stage_error"
+                with fts.cursor() as conn:
+                    session_store.set_model_retry_reason(conn, session_id, retry_reason)
             return result
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -290,3 +320,29 @@ def run(cfg: Config, *, limit: int | None = None) -> WriterRunResult:
             if cr.summary:
                 result.summaries.append(cr.summary)
     return result
+
+
+def retry_pending_modeling(cfg: Config, *, limit: int | None = None) -> list[SessionModelResult]:
+    """Retry only closing-block waits that became newly eligible.
+
+    Generic classifier, pattern, store, and LLM errors are deliberately left to
+    boot/daily/manual recovery rather than hammered every minute.  The minute
+    loop handles one cheap, provable transition only: a reduced session was
+    persisted as ``awaiting_closing_block`` and that exact wall block now exists.
+    """
+    with fts.cursor() as conn:
+        pending = session_store.list_pending_modeling(conn)
+        eligible: list[session_store.SessionRow] = []
+        window_minutes = max(1, int(getattr(cfg.timeline, "window_minutes", 1)))
+        step = timedelta(minutes=window_minutes)
+        for row in pending:
+            if row.model_retry_reason != "awaiting_closing_block" or row.end_time is None:
+                continue
+            closing_start = timeline_store.floor_to_window(row.end_time, window_minutes)
+            if closing_start >= row.end_time:
+                continue
+            if timeline_store.get_window(conn, closing_start, closing_start + step) is not None:
+                eligible.append(row)
+    if limit is not None:
+        eligible = eligible[: max(0, limit)]
+    return [finalize_session(cfg, session_id=row.id) for row in eligible]

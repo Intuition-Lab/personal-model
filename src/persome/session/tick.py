@@ -9,7 +9,8 @@ The daemon tasks wired here include:
     ``reducer.daily_tick_hour/minute``), force-ends the currently open
     session, retries any ``failed`` sessions, and covers the edge case
     where the process was offline across midnight.
-  * ``run_reducer_retry_tick`` — retries due failed reductions once per minute
+  * ``run_reducer_retry_tick`` — retries due reductions and incomplete terminal
+    modeling once per minute
     and sends terminal success or heuristic fallback through model finalization.
   * ``run_wal_checkpoint_tick`` — owns every scheduled WAL checkpoint; it
     truncates after daemon start and at each local-day rollover, then otherwise
@@ -30,6 +31,7 @@ from ..evomem import inversion as evo_inversion
 from ..logger import get
 from ..store import fts
 from ..store import parser_ticks as parser_ticks_store
+from ..timeline import store as timeline_store
 from ..writer import agent as writer_agent
 from ..writer import classifier as classifier_mod
 from ..writer import (
@@ -138,7 +140,7 @@ def build_manager(cfg: Config) -> SessionManager:
 
 
 async def run_reducer_retry_tick(cfg: Config) -> None:
-    """Catch up persisted work at boot, then retry due terminal reductions."""
+    """Catch up at boot, then retry due reductions and pending modeling."""
     if not cfg.reducer.enabled:
         logger.info("reducer retry loop not started (reducer disabled)")
         return
@@ -159,6 +161,10 @@ async def run_reducer_retry_tick(cfg: Config) -> None:
     while True:
         try:
             await asyncio.sleep(interval)
+            pending = await asyncio.to_thread(writer_agent.retry_pending_modeling, cfg)
+            completed = sum(1 for modeled in pending if modeled.completed)
+            if completed:
+                logger.info("model recovery: completed %d pending session(s)", completed)
             results = await asyncio.to_thread(session_reducer.retry_due, cfg)
             for reduced in results:
                 modeled = await asyncio.to_thread(
@@ -278,6 +284,16 @@ async def run_classifier_tick(cfg: Config, manager: SessionManager) -> None:
 
             if now - window_start < timedelta(seconds=interval):
                 continue
+            # The active tick owns only closed wall windows. Using ``now`` as
+            # both focus-entry and timeline watermark would skip the current
+            # partial minute: its TimelineBlock materializes later, after
+            # ``classified_end`` had already advanced past it.
+            window_end = timeline_store.floor_to_window(
+                now,
+                max(1, int(getattr(cfg.timeline, "window_minutes", 1))),
+            )
+            if window_end <= window_start:
+                continue
 
             result = await asyncio.to_thread(
                 classifier_mod.classify_window,
@@ -285,7 +301,7 @@ async def run_classifier_tick(cfg: Config, manager: SessionManager) -> None:
                 session_id=session_id,
                 event_daily_path=event_daily_name,
                 start=window_start,
-                end=now,
+                end=window_end,
                 include_prior_day=window_start == session_start,
             )
 
@@ -307,9 +323,9 @@ async def run_classifier_tick(cfg: Config, manager: SessionManager) -> None:
                     "classifier tick %s: committed with no writes",
                     session_id,
                 )
-            if result.committed or result.skipped_reason:
+            if (result.committed or result.skipped_reason) and not result.retryable:
                 with fts.cursor() as conn:
-                    session_store.set_classified_end(conn, session_id, now)
+                    session_store.set_classified_end(conn, session_id, window_end)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

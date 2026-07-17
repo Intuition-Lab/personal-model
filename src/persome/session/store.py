@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
-from ..capture.timestamps import capture_timestamp_epoch
+from ..capture.timestamps import (
+    capture_timestamp_epoch,
+    parse_capture_timestamp,
+)
 
 SessionStatus = Literal["active", "ended", "reduced", "failed"]
 
@@ -32,7 +35,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     classified_end TEXT,
     pattern_detected_end TEXT,
     delta_end TEXT,
-    modeled_at TEXT
+    modeled_at TEXT,
+    model_retry_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_time);
@@ -65,6 +69,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "UPDATE sessions SET modeled_at=updated_at"
             " WHERE status='reduced' AND modeled_at IS NULL"
         )
+    if "model_retry_reason" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN model_retry_reason TEXT NOT NULL DEFAULT ''")
 
 
 @dataclass
@@ -83,6 +89,7 @@ class SessionRow:
     pattern_detected_end: datetime | None = None
     delta_end: datetime | None = None
     modeled_at: datetime | None = None
+    model_retry_reason: str = ""
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -129,12 +136,48 @@ def mark_ended(conn: sqlite3.Connection, session_id: str, end_time: datetime) ->
     )
 
 
+def _latest_durable_event_at(
+    conn: sqlite3.Connection,
+    *,
+    start_time: datetime,
+    before: datetime,
+) -> datetime | None:
+    """Return the latest capture/source instant inside one stranded session."""
+    row = conn.execute(
+        """
+        SELECT event_time
+          FROM (
+                SELECT timestamp AS event_time
+                  FROM captures
+                 WHERE persome_epoch(timestamp) >= persome_epoch(?)
+                   AND persome_epoch(timestamp) < persome_epoch(?)
+                UNION ALL
+                SELECT captured_at AS event_time
+                  FROM timeline_block_sources
+                 WHERE captured_at != ''
+                   AND persome_epoch(captured_at) >= persome_epoch(?)
+                   AND persome_epoch(captured_at) < persome_epoch(?)
+               )
+         ORDER BY persome_epoch(event_time) DESC
+         LIMIT 1
+        """,
+        (
+            start_time.isoformat(),
+            before.isoformat(),
+            start_time.isoformat(),
+            before.isoformat(),
+        ),
+    ).fetchone()
+    return parse_capture_timestamp(str(row[0])) if row is not None else None
+
+
 def recover_active(conn: sqlite3.Connection, *, recovered_at: datetime) -> list[SessionRow]:
     """Close sessions left active by a previous daemon process.
 
-    A later session start is the safest boundary for an older stranded row. The
-    newest row closes at daemon boot. The status guard in ``mark_ended`` keeps
-    this recovery idempotent across repeated starts.
+    Every row closes just after its last durable capture/source instant inside
+    ``[start, min(next_start, recovered_at))``. The later session/boot instant is
+    only a hard cap, never evidence that the user remained active until then.
+    The status guard in ``mark_ended`` keeps recovery idempotent across starts.
     """
     rows = conn.execute(
         "SELECT * FROM sessions ORDER BY persome_epoch(start_time) ASC, "
@@ -153,7 +196,17 @@ def recover_active(conn: sqlite3.Connection, *, recovered_at: datetime) -> list[
             ),
             None,
         )
-        end_time = min(recovered_at, next_start) if next_start else recovered_at
+        upper_bound = min(recovered_at, next_start) if next_start else recovered_at
+        last_event = _latest_durable_event_at(
+            conn,
+            start_time=row.start_time,
+            before=upper_bound,
+        )
+        terminal_event = max(row.start_time, last_event or row.start_time)
+        end_time = min(
+            upper_bound,
+            terminal_event + timedelta(microseconds=1),
+        )
         end_time = max(row.start_time, end_time)
         mark_ended(conn, row.id, end_time)
         row.end_time = end_time
@@ -189,6 +242,29 @@ def mark_failed(
         (
             next_retry_at.isoformat() if next_retry_at else None,
             error,
+            datetime.now().astimezone().isoformat(),
+            session_id,
+        ),
+    )
+
+
+def defer_reduction(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    reason: str,
+    next_retry_at: datetime,
+) -> None:
+    """Retry a not-yet-closed evidence boundary without spending LLM attempts."""
+    conn.execute(
+        """
+        UPDATE sessions
+           SET status='failed', next_retry_at=?, last_error=?, updated_at=?
+         WHERE id=?
+        """,
+        (
+            next_retry_at.isoformat(),
+            reason,
             datetime.now().astimezone().isoformat(),
             session_id,
         ),
@@ -260,9 +336,25 @@ def set_delta_end(conn: sqlite3.Connection, session_id: str, delta_end: datetime
 def mark_modeled(conn: sqlite3.Connection, session_id: str, modeled_at: datetime) -> None:
     """Mark terminal classifier/pattern/delta processing complete."""
     conn.execute(
-        "UPDATE sessions SET modeled_at=?, updated_at=? WHERE id=?",
+        "UPDATE sessions SET modeled_at=?, model_retry_reason='', updated_at=? WHERE id=?",
         (
             modeled_at.isoformat(),
+            datetime.now().astimezone().isoformat(),
+            session_id,
+        ),
+    )
+
+
+def set_model_retry_reason(
+    conn: sqlite3.Connection,
+    session_id: str,
+    reason: str,
+) -> None:
+    """Persist why terminal modeling remains incomplete across restarts."""
+    conn.execute(
+        "UPDATE sessions SET model_retry_reason=?, updated_at=? WHERE id=?",
+        (
+            str(reason or ""),
             datetime.now().astimezone().isoformat(),
             session_id,
         ),
@@ -394,6 +486,10 @@ def _to_row(r: sqlite3.Row) -> SessionRow:
         modeled_at = _dt(r["modeled_at"])
     except (IndexError, KeyError):
         modeled_at = None
+    try:
+        model_retry_reason = str(r["model_retry_reason"] or "")
+    except (IndexError, KeyError):
+        model_retry_reason = ""
     return SessionRow(
         id=r["id"],
         start_time=_dt(r["start_time"]) or datetime.now().astimezone(),
@@ -409,4 +505,5 @@ def _to_row(r: sqlite3.Row) -> SessionRow:
         pattern_detected_end=pattern_detected_end,
         delta_end=delta_end,
         modeled_at=modeled_at,
+        model_retry_reason=model_retry_reason,
     )

@@ -107,7 +107,8 @@ CREATE TABLE sessions (
     classified_end TEXT,
     pattern_detected_end TEXT,
     delta_end TEXT,
-    modeled_at TEXT
+    modeled_at TEXT,
+    model_retry_reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE skill_observations (
@@ -123,6 +124,16 @@ CREATE TABLE sqlite_sequence(name,seq);
 CREATE TABLE system_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE timeline_block_sources (
+    block_id TEXT NOT NULL,
+    capture_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL DEFAULT '',
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (block_id, capture_id),
+    UNIQUE (block_id, ordinal),
+    FOREIGN KEY (block_id) REFERENCES timeline_blocks(id) ON DELETE CASCADE
 );
 
 CREATE TABLE timeline_blocks (
@@ -166,6 +177,9 @@ CREATE INDEX idx_sessions_status ON sessions(status);
 
 CREATE INDEX idx_skill_observations_block
     ON skill_observations(timeline_block_id);
+
+CREATE INDEX idx_timeline_block_sources_capture
+    ON timeline_block_sources(capture_id);
 
 CREATE INDEX idx_tlb_end ON timeline_blocks(end_time);
 
@@ -254,6 +268,13 @@ CREATE INDEX idx_health_events_provider_time
     ON health_events(provider, started_at DESC);
 
 -- ---- store/memory_deltas.py ----
+
+CREATE TABLE memory_delta_evidence_claims (
+    evidence_id TEXT PRIMARY KEY,
+    delta_id INTEGER NOT NULL REFERENCES memory_deltas(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    UNIQUE(delta_id, ordinal)
+);
 
 CREATE TABLE memory_deltas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

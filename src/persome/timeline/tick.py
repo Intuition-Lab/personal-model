@@ -11,7 +11,9 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
+from .. import paths
 from ..capture import scheduler as capture_scheduler
+from ..capture.timestamps import parse_capture_path_timestamp
 from ..config import Config
 from ..logger import get
 from ..store import fts
@@ -29,6 +31,33 @@ def _now() -> datetime:
     return datetime.now().astimezone()
 
 
+def _earliest_closed_occupied_missing(
+    conn,
+    *,
+    current_floor: datetime,
+    window_minutes: int,
+) -> datetime | None:
+    """Return the earliest closed raw-capture window lacking a block."""
+    buffer_dir = paths.capture_buffer_dir()
+    if not buffer_dir.exists():
+        return None
+    step = timedelta(minutes=window_minutes)
+    missing: dict[float, datetime] = {}
+    for path in buffer_dir.iterdir():
+        if path.suffix != ".json" or not path.is_file():
+            continue
+        captured_at = parse_capture_path_timestamp(path)
+        if captured_at is None:
+            continue
+        local_captured_at = captured_at.astimezone(current_floor.tzinfo)
+        window_start = store.floor_to_window(local_captured_at, window_minutes)
+        window_end = window_start + step
+        if window_end > current_floor or store.has_window(conn, window_start, window_end):
+            continue
+        missing[window_start.timestamp()] = window_start
+    return missing[min(missing)] if missing else None
+
+
 def _run_once(cfg: Config) -> int:
     window_minutes = cfg.timeline.window_minutes
     lookback_minutes = cfg.timeline.cold_lookback_minutes
@@ -38,10 +67,17 @@ def _run_once(cfg: Config) -> int:
 
     with fts.cursor() as conn:
         latest_end = store.get_latest_end(conn)
+        gap_start = _earliest_closed_occupied_missing(
+            conn,
+            current_floor=current_floor,
+            window_minutes=window_minutes,
+        )
     if latest_end is None:
         # First run — only build windows within the lookback horizon
         # so we don't LLM-process hours of backfill on startup.
         latest_end = current_floor - timedelta(minutes=lookback_minutes)
+    if gap_start is not None and gap_start < latest_end:
+        latest_end = gap_start
 
     pending = store.iter_windows(latest_end, current_floor, window_minutes)
     if not pending:
@@ -87,6 +123,15 @@ def _cleanup_buffer_once(cfg: Config) -> dict[str, int]:
     """
     with fts.cursor() as conn:
         safe_end = store.get_latest_end(conn)
+        if safe_end is not None:
+            current_floor = store.floor_to_window(_now(), cfg.timeline.window_minutes)
+            gap_start = _earliest_closed_occupied_missing(
+                conn,
+                current_floor=current_floor,
+                window_minutes=cfg.timeline.window_minutes,
+            )
+            if gap_start is not None and gap_start < safe_end:
+                safe_end = gap_start
     return capture_scheduler.cleanup_buffer(
         cfg.capture.buffer_retention_hours,
         safe_end.isoformat() if safe_end else None,

@@ -257,8 +257,8 @@ def test_session_recovery_and_retry_order_mixed_offsets_by_instant(ac_root: Path
         due = session_store.list_due_for_retry(conn, now=datetime(2025, 11, 2, 2, 30, tzinfo=UTC))
 
     by_id = {row.id: row for row in recovered}
-    assert by_id["old"].end_time == new_start
-    assert by_id["new"].end_time == datetime(2025, 11, 2, 6, 10, tzinfo=UTC)
+    assert by_id["old"].end_time == old_start + timedelta(microseconds=1)
+    assert by_id["new"].end_time == new_start + timedelta(microseconds=1)
     assert [row.id for row in due] == ["retry"]
 
 

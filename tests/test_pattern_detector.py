@@ -62,6 +62,67 @@ def _seed_captures(conn) -> None:
         )
 
 
+def _write_capture(ts: datetime, text: str, *, app: str) -> None:
+    path = paths.capture_buffer_dir() / (
+        ts.isoformat().replace(":", "-").replace("+", "p") + ".json"
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": ts.isoformat(),
+                "window_meta": {"app_name": app, "title": "cutoff test"},
+                "focused_element": {"role": "AXStaticText", "value": text},
+                "visible_text": text,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_pattern_raw_context_clips_terminal_straddler(
+    ac_root: Path,
+    fake_llm,
+) -> None:
+    minute = datetime(2026, 5, 11, 8, 30, tzinfo=_TZ)
+    start = minute + timedelta(seconds=10)
+    end = minute + timedelta(seconds=30)
+    safe = "SAFE_PATTERN_DECISION"
+    secret = "POST_CUTOFF_SECRET_PATTERN"
+    _write_capture(minute + timedelta(seconds=20), safe, app="SafeApp")
+    _write_capture(minute + timedelta(seconds=50), secret, app="SecretApp")
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=minute,
+                end_time=minute + timedelta(minutes=1),
+                entries=[f"normalized {safe}; {secret}"],
+                apps_used=["SafeApp", "SecretApp"],
+                capture_count=2,
+                focus_excerpt=secret,
+                attention_surface=secret,
+            ),
+        )
+    fake_llm.add_script(
+        "pattern_detector",
+        [_response([_tool_call("commit", {"summary": "cutoff safe"}, cid="cutoff")])],
+    )
+    cfg = config_mod.load(ac_root / "config.toml")
+    cfg.pattern_detector.structured_filter = False
+
+    result = pd_mod.detect_after_classify(
+        cfg,
+        session_id="sess-pattern-cutoff",
+        event_daily_path="event-2026-05-11.md",
+        session_start=start,
+        session_end=end,
+    )
+
+    assert result.committed and not result.retryable
+    sent = json.dumps(fake_llm.calls, ensure_ascii=False, default=str)
+    assert safe in sent and secret not in sent
+
+
 def test_pattern_detector_creates_workflow(ac_root: Path, monkeypatch) -> None:
     with fts.cursor() as conn:
         _seed_timeline_blocks(conn)
@@ -272,6 +333,10 @@ def test_collect_candidates_finds_app_sequences(ac_root: Path) -> None:
             lookback_start=start,
             window_end=end,
             min_occurrences=2,
+            timeline_blocks=sorted(
+                timeline_store.query_range(conn, start, end, limit=200),
+                key=lambda block: block.start_time,
+            ),
         )
 
     assert "app_sequences" in candidates
@@ -306,6 +371,7 @@ def test_collect_candidates_uses_durable_event_memory_not_intents(ac_root: Path)
             lookback_start=datetime.now().astimezone() - timedelta(days=1),
             window_end=datetime.now().astimezone() + timedelta(days=1),
             min_occurrences=2,
+            timeline_blocks=[],
         )
 
     assert "intents" not in candidates
@@ -333,6 +399,7 @@ def test_pattern_detector_renders_durable_event_memory(ac_root: Path) -> None:
             lookback_start=now - timedelta(days=7),
             window_end=now + timedelta(minutes=1),
             min_occurrences=2,
+            timeline_blocks=[],
         )
         assert "event_memory" in candidates
         ctx = pd_mod._assemble_context(

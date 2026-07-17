@@ -129,4 +129,4 @@ def test_session_end_callback_receives_correct_range() -> None:
     assert len(captured) == 1
     _, a, b = captured[0]
     assert a == start
-    assert b == last_event
+    assert b == last_event + timedelta(microseconds=1)

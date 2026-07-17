@@ -41,6 +41,7 @@ from ..store import fts
 from ..store import memory_deltas as deltas_store
 from ..store import owner_aliases as owner_alias_store
 from ..store import relation_edges as edges_store
+from ..timeline import aggregator as timeline_aggregator
 from ..timeline import store as tl_store
 from . import llm as llm_mod
 
@@ -85,6 +86,180 @@ class DeltaResult:
     counts: dict[str, int] = field(default_factory=dict)
     dropped: int = 0
     skipped_reason: str = ""
+
+
+@dataclass(frozen=True)
+class _EvidenceWindow:
+    """One prompt window plus the durable evidence IDs that back it."""
+
+    block: tl_store.TimelineBlock
+    claim_ids: tuple[str, ...]
+
+
+def _capture_claim_id(path: Any) -> str:
+    """Stable, non-content identifier for one raw capture receipt."""
+    return f"capture:{path.stem}"
+
+
+def _select_cutoff_safe_evidence(
+    cfg: Any,
+    conn: Any,
+    *,
+    start_time: datetime,
+    end_time: datetime,
+    is_final: bool,
+    max_blocks: int,
+) -> tuple[list[tl_store.TimelineBlock], list[str], str]:
+    """Select unclaimed evidence without crossing either half-open cutoff.
+
+    Complete wall windows retain the compact normalized TimelineBlock. Partial
+    boundary windows are reconstructed from raw captures whose timestamps are
+    inside the exact slice. For terminal off-minute ends, the closing block is
+    also a completion barrier: until it materializes, the capture set for that
+    minute is not known to be closed and finalization remains retryable.
+    """
+    bounded_max = max(0, min(max_blocks, 200))
+    if start_time >= end_time or bounded_max == 0:
+        return [], [], "no_blocks"
+
+    sliced = timeline_aggregator.exact_timeline_slice(
+        cfg,
+        conn,
+        start=start_time,
+        end=end_time,
+        require_closing_block=is_final,
+        limit=200,
+        include_full_captures=True,
+    )
+    if sliced.skipped_reason:
+        return [], [], sliced.skipped_reason
+
+    claimed_capture_times = deltas_store.claimed_capture_evidence_times(
+        conn,
+        start=start_time,
+        end=end_time,
+    )
+    opaque_claim_windows = deltas_store.unparseable_capture_claim_windows(
+        conn,
+        start=start_time,
+        end=end_time,
+    )
+    selected: list[_EvidenceWindow] = []
+    for item in sliced.evidence:
+        persisted_id = item.persisted_block_id
+        parsed = list(item.parsed_captures)
+        capture_ids = [_capture_claim_id(path) for path, _ in parsed]
+        manifest = tl_store.source_manifest(conn, persisted_id)
+        manifest_ids = [source.capture_id for source in manifest]
+        source_ids = manifest_ids if item.full_window and manifest_ids else capture_ids
+
+        candidate_ids = [persisted_id, *source_ids]
+        claimed = deltas_store.claimed_evidence_ids(conn, candidate_ids)
+        if persisted_id in claimed:
+            # A whole-block delta owns every derivative of this wall window.
+            # A later clipped session must not replay raw captures from it.
+            continue
+
+        if item.full_window:
+            window_claims = {
+                evidence_id
+                for evidence_id, timestamp in claimed_capture_times.items()
+                if item.block.start_time <= timestamp < item.block.end_time
+            }
+            if not manifest_ids:
+                opaque_overlap = any(
+                    window is None
+                    or (window[1] > item.block.start_time and window[0] < item.block.end_time)
+                    for window in opaque_claim_windows
+                )
+                if window_claims or opaque_overlap:
+                    # This is a pre-manifest block. A prior clipped delta proves
+                    # overlap, but after retention there is no durable way to
+                    # prove which residual captures backed the whole summary.
+                    return [], [], "no_cutoff_safe_blocks"
+                selected.append(
+                    _EvidenceWindow(
+                        block=item.block,
+                        claim_ids=(persisted_id, *capture_ids),
+                    )
+                )
+                continue
+
+            claimed_sources = set(manifest_ids).intersection(window_claims | claimed)
+            if not claimed_sources:
+                selected.append(
+                    _EvidenceWindow(
+                        block=item.block,
+                        claim_ids=(persisted_id, *manifest_ids),
+                    )
+                )
+                continue
+
+            # An earlier clipped window already consumed some captures from this
+            # minute. Never resend its whole summary. Every unclaimed source in
+            # the durable manifest must still have raw provenance before the
+            # residual can be rendered; missing already-claimed files are safe
+            # because their text is deliberately excluded.
+            unclaimed_sources = set(manifest_ids) - claimed_sources
+            raw_by_id = {_capture_claim_id(path): (path, data) for path, data in parsed}
+            if not unclaimed_sources.issubset(raw_by_id):
+                return [], [], "no_cutoff_safe_blocks"
+            residual = [
+                raw_by_id[evidence_id]
+                for evidence_id in manifest_ids
+                if evidence_id in unclaimed_sources
+            ]
+            if not residual:
+                continue
+            block = timeline_aggregator.render_capture_slice(
+                cfg,
+                start=item.block.start_time,
+                end=item.block.end_time,
+                parsed=residual,
+                persisted_block_id=persisted_id,
+            )
+            if block is not None:
+                selected.append(
+                    _EvidenceWindow(
+                        block=block,
+                        claim_ids=(
+                            persisted_id,
+                            *(_capture_claim_id(path) for path, _ in residual),
+                        ),
+                    )
+                )
+            continue
+
+        # A partial wall window can only be represented faithfully by its raw
+        # captures. It claims captures, never the shared whole-block ID.
+        residual = [item for item in parsed if _capture_claim_id(item[0]) not in claimed]
+        block = timeline_aggregator.render_capture_slice(
+            cfg,
+            start=item.block.start_time,
+            end=item.block.end_time,
+            parsed=residual,
+            persisted_block_id=persisted_id,
+        )
+        if block is not None:
+            selected.append(
+                _EvidenceWindow(
+                    block=block,
+                    claim_ids=tuple(_capture_claim_id(path) for path, _ in residual),
+                )
+            )
+
+    selected = selected[-bounded_max:]
+    blocks = [item.block for item in selected]
+    claim_ids: list[str] = []
+    seen: set[str] = set()
+    for item in selected:
+        for claim_id in item.claim_ids:
+            if claim_id not in seen:
+                claim_ids.append(claim_id)
+                seen.add(claim_id)
+    if blocks:
+        return blocks, claim_ids, ""
+    return [], [], "no_blocks"
 
 
 def _safe_json(text: str) -> dict:
@@ -422,17 +597,21 @@ def run_after_session(
     max_blocks = int(getattr(cfg.memory_delta, "max_blocks", 120))
     try:
         with fts.cursor() as conn:
-            # newest-first + limit gives the window's most recent max_blocks;
-            # reversed back to chronological order for the event log.
-            blocks = list(
-                reversed(tl_store.query_range(conn, start_time, end_time, limit=max_blocks))
+            deltas_store.ensure_schema(conn)
+            blocks, claim_ids, selection_reason = _select_cutoff_safe_evidence(
+                cfg,
+                conn,
+                start_time=start_time,
+                end_time=end_time,
+                is_final=is_final,
+                max_blocks=max_blocks,
             )
     except Exception:  # noqa: BLE001 — fail-open, never disturb the writer chain
         logger.warning("memory_delta %s: block read failed", session_id, exc_info=True)
         result.skipped_reason = "block_read_failed"
         return result
     if not blocks:
-        result.skipped_reason = "no_blocks"
+        result.skipped_reason = selection_reason or "no_blocks"
         return result
 
     roster_entries = _load_roster(cfg)
@@ -480,45 +659,71 @@ def run_after_session(
     )
     try:
         with fts.cursor() as conn:
-            for candidate in owner_candidates:
-                owner_identity.record_candidate(
-                    conn,
-                    alias=candidate["alias"],
-                    session_id=session_id,
-                    source_kind=candidate["source_kind"],
-                    quote=candidate["quote"],
-                    confidence=candidate["confidence"],
-                )
+            # Schema helpers use executescript() on first use, which would
+            # implicitly commit a caller-owned transaction. Initialize both
+            # stores before acquiring the write lock.
+            deltas_store.ensure_schema(conn)
+            owner_alias_store.ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # The lock makes the ownership recheck, owner-alias evidence,
+                # deterministic gates, delta row, and evidence claims one
+                # indivisible write. A direct replay racing this process either
+                # wins before BEGIN (and is observed here) or waits until after
+                # commit; it can never leave alias side effects on collision.
+                if deltas_store.claimed_evidence_ids(conn, claim_ids):
+                    conn.rollback()
+                    result.skipped_reason = "no_blocks"
+                    return result
+                for candidate in owner_candidates:
+                    owner_identity.record_candidate(
+                        conn,
+                        alias=candidate["alias"],
+                        session_id=session_id,
+                        source_kind=candidate["source_kind"],
+                        quote=candidate["quote"],
+                        confidence=candidate["confidence"],
+                    )
 
-            # Rebuild after recording: a second independent session can promote
-            # the alias during this very window, so its relation endpoints must
-            # canonicalize to self immediately.
-            roster = identity_mod.load_roster(cfg)
-            clean, gated_dropped = gate_delta(
-                raw,
-                roster=roster,
-                session_text=session_text,
-                min_confidence=float(getattr(cfg.memory_delta, "min_confidence", 0.5)),
-                cooccurrence=bool(getattr(cfg.memory_delta, "cooccurrence_knows", True)),
-                owner_candidates=owner_candidates,
-                protected_owner_aliases=owner_identity.reserved_aliases(cfg, conn=conn),
-            )
-            dropped = candidate_dropped + gated_dropped
-            delta_id = deltas_store.insert(
-                conn,
-                session_id=session_id,
-                payload=clean,
-                model=cfg.model_for(STAGE).model,
-                dropped=dropped,
-                apply_status=(
-                    "pending"
-                    if getattr(cfg.memory_delta, "apply_enabled", False)
-                    else "not_requested"
-                ),
-                window_start=start_time,
-                window_end=end_time,
-                is_final=is_final,
-            )
+                # Rebuild the owner portion on this same connection so a newly
+                # promoted alias is visible before commit. The non-owner roster
+                # was loaded before the LLM call and remains immutable here.
+                roster = identity_mod.Roster.build(
+                    [
+                        ("self", owner_identity.active_aliases(cfg, conn=conn)),
+                        *roster_entries[1:],
+                    ]
+                )
+                clean, gated_dropped = gate_delta(
+                    raw,
+                    roster=roster,
+                    session_text=session_text,
+                    min_confidence=float(getattr(cfg.memory_delta, "min_confidence", 0.5)),
+                    cooccurrence=bool(getattr(cfg.memory_delta, "cooccurrence_knows", True)),
+                    owner_candidates=owner_candidates,
+                    protected_owner_aliases=owner_identity.reserved_aliases(cfg, conn=conn),
+                )
+                dropped = candidate_dropped + gated_dropped
+                delta_id = deltas_store.insert(
+                    conn,
+                    session_id=session_id,
+                    payload=clean,
+                    model=cfg.model_for(STAGE).model,
+                    dropped=dropped,
+                    apply_status=(
+                        "pending"
+                        if getattr(cfg.memory_delta, "apply_enabled", False)
+                        else "not_requested"
+                    ),
+                    window_start=start_time,
+                    window_end=end_time,
+                    is_final=is_final,
+                    evidence_ids=claim_ids,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
     except Exception:  # noqa: BLE001
         logger.warning("memory_delta %s: persist failed", session_id, exc_info=True)
         result.skipped_reason = "persist_failed"

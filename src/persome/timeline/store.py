@@ -3,6 +3,9 @@
 Lives in the shared ``index.db`` so users still have one file to back
 up. The schema enforces a uniqueness constraint on
 ``(start_time, end_time)`` so the aggregator tick is idempotent.
+Each production block atomically records the exact bounded capture IDs used by
+all of its derivatives, so later cutoff-safe replay does not depend on raw-file
+retention.
 """
 
 from __future__ import annotations
@@ -11,10 +14,16 @@ import hashlib
 import json
 import os
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from ..capture.timestamps import capture_timestamp_epoch
+from .. import paths
+from ..capture.timestamps import (
+    capture_timestamp_epoch,
+    parse_capture_path_timestamp,
+    parse_capture_timestamp,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS timeline_blocks (
@@ -37,6 +46,18 @@ CREATE TABLE IF NOT EXISTS timeline_blocks (
 );
 CREATE INDEX IF NOT EXISTS idx_tlb_start ON timeline_blocks(start_time);
 CREATE INDEX IF NOT EXISTS idx_tlb_end ON timeline_blocks(end_time);
+
+CREATE TABLE IF NOT EXISTS timeline_block_sources (
+    block_id TEXT NOT NULL,
+    capture_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL DEFAULT '',
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (block_id, capture_id),
+    UNIQUE (block_id, ordinal),
+    FOREIGN KEY (block_id) REFERENCES timeline_blocks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_timeline_block_sources_capture
+    ON timeline_block_sources(capture_id);
 
 CREATE TABLE IF NOT EXISTS skill_observations (
     session_id TEXT NOT NULL,
@@ -80,6 +101,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "attention_rung" not in cols:
         conn.execute(
             "ALTER TABLE timeline_blocks ADD COLUMN attention_rung TEXT NOT NULL DEFAULT ''"
+        )
+    source_cols = {row["name"] for row in conn.execute("PRAGMA table_info(timeline_block_sources)")}
+    if "captured_at" not in source_cols:
+        conn.execute(
+            "ALTER TABLE timeline_block_sources ADD COLUMN captured_at TEXT NOT NULL DEFAULT ''"
         )
 
 
@@ -125,6 +151,14 @@ class TimelineBlock:
             self.created_at = datetime.now().astimezone()
 
 
+@dataclass(frozen=True)
+class TimelineBlockSource:
+    """One capture identity and its durable event-time position."""
+
+    capture_id: str
+    captured_at: datetime | None
+
+
 def _make_id(start: datetime) -> str:
     stamp = start.strftime("%Y%m%d-%H%M")
     suffix = hashlib.blake2s(os.urandom(8), digest_size=2).hexdigest()
@@ -151,33 +185,163 @@ def has_window(conn: sqlite3.Connection, start: datetime, end: datetime) -> bool
     return row is not None
 
 
-def insert(conn: sqlite3.Connection, block: TimelineBlock) -> None:
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO timeline_blocks
-            (id, start_time, end_time, timezone, entries, apps_used, capture_count,
-             created_at, skill_hints, action_trace, focus_excerpt,
-             focus_structured, attention_surface, attention_confidence, attention_rung)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            block.id,
-            block.start_time.isoformat(),
-            block.end_time.isoformat(),
-            block.timezone,
-            json.dumps(block.entries, ensure_ascii=False),
-            json.dumps(block.apps_used, ensure_ascii=False),
-            block.capture_count,
-            (block.created_at or datetime.now().astimezone()).isoformat(),
-            json.dumps(block.skill_hints, ensure_ascii=False),
-            json.dumps(block.action_trace, ensure_ascii=False),
-            block.focus_excerpt,
-            block.focus_structured,
-            block.attention_surface,
-            block.attention_confidence,
-            block.attention_rung,
-        ),
+def get_window(conn: sqlite3.Connection, start: datetime, end: datetime) -> TimelineBlock | None:
+    """Return the exact wall-clock block for ``[start, end)``, if materialized."""
+    row = conn.execute(
+        "SELECT * FROM timeline_blocks "
+        "WHERE persome_epoch(start_time)=persome_epoch(?) "
+        "AND persome_epoch(end_time)=persome_epoch(?) LIMIT 1",
+        (start.isoformat(), end.isoformat()),
+    ).fetchone()
+    return _row_to_block(row) if row is not None else None
+
+
+def insert(
+    conn: sqlite3.Connection,
+    block: TimelineBlock,
+    *,
+    source_capture_ids: Sequence[str] = (),
+    source_captures: Sequence[TimelineBlockSource] = (),
+) -> None:
+    ordered_sources = _normalize_sources(
+        source_capture_ids=source_capture_ids,
+        source_captures=source_captures,
     )
+    nested = conn.in_transaction
+    if ordered_sources:
+        if nested:
+            conn.execute("SAVEPOINT timeline_block_with_sources")
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO timeline_blocks
+                (id, start_time, end_time, timezone, entries, apps_used, capture_count,
+                 created_at, skill_hints, action_trace, focus_excerpt,
+                 focus_structured, attention_surface, attention_confidence, attention_rung)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                block.id,
+                block.start_time.isoformat(),
+                block.end_time.isoformat(),
+                block.timezone,
+                json.dumps(block.entries, ensure_ascii=False),
+                json.dumps(block.apps_used, ensure_ascii=False),
+                block.capture_count,
+                (block.created_at or datetime.now().astimezone()).isoformat(),
+                json.dumps(block.skill_hints, ensure_ascii=False),
+                json.dumps(block.action_trace, ensure_ascii=False),
+                block.focus_excerpt,
+                block.focus_structured,
+                block.attention_surface,
+                block.attention_confidence,
+                block.attention_rung,
+            ),
+        )
+        target_block_id = block.id
+        if cursor.rowcount == 0:
+            existing = get_window(conn, block.start_time, block.end_time)
+            if existing is None:
+                if ordered_sources:
+                    raise sqlite3.IntegrityError(
+                        "timeline block insert was ignored without an existing window"
+                    )
+                return
+            target_block_id = existing.id
+
+        if ordered_sources:
+            existing_sources = tuple(source_manifest(conn, target_block_id))
+            if existing_sources and existing_sources != ordered_sources:
+                raise sqlite3.IntegrityError(
+                    "timeline block source manifest conflicts with existing manifest"
+                )
+            if not existing_sources:
+                conn.executemany(
+                    "INSERT INTO timeline_block_sources"
+                    " (block_id, capture_id, captured_at, ordinal) VALUES (?, ?, ?, ?)",
+                    (
+                        (
+                            target_block_id,
+                            source.capture_id,
+                            source.captured_at.isoformat(),
+                            ordinal,
+                        )
+                        for ordinal, source in enumerate(ordered_sources)
+                    ),
+                )
+            if nested:
+                conn.execute("RELEASE SAVEPOINT timeline_block_with_sources")
+            else:
+                conn.commit()
+    except Exception:
+        if ordered_sources:
+            if nested:
+                conn.execute("ROLLBACK TO SAVEPOINT timeline_block_with_sources")
+                conn.execute("RELEASE SAVEPOINT timeline_block_with_sources")
+            else:
+                conn.rollback()
+        raise
+
+
+def _normalize_sources(
+    *,
+    source_capture_ids: Sequence[str],
+    source_captures: Sequence[TimelineBlockSource],
+) -> tuple[TimelineBlockSource, ...]:
+    if source_capture_ids and source_captures:
+        raise ValueError("pass source_capture_ids or source_captures, not both")
+    candidates: list[TimelineBlockSource] = []
+    if source_captures:
+        candidates.extend(source_captures)
+    else:
+        for raw_id in source_capture_ids:
+            capture_id = str(raw_id or "").strip()
+            if not capture_id:
+                continue
+            stem = capture_id.removeprefix("capture:")
+            captured_at = parse_capture_path_timestamp(paths.capture_buffer_dir() / f"{stem}.json")
+            if captured_at is None:
+                raise ValueError(f"source capture has no recoverable timestamp: {capture_id}")
+            candidates.append(TimelineBlockSource(capture_id=capture_id, captured_at=captured_at))
+
+    ordered: list[TimelineBlockSource] = []
+    seen: dict[str, datetime] = {}
+    for source in candidates:
+        capture_id = str(source.capture_id or "").strip()
+        captured_at = source.captured_at
+        if not capture_id:
+            raise ValueError("timeline source capture_id must be non-empty")
+        if captured_at is None or captured_at.tzinfo is None or captured_at.utcoffset() is None:
+            raise ValueError("timeline source captured_at must be timezone-aware")
+        prior = seen.get(capture_id)
+        if prior is not None:
+            if prior != captured_at:
+                raise ValueError("duplicate timeline source has conflicting captured_at")
+            continue
+        seen[capture_id] = captured_at
+        ordered.append(TimelineBlockSource(capture_id=capture_id, captured_at=captured_at))
+    return tuple(ordered)
+
+
+def source_manifest(conn: sqlite3.Connection, block_id: str) -> list[TimelineBlockSource]:
+    """Return one block's durable bounded-source manifest in prompt order."""
+    rows = conn.execute(
+        "SELECT capture_id, captured_at FROM timeline_block_sources"
+        " WHERE block_id=? ORDER BY ordinal ASC",
+        (block_id,),
+    ).fetchall()
+    manifest: list[TimelineBlockSource] = []
+    for row in rows:
+        captured_at = parse_capture_timestamp(str(row[1] or ""))
+        manifest.append(TimelineBlockSource(capture_id=str(row[0]), captured_at=captured_at))
+    return manifest
+
+
+def source_capture_ids(conn: sqlite3.Connection, block_id: str) -> list[str]:
+    """Return one block's durable bounded-source manifest in prompt order."""
+    return [source.capture_id for source in source_manifest(conn, block_id)]
 
 
 def claim_skill_observation(
