@@ -97,16 +97,24 @@ per-identity fan-out cap.
 Persist-before-apply is deliberate. `apply_status` is `pending`, `applied`, or
 `failed`; a retry reuses the stored window payload and only resumes apply.
 `sessions.delta_end` advances only after success, so retries avoid another LLM
-extraction. Apply mutations and the final status update are not yet one atomic
-transaction; a crash between them can repeat additive relation reinforcement,
-which requires a follow-up idempotency fix. Terminal finalization processes
-only the remaining tail. Session timestamps are capture instants while timeline
-blocks are closed, minute-aligned windows. A complete minute keeps its compact
-normalized TimelineBlock. A minute that crosses an active/session boundary is
-instead reconstructed from source captures inside the exact half-open slice;
-whole-minute entries and focus fields never cross that cutoff. Session end is
-stored as an exclusive instant just after its final event, so the terminal
-capture remains in the slice while later heartbeat captures do not.
+extraction. Point, assertion, event-edge, ordinary relation, and close writes
+in that persisted payload are content-keyed, MAX-based, or monotone
+idempotent. The two additive paths additionally write a
+`memory_delta_apply_receipts` row before mutation. Its
+`(delta_id, logical edge validity generation)` key freezes the next absolute
+observation target under `BEGIN IMMEDIATE`; retry uses `MAX(target)`, so an
+interruption between model writes and the final status update cannot
+double-count attention or co-occurrence evidence. A closed and later reopened
+edge starts a new generation at one rather than inheriting the old interval's
+strength.
+Terminal finalization processes only the remaining tail. Session timestamps
+are capture instants while timeline blocks are closed, minute-aligned windows.
+A complete minute keeps its compact normalized TimelineBlock. A minute that
+crosses an active/session boundary is instead reconstructed from source
+captures inside the exact half-open slice; whole-minute entries and focus
+fields never cross that cutoff. Session end is stored as an exclusive instant
+just after its final event, so the terminal capture remains in the slice while
+later heartbeat captures do not.
 
 Terminal off-minute modeling waits until the closing TimelineBlock exists only
 when that exact terminal slice contains durable capture occupancy. That block is
@@ -128,6 +136,11 @@ LLM/persistence failure leaves evidence unclaimed for retry; apply failure keeps
 the claims attached to the stored payload that retry resumes. When a window
 exceeds `max_blocks`, the newest configured number still wins and the selected
 subset is rendered chronologically.
+
+Additive apply receipts reserve targets from
+`max(current edge observations, prior receipt target) + 1`. Because allocation
+holds the database write lock, a second delta cannot reuse a target even when
+the first delta crashes after receipt commit but before edge mutation.
 
 The final evidence-ownership recheck, owner-alias mutations, deterministic
 gate, delta row, and evidence claims run under one `BEGIN IMMEDIATE`

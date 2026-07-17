@@ -23,6 +23,13 @@ source capture IDs, so adjacent off-minute windows consume disjoint evidence
 without sending text beyond either cutoff. The receipts and delta row commit
 atomically: extraction or persistence failure leaves evidence retryable, while
 apply failure keeps the receipts attached to the payload.
+
+``memory_delta_apply_receipts`` makes the only additive apply effects
+crash-idempotent. Before an attention-floor or co-occurrence edge mutates, its
+``(delta_id, effect_key)`` receipt durably freezes the next absolute
+``observations`` target within one edge validity generation. Retrying the same
+delta uses ``MAX(target)`` rather than another increment, while a different
+delta reserves the next target.
 """
 
 from __future__ import annotations
@@ -55,6 +62,13 @@ _REQUIRED_DELTA_COLUMNS = frozenset(
         "is_final",
     }
 )
+_REQUIRED_TABLES = frozenset(
+    {
+        "memory_deltas",
+        "memory_delta_evidence_claims",
+        "memory_delta_apply_receipts",
+    }
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_deltas (
@@ -79,6 +93,16 @@ CREATE TABLE IF NOT EXISTS memory_delta_evidence_claims (
     ordinal INTEGER NOT NULL,
     UNIQUE(delta_id, ordinal)
 );
+
+CREATE TABLE IF NOT EXISTS memory_delta_apply_receipts (
+    delta_id INTEGER NOT NULL REFERENCES memory_deltas(id) ON DELETE CASCADE,
+    effect_key TEXT NOT NULL,
+    target_observations INTEGER NOT NULL CHECK(target_observations >= 1),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(delta_id, effect_key)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_delta_apply_effect
+    ON memory_delta_apply_receipts(effect_key, target_observations DESC);
 """
 
 
@@ -87,10 +111,12 @@ def _schema_ready(conn: sqlite3.Connection) -> bool:
         str(row[0])
         for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
-            " AND name IN ('memory_deltas', 'memory_delta_evidence_claims')"
+            " AND name IN"
+            " ('memory_deltas', 'memory_delta_evidence_claims',"
+            "  'memory_delta_apply_receipts')"
         ).fetchall()
     }
-    if tables != {"memory_deltas", "memory_delta_evidence_claims"}:
+    if tables != _REQUIRED_TABLES:
         return False
     columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_deltas)")}
     return columns >= _REQUIRED_DELTA_COLUMNS
@@ -409,6 +435,119 @@ def next_for_session_start(
 def set_apply_status(conn: sqlite3.Connection, delta_id: int, status: str) -> None:
     ensure_schema(conn)
     conn.execute("UPDATE memory_deltas SET apply_status=? WHERE id=?", (status, delta_id))
+
+
+def reserve_additive_target(
+    conn: sqlite3.Connection,
+    *,
+    delta_id: int,
+    effect_key: str,
+    src_identity: str,
+    dst_identity: str,
+    predicate: str,
+) -> tuple[int, str | None]:
+    """Durably reserve one additive edge's absolute observation target.
+
+    Allocation holds ``BEGIN IMMEDIATE`` while reading both the live edge and
+    prior reservations in its current validity generation. Therefore delta B
+    reserves ``N+2`` even when delta A already reserved ``N+1`` but crashed
+    before mutating the edge. A newly reopened edge starts a fresh generation
+    at one. The receipt commits before the caller applies ``MAX(target)``, so
+    every interruption point is retryable without another additive increment.
+
+    Returns ``(target_observations, current_edge_id)``. The edge id is refreshed
+    under the same write lock so a retry does not rely on a stale pre-receipt
+    edge scan.
+    """
+    ensure_schema(conn)
+    from . import relation_edges as edges_store
+
+    edges_store.ensure_schema(conn)
+    effect = str(effect_key).strip()
+    src = str(src_identity).strip()
+    dst = str(dst_identity).strip()
+    pred = str(predicate).strip()
+    if int(delta_id) < 1:
+        raise ValueError("memory_delta apply receipt requires a positive delta_id")
+    if not effect or not src or not dst or not pred:
+        raise ValueError("memory_delta apply receipt edge fields must be non-empty")
+    if conn.in_transaction:
+        raise RuntimeError("reserve_additive_target requires an autocommit connection")
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if conn.execute("SELECT 1 FROM memory_deltas WHERE id=?", (delta_id,)).fetchone() is None:
+            raise ValueError(f"memory_delta {delta_id} does not exist")
+
+        if pred == "knows":
+            edge = conn.execute(
+                "SELECT edge_id, observations FROM relation_edges"
+                " WHERE predicate=? AND valid_to IS NULL"
+                " AND status IN ('shadow','active')"
+                " AND ((src_identity=? AND dst_identity=?)"
+                "      OR (src_identity=? AND dst_identity=?))"
+                " ORDER BY observations DESC, created_at ASC LIMIT 1",
+                (pred, src, dst, dst, src),
+            ).fetchone()
+            previous_generation = conn.execute(
+                "SELECT edge_id FROM relation_edges"
+                " WHERE predicate=? AND valid_to IS NOT NULL"
+                " AND ((src_identity=? AND dst_identity=?)"
+                "      OR (src_identity=? AND dst_identity=?))"
+                " ORDER BY valid_to DESC, created_at DESC LIMIT 1",
+                (pred, src, dst, dst, src),
+            ).fetchone()
+        else:
+            edge = conn.execute(
+                "SELECT edge_id, observations FROM relation_edges"
+                " WHERE src_identity=? AND dst_identity=? AND predicate=?"
+                " AND valid_to IS NULL AND status IN ('shadow','active')"
+                " ORDER BY observations DESC, created_at ASC LIMIT 1",
+                (src, dst, pred),
+            ).fetchone()
+            previous_generation = conn.execute(
+                "SELECT edge_id FROM relation_edges"
+                " WHERE src_identity=? AND dst_identity=? AND predicate=?"
+                " AND valid_to IS NOT NULL"
+                " ORDER BY valid_to DESC, created_at DESC LIMIT 1",
+                (src, dst, pred),
+            ).fetchone()
+        edge_id = str(edge[0]) if edge is not None else None
+        current_observations = int(edge[1] or 0) if edge is not None else 0
+        generation = str(previous_generation[0]) if previous_generation is not None else "initial"
+        scoped_effect = f"{effect}:generation:{generation}"
+
+        existing = conn.execute(
+            "SELECT target_observations FROM memory_delta_apply_receipts"
+            " WHERE delta_id=? AND effect_key=?",
+            (delta_id, scoped_effect),
+        ).fetchone()
+        if existing is not None:
+            target = int(existing[0])
+        else:
+            receipt_max = conn.execute(
+                "SELECT COALESCE(MAX(target_observations), 0)"
+                " FROM memory_delta_apply_receipts WHERE effect_key=?",
+                (scoped_effect,),
+            ).fetchone()
+            max_reserved = int(receipt_max[0] or 0) if receipt_max is not None else 0
+            target = max(current_observations, max_reserved) + 1
+            conn.execute(
+                "INSERT INTO memory_delta_apply_receipts"
+                " (delta_id, effect_key, target_observations, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    delta_id,
+                    scoped_effect,
+                    target,
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+        conn.commit()
+        return target, edge_id
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def stats(conn: sqlite3.Connection) -> dict:

@@ -49,7 +49,7 @@ _PURGE_BUSY_TIMEOUT_MS = 100
 # independent from PRAGMA user_version, which already tracks the secure-FTS
 # migration. Clients require an exact match: an older binary must not assume a
 # future schema is backward compatible.
-_RUNTIME_SCHEMA_REVISION = "2026-07-17.3"
+_RUNTIME_SCHEMA_REVISION = "2026-07-17.4"
 _ENTRIES_FTS_OBJECTS = (
     "entries",
     "entries_data",

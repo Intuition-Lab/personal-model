@@ -3646,6 +3646,7 @@ def _clean_timeline_locked() -> int:
 
 _MODEL_TABLES = (
     # Child receipts first: runtime connections do not enable foreign_keys.
+    "memory_delta_apply_receipts",
     "memory_delta_evidence_claims",
     "memory_deltas",
     "memory_contradictions",

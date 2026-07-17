@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from persome.evomem.engine import EvoMemory
 from persome.store import fts
+from persome.store import memory_deltas as deltas_store
 from persome.store import relation_edges as edges_store
 from persome.writer import delta_apply
 
@@ -357,6 +358,129 @@ def test_cooccurrence_relation_accumulates_then_promotes(ac_root):
         ).fetchone()[0]
     assert tuple(row) == (3, "shadow")
     assert promoted == 1 and status == "active"
+
+
+def test_receipt_targets_survive_interleaved_deltas_before_first_mutation(ac_root):
+    """A reserved-but-not-mutated delta cannot make the next delta reuse its target."""
+    effect_key = "edge:test-interleaved-cooccurrence"
+    with fts.cursor() as conn:
+        edge_id = edges_store.add_edge(
+            conn,
+            src_identity="\u5f20\u4e09",
+            dst_identity="\u674e\u56db",
+            predicate="knows",
+            src_kind="person",
+            dst_kind="person",
+            provenance="inferred",
+            confidence=0.6,
+            observations=5,
+        )
+        delta_a = deltas_store.insert(conn, session_id="delta-a", payload={})
+        delta_b = deltas_store.insert(conn, session_id="delta-b", payload={})
+
+        # A freezes 6, then crashes before touching the edge. B must observe A's
+        # durable reservation and freeze 7 even though the live edge is still 5.
+        target_a, found_a = deltas_store.reserve_additive_target(
+            conn,
+            delta_id=delta_a,
+            effect_key=effect_key,
+            src_identity="\u5f20\u4e09",
+            dst_identity="\u674e\u56db",
+            predicate="knows",
+        )
+        target_b, found_b = deltas_store.reserve_additive_target(
+            conn,
+            delta_id=delta_b,
+            effect_key=effect_key,
+            src_identity="\u674e\u56db",
+            dst_identity="\u5f20\u4e09",
+            predicate="knows",
+        )
+
+        assert (target_a, found_a) == (6, edge_id)
+        assert (target_b, found_b) == (7, edge_id)
+
+        # B mutates first; delayed/retried A uses MAX(6), so it cannot erase or
+        # duplicate either observation.
+        edges_store.reinforce_edge(
+            conn,
+            edge_id=edge_id,
+            observations=target_b,
+            additive=False,
+        )
+        edges_store.reinforce_edge(
+            conn,
+            edge_id=edge_id,
+            observations=target_a,
+            additive=False,
+        )
+        observations = conn.execute(
+            "SELECT observations FROM relation_edges WHERE edge_id=?",
+            (edge_id,),
+        ).fetchone()[0]
+        receipts = conn.execute(
+            "SELECT delta_id, target_observations FROM memory_delta_apply_receipts"
+            " WHERE effect_key LIKE ? ORDER BY target_observations",
+            (f"{effect_key}:generation:%",),
+        ).fetchall()
+
+    assert observations == 7
+    assert [tuple(row) for row in receipts] == [(delta_a, 6), (delta_b, 7)]
+
+
+def test_additive_receipt_target_resets_for_reopened_edge_generation(ac_root):
+    effect_key = "edge:test-reopened-floor"
+    with fts.cursor() as conn:
+        first_edge = edges_store.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity="Project A",
+            predicate="engaged_with",
+            src_kind="self",
+            dst_kind="project",
+            provenance="inferred",
+            confidence=1.0,
+            observations=4,
+            status="active",
+        )
+        first_delta = deltas_store.insert(conn, session_id="before-close", payload={})
+        first_target, _ = deltas_store.reserve_additive_target(
+            conn,
+            delta_id=first_delta,
+            effect_key=effect_key,
+            src_identity="self",
+            dst_identity="Project A",
+            predicate="engaged_with",
+        )
+        assert first_target == 5
+        edges_store.reinforce_edge(
+            conn,
+            edge_id=first_edge,
+            observations=first_target,
+            additive=False,
+        )
+        assert edges_store.close_edge(conn, edge_id=first_edge)
+
+        reopened_delta = deltas_store.insert(conn, session_id="after-close", payload={})
+        reopened_target, open_edge = deltas_store.reserve_additive_target(
+            conn,
+            delta_id=reopened_delta,
+            effect_key=effect_key,
+            src_identity="self",
+            dst_identity="Project A",
+            predicate="engaged_with",
+        )
+        targets = [
+            row[0]
+            for row in conn.execute(
+                "SELECT target_observations FROM memory_delta_apply_receipts"
+                " WHERE effect_key LIKE ? ORDER BY delta_id",
+                (f"{effect_key}:generation:%",),
+            )
+        ]
+
+    assert reopened_target == 1 and open_edge is None
+    assert targets == [5, 1]
 
 
 def test_org_nesting_part_of(ac_root):
