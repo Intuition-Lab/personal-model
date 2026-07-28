@@ -19,13 +19,13 @@ Personal Model is an open-source, local-first long-term memory Runtime. It learn
 
 **Runs locally on your Mac. Private by default. Yours to inspect, correct, export, and delete.**
 
-[![CI](https://github.com/Intuition-Lab/personal-model/actions/workflows/ci.yml/badge.svg)](https://github.com/Intuition-Lab/personal-model/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/Intuition-Lab/personal-model)](https://github.com/Intuition-Lab/personal-model/releases) [![GitHub stars](https://img.shields.io/github/stars/Intuition-Lab/personal-model?style=flat&logo=github&label=Stars)](https://github.com/Intuition-Lab/personal-model) [![License: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-blue)](LICENSE) [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black)](#2-install-with-your-data) [![MCP](https://img.shields.io/badge/interface-MCP-0b7285)](MCP.md) [![Official MCP Registry](https://img.shields.io/badge/Official_MCP_Registry-Personal_Model-6f42c1)](https://registry.modelcontextprotocol.io/?q=personal-model)
+[![CI](https://github.com/Intuition-Lab/personal-model/actions/workflows/ci.yml/badge.svg)](https://github.com/Intuition-Lab/personal-model/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/Intuition-Lab/personal-model)](https://github.com/Intuition-Lab/personal-model/releases) [![GitHub stars](https://img.shields.io/github/stars/Intuition-Lab/personal-model?style=flat&logo=github&label=Stars)](https://github.com/Intuition-Lab/personal-model) [![License: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-blue)](LICENSE) [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black)](#1-install-with-your-data) [![MCP](https://img.shields.io/badge/interface-MCP-0b7285)](MCP.md) [![Official MCP Registry](https://img.shields.io/badge/Official_MCP_Registry-Personal_Model-6f42c1)](https://registry.modelcontextprotocol.io/?q=personal-model)
 
-[Try the five-minute demo](#1-five-minute-synthetic-demo) · [Install Personal Model](#2-install-with-your-data) · [Connect your AI tool](#works-with-claude-code-codex-cursor-agent-and-mcp-clients) · [Star Personal Model on GitHub](https://github.com/Intuition-Lab/personal-model)
+[Install Personal Model](#1-install-with-your-data) · [Connect your AI tool](#works-with-claude-code-codex-cursor-agent-and-mcp-clients) · [Star Personal Model on GitHub](https://github.com/Intuition-Lab/personal-model)
 
 ![Illustration of a mature Personal Model with evidence-linked Points, Lines, Faces, Volumes, and a Root](docs/assets/readme/personal-model.png)
 
-_Concept illustration of a mature Personal Model. The deterministic Runtime proof is shown in the demo below._
+_Concept illustration of a mature Personal Model._
 
 ---
 
@@ -123,28 +123,9 @@ external actions that need your approval.
 
 ## Install, connect, and verify
 
-**Choose the path that matches what you want to prove.** The synthetic demo and the real-data install are intentionally separate.
+**Install Personal Model, connect a trusted MCP client, then verify the local Runtime.**
 
-### 1. Five-minute synthetic demo
-
-Try the complete model without touching your personal data. This path requires
-Git and [uv](https://docs.astral.sh/uv/getting-started/installation/), but no API
-key, macOS Accessibility permission, or access to your existing `~/.persome`
-data.
-
-```text
-git clone https://github.com/Intuition-Lab/personal-model.git
-cd personal-model
-uv run python scripts/sample_demo.py
-```
-
-The script opens the local viewer at `http://127.0.0.1:8743/model` and deletes its temporary synthetic data when you press `Ctrl-C`. Add `--showcase` for the denser, still fully synthetic graph shown below.
-
-![Personal Model local viewer rendering a dense synthetic Point, Line, Face, Volume, and Root graph](docs/assets/persome-model-hero.png)
-
-_Actual `/model` screenshot produced by `scripts/sample_demo.py --showcase`: 424 synthetic Points, 146 Lines, 12 Faces, 4 Volumes, and 1 Root. It contains no personal data._
-
-### 2. Install with your data
+### 1. Install with your data
 
 Requirements: macOS 13 or newer and Xcode Command Line Tools. For the shortest package-managed installation:
 
@@ -202,7 +183,7 @@ A trusted MCP client that supports Sampling with tools can still call
 use the connected agent allowance without exposing its OAuth token to Personal Model;
 the CLI bridge is the opt-in path that also powers unattended stages.
 
-### 3. Connect a trusted MCP client
+### 2. Connect a trusted MCP client
 
 Register whichever owner-local clients you use:
 
@@ -243,7 +224,7 @@ persome install mcp-json --filename persome-mcp.json
 
 > MCP access is a personal-data capability; register only clients you trust.
 
-### 4. Verify and ask grounded questions
+### 3. Verify and ask grounded questions
 
 ```text
 persome status
@@ -266,7 +247,7 @@ After connecting an MCP client, try one of these recipes:
 
 Active work is reduced every five minutes by default. With valid capture and a working semantic provider, a first useful recall is operationally expected within about ten minutes—not guaranteed as a benchmark result.
 
-### 5. Update Personal Model
+### 4. Update Personal Model
 
 For a `uv tool` installation, upgrade with the package manager and re-run Runtime proof:
 
