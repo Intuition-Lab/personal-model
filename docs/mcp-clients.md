@@ -64,6 +64,18 @@ codex mcp add persome -- persome mcp
 The CLI and IDE extension share `~/.codex/config.toml`. Remove the entry with
 `persome uninstall codex`.
 
+## Cursor Agent CLI
+
+```bash
+persome install cursor-agent
+```
+
+The installer writes an owner-only stdio entry to `~/.cursor/mcp.json`, preserves
+unrelated keys and MCP servers, and records the absolute Persome executable path.
+Start a new Cursor Agent session, then confirm that `persome` exposes tools
+including `search`, `read_receipt`, and `get_model_snapshot`. Remove the same
+user-scoped entry with `persome uninstall cursor --scope user`.
+
 ## opencode
 
 ```bash
