@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/Intuition-Lab/personal-model/releases/tag/v0.3.2">
-    <img src="docs/assets/readme/demo-preview.gif" alt="Looping 10-second preview of the Personal Model viewer orbiting an evidence-linked model" width="720">
+    <img src="docs/assets/readme/demo-preview.gif" alt="Looping 10-second preview of the Personal Model viewer orbiting an evidence-linked model" width="100%">
   </a>
 </p>
 <p align="center">
