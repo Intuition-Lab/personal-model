@@ -19,6 +19,11 @@ def test_readme_heroes_and_demo_keep_branding_and_runtime_proof_distinct() -> No
 
     assert hero.startswith("# Personal Model: local-first AI memory for coding agents\n")
     assert sum(line.startswith("# ") for line in hero.splitlines()) == 1
+    preview = root / "docs/assets/readme/demo-preview.gif"
+    assert "docs/assets/readme/demo-preview.gif" in hero
+    assert preview.is_file()
+    assert preview.stat().st_size < 10_000_000
+    assert "releases/download/v0.3.2/demo.mp4" not in hero
     assert "docs/assets/readme/human-md-hero.png" in hero
     assert (root / "docs/assets/readme/human-md-hero.png").is_file()
     assert "docs/assets/readme/personal-model.png" in hero
