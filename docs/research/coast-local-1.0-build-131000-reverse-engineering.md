@@ -30,8 +30,9 @@ application layer. This matches Coast's current
 the database is not separately encrypted and recommends FileVault. No evidence
 of general screen-recording upload was found in this Lite build, but it does
 make or prepare limited outbound requests for updates, analytics, diagnostics,
-favicons, and optional newsletter signup. Airgap Mode suppresses telemetry,
-update checks, and remote favicon requests after relaunch.
+favicons, and optional newsletter signup. Coast's UI and documentation say
+Airgap Mode suppresses telemetry, update checks, and remote favicon requests
+after relaunch; that behavior was not runtime-tested.
 
 ## Evidence discipline
 
@@ -104,9 +105,10 @@ source names, the live schema, media formats, and bundled CLI help:
 - `BrowserURLService` associates supported browser windows with URLs/domains.
 - `AccessibilityTreeBuilder`, `ax_node`, `ax_node_edge`, and `ax_snapshot`
   preserve a content-deduplicated AX tree.
-- Pending frames are ordinary HEIC images. A sampled archive was an ordinary
-  HEVC MP4 encoded with `hevc_videotoolbox`; the database maps each logical
-  frame to a video and frame index.
+- Pending frames are ordinary HEIC images. Container and codec metadata from
+  one archive showed an ordinary HEVC MP4 encoded with
+  `hevc_videotoolbox`; the database maps each logical frame to a video and
+  frame index.
 - FTS5 indexes foreground OCR, background OCR, and titles.
 - `TFIDFEmbeddingProvider` supports text-difference sampling and result
   coverage. This is lexical TF-IDF, not a neural embedding model.
@@ -169,8 +171,10 @@ inverse-document-frequency values.
 ### Pixel storage
 
 Pending pixels are regular HEIC files. Compacted archives are regular,
-extensionless ISO MP4 files. The sampled segment used HEVC at one encoded frame
-per second. These files are not encrypted containers.
+extensionless ISO MP4 files. The inspected segment used an MP4 timebase of one
+encoded frame per second; that archive setting is separate from the roughly
+two-second wall-clock capture interval. These files are not encrypted
+containers.
 
 The current official policy is unusually explicit about this boundary:
 recordings stay on the Mac, but the application does not separately encrypt its
@@ -218,13 +222,14 @@ Unix domain socket. The public surface includes:
 - segment sampling and TF-IDF-based coverage; and
 - an immediate current-screen capture command.
 
-The socket is reachable only through the owner's `~/Library` tree, whose parent
-directory is owner-only on the observed system. No bearer token or explicit
-per-client approval appears in CLI help. An application-layer peer credential
-or handshake was not tested, so it would be incorrect to claim that no
-authentication exists. The practical documented boundary, however, is the
-signed-in user account: installing the bundled skill lets a trusted same-user
-agent query the history.
+Ordinary access to the socket must traverse the owner's `~/Library` tree, whose
+parent directory is owner-only on the observed system. This blocks normal
+cross-account access, but not root or another privileged principal. No bearer
+token or explicit per-client approval appears in CLI help. An application-layer
+peer credential or handshake was not tested, so it would be incorrect to claim
+that no authentication exists. The practical documented boundary, however, is
+the signed-in user account: installing the bundled skill lets a trusted
+same-user agent query the history.
 
 The application can detect and route to Claude, Codex, Cursor, and OpenClaw.
 It either opens a desktop chat with a prefilled prompt or launches the agent CLI
@@ -304,7 +309,8 @@ AVFoundation/CoreAudio linkage alone is not evidence of audio capture.
 - Hardened Runtime and PIE;
 - signed Sparkle updates with an embedded Ed25519 public key;
 - owner-directory protection around the data root and CLI socket;
-- FileVault-compatible local-only storage;
+- local storage that can benefit from FileVault protection before volume
+  unlock;
 - explicit capture exclusions, pause, retention, CLI disable, and Airgap Mode;
   and
 - no evidence of a general screen-data sync path in the installed Lite build.
@@ -371,8 +377,9 @@ Coast: raw visual recall that an external agent interprets
 Persome: evidence-linked, correctable delegation context that an agent inherits
 ```
 
-Persome should preserve its stronger boundaries while matching Coast's
-retrieval ergonomics:
+For Persome, the product opportunity is to preserve its
+[documented security boundaries](../../SECURITY_PRIVACY.md) while matching
+Coast's retrieval ergonomics:
 
 - owner-only `0700`/`0600` storage rather than relying on an owner-only ancestor;
 - fail-closed screenshot encryption or omission;
@@ -382,8 +389,9 @@ retrieval ergonomics:
 - a clear distinction between raw capture, inferred memory, and modeled claims.
 
 Coast demonstrates that agent distribution can be a product feature in its own
-right. Persome's advantage is making the handoff smaller, more durable, more
-auditable, and safer than sending a raw screen-history corpus to every agent.
+right. Persome can differentiate by making the handoff smaller, more durable,
+more auditable, and safer than exposing selected raw screen-history evidence to
+agents.
 
 ## Safe reproduction commands
 
