@@ -319,14 +319,6 @@ client moves into the verified table only after the path is reproducible.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and DCO
 requirements.
 
-## Star History
-
-[View Personal Model's growth on Star History](https://www.star-history.com/#Intuition-Lab/personal-model&Date) or
-[star the repository](https://github.com/Intuition-Lab/personal-model) to follow
-new Runtime and MCP releases.
-
-<!-- A live chart embed now requires repository-owner-generated sealed-token code. -->
-
 ---
 
 <p align="center"><a href="https://github.com/Intuition-Lab/personal-model"><b>Star Personal Model on GitHub</b></a> · <a href="https://registry.modelcontextprotocol.io/?q=personal-model">Official MCP Registry</a> · <a href="https://github.com/Intuition-Lab/personal-model/blob/main/docs/mcp-clients.md">MCP client setup</a> · <a href="https://github.com/Intuition-Lab/personal-model/blob/main/SECURITY_PRIVACY.md">Security &amp; privacy</a></p>
@@ -383,3 +375,13 @@ new Runtime and MCP releases.
 <!-- ALL-CONTRIBUTORS-LIST:END -->
 
 </details>
+
+## Star History
+
+<p align="center">
+  <a href="https://www.star-history.com/#Intuition-Lab/personal-model&amp;Date">
+    <img src="docs/assets/readme/star-history.svg" alt="Star history for Intuition-Lab/personal-model through July 31, 2026" width="100%">
+  </a>
+</p>
+
+<p align="center"><sub>Snapshot through July 31, 2026 · <a href="https://www.star-history.com/#Intuition-Lab/personal-model&amp;Date">Open on Star History</a></sub></p>
