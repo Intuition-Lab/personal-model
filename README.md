@@ -243,7 +243,7 @@ After connecting an MCP client, try one of these recipes:
 
 > Help me continue where I left off on **[project]**. Search recent Personal Model context, distinguish observed facts from inferences, and show the receipts behind the proposed next step.
 
-> Review my current Personal Model with `get_model_snapshot`. Summarize my active priorities and unresolved work, cite supporting evidence, and call out anything sparse, stale, or conflicted.
+> Review my current Personal Model with the default `get_model_snapshot` overview. Page only the specific model sections needed for the answer, cite supporting evidence, and call out anything sparse, stale, or conflicted.
 
 Active work is reduced every five minutes by default. With valid capture and a working semantic provider, a first useful recall is operationally expected within about ten minutes—not guaranteed as a benchmark result.
 

@@ -41,6 +41,16 @@ async def verify(url: str) -> dict:
             if receipt[key] != top[key]:
                 raise RuntimeError(f"receipt mismatch for {key}")
 
+        model_result = await session.call_tool("get_model_snapshot", {})
+        model_text = model_result.content[0].text
+        model = json.loads(model_text)
+        if model.get("section") != "overview" or model.get("projection_schema_version") != 1:
+            raise RuntimeError("get_model_snapshot did not return the bounded overview contract")
+        if len(model_text.encode("utf-8")) > 64 * 1024:
+            raise RuntimeError("get_model_snapshot exceeded the documented MCP result budget")
+        if model_result.structuredContent is not None:
+            raise RuntimeError("get_model_snapshot duplicated its JSON as structured output")
+
         return {
             "endpoint": url,
             "tool_count": len(tool_names),
@@ -52,6 +62,7 @@ async def verify(url: str) -> dict:
                 "content": top["content"],
             },
             "receipt_verified": True,
+            "model_projection_verified": True,
         }
 
 

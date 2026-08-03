@@ -58,7 +58,7 @@ Example client configuration:
 | `resolve_evidence` | Resolve any model ID or receipt one layer down with human labels; separates direct sources, nearby context, and Point history. |
 | `recent_activity` | Read recent durable event entries. |
 | `behavior_patterns` | Read modeled patterns and supporting evidence. |
-| `get_model_snapshot` | Return the versioned Point/Line/Face/Volume/Root model. |
+| `get_model_snapshot` | Return a bounded model overview or one paged Point/Line/Face/Volume/Root/receipt section. |
 | `entity_graph` | Compatibility graph view backed by the same model stores. |
 | `verify_fact` | Check a claim against current and superseded memory. |
 | `get_schema` | Return the Markdown memory schema. |
@@ -94,6 +94,50 @@ stable technical handle in `reference`, and separates `sources`, `context`, and
 Point predecessor/successor `history`. Consumers must not present nearby
 `context` as direct proof.
 
+## Bounded model projection
+
+`get_model_snapshot` defaults to `section="overview"`: build metadata and full
+model counts plus compact Root, Face, and Volume objects. The response has its
+own `projection_schema_version` and explicitly reports coverage; omitted
+Points, Lines, and receipts are not represented as empty canonical arrays.
+
+Call `section="points"`, `"lines"`, `"faces"`, `"volumes"`, `"root"`, or
+`"receipts"` without a cursor for the first page, then pass that page's opaque
+`next_cursor` as `cursor` for the next page. The overview itself does not return
+a page cursor. `limit` is capped at 100, or pass up to 20 exact `ids`.
+Aggregate receipt arrays require `include_evidence_refs=true`.
+
+The JSON string in the MCP result's `content[0].text` is capped at 64 KiB and
+may contain a smaller effective page to stay within that bound. JSON-RPC
+framing and escaping add transport bytes outside this payload budget. An
+individually oversized item returns a `resume_cursor` when later items remain.
+Each page is stable for its own call; restart pagination if a cursor becomes
+stale while the model changes.
+
+The complete schema-v1 snapshot, including historical Points and receipts,
+stays available as an owner-local file:
+
+```bash
+persome model export --out ./model-snapshot.json
+```
+
+`section="full"` returns this instruction without serializing the full model
+over MCP.
+
+### Compatibility and migration
+
+This bounded default is a breaking response-contract migration targeted for
+the next minor release, v0.4.0; it must not ship as a v0.3.x patch. In v0.3.x,
+`get_model_snapshot(redact=...)` returned the complete canonical
+`schema_version: 1` object. Starting with v0.4.0, the same call returns the
+separately versioned `section="overview"` envelope.
+
+Consumers must branch on `projection_schema_version`, page only the sections
+they need, and use `persome model export` when they require the complete
+canonical object. Missing Point, Line, or receipt arrays in an overview mean
+“omitted,” not “empty.” CLI export and owner-local `/model/graph` retain the
+complete canonical schema-v1 contract.
+
 ## Transport configuration
 
 ```toml
@@ -118,7 +162,7 @@ use streamable HTTP or stdio.
 - MCP results contain personal data and must be treated as untrusted content by
   consuming agents; captured text may contain prompt injection.
 - Screenshots are excluded unless explicitly requested.
-- `get_model_snapshot` redacts by default.
+- `get_model_snapshot` projections redact by default and are byte-bounded.
 - `remember` and `correct_memory` are deliberate writes with audit history.
 
 The daemon HTTP endpoint also serves `/model`. Open the

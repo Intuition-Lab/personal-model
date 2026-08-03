@@ -2,8 +2,9 @@
 
 `persome.model` is the public, read-only projection of the model stored by the Runtime.
 It does not define a second model or run capture/build jobs. It turns the current SQLite state into
-one versioned JSON object that a viewer, MCP adapter, or external client can consume without importing
-internal DAOs.
+one versioned JSON object that the local viewer and CLI export can consume without importing internal
+DAOs. The MCP adapter reads that same live generation through a separately versioned, bounded
+overview/page envelope; it does not serialize the complete object into one tool result.
 
 The operator surface is:
 
@@ -62,8 +63,8 @@ from package releases.
 Every `build` object records the core commit, stage model names, prompt hashes, a config hash, input
 window, mock/real mode, timing, and degraded stages. Configuration values themselves are not copied
 into the manifest. Fixed inputs and timestamps produce the same `build_id`.
-The live HTTP, MCP, and CLI-export projections preserve that persisted manifest
-exactly. The manifest `build_id` must match the stable hash of every other manifest field, and
+The live HTTP and CLI-export snapshots, plus each successful MCP overview/page
+projection, preserve that persisted manifest exactly. The manifest `build_id` must match the stable hash of every other manifest field, and
 `complete`/`degraded` must agree with an empty/non-empty `degraded_stages` list. If there is no valid
 completed or degraded manifest, the projection reports
 `status: not_built`, `trigger: no_completed_build`, and a null `build_id`
@@ -71,6 +72,29 @@ instead of synthesizing a completed build from the current database contents.
 The `not_built` and `building` states keep the same fixed build-object keys;
 unavailable commit, config hash, mode, and timestamps are null, model and prompt
 maps are empty, and the input-window bounds are null.
+
+## MCP projection contract
+
+`get_model_snapshot` defaults to an `overview` envelope with
+`projection_schema_version: 1`, the underlying `model_schema_version`, build
+metadata, canonical totals in `model_stats`, compact Root/Face/Volume objects,
+and explicit coverage. Missing `points`, `lines`, or `receipts` mean “omitted
+from this bounded response,” never “the model has none.”
+
+The six Point/Line/Face/Volume/Root/receipt sections are cursor-paged with a maximum of 100 items, and
+up to 20 exact IDs can be selected. Aggregate evidence arrays are counts unless
+explicitly requested. The JSON string in the MCP result's `content[0].text` is
+at most 64 KiB; JSON-RPC framing and escaping are outside that payload budget.
+A smaller effective page or a bounded oversized-item error preserves the text
+payload limit. The error includes a `resume_cursor` when later page items remain.
+The consistency guarantee covers one call, not a sequence of pages while the
+Runtime continues writing.
+
+Full schema-v1 data remains available through `persome model export` and the
+owner-local `/model/graph`. Asking MCP for `section="full"` returns that CLI
+instruction without constructing or sending an unbounded result. This keeps
+historical shadow Points and their evolution/receipt chain in the canonical
+contract while keeping transport behavior safe.
 
 A Face becomes active only after mined and emergent signals agree across stable footprints. A
 Volume has one honest producer (the cross-domain sweeper), so it becomes active after two stable

@@ -142,8 +142,9 @@ model stages report degradation rather than silently claiming success.
   expiring, revocable device sessions.
 - MCP tool execution itself has no provider egress, but a connected agent may
   send returned personal data to its own model provider.
-- `/model/graph` is a raw owner-local inspection surface. Default CLI/MCP model
-  export is redacted; the browser viewer is not a safe publication artifact.
+- `/model/graph` is a raw owner-local inspection surface. CLI model export and
+  bounded MCP model projections redact by default; the browser viewer is not a
+  safe publication artifact.
 - `HUMAN.md` is also a raw owner-local inspection surface, despite its readable
   format and `0600` mode. Do not publish or attach it as though it were a
   redacted export.

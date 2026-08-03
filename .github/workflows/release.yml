@@ -7,7 +7,9 @@ name: Release
 #
 # Cut a release:
 #   1. bump `version` in pyproject.toml + `__version__` in src/persome/__init__.py
-#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+#   2. bump `version` + `packages[0].version` in server.json to the same value
+#   3. run `uv lock` and commit uv.lock + .github/releases/vX.Y.Z.md
+#   4. merge that release-prep commit to main, then tag and push that exact commit
 
 on:
   push:
@@ -45,9 +47,13 @@ jobs:
       - name: Check tag matches package version
         run: |
           pkg_version="$(uv run --no-project python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          registry_version="$(jq -r '.version' server.json)"
+          registry_package_version="$(jq -r '.packages[0].version' server.json)"
           tag_version="${GITHUB_REF_NAME#v}"
-          if [ "$pkg_version" != "$tag_version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME != pyproject version $pkg_version"
+          if [ "$pkg_version" != "$tag_version" ] || \
+             [ "$registry_version" != "$tag_version" ] || \
+             [ "$registry_package_version" != "$tag_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME must match pyproject ($pkg_version), server.json ($registry_version), and Registry package ($registry_package_version)"
             exit 1
           fi
           test -f ".github/releases/${GITHUB_REF_NAME}.md"

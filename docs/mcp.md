@@ -57,7 +57,7 @@ Example stdio client configuration:
 | `resolve_evidence` | Resolve model, memory, activity, and capture references through one progressive evidence contract. |
 | `recent_activity` | Read recent durable event entries. |
 | `behavior_patterns` | Read modeled behavioral patterns plus evidence-backed observed workflow playbooks. |
-| `get_model_snapshot` | Return the versioned Point/Line/Face/Volume/Root model snapshot. |
+| `get_model_snapshot` | Return a bounded model overview or one paged Point/Line/Face/Volume/Root/receipt section. |
 | `entity_graph` | Read the entity/relation graph; retained as a compatibility model view. |
 | `verify_fact` | Check a claim's freshness and explain existing open contradiction ledger rows. |
 | `remember` | Append an explicit, auditable memory. |
@@ -108,6 +108,67 @@ true. When a recalled entry participates in an open contradiction ledger row,
 the result includes the recorded reason and bounded competing claim. Resolved or
 dismissed rows are not replayed.
 
+## Bounded model projection
+
+The canonical model snapshot contains every non-archived historical Point,
+evolution Line, and evidence receipt, so it grows with the audit history. MCP
+does not put that complete object in one result. `get_model_snapshot` defaults
+to an explicit `overview` envelope containing:
+
+```text
+projection_schema_version, model_schema_version, section,
+generated_at, build, model_stats, root, faces, volumes,
+coverage, paging, full_export
+```
+
+Root, Face, and Volume objects retain their high-level meaning and evidence
+counts, while unbounded member/receipt arrays are summarized. Points, Lines,
+Faces, Volumes, Root, and receipt objects can be read with their section name, a
+maximum `limit` of 100. Subsequent pages use the returned opaque `cursor`. Pass
+up to 20 exact `ids` instead of a cursor for a focused selection. Set
+`include_evidence_refs=true` only when the full aggregate references are
+needed; the byte budget still applies.
+
+Call a paged section without `cursor` for its first page, then pass that page's
+opaque `next_cursor` as `cursor` for the next page. The overview does not return
+a page cursor. The JSON string in the MCP result's `content[0].text` is capped
+at 64 KiB. JSON-RPC framing and escaping add transport bytes outside this
+payload budget. The server reduces the effective page before serialization and
+returns a small explicit error if one object by itself cannot fit. When later
+items remain, that error includes a `resume_cursor` that explicitly skips the
+oversized object. One call is transactionally stable, but a page sequence is
+not a frozen database revision; restart if a cursor is stale. Default redaction
+applies before projection.
+
+To avoid rebuilding a large canonical object for every page, one redaction
+variant is retained in process memory for at most 15 seconds; explicit MCP
+memory/model writes clear it, and it is never written to another file.
+
+Use the CLI for the complete schema-v1 object:
+
+```bash
+persome model export --out ./model-snapshot.json
+persome model export --out ./model-snapshot.json --raw  # explicit local opt-out
+```
+
+`section="full"` returns a bounded export hint and never constructs an
+unbounded MCP response. CLI export and owner-local `/model/graph` retain the
+complete historical/audit contract.
+
+### v0.4.0 response migration
+
+The bounded default is a breaking MCP response-contract change scheduled for
+the next minor release, v0.4.0, rather than a v0.3.x patch. In v0.3.x,
+`get_model_snapshot(redact=...)` returned the complete canonical
+`schema_version: 1` snapshot. In v0.4.0, the same call returns the separately
+versioned `section="overview"` envelope.
+
+Client integrations must detect `projection_schema_version`, treat omitted
+overview sections as omitted rather than empty, and request the required page
+explicitly. Integrations that need one complete canonical object must use
+`persome model export`; owner-local `/model/graph` and CLI export retain the
+canonical schema-v1 shape.
+
 ## Transport
 
 ```toml
@@ -136,7 +197,7 @@ port = 8742
   to the originating trusted client through MCP Sampling; the client remains in
   control of its model, authentication, approval policy, and allowance.
 - Screenshots are excluded unless a tool call explicitly requests one.
-- `get_model_snapshot` redacts detectable secrets and local paths by default.
+- `get_model_snapshot` projections redact detectable secrets and local paths by default and are byte-bounded.
 - Write tools are explicit and auditable; the removed computer-use tools are
   not part of this server.
 
