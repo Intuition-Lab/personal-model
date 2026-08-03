@@ -77,8 +77,8 @@ exposes only compact OCR state because it is the unauthenticated liveness route.
 
 ## Model contract
 
-`GET /model/graph` wraps a `model` object with the same schema returned by the
-MCP `get_model_snapshot` tool and CLI `persome model export`:
+`GET /model/graph` wraps a complete `model` object with the same schema written
+by CLI `persome model export`:
 
 ```text
 schema_version, generated_at, build,
@@ -90,9 +90,14 @@ Every Line derived from activity carries `source_kind`, `source_id`, and
 `event:intent:<id>` and are read only when an old `intents` table exists.
 
 The loopback viewer receives raw local graph/model detail so its owner can
-inspect the real person model. `persome model export` and MCP
-`get_model_snapshot` apply deterministic redaction by default; `/model/graph`
-is not a publication endpoint.
+inspect the real person model. `persome model export` applies deterministic
+redaction by default; `/model/graph` is not a publication endpoint.
+
+MCP `get_model_snapshot` reads the same live generation but returns a separate
+bounded envelope: the default overview carries compact Root/Face/Volume data
+and canonical totals, while Points, Lines, Faces, Volumes, and receipts are
+available in 64 KiB-bounded pages or by exact ID. Full snapshots are exported
+to a local file instead of being placed in one MCP result.
 
 The authenticated viewer polls for model changes, but the Runtime keeps one
 owner-local graph payload in memory for at most 15 seconds and makes refresh

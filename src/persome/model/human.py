@@ -260,7 +260,7 @@ def render_human_markdown(snapshot: dict[str, Any], *, redacted: bool = False) -
             f"{int(stats.get('roots') or 0)} Root",
             f"- Evidence receipts: {int(stats.get('receipts') or 0)}",
             f"- Degraded stages: {_safe_markdown(', '.join(map(str, degraded))) or 'none'}",
-            "- Full evidence: `persome model export` or MCP `get_model_snapshot`",
+            "- Full evidence: `persome model export`; MCP provides bounded overview/pages",
             "",
         ]
     )

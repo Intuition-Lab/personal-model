@@ -1,10 +1,13 @@
 # Personal model format
 
 The public personal model is a versioned, read-only JSON projection of local
-Runtime state. CLI export, MCP `get_model_snapshot`, and the `model` object
-inside `/model/graph` expose the same schema; consumers must not import internal
-DAOs or query SQLite tables directly. Redaction policy differs: export and MCP
-redact by default, while the owner-only loopback viewer uses raw local content.
+Runtime state. CLI export and the `model` object inside `/model/graph` expose
+the complete schema below; consumers must not import internal DAOs or query
+SQLite tables directly. MCP `get_model_snapshot` overview/page reads use the
+same live model generation but return a separately versioned, bounded projection so a growing
+audit history cannot overflow an MCP client. Redaction policy differs: export
+and MCP redact by default, while the owner-only loopback viewer uses raw local
+content.
 
 `<PERSOME_ROOT>/HUMAN.md` (`~/.persome/HUMAN.md` by default) is a separate,
 deterministic reading view of that snapshot, not another model or import
@@ -33,6 +36,36 @@ an explicit still-forming placeholder rather than a fabricated identity.
 
 Consumers must branch on `schema_version`. Package versions do not substitute
 for a schema check.
+
+## MCP bounded projection
+
+`get_model_snapshot(section="overview")` is the default agent-facing read. It
+returns `projection_schema_version`, `model_schema_version`, build metadata,
+canonical `model_stats`, and compact Root/Face/Volume objects. It deliberately
+omits `points`, `lines`, and `receipts` instead of returning empty arrays that
+could be mistaken for an empty model. `coverage` states what was returned and
+the full canonical totals.
+
+Use the `points`, `lines`, `faces`, `volumes`, `root`, or `receipts` sections
+with the opaque `cursor` and a limit of at most 100. Up to 20 exact `ids` can replace a
+cursor for a focused read. Aggregate member and receipt arrays are summarized
+by default; `include_evidence_refs=true` opts into them while retaining the
+same hard 64 KiB JSON-result budget. A page may therefore return fewer items
+than requested, and one individually oversized object returns an explicit
+bounded error with a `resume_cursor` when later items remain. Each call is
+transactionally stable; pages do not claim a
+cross-call frozen database revision.
+
+`section="full"` never serializes the full object over MCP. It returns the
+local, redacted-by-default export instruction instead:
+
+```bash
+persome model export --out ./model-snapshot.json
+```
+
+This projection does not change canonical `schema_version: 1`: CLI export and
+`/model/graph` still include historical Points, evolution Lines, and complete
+receipts.
 
 The `build` object has one fixed key set in every state. While a build is in
 progress or no valid completed build exists, unavailable identity fields are

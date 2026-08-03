@@ -37,6 +37,7 @@ from ..store import fts, health_events
 from ..timeline import attention_trajectory as attention_traj
 from ..timeline import store as timeline_store
 from . import captures as captures_mod
+from . import model_projection
 from .limits import (
     bounded_float,
     bounded_int,
@@ -46,6 +47,54 @@ from .limits import (
 )
 
 logger = get("persome.mcp")
+
+_MCP_MODEL_SNAPSHOT_CACHE_TTL_SECONDS = 15.0
+
+
+class _ModelSnapshotCache:
+    """Keep one short-lived canonical snapshot for an MCP overview/page sequence."""
+
+    def __init__(self, *, ttl_seconds: float = _MCP_MODEL_SNAPSHOT_CACHE_TTL_SECONDS) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._lock = threading.Lock()
+        self._entry: tuple[bool, float, dict[str, Any]] | None = None
+        self._expiry_timer: threading.Timer | None = None
+
+    def get(self, conn, *, redact: bool) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+        from ..model import build_live_snapshot
+
+        with self._lock:
+            now = time.monotonic()
+            if self._entry is not None:
+                cached_redact, created_at, snapshot = self._entry
+                if cached_redact == redact and now - created_at < self._ttl_seconds:
+                    return snapshot
+            snapshot = build_live_snapshot(conn, redact=redact)
+            created_at = time.monotonic()
+            self._entry = (redact, created_at, snapshot)
+            if self._expiry_timer is not None:
+                self._expiry_timer.cancel()
+            self._expiry_timer = threading.Timer(
+                self._ttl_seconds,
+                self._expire,
+                args=(created_at,),
+            )
+            self._expiry_timer.daemon = True
+            self._expiry_timer.start()
+            return snapshot
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entry = None
+            if self._expiry_timer is not None:
+                self._expiry_timer.cancel()
+                self._expiry_timer = None
+
+    def _expire(self, created_at: float) -> None:
+        with self._lock:
+            if self._entry is not None and self._entry[1] == created_at:
+                self._entry = None
+                self._expiry_timer = None
 
 
 def _parse_iso_opt(value: str | None) -> datetime | None:
@@ -140,11 +189,32 @@ def _read_memory(  # type: ignore[no-untyped-def]
     }
 
 
-def _get_model_snapshot(conn, *, redact: bool = True) -> dict[str, Any]:  # type: ignore[no-untyped-def]
-    """Project the live personal model through the same versioned contract as CLI export."""
+def _get_model_snapshot(  # type: ignore[no-untyped-def]
+    conn,
+    *,
+    redact: bool = True,
+    section: str = "overview",
+    cursor: str | None = None,
+    limit: int = model_projection.DEFAULT_PAGE_LIMIT,
+    ids: list[str] | None = None,
+    include_evidence_refs: bool = False,
+) -> dict[str, Any]:
+    """Return one bounded MCP projection of the live, versioned personal model."""
+    model_projection.validate_request(section=section, cursor=cursor, ids=ids)
+    if section == "full":
+        return model_projection.full_export_response(redact=redact)
     from ..model import build_live_snapshot
 
-    return build_live_snapshot(conn, redact=redact)
+    snapshot = build_live_snapshot(conn, redact=redact)
+    return model_projection.project_snapshot(
+        snapshot,
+        redact=redact,
+        section=section,
+        cursor=cursor,
+        limit=limit,
+        ids=ids,
+        include_evidence_refs=include_evidence_refs,
+    )
 
 
 def _search(  # type: ignore[no-untyped-def]
@@ -1027,6 +1097,7 @@ def build_server(
     # FastMCP otherwise reports the SDK version in the MCP initialize response.
     # The server contract must identify the Persome Runtime release instead.
     server._mcp_server.version = __version__  # noqa: SLF001
+    model_snapshot_cache = _ModelSnapshotCache()
 
     @server.tool()
     def list_memories(include_dormant: bool = False, include_archived: bool = False) -> str:
@@ -1100,6 +1171,7 @@ def build_server(
         correction = bounded_text("correction", correction, maximum=20_000)
         with fts.cursor() as conn:
             res = correct_mod.update_memory(cfg, conn, correction, source="agent")
+        model_snapshot_cache.clear()
         return json.dumps(
             {"kind": res.kind, "applied": res.applied, "reason": res.reason, "ok": res.ok},
             ensure_ascii=False,
@@ -1218,17 +1290,52 @@ def build_server(
         with fts.cursor() as conn:
             return json.dumps(_behavior_patterns(conn), ensure_ascii=False)
 
-    @server.tool()
-    def get_model_snapshot(redact: bool = True) -> str:
-        """Return the versioned Point/Line/Face/Volume/Root personal-model snapshot.
+    @server.tool(structured_output=False)
+    def get_model_snapshot(
+        redact: bool = True,
+        section: str = "overview",
+        cursor: str | None = None,
+        limit: int = model_projection.DEFAULT_PAGE_LIMIT,
+        ids: list[str] | None = None,
+        include_evidence_refs: bool = False,
+    ) -> str:
+        """Return a bounded projection of the versioned Personal Model.
 
-        This is the stable Runtime boundary used by viewers and external clients. It includes
-        build metadata, provenance receipts, geometry counts, and the singleton Root. The call
-        is local, read-only, and uncached. ``redact=true`` is the safe default; pass false only
-        when the user explicitly needs their unredacted local model.
+        The default ``section=overview`` returns model/build stats plus compact Root, Face, and
+        Volume objects. Use ``points``, ``lines``, ``faces``, ``volumes``, ``root``, or
+        ``receipts`` for bounded pages; pass the returned opaque ``cursor`` for the next page,
+        or up to 20 exact ``ids`` for a focused selection. Aggregate evidence-reference arrays
+        stay summarized unless ``include_evidence_refs=true`` on their paged section, and still
+        cannot exceed the result byte budget.
+        ``section=full`` returns a small CLI-export instruction because an unbounded snapshot is
+        unsafe for MCP transports. ``redact=true`` is the safe default; pass false only when the
+        user explicitly needs unredacted local model data.
         """
+        section = bounded_text("section", section, maximum=32)
+        cursor = bounded_optional_text("cursor", cursor, maximum=2048)
+        limit = bounded_int(limit, minimum=1, maximum=100)
+        ids = bounded_text_list(
+            "ids",
+            ids,
+            maximum_items=20,
+            maximum_item_chars=1024,
+        )
+        model_projection.validate_request(section=section, cursor=cursor, ids=ids)
+        if section == "full":
+            return model_projection.dumps(model_projection.full_export_response(redact=redact))
         with fts.cursor() as conn:
-            return json.dumps(_get_model_snapshot(conn, redact=redact), ensure_ascii=False)
+            snapshot = model_snapshot_cache.get(conn, redact=redact)
+            return model_projection.dumps(
+                model_projection.project_snapshot(
+                    snapshot,
+                    redact=redact,
+                    section=section,
+                    cursor=cursor,
+                    limit=limit,
+                    ids=ids,
+                    include_evidence_refs=include_evidence_refs,
+                )
+            )
 
     @server.tool()
     def resolve_evidence(reference: str) -> str:
@@ -1725,7 +1832,10 @@ def build_server(
             with use_bridge(bridge):
                 return writer_agent.run(cfg, limit=max_sessions)
 
-        result = await run_request_scoped(bridge, _run)
+        try:
+            result = await run_request_scoped(bridge, _run)
+        finally:
+            model_snapshot_cache.clear()
         status = "aborted" if bridge.cancelled else "completed"
         return json.dumps(
             {
@@ -1768,10 +1878,9 @@ def build_server(
             maximum_item_chars=128,
         )
         with fts.cursor() as conn:
-            return json.dumps(
-                _memory_write.remember(conn, content=content, tags=tag_list, run_id=run_id),
-                ensure_ascii=False,
-            )
+            result = _memory_write.remember(conn, content=content, tags=tag_list, run_id=run_id)
+        model_snapshot_cache.clear()
+        return json.dumps(result, ensure_ascii=False)
 
     if include_http_routes:
         from ..api import register_routes
