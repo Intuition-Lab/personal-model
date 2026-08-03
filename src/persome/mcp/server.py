@@ -25,7 +25,9 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import Field
 
 from .. import __version__, index_health
 from ..config import Config
@@ -49,6 +51,21 @@ from .limits import (
 logger = get("persome.mcp")
 
 _MCP_MODEL_SNAPSHOT_CACHE_TTL_SECONDS = 15.0
+
+_ModelSnapshotSection = Literal[
+    "overview",
+    "points",
+    "lines",
+    "faces",
+    "volumes",
+    "root",
+    "receipts",
+    "full",
+]
+_ModelSnapshotCursor = Annotated[str | None, Field(max_length=2048)]
+_ModelSnapshotLimit = Annotated[int, Field(ge=1, le=100)]
+_ModelSnapshotId = Annotated[str, Field(min_length=1, max_length=1024)]
+_ModelSnapshotIds = Annotated[list[_ModelSnapshotId] | None, Field(max_length=20)]
 
 
 class _ModelSnapshotCache:
@@ -1293,10 +1310,10 @@ def build_server(
     @server.tool(structured_output=False)
     def get_model_snapshot(
         redact: bool = True,
-        section: str = "overview",
-        cursor: str | None = None,
-        limit: int = model_projection.DEFAULT_PAGE_LIMIT,
-        ids: list[str] | None = None,
+        section: _ModelSnapshotSection = "overview",
+        cursor: _ModelSnapshotCursor = None,
+        limit: _ModelSnapshotLimit = model_projection.DEFAULT_PAGE_LIMIT,
+        ids: _ModelSnapshotIds = None,
         include_evidence_refs: bool = False,
     ) -> str:
         """Return a bounded projection of the versioned Personal Model.

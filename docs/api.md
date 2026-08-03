@@ -95,9 +95,11 @@ redaction by default; `/model/graph` is not a publication endpoint.
 
 MCP `get_model_snapshot` reads the same live generation but returns a separate
 bounded envelope: the default overview carries compact Root/Face/Volume data
-and canonical totals, while Points, Lines, Faces, Volumes, and receipts are
-available in 64 KiB-bounded pages or by exact ID. Full snapshots are exported
-to a local file instead of being placed in one MCP result.
+and canonical totals, while Points, Lines, Faces, Volumes, Root, and receipts are
+available in pages or by exact ID. Each page's `content[0].text` JSON payload is
+capped at 64 KiB; JSON-RPC framing and escaping are outside that payload
+budget. Full snapshots are exported to a local file instead of being placed in
+one MCP result.
 
 The authenticated viewer polls for model changes, but the Runtime keeps one
 owner-local graph payload in memory for at most 15 seconds and makes refresh

@@ -124,17 +124,22 @@ coverage, paging, full_export
 Root, Face, and Volume objects retain their high-level meaning and evidence
 counts, while unbounded member/receipt arrays are summarized. Points, Lines,
 Faces, Volumes, Root, and receipt objects can be read with their section name, a
-maximum `limit` of 100, and the returned opaque `cursor`. Pass up to 20 exact
-`ids` instead of a cursor for a focused selection. Set
+maximum `limit` of 100. Subsequent pages use the returned opaque `cursor`. Pass
+up to 20 exact `ids` instead of a cursor for a focused selection. Set
 `include_evidence_refs=true` only when the full aggregate references are
 needed; the byte budget still applies.
 
-Every serialized result is capped at 64 KiB. The server reduces the effective
-page before serialization and returns a small explicit error if one object by
-itself cannot fit. When later items remain, that error includes a
-`resume_cursor` that explicitly skips the oversized object. One call is
-transactionally stable, but a page sequence is not a frozen database revision;
-restart if a cursor is stale. Default redaction applies before projection.
+Call a paged section without `cursor` for its first page, then pass that page's
+opaque `next_cursor` as `cursor` for the next page. The overview does not return
+a page cursor. The JSON string in the MCP result's `content[0].text` is capped
+at 64 KiB. JSON-RPC framing and escaping add transport bytes outside this
+payload budget. The server reduces the effective page before serialization and
+returns a small explicit error if one object by itself cannot fit. When later
+items remain, that error includes a `resume_cursor` that explicitly skips the
+oversized object. One call is transactionally stable, but a page sequence is
+not a frozen database revision; restart if a cursor is stale. Default redaction
+applies before projection.
+
 To avoid rebuilding a large canonical object for every page, one redaction
 variant is retained in process memory for at most 15 seconds; explicit MCP
 memory/model writes clear it, and it is never written to another file.
@@ -149,6 +154,20 @@ persome model export --out ./model-snapshot.json --raw  # explicit local opt-out
 `section="full"` returns a bounded export hint and never constructs an
 unbounded MCP response. CLI export and owner-local `/model/graph` retain the
 complete historical/audit contract.
+
+### v0.4.0 response migration
+
+The bounded default is a breaking MCP response-contract change scheduled for
+the next minor release, v0.4.0, rather than a v0.3.x patch. In v0.3.x,
+`get_model_snapshot(redact=...)` returned the complete canonical
+`schema_version: 1` snapshot. In v0.4.0, the same call returns the separately
+versioned `section="overview"` envelope.
+
+Client integrations must detect `projection_schema_version`, treat omitted
+overview sections as omitted rather than empty, and request the required page
+explicitly. Integrations that need one complete canonical object must use
+`persome model export`; owner-local `/model/graph` and CLI export retain the
+canonical schema-v1 shape.
 
 ## Transport
 

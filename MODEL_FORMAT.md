@@ -50,10 +50,12 @@ Use the `points`, `lines`, `faces`, `volumes`, `root`, or `receipts` sections
 with the opaque `cursor` and a limit of at most 100. Up to 20 exact `ids` can replace a
 cursor for a focused read. Aggregate member and receipt arrays are summarized
 by default; `include_evidence_refs=true` opts into them while retaining the
-same hard 64 KiB JSON-result budget. A page may therefore return fewer items
-than requested, and one individually oversized object returns an explicit
-bounded error with a `resume_cursor` when later items remain. Each call is
-transactionally stable; pages do not claim a
+same hard 64 KiB budget for the JSON string in the MCP result's
+`content[0].text`; JSON-RPC framing and escaping are outside that payload
+budget. A page may therefore return fewer items than requested, and one
+individually oversized object returns an explicit bounded error with a
+`resume_cursor` when later items remain. Each call is transactionally stable;
+pages do not claim a
 cross-call frozen database revision.
 
 `section="full"` never serializes the full object over MCP. It returns the
@@ -66,6 +68,13 @@ persome model export --out ./model-snapshot.json
 This projection does not change canonical `schema_version: 1`: CLI export and
 `/model/graph` still include historical Points, evolution Lines, and complete
 receipts.
+
+The bounded envelope replaces the v0.3.x default MCP response starting with
+the next minor release, v0.4.0. Existing integrations that parsed canonical
+top-level arrays from `get_model_snapshot()` must migrate to
+`projection_schema_version`, request the needed section pages, or use
+`persome model export` for one complete canonical object. This breaking
+response change must not be published as a v0.3.x patch.
 
 The `build` object has one fixed key set in every state. While a build is in
 progress or no valid completed build exists, unavailable identity fields are

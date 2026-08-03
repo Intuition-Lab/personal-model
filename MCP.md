@@ -101,13 +101,18 @@ model counts plus compact Root, Face, and Volume objects. The response has its
 own `projection_schema_version` and explicitly reports coverage; omitted
 Points, Lines, and receipts are not represented as empty canonical arrays.
 
-Use `section="points"`, `"lines"`, `"faces"`, `"volumes"`, `"root"`, or
-`"receipts"` with the returned opaque cursor. `limit` is capped at 100, or pass up to 20
-exact `ids`. Aggregate receipt arrays require
-`include_evidence_refs=true`. Every result is capped at 64 KiB and may use a
-smaller effective page to stay within that bound. An individually oversized
-item returns a `resume_cursor` when later items remain. Each page is stable for
-its own call; restart pagination if a cursor becomes stale while the model changes.
+Call `section="points"`, `"lines"`, `"faces"`, `"volumes"`, `"root"`, or
+`"receipts"` without a cursor for the first page, then pass that page's opaque
+`next_cursor` as `cursor` for the next page. The overview itself does not return
+a page cursor. `limit` is capped at 100, or pass up to 20 exact `ids`.
+Aggregate receipt arrays require `include_evidence_refs=true`.
+
+The JSON string in the MCP result's `content[0].text` is capped at 64 KiB and
+may contain a smaller effective page to stay within that bound. JSON-RPC
+framing and escaping add transport bytes outside this payload budget. An
+individually oversized item returns a `resume_cursor` when later items remain.
+Each page is stable for its own call; restart pagination if a cursor becomes
+stale while the model changes.
 
 The complete schema-v1 snapshot, including historical Points and receipts,
 stays available as an owner-local file:
@@ -118,6 +123,20 @@ persome model export --out ./model-snapshot.json
 
 `section="full"` returns this instruction without serializing the full model
 over MCP.
+
+### Compatibility and migration
+
+This bounded default is a breaking response-contract migration targeted for
+the next minor release, v0.4.0; it must not ship as a v0.3.x patch. In v0.3.x,
+`get_model_snapshot(redact=...)` returned the complete canonical
+`schema_version: 1` object. Starting with v0.4.0, the same call returns the
+separately versioned `section="overview"` envelope.
+
+Consumers must branch on `projection_schema_version`, page only the sections
+they need, and use `persome model export` when they require the complete
+canonical object. Missing Point, Line, or receipt arrays in an overview mean
+“omitted,” not “empty.” CLI export and owner-local `/model/graph` retain the
+complete canonical schema-v1 contract.
 
 ## Transport configuration
 

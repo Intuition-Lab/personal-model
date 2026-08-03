@@ -2,8 +2,15 @@
 
 import asyncio
 import json
+import os
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from mcp.types import CallToolResult
 
 from persome import __version__, paths
@@ -291,6 +298,64 @@ def test_registered_get_model_snapshot_bounds_large_default_result(
     assert len(wire) < 2 * model_projection.MAX_RESULT_BYTES + 4096
 
 
+def test_stdio_get_model_snapshot_bounds_17_mib_canonical_snapshot(ac_root: Path) -> None:
+    fts.initialize_runtime_schema()
+    child_code = """
+from persome.config import Config
+from persome.mcp.server import build_server
+import persome.model as model
+
+marker = "transport-private-marker-" + "x" * (17 * 1024 * 1024)
+snapshot = {
+    "schema_version": 1,
+    "generated_at": "2026-08-03T00:00:00+00:00",
+    "build": {},
+    "points": [{"id": "point-large", "content": marker}],
+    "lines": [],
+    "faces": [],
+    "volumes": [],
+    "root": None,
+    "receipts": [],
+    "stats": {
+        "points": 1,
+        "active_points": 1,
+        "evolution_lines": 0,
+        "relation_lines": 0,
+        "faces": 0,
+        "volumes": 0,
+        "roots": 0,
+        "receipts": 0,
+        "redactions": {},
+    },
+}
+model.build_live_snapshot = lambda conn, redact=True: snapshot
+build_server(Config(), auth_enabled=False, include_http_routes=False).run()
+"""
+
+    async def call_snapshot() -> CallToolResult:
+        env = os.environ.copy()
+        env["PERSOME_ROOT"] = str(ac_root)
+        env["PERSOME_LLM_MOCK"] = "1"
+        params = StdioServerParameters(command=sys.executable, args=["-c", child_code], env=env)
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            return await session.call_tool("get_model_snapshot", {})
+
+    result = asyncio.run(asyncio.wait_for(call_snapshot(), timeout=30.0))
+    assert result.isError is False
+    assert result.structuredContent is None
+    assert len(result.content) == 1
+    raw = result.content[0].text
+    parsed = json.loads(raw)
+    assert parsed["section"] == "overview"
+    assert parsed["model_stats"]["points"] == 1
+    assert "transport-private-marker" not in raw
+    assert len(raw.encode("utf-8")) <= model_projection.MAX_RESULT_BYTES
+
+
 def test_registered_get_model_snapshot_pages_points_with_opaque_cursor(
     ac_root: Path, monkeypatch
 ) -> None:
@@ -316,6 +381,113 @@ def test_registered_get_model_snapshot_pages_points_with_opaque_cursor(
     assert second["page"]["has_more"] is False
     assert second["page"]["next_cursor"] is None
     assert build_calls == [True]
+
+
+def test_registered_get_model_snapshot_rejects_malformed_cursor_before_build(
+    ac_root: Path, monkeypatch
+) -> None:
+    build_calls = []
+
+    def fake_live_snapshot(conn, *, redact=True):  # type: ignore[no-untyped-def]
+        build_calls.append(redact)
+        return _synthetic_snapshot()
+
+    monkeypatch.setattr(model_mod, "build_live_snapshot", fake_live_snapshot)
+    server = mcp_server.build_server(auth_enabled=False)
+    tool = server._tool_manager.get_tool("get_model_snapshot")
+    assert tool is not None
+
+    with pytest.raises(ValueError, match="invalid model pagination cursor"):
+        tool.fn(section="points", cursor="not-a-model-cursor")
+
+    assert build_calls == []
+
+
+def test_model_snapshot_cache_ttl_and_stale_timer_guard(monkeypatch) -> None:
+    now = [100.0]
+    build_calls: list[bool] = []
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, function, args=()):  # type: ignore[no-untyped-def]
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.cancelled = False
+            self.daemon = False
+            timers.append(self)
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+        def fire(self) -> None:
+            self.function(*self.args)
+
+    def fake_live_snapshot(conn, *, redact=True):  # type: ignore[no-untyped-def]
+        build_calls.append(redact)
+        return {"redact": redact, "generation": len(build_calls)}
+
+    monkeypatch.setattr(mcp_server.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(mcp_server.threading, "Timer", FakeTimer)
+    monkeypatch.setattr(model_mod, "build_live_snapshot", fake_live_snapshot)
+    cache = mcp_server._ModelSnapshotCache(ttl_seconds=15.0)
+
+    first = cache.get(None, redact=True)
+    now[0] = 114.999
+    assert cache.get(None, redact=True) is first
+    now[0] = 115.0
+    second = cache.get(None, redact=True)
+
+    assert second is not first
+    assert build_calls == [True, True]
+    assert timers[0].cancelled is True
+    timers[0].fire()
+    assert cache._entry is not None
+    timers[1].fire()
+    assert cache._entry is None
+
+
+def test_model_snapshot_cache_single_flight_and_redaction_isolation(monkeypatch) -> None:
+    build_calls: list[bool] = []
+    calls_lock = threading.Lock()
+    start = threading.Barrier(8)
+    build_started = threading.Event()
+    release_build = threading.Event()
+
+    def fake_live_snapshot(conn, *, redact=True):  # type: ignore[no-untyped-def]
+        with calls_lock:
+            build_calls.append(redact)
+        build_started.set()
+        assert release_build.wait(timeout=10.0)
+        return {"redact": redact, "generation": len(build_calls)}
+
+    monkeypatch.setattr(model_mod, "build_live_snapshot", fake_live_snapshot)
+    cache = mcp_server._ModelSnapshotCache(ttl_seconds=15.0)
+
+    def get_redacted(_index: int) -> dict:
+        start.wait()
+        return cache.get(None, redact=True)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(get_redacted, index) for index in range(8)]
+        assert build_started.wait(timeout=10.0)
+        release_build.set()
+        redacted = [future.result(timeout=10.0) for future in futures]
+
+    assert build_calls == [True]
+    assert len({id(snapshot) for snapshot in redacted}) == 1
+    raw = cache.get(None, redact=False)
+    raw_again = cache.get(None, redact=False)
+    redacted_again = cache.get(None, redact=True)
+
+    assert raw["redact"] is False
+    assert raw_again is raw
+    assert redacted_again["redact"] is True
+    assert redacted_again is not redacted[0]
+    assert build_calls == [True, False, True]
 
 
 def test_registered_get_model_snapshot_pages_shadow_evolution_history(
@@ -498,6 +670,58 @@ def test_registered_get_model_snapshot_redacts_real_model_pages(ac_root: Path) -
     assert home_path in raw_points
 
 
+def test_registered_model_writes_invalidate_snapshot_cache(ac_root: Path, monkeypatch) -> None:
+    from persome.writer import agent as writer_agent
+    from persome.writer import correct as correct_mod
+
+    build_calls: list[bool] = []
+
+    def fake_live_snapshot(conn, *, redact=True):  # type: ignore[no-untyped-def]
+        build_calls.append(redact)
+        return _synthetic_snapshot()
+
+    monkeypatch.setattr(model_mod, "build_live_snapshot", fake_live_snapshot)
+    monkeypatch.setattr(
+        correct_mod,
+        "update_memory",
+        lambda *args, **kwargs: correct_mod.UpdateResult("noop", reason="fixture"),
+    )
+    server = mcp_server.build_server(auth_enabled=False)
+    model_tool = server._tool_manager.get_tool("get_model_snapshot")
+    remember_tool = server._tool_manager.get_tool("remember")
+    correct_tool = server._tool_manager.get_tool("correct_memory")
+    process_tool = server._tool_manager.get_tool("process_pending_model_work")
+    assert model_tool is not None
+    assert remember_tool is not None
+    assert correct_tool is not None
+    assert process_tool is not None
+
+    model_tool.fn()
+    model_tool.fn(section="points")
+    assert build_calls == [True]
+
+    remember_tool.fn(content="A durable test finding")
+    model_tool.fn()
+    assert build_calls == [True, True]
+
+    correct_tool.fn(correction="The prior fixture is wrong")
+    model_tool.fn()
+    assert build_calls == [True, True, True]
+
+    class FakeSession:
+        @staticmethod
+        def check_client_capability(capability) -> bool:  # type: ignore[no-untyped-def]
+            return True
+
+    class FakeContext:
+        session = FakeSession()
+
+    monkeypatch.setattr(writer_agent, "run", lambda cfg, *, limit: writer_agent.WriterRunResult())
+    asyncio.run(process_tool.fn(FakeContext()))
+    model_tool.fn()
+    assert build_calls == [True, True, True, True]
+
+
 def test_registered_get_model_snapshot_full_returns_cli_hint_without_build(
     ac_root: Path, monkeypatch
 ) -> None:
@@ -534,6 +758,27 @@ def test_server_reports_runtime_version(ac_root: Path) -> None:
         "redact",
         "section",
     }
+    properties = model_tool.parameters["properties"]
+    assert properties["section"]["enum"] == [
+        "overview",
+        "points",
+        "lines",
+        "faces",
+        "volumes",
+        "root",
+        "receipts",
+        "full",
+    ]
+    assert properties["limit"]["minimum"] == 1
+    assert properties["limit"]["maximum"] == 100
+    cursor_string = next(
+        item for item in properties["cursor"]["anyOf"] if item.get("type") == "string"
+    )
+    assert cursor_string["maxLength"] == 2048
+    ids_array = next(item for item in properties["ids"]["anyOf"] if item.get("type") == "array")
+    assert ids_array["maxItems"] == 20
+    assert ids_array["items"]["minLength"] == 1
+    assert ids_array["items"]["maxLength"] == 1024
 
 
 def test_stdio_server_skips_daemon_http_routes(ac_root: Path) -> None:

@@ -83,9 +83,10 @@ from this bounded response,” never “the model has none.”
 
 The six Point/Line/Face/Volume/Root/receipt sections are cursor-paged with a maximum of 100 items, and
 up to 20 exact IDs can be selected. Aggregate evidence arrays are counts unless
-explicitly requested. Every serialized MCP projection is at most 64 KiB; a
-smaller effective page or a bounded oversized-item error preserves that limit.
-The error includes a `resume_cursor` when later page items remain.
+explicitly requested. The JSON string in the MCP result's `content[0].text` is
+at most 64 KiB; JSON-RPC framing and escaping are outside that payload budget.
+A smaller effective page or a bounded oversized-item error preserves the text
+payload limit. The error includes a `resume_cursor` when later page items remain.
 The consistency guarantee covers one call, not a sequence of pages while the
 Runtime continues writing.
 
