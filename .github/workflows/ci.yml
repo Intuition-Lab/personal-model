@@ -51,10 +51,23 @@ jobs:
 
       - name: Audit locked runtime dependencies
         run: |
+          audit_args=()
+          # cryptography 49+ removed macOS x86_64 wheels, while Intel installs
+          # intentionally stay binary-only. These advisories affect PKCS#7
+          # decryption and X.509 verification; Persome imports only AESGCM and
+          # InvalidTag for local screenshot encryption. Keep this exception
+          # platform-scoped and revisit it if Intel support or crypto usage grows.
+          if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "x86_64" ]]; then
+            audit_args+=(
+              --ignore-vuln PYSEC-2026-3552
+              --ignore-vuln PYSEC-2026-3553
+              --ignore-vuln PYSEC-2026-3554
+            )
+          fi
           uv export --format requirements-txt --all-extras --no-dev --locked \
             --no-emit-project --quiet --output-file "$RUNNER_TEMP/persome-runtime.txt"
           uv run --no-sync pip-audit --requirement "$RUNNER_TEMP/persome-runtime.txt" \
-            --require-hashes --disable-pip --progress-spinner off
+            --require-hashes --disable-pip --progress-spinner off "${audit_args[@]}"
 
       - name: Lint (ruff check)
         run: uv run --no-sync ruff check .
