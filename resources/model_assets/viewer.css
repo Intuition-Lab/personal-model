@@ -718,7 +718,7 @@ button {
 
 .detail-tabs {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 3px;
   margin-bottom: 14px;
   padding: 3px;
@@ -1493,4 +1493,114 @@ button {
 
 #index-health-banner[hidden] {
   display: none;
+}
+
+/* ── Correct panel ─────────────────────────────────────────────────────── */
+
+.edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.edit-form label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.edit-form textarea,
+.edit-form input[type="text"] {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.edit-form textarea:focus,
+.edit-form input[type="text"]:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.32);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.edit-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.edit-actions button {
+  padding: 8px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.06);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.edit-actions button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+.edit-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.edit-actions button[data-op="retire"] {
+  margin-left: auto;
+  border-color: rgba(255, 138, 128, 0.32);
+  color: rgba(255, 176, 168, 0.92);
+}
+
+.edit-actions button[data-op="retire"]:hover:not(:disabled) {
+  background: rgba(255, 106, 92, 0.14);
+  border-color: rgba(255, 138, 128, 0.5);
+}
+
+.edit-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.edit-status {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.edit-status[data-tone="error"] { color: rgba(255, 158, 148, 0.95); }
+.edit-status[data-tone="warn"] { color: rgba(255, 213, 138, 0.95); }
+.edit-status[data-tone="ok"] { color: rgba(150, 226, 178, 0.95); }
+
+.detail-authored {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid rgba(150, 226, 178, 0.28);
+  border-radius: 999px;
+  background: rgba(150, 226, 178, 0.1);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(150, 226, 178, 0.95);
 }

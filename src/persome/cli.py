@@ -3563,6 +3563,51 @@ def model_status_cmd() -> None:
     console.print(f"last build: {last.get('build_id') or 'none'}")
 
 
+@model_app.command("edit")
+def model_edit_cmd(
+    kind: str = typer.Argument(..., help="point | face | volume | root"),
+    target_id: str = typer.Argument(..., help="The object's id as shown in the model viewer."),
+    replacement: str = typer.Option(
+        "", "--text", help="The owner's wording. Required unless --retire."
+    ),
+    retire: bool = typer.Option(
+        False, "--retire", help="Reject the object instead of rewriting it."
+    ),
+    reason: str = typer.Option("", "--reason", help="Why the correction was made."),
+) -> None:
+    """Correct one modeled object by hand.
+
+    The scriptable twin of the viewer's Correct panel: same writer, same
+    guarantees, no LLM. A Point rewrite supersedes the observed fact and keeps
+    the original in history; a Face, Volume, or Root rewrite marks the object
+    owner-authored so derivation stops overwriting it.
+    """
+    from .model.edit import apply_model_edit
+
+    _init()
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn,
+            kind=kind,
+            target_id=target_id,
+            op="retire" if retire else "rewrite",
+            replacement=replacement,
+            reason=reason,
+        )
+    if not result.ok:
+        console.print(f"[red]edit rejected:[/red] {result.reason}")
+        raise typer.Exit(code=1)
+    for line in result.applied:
+        console.print(f"  - {line}")
+    if result.new_id and result.new_id != result.target_id:
+        console.print(f"new id: {result.new_id}")
+    if result.shadow_misses:
+        console.print(
+            "[yellow]warning:[/yellow] the memory changed but the model layer did not"
+            " pick it up; run `persome doctor`"
+        )
+
+
 @model_app.command("open")
 def model_open(
     after: int = typer.Option(

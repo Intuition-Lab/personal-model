@@ -29,6 +29,7 @@ runtime schema.
 | GET | `/model/graph` | Read the canonical versioned model snapshot. |
 | GET | `/model/evidence?ref=...` | Resolve a model ID or receipt into direct sources and separately labeled nearby context. |
 | GET | `/model/node?id=...` | Resolve a snapshot Point ID or relation endpoint to receipts and its relation tree. |
+| POST | `/model/edit` | Apply one owner correction to a modeled object: rewrite its wording or reject it. |
 
 ### Wearable and health event import
 
@@ -119,6 +120,13 @@ polls and turns a request that exceeds 45 seconds into an explicit retry state.
   bearer in a URL. It exchanges the one-use nonce for an HttpOnly cookie scoped
   to a fresh unguessable viewer path (localhost cookies have no port boundary),
   and protected responses are not cacheable.
+- The viewer capability carries write authority for `POST /model/edit`, because
+  the viewer is the owner's own correction surface. The methods it accepts are
+  an explicit allowlist rather than an omission. What makes that safe is the
+  combination the capability already relies on: the cookie is `HttpOnly` and
+  `SameSite=Strict` so no cross-site page can drive it, the path token must
+  match the cookie, the capability expires, the listener is loopback-only, and
+  the origin guard runs in front. Bearer holders are unaffected.
 - `/captures/ingest` assumes a trusted local producer that obtains the owner
   token through an approved local secret channel and sends the bearer header;
   it is not a public upload API.

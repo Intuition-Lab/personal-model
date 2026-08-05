@@ -45,6 +45,8 @@ const detailHistoryEl = document.getElementById("detail-history-list");
 const evidenceBreadcrumbsEl = document.getElementById("evidence-breadcrumbs");
 const detailTabEls = [...document.querySelectorAll("[data-detail-tab]")];
 const detailPanelEls = [...document.querySelectorAll(".detail-panel")];
+const detailEditFormEl = document.getElementById("detail-edit-form");
+const detailTabEditEl = document.getElementById("detail-tab-edit");
 const emptyEl = document.getElementById("empty");
 const errorEl = document.getElementById("error");
 const modelIdentityEl = document.getElementById("model-identity");
@@ -1230,6 +1232,163 @@ function appendLineTechnicalDetails(item) {
   detailSummaryEl.appendChild(details);
 }
 
+// Kinds that map to a durable row the owner can correct. Evolution lines are
+// synthesized from supersede chains and relation lines are derived edges —
+// neither is an object with an editable proposition. Context nodes are
+// fabricated in this file from relation endpoints and have no server row at all.
+const EDITABLE_KINDS = new Set(["point", "face", "volume", "root"]);
+
+function isEditable(kind, item) {
+  return Boolean(item) && EDITABLE_KINDS.has(kind) && Boolean(item.id);
+}
+
+function editableText(kind, item) {
+  return kind === "point" ? item.content || "" : item.signature || "";
+}
+
+function setEditStatus(message, tone) {
+  const status = detailEditFormEl.querySelector(".edit-status");
+  if (!status) return;
+  status.textContent = message || "";
+  if (tone) status.dataset.tone = tone;
+  else delete status.dataset.tone;
+}
+
+async function submitEdit(kind, item, op, replacement, reason) {
+  const buttons = [...detailEditFormEl.querySelectorAll("button")];
+  buttons.forEach((button) => { button.disabled = true; });
+  setEditStatus(op === "retire" ? "Rejecting…" : "Saving…", null);
+  try {
+    const response = await fetch("./edit", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        kind,
+        id: item.id,
+        op,
+        replacement: op === "retire" ? "" : replacement,
+        reason,
+      }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detail = payload?.detail || `HTTP ${response.status}`;
+      setEditStatus(`Could not save: ${detail}`, "error");
+      buttons.forEach((button) => { button.disabled = false; });
+      return;
+    }
+    const data = payload?.data || {};
+    // A Point rewrite supersedes the old fact, so the object the owner was
+    // looking at now has a new id. Re-target the drawer or it closes on reload.
+    const nextId = data.new_id || item.id;
+    await loadModel(true);
+    if (op === "retire") {
+      clearSelection();
+      return;
+    }
+    const refreshed = items.get(selectionKey(kind, nextId));
+    if (refreshed) {
+      showDetails(kind, refreshed);
+      setDetailTab("edit");
+    } else {
+      clearSelection();
+      return;
+    }
+    if (data.shadow_misses) {
+      // The markdown layer changed but the Point may not have moved. Saying
+      // "saved" here would be a lie the owner cannot see through.
+      setEditStatus(
+        "Saved to memory, but the model layer did not pick it up."
+        + " Run `persome doctor` — the model may need a rebuild.",
+        "warn",
+      );
+    } else {
+      setEditStatus("Saved.", "ok");
+    }
+  } catch (error) {
+    setEditStatus(`Could not save: ${error?.message || error}`, "error");
+    buttons.forEach((button) => { button.disabled = false; });
+  }
+}
+
+function renderEditor(kind, item) {
+  detailEditFormEl.replaceChildren();
+  const editable = isEditable(kind, item);
+  detailTabEditEl.hidden = !editable;
+  if (!editable) {
+    const note = document.createElement("p");
+    note.className = "edit-note";
+    note.textContent = kind === "line"
+      ? "Lines are derived from the objects they connect. Correct those instead."
+      : "This node is drawn from context and has nothing stored to correct.";
+    detailEditFormEl.appendChild(note);
+    return;
+  }
+
+  const form = document.createElement("div");
+  form.className = "edit-form";
+
+  const textLabel = document.createElement("label");
+  textLabel.setAttribute("for", "edit-replacement");
+  textLabel.textContent = kind === "point" ? "In your words" : "What this should say";
+  const textarea = document.createElement("textarea");
+  textarea.id = "edit-replacement";
+  textarea.rows = 4;
+  textarea.maxLength = 4000;
+  textarea.value = editableText(kind, item);
+
+  const reasonLabel = document.createElement("label");
+  reasonLabel.setAttribute("for", "edit-reason");
+  reasonLabel.textContent = "Why (optional)";
+  const reason = document.createElement("input");
+  reason.id = "edit-reason";
+  reason.type = "text";
+  reason.maxLength = 500;
+
+  const actions = document.createElement("div");
+  actions.className = "edit-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.dataset.op = "rewrite";
+  save.textContent = "Save correction";
+  const retire = document.createElement("button");
+  retire.type = "button";
+  retire.dataset.op = "retire";
+  retire.textContent = "This is wrong about me";
+  actions.append(save, retire);
+
+  const note = document.createElement("p");
+  note.className = "edit-note";
+  note.textContent = kind === "point"
+    ? "Your wording supersedes the observed fact. The original stays in your history."
+    : "Your wording replaces this claim and stops the model from rewriting it."
+      + " Evidence keeps accruing underneath.";
+
+  const status = document.createElement("p");
+  status.className = "edit-status";
+
+  save.addEventListener("click", () => {
+    const replacement = textarea.value.trim();
+    if (!replacement) {
+      setEditStatus("Write the correction first.", "error");
+      return;
+    }
+    if (replacement === editableText(kind, item).trim()) {
+      setEditStatus("That is what it already says.", null);
+      return;
+    }
+    submitEdit(kind, item, "rewrite", replacement, reason.value.trim());
+  });
+  retire.addEventListener("click", () => {
+    submitEdit(kind, item, "retire", "", reason.value.trim());
+  });
+
+  form.append(textLabel, textarea, reasonLabel, reason, actions, note, status);
+  detailEditFormEl.appendChild(form);
+}
+
 function showDetails(kind, item) {
   const lineDetail = kind === "line" ? linePresentation(item, model) : null;
   selected = { kind, id: item.id };
@@ -1244,6 +1403,12 @@ function showDetails(kind, item) {
   );
   evidenceTrail = [{ label: detailTitleEl.textContent, data: null }];
   detailMetaEl.replaceChildren();
+  if (isAuthored(kind, item)) {
+    const badge = document.createElement("span");
+    badge.className = "detail-authored";
+    badge.textContent = "Your words";
+    detailMetaEl.appendChild(badge);
+  }
   appendMeta("Layer", item.layer || item.level);
   appendMeta("Status", item.status);
   appendMeta("Type", item.kind);
@@ -1259,8 +1424,17 @@ function showDetails(kind, item) {
   if (lineDetail) appendLineTechnicalDetails(item);
   renderNodeEvidence(kind, item);
   renderNodeHistory(item);
+  renderEditor(kind, item);
   setDetailTab("overview");
   detailEl.hidden = false;
+}
+
+// An owner-authored object must not read as a machine-derived claim. Faces,
+// Volumes and the Root carry `provenance="authored"`; Points carry the
+// `source:owner-edit` tag.
+function isAuthored(kind, item) {
+  if (kind === "point") return String(item.tags || "").split(/\s+/).includes("source:owner-edit");
+  return item.provenance === "authored";
 }
 
 function updateTimelineBounds() {
@@ -1714,20 +1888,25 @@ renderer.domElement.addEventListener("pointerup", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && selected) {
-    clearSelection();
-    return;
-  }
   const target = event.target;
-  if (
+  const typing = (
     target instanceof HTMLInputElement
     || target instanceof HTMLTextAreaElement
     || target instanceof HTMLSelectElement
-    || target?.isContentEditable
-    || event.metaKey
-    || event.ctrlKey
-    || event.altKey
-  ) return;
+    || Boolean(target?.isContentEditable)
+  );
+  if (event.key === "Escape" && selected) {
+    // Escape used to close the drawer unconditionally. With a correction box in
+    // it, that would throw away whatever the owner had typed. Inside a field,
+    // Escape now only leaves the field; a second press closes the drawer.
+    if (typing) {
+      target.blur();
+      return;
+    }
+    clearSelection();
+    return;
+  }
+  if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
   if (event.key === "+" || event.key === "=") {
     event.preventDefault();
     stepZoom(1);

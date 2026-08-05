@@ -1,0 +1,467 @@
+"""Owner corrections to the live personal model.
+
+The regression this whole feature exists to prevent is at the top: derivation
+used to overwrite anything a human wrote.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+
+import pytest
+from fastapi.testclient import TestClient
+
+from persome.api import build_api_app
+from persome.evidence import OWNER_EDIT_TAG
+from persome.evomem import backfill
+from persome.model.edit import apply_model_edit
+from persome.model.snapshot import build_snapshot, validate_snapshot
+from persome.store import entries as entries_mod
+from persome.store import fts
+from persome.store import schema_faces as sf
+
+# ── fixtures ──────────────────────────────────────────────────────────────
+
+
+def _seed_point(content: str = "Alex reserves mornings for focused writing.") -> str:
+    """Create one Point through the production path and return its node_id."""
+    with fts.cursor() as conn:
+        entries_mod.create_file(conn, name="person-alex.md", description="alex", tags=["t"])
+        entries_mod.append_entry(conn, name="person-alex.md", content=content, tags=["topic:work"])
+    assert backfill.run_backfill().ok
+    with fts.cursor() as conn:
+        row = conn.execute("SELECT node_id FROM evo_nodes LIMIT 1").fetchone()
+    return str(row[0])
+
+
+def _seed_face(signature: str = "Alex protects deep work.", level: int = 1) -> str:
+    with fts.cursor() as conn:
+        face_id = sf.record_face(
+            conn,
+            source=sf.PROVENANCE_MINED,
+            signature=signature,
+            members=["m1", "m2", "m3"],
+            level=level,
+        )
+        conn.execute("UPDATE schema_faces SET status = 'active' WHERE face_id = ?", (face_id,))
+    return face_id
+
+
+def _live(face_id: str) -> dict:
+    with fts.cursor() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM schema_faces WHERE face_id = ?", (face_id,)).fetchone()
+    return dict(row)
+
+
+# ── the core regression ───────────────────────────────────────────────────
+
+
+def test_re_mine_does_not_overwrite_an_authored_signature(ac_root) -> None:
+    """A re-mine used to clobber the owner's wording. That is the whole bug."""
+    face_id = _seed_face("Alex works late.")
+
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn,
+            kind="face",
+            target_id=face_id,
+            op="rewrite",
+            replacement="Alex works late by choice, not pressure.",
+        )
+    assert result.ok
+    assert result.prior_text == "Alex works late."
+
+    # The schema miner reaches the same regularity again, with its own wording.
+    with fts.cursor() as conn:
+        again = sf.record_face(
+            conn,
+            source=sf.PROVENANCE_EMERGENT,
+            signature="Alex works late.",
+            members=["m1", "m2", "m3"],
+        )
+    assert again == face_id, "the re-mine must fold onto the same object"
+
+    row = _live(face_id)
+    assert row["signature"] == "Alex works late by choice, not pressure."
+    assert row["provenance"] == sf.PROVENANCE_AUTHORED
+
+
+def test_authored_object_keeps_accruing_evidence(ac_root) -> None:
+    """Authoring pins the wording, not the object. Evidence must keep moving."""
+    face_id = _seed_face("Alex protects deep work.")
+    before = _live(face_id)["observations"]
+
+    with fts.cursor() as conn:
+        apply_model_edit(
+            conn, kind="face", target_id=face_id, op="rewrite", replacement="I guard my mornings."
+        )
+        sf.record_face(
+            conn,
+            source=sf.PROVENANCE_EMERGENT,
+            signature="Alex protects deep work.",
+            members=["m1", "m2", "m3"],
+            confidence=0.9,
+        )
+
+    row = _live(face_id)
+    assert row["observations"] == before + 1
+    assert row["confidence"] == pytest.approx(0.9)
+    assert row["signature"] == "I guard my mornings."
+
+
+def test_authored_root_survives_root_synthesis(ac_root, monkeypatch) -> None:
+    """`upsert_root` replaces the apex row wholesale; the gate must stop it."""
+    from persome import config as config_mod
+    from persome.writer import root_synthesis
+
+    root_id = _seed_face("A person becoming more deliberate.", level=3)
+    with fts.cursor() as conn:
+        apply_model_edit(
+            conn,
+            kind="root",
+            target_id=root_id,
+            op="rewrite",
+            replacement="I am learning to say no.",
+        )
+
+    cfg = config_mod.load()
+    with fts.cursor() as conn:
+        result = root_synthesis.synthesize_root(
+            cfg,
+            conn,
+            llm_call=lambda _messages: pytest.fail("an authored root must not spend an LLM call"),
+        )
+
+    assert result.reason == "skip_authored"
+    assert result.face_id == root_id
+    assert _live(root_id)["signature"] == "I am learning to say no."
+
+
+# ── retire ────────────────────────────────────────────────────────────────
+
+
+def test_retiring_a_face_removes_it_but_keeps_it_queryable(ac_root) -> None:
+    face_id = _seed_face("Alex avoids meetings before noon.")
+
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="face", target_id=face_id, op="retire").ok
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert all(face["id"] != face_id for face in snapshot["faces"])
+    row = _live(face_id)
+    assert row["status"] == "archived"
+    # Withdrawal is not deletion: the evidence it stood on is still there.
+    assert json.loads(row["members"]) == ["m1", "m2", "m3"]
+    assert row["observations"] >= 1
+
+
+def test_retiring_a_point_removes_it_from_the_live_model(ac_root) -> None:
+    point_id = _seed_point()
+
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="point", target_id=point_id, op="retire").ok
+        snapshot = build_snapshot(conn, redact=False)
+        retired = conn.execute(
+            "SELECT content, valid_until FROM evo_nodes WHERE node_id = ?", (point_id,)
+        ).fetchone()
+
+    assert all(point["id"] != point_id for point in snapshot["points"])
+    assert retired is not None and retired[1], "the retirement must be stamped, not erased"
+
+
+def test_retiring_the_last_geometry_degrades_rather_than_fabricates(ac_root) -> None:
+    """Emptying the model must read as degraded, never as a placeholder claim."""
+    face_id = _seed_face("Alex protects deep work.")
+    with fts.cursor() as conn:
+        apply_model_edit(conn, kind="face", target_id=face_id, op="retire")
+        snapshot = build_snapshot(conn, redact=False)
+
+    validate_snapshot(snapshot)
+    assert snapshot["faces"] == []
+    assert snapshot["root"] is None
+    assert snapshot["stats"]["faces"] == 0
+
+
+# ── Point corrections ─────────────────────────────────────────────────────
+
+
+def test_point_rewrite_supersedes_and_marks_owner_authorship(ac_root) -> None:
+    point_id = _seed_point()
+
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=point_id,
+            op="rewrite",
+            replacement="I reserve mornings for writing because afternoons get taken.",
+            reason="the model guessed at my reason",
+        )
+    assert result.ok
+    assert result.new_id and result.new_id != point_id
+
+    with fts.cursor() as conn:
+        conn.row_factory = sqlite3.Row
+        new = conn.execute(
+            "SELECT content, tags, supersedes FROM evo_nodes WHERE node_id = ?",
+            (result.new_id,),
+        ).fetchone()
+
+    assert OWNER_EDIT_TAG in str(new["tags"]).split()
+    assert "topic:work" in str(new["tags"]).split(), "existing tags must survive"
+    assert point_id in json.loads(new["supersedes"])
+
+
+def test_point_rewrite_survives_a_model_build(ac_root, monkeypatch) -> None:
+    """The durability claim, exercised against the real build entrypoint."""
+    from persome import config as config_mod
+    from persome.model import build as build_mod
+
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=point_id,
+            op="rewrite",
+            replacement="I reserve mornings for writing.",
+        )
+    assert result.ok
+
+    build_mod.run_model_build(config_mod.load())
+
+    with fts.cursor() as conn:
+        snapshot = build_snapshot(conn, redact=False)
+    contents = [point["content"] for point in snapshot["points"]]
+    assert "I reserve mornings for writing." in contents
+
+
+def test_the_predecessor_stays_as_history(ac_root) -> None:
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        snapshot = build_snapshot(conn, redact=False)
+
+    ids = {point["id"] for point in snapshot["points"]}
+    assert point_id in ids, "a superseded Point is history, not a withdrawal"
+    assert any(
+        line["source"] == point_id and line["target"] == result.new_id for line in snapshot["lines"]
+    )
+
+
+def test_a_face_keeps_its_member_receipts_after_a_point_is_rewritten(ac_root) -> None:
+    """H1: member keys are content hashes, so a correction used to break them."""
+    original = "Alex reserves mornings for focused writing."
+    point_id = _seed_point(original)
+
+    with fts.cursor() as conn:
+        face_id = sf.record_face(
+            conn,
+            source=sf.PROVENANCE_MINED,
+            signature="Alex protects deep work.",
+            members=[sf.member_key(original)],
+        )
+        conn.execute("UPDATE schema_faces SET status = 'active' WHERE face_id = ?", (face_id,))
+        before = build_snapshot(conn, redact=False)
+
+    face_before = next(face for face in before["faces"] if face["id"] == face_id)
+    assert face_before["member_receipts"], "precondition: the Face resolves its member"
+
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=point_id,
+            op="rewrite",
+            replacement="I reserve mornings for writing, and I protect that.",
+        )
+        after = build_snapshot(conn, redact=False)
+
+    face_after = next(face for face in after["faces"] if face["id"] == face_id)
+    assert face_after["member_receipts"], "the Face must not lose its evidence to a typo fix"
+    # And it points at the current wording, not the text the owner replaced.
+    assert any(result.new_id in receipt for receipt in face_after["member_receipts"])
+
+
+# ── evidence honesty ──────────────────────────────────────────────────────
+
+
+def test_owner_authored_facts_get_no_fabricated_context(ac_root) -> None:
+    """H2: a typed assertion must not collect whatever was on screen as proof."""
+    from persome.evidence import resolve_evidence
+
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        conn.execute(
+            "INSERT INTO captures (id, timestamp, app_name, window_title, visible_text)"
+            " VALUES ('cap-1', datetime('now'), 'Mail', 'Inbox', 'unrelated')"
+        )
+        result = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        resolved = resolve_evidence(conn, result.new_id)
+
+    assert resolved.get("context") == []
+
+
+def test_every_edit_records_the_text_it_displaced(ac_root) -> None:
+    face_id = _seed_face("Alex works late.")
+    with fts.cursor() as conn:
+        apply_model_edit(
+            conn,
+            kind="face",
+            target_id=face_id,
+            op="rewrite",
+            replacement="I work late by choice.",
+            reason="tone",
+        )
+        rows = conn.execute(
+            "SELECT payload FROM memory_deltas WHERE session_id = 'owner-edit'"
+        ).fetchall()
+
+    assert len(rows) == 1
+    edit = json.loads(rows[0][0])["owner_edit"]
+    assert edit["prior_text"] == "Alex works late."
+    assert edit["new_text"] == "I work late by choice."
+    assert edit["reason"] == "tone"
+
+
+# ── rejections ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("kind", "target", "op", "replacement", "expected"),
+    [
+        ("line", "edge-1", "rewrite", "x", "unknown_kind"),
+        ("face", "face-1", "merge", "x", "unknown_op"),
+        ("face", "", "rewrite", "x", "missing_target"),
+        ("face", "face-1", "rewrite", "", "empty_replacement"),
+        ("face", "face-missing", "rewrite", "x", "unknown_object"),
+        ("point", "point-missing", "rewrite", "x", "unknown_point"),
+    ],
+)
+def test_invalid_edits_are_refused_by_reason(
+    ac_root, kind, target, op, replacement, expected
+) -> None:
+    _seed_point()  # so `evo_nodes` exists and a missing id is a miss, not an outage
+    with fts.cursor() as conn:
+        result = apply_model_edit(conn, kind=kind, target_id=target, op=op, replacement=replacement)
+    assert not result.ok
+    assert result.reason == expected
+
+
+def test_editing_a_volume_through_the_face_kind_is_refused(ac_root) -> None:
+    """A level mismatch would retire the wrong tier of the geometry."""
+    volume_id = _seed_face("Alex's work and study rhythms rhyme.", level=2)
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn, kind="face", target_id=volume_id, op="rewrite", replacement="x"
+        )
+    assert not result.ok
+    assert result.reason == "kind_level_mismatch"
+
+
+def test_a_retired_point_cannot_be_retired_twice(ac_root) -> None:
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="point", target_id=point_id, op="retire").ok
+        again = apply_model_edit(conn, kind="point", target_id=point_id, op="retire")
+    assert not again.ok
+    assert again.reason == "point_already_retired"
+
+
+# ── HTTP surface ──────────────────────────────────────────────────────────
+
+
+def test_route_applies_an_edit_and_reports_the_new_id(ac_root) -> None:
+    point_id = _seed_point()
+    client = TestClient(build_api_app(auth_enabled=False))
+
+    response = client.post(
+        "/model/edit",
+        json={
+            "schema_version": 1,
+            "kind": "point",
+            "id": point_id,
+            "op": "rewrite",
+            "replacement": "I write at dawn.",
+            "reason": "clarity",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["new_id"] and data["new_id"] != point_id
+    assert data["shadow_misses"] == 0
+
+
+def test_route_rejects_an_unknown_object_with_a_reason(ac_root) -> None:
+    client = TestClient(build_api_app(auth_enabled=False))
+    response = client.post(
+        "/model/edit",
+        json={
+            "schema_version": 1,
+            "kind": "face",
+            "id": "face-nope",
+            "op": "rewrite",
+            "replacement": "x",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "unknown_object"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"schema_version": 1, "kind": "face", "id": "f", "op": "rewrite", "replacement": ""},
+        {"schema_version": 1, "kind": "face", "id": "f", "op": "retire", "replacement": "x"},
+        {"schema_version": 1, "kind": "line", "id": "f", "op": "rewrite", "replacement": "x"},
+        {"schema_version": 2, "kind": "face", "id": "f", "op": "rewrite", "replacement": "x"},
+    ],
+)
+def test_route_validates_the_body(ac_root, body) -> None:
+    client = TestClient(build_api_app(auth_enabled=False))
+    assert client.post("/model/edit", json=body).status_code == 422
+
+
+def test_edit_route_requires_authentication(ac_root, monkeypatch) -> None:
+    """The write route must never be reachable without a credential."""
+    from persome.env_file import LOCAL_API_TOKEN_ENV
+
+    monkeypatch.setenv(LOCAL_API_TOKEN_ENV, "x" * 43)
+    client = TestClient(build_api_app(auth_enabled=True))
+    response = client.post(
+        "/model/edit",
+        json={"schema_version": 1, "kind": "face", "id": "f", "op": "retire"},
+    )
+    assert response.status_code == 401
+
+
+# ── the agent guarantee ───────────────────────────────────────────────────
+
+
+def test_corrections_are_visible_through_the_mcp_snapshot(ac_root) -> None:
+    """Edits must reach agents, not only the viewer."""
+    from persome.mcp import server as mcp_server
+
+    face_id = _seed_face("Alex works late.")
+    with fts.cursor() as conn:
+        apply_model_edit(
+            conn,
+            kind="face",
+            target_id=face_id,
+            op="rewrite",
+            replacement="I work late by choice.",
+        )
+
+    with fts.cursor() as conn:
+        snapshot = mcp_server._ModelSnapshotCache().get(conn, redact=False)
+
+    face = next(item for item in snapshot["faces"] if item["id"] == face_id)
+    assert face["signature"] == "I work late by choice."
+    assert face["provenance"] == sf.PROVENANCE_AUTHORED

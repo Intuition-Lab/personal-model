@@ -264,9 +264,7 @@ def record_face(
     return existing["face_id"]
 
 
-def set_authored_signature(
-    conn: sqlite3.Connection, *, face_id: str, signature: str
-) -> str | None:
+def set_authored_signature(conn: sqlite3.Connection, *, face_id: str, signature: str) -> str | None:
     """Replace one live object's proposition with the owner's own wording.
 
     Returns the signature that was displaced (so the caller can record it as the

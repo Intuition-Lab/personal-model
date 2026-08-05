@@ -94,6 +94,7 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
         <button id="detail-tab-overview" type="button" role="tab" data-detail-tab="overview" aria-controls="detail-overview" aria-selected="true">Overview</button>
         <button id="detail-tab-evidence" type="button" role="tab" data-detail-tab="evidence" aria-controls="detail-evidence" aria-selected="false" tabindex="-1">Evidence</button>
         <button id="detail-tab-history" type="button" role="tab" data-detail-tab="history" aria-controls="detail-history" aria-selected="false" tabindex="-1">History</button>
+        <button id="detail-tab-edit" type="button" role="tab" data-detail-tab="edit" aria-controls="detail-edit" aria-selected="false" tabindex="-1">Correct</button>
       </nav>
       <section id="detail-overview" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-overview">
         <div id="detail-summary" class="detail-summary"></div>
@@ -105,6 +106,9 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       </section>
       <section id="detail-history" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-history" hidden>
         <div id="detail-history-list" class="detail-receipts"></div>
+      </section>
+      <section id="detail-edit" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-edit" aria-live="off" hidden>
+        <div id="detail-edit-form"></div>
       </section>
     </aside>
 

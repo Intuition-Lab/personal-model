@@ -116,6 +116,22 @@ def _point_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     )
 
 
+def _visible_content(row: sqlite3.Row) -> str:
+    """A Point's fact body, without the structural supersede marker.
+
+    ``supersede_entry`` appends an HTML comment naming the entry a correction
+    replaced. The FTS projection already strips it so it never becomes
+    searchable personal content; the model snapshot must strip it too, or a
+    corrected Point renders its own bookkeeping to the owner.
+    """
+    from ..store.entries import strip_supersede_provenance
+
+    return strip_supersede_provenance(
+        str(row["content"] or ""),
+        supersedes={str(value) for value in _json_list(row["supersedes"])},
+    )
+
+
 def _relation_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     if not _table_exists(conn, "relation_edges"):
         return []
@@ -262,16 +278,14 @@ def build_snapshot(
     point_rows = _point_rows(conn)
     from ..store.schema_faces import member_key
 
-    raw_content: dict[str, str] = {
-        str(row["node_id"]): str(row["content"] or "") for row in point_rows
-    }
+    raw_content: dict[str, str] = {str(row["node_id"]): _visible_content(row) for row in point_rows}
 
     for row in point_rows:
         node_id = str(row["node_id"])
         file_name = redactor.text(row["file_name"]) or ""
         receipt = f"⟨{node_id}:{file_name}⟩"
         point_receipts[node_id] = receipt
-        point_receipts.setdefault(member_key(str(row["content"] or "")), receipt)
+        point_receipts.setdefault(member_key(raw_content[node_id]), receipt)
         receipts[receipt] = {
             "receipt": receipt,
             "source_kind": "point",
@@ -281,7 +295,7 @@ def build_snapshot(
         points.append(
             {
                 "id": node_id,
-                "content": redactor.text(row["content"]),
+                "content": redactor.text(raw_content[node_id]),
                 "layer": row["layer"],
                 "supersedes": [str(value) for value in _json_list(row["supersedes"])],
                 "superseded_by": [str(value) for value in _json_list(row["superseded_by"])],
