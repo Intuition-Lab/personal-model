@@ -44,6 +44,11 @@ logger = get("persome.store.schema_faces")
 PROVENANCE_MINED = "mined"
 PROVENANCE_EMERGENT = "emergent"
 PROVENANCE_BOTH = "both"
+# The memory owner replaced this object's proposition by hand. Derivation keeps
+# running underneath it — observations and confidence still accrue — but the
+# extractors stop rewriting the signature, so the owner's wording is what every
+# reader (viewer, MCP snapshot, HUMAN.md card, export) sees from then on.
+PROVENANCE_AUTHORED = "authored"
 
 # footprint-Jaccard floor for "same face" folding (merge conservatively —
 # below it, a new face is born instead of polluting an existing one)
@@ -224,7 +229,16 @@ def record_face(
         footprints = footprints[-FOOTPRINT_HISTORY_KEEP:]
         members_json = json.dumps(sorted(member_set))
     provenance = existing["provenance"]
-    if provenance != PROVENANCE_BOTH and provenance != source:
+    authored = provenance == PROVENANCE_AUTHORED
+    if authored:
+        # The owner rewrote this proposition. Their wording outranks every
+        # extractor, so the signature write below is suppressed by binding an
+        # empty string to the CASE guard, and provenance does not escalate away
+        # from `authored`. Everything else still lands: members, footprints,
+        # observations, and the confidence ratchet keep accruing, so an
+        # owner-authored object goes on gathering evidence like any other.
+        signature = ""
+    elif provenance != PROVENANCE_BOTH and provenance != source:
         provenance = PROVENANCE_BOTH  # the other signal arrived — escalate
     try:
         merged_anchors = set(json.loads(existing["anchors"] or "[]")) | anchor_set
@@ -248,6 +262,65 @@ def record_face(
         ),
     )
     return existing["face_id"]
+
+
+def set_authored_signature(
+    conn: sqlite3.Connection, *, face_id: str, signature: str
+) -> str | None:
+    """Replace one live object's proposition with the owner's own wording.
+
+    Returns the signature that was displaced (so the caller can record it as the
+    edit's audit trail), or ``None`` when no live row carries ``face_id``.
+
+    The row is updated in place rather than superseded on purpose: a new row
+    would mint a new ``face_id`` and dangle every child's ``parent_face`` and
+    every parent's ``members`` entry. Identity is what keeps the geometry
+    connected, so identity is what is preserved.
+
+    ``provenance`` flips to :data:`PROVENANCE_AUTHORED`, which is what stops
+    :func:`record_face` from rewriting the signature on the next re-mine and
+    what marks the object as owner-authored for every reader.
+    """
+    ensure_schema(conn)
+    text = (signature or "").strip()
+    if not text:
+        raise ValueError("authored signature must not be empty")
+    row = conn.execute(
+        "SELECT signature FROM schema_faces WHERE face_id = ? AND valid_to IS NULL",
+        (face_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    prior = str(row[0] or "")
+    conn.execute(
+        "UPDATE schema_faces SET signature = ?, provenance = ? WHERE face_id = ?",
+        (text, PROVENANCE_AUTHORED, face_id),
+    )
+    return prior
+
+
+def retire_face(conn: sqlite3.Connection, *, face_id: str) -> str | None:
+    """Retire one live object the owner rejected. Returns its signature, or
+    ``None`` when no live row carries ``face_id``.
+
+    Archival is deliberately a status change, not a delete: the row, its
+    members, its footprints, and its observation count stay queryable. The
+    snapshot projector already filters ``status = 'active'``
+    (``model/snapshot.py``), so the object leaves the viewer, the share card,
+    the HUMAN.md card, and the MCP snapshot together, with no projection change.
+    """
+    ensure_schema(conn)
+    row = conn.execute(
+        "SELECT signature FROM schema_faces WHERE face_id = ? AND valid_to IS NULL",
+        (face_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute(
+        "UPDATE schema_faces SET status = ? WHERE face_id = ?",
+        (MemoryStatus.ARCHIVED.value, face_id),
+    )
+    return str(row[0] or "")
 
 
 def maybe_promote(

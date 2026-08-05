@@ -269,10 +269,25 @@ def test_point_correction_and_delete_keep_auditable_history(ac_root, monkeypatch
     with fts.cursor() as conn:
         deleted_snapshot = build_snapshot(conn, generated_at="2026-07-11T08:00:00+00:00")
     deleted_points = {point["id"]: point for point in deleted_snapshot["points"]}
-    assert deleted_points["point-focus-v3"]["status"] == "shadow"
+    # A Point retired without a successor has been withdrawn, so it leaves the
+    # live model the way a closed Line or an archived Face does.
+    assert "point-focus-v3" not in deleted_points
+    # Withdrawal is not amnesia. The predecessor still carries the chain,
+    # because it names its successor in `superseded_by` and is therefore
+    # history rather than a live claim.
     assert deleted_points["point-focus-v2"]["content"] == (
         "The user reserves mornings for focused writing and review."
     )
+    # And the withdrawn row itself stays queryable in the store, which is what
+    # keeps the retirement reversible and auditable.
+    with fts.cursor() as conn:
+        retired = conn.execute(
+            "SELECT content, valid_until FROM evo_nodes WHERE node_id = ?",
+            ("point-focus-v3",),
+        ).fetchone()
+    assert retired is not None
+    assert retired[0] == "The user now reserves mornings for release review."
+    assert retired[1] == "2026-07-11T08:00:00+00:00"
 
 
 def test_fresh_root_rebuild_is_structurally_identical(ac_root, monkeypatch, tmp_path) -> None:

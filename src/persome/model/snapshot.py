@@ -99,10 +99,19 @@ def _point_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         _select("valid_until", columns),
         _select("gmt_created", columns),
     ]
+    # A Point that was retired without a successor has been withdrawn by its
+    # owner, so it leaves the live model the way a closed Line or an archived
+    # Face does. A Point that was *superseded* also carries ``valid_until``, but
+    # it names its successor in ``superseded_by`` and must stay: it is the tail
+    # of an evolution Line and the model's own record of how a belief changed.
+    # Lines and Faces already filter on their validity window here; Points did
+    # not, which is why a forgotten memory used to keep rendering.
     return list(
         conn.execute(
             f"SELECT {', '.join(selected)} FROM evo_nodes "
-            "WHERE status != 'archived' ORDER BY node_id"
+            "WHERE status != 'archived' "
+            "AND (valid_until IS NULL OR (superseded_by IS NOT NULL AND superseded_by != '[]')) "
+            "ORDER BY node_id"
         ).fetchall()
     )
 
@@ -253,6 +262,10 @@ def build_snapshot(
     point_rows = _point_rows(conn)
     from ..store.schema_faces import member_key
 
+    raw_content: dict[str, str] = {
+        str(row["node_id"]): str(row["content"] or "") for row in point_rows
+    }
+
     for row in point_rows:
         node_id = str(row["node_id"])
         file_name = redactor.text(row["file_name"]) or ""
@@ -285,6 +298,21 @@ def build_snapshot(
                 "receipt": receipt,
             }
         )
+
+    # Faces address their members by `member_key(content)`, a hash of the fact
+    # body. Rewriting a Point therefore changes the key its Faces recorded, and
+    # each Face would resolve that stale key to the wording the owner just
+    # corrected — or, once the predecessor ages out, to nothing at all. Point
+    # every predecessor's key at its successor's receipt so a Face keeps
+    # citing the current wording of its own evidence. Written after the loop
+    # above, and as an assignment rather than `setdefault`, so a successor
+    # deliberately outranks the predecessor's self-registration. The supersede
+    # relationship itself is not lost: it is the evolution Line built below.
+    for point in points:
+        for old_id in point["supersedes"]:
+            previous = raw_content.get(old_id)
+            if previous:
+                point_receipts[member_key(previous)] = point["receipt"]
 
     lines: list[dict[str, Any]] = []
     for point in points:

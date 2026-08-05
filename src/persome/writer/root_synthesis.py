@@ -186,11 +186,23 @@ def synthesize_root(
     budget: int | None = None,
     roster: Any | None = None,
 ) -> RootResult:
-    """Gather → LLM → 4 gates → upsert_root born-active. Injectable ``llm_call``/``roster``
+    """Gather → LLM → gates → upsert_root born-active. Injectable ``llm_call``/``roster``
     for tests. Returns a RootResult; NEVER raises (fail-open is the tick's contract, but we
-    also guard here)."""
+    also guard here).
+
+    An owner-authored apex short-circuits the whole pass (``skip_authored``): it
+    is a healthy no-op, not a failure, and it spends no LLM budget."""
     budget = int(budget if budget is not None else getattr(cfg.schema, "root_token_budget", 1500))
     try:
+        # gate 0: the owner wrote this apex by hand. `upsert_root` does not
+        # update — it closes every live level-3 row and inserts a fresh one — so
+        # without this gate the next nightly pass would discard the owner's text
+        # and there would be no row left to key a preference off. Checked before
+        # gathering so an authored root costs no LLM call at all.
+        live_root = schema_faces.resident_root(conn)
+        if live_root is not None and live_root["provenance"] == schema_faces.PROVENANCE_AUTHORED:
+            return RootResult(str(live_root["face_id"]), "skip_authored")
+
         bodies = _active(conn, 2)
         faces = _active(conn, 1, _TOP_FACES)
         profile = _profile_facts(cfg)

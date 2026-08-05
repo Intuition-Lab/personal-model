@@ -43,6 +43,7 @@ from .models import (
     CaptureIngestBody,
     HealthEventsImportBody,
     MobileEventIngestBody,
+    ModelEditBody,
     ModelPing,
 )
 
@@ -876,6 +877,50 @@ def model_share_card() -> dict[str, Any]:
     with fts_store.cursor() as conn:
         snapshot = build_live_snapshot(conn, redact=True)
     return {"model": _share_card_projection(snapshot)}
+
+
+@router.post("/model/edit", response_model=ApiResponse, include_in_schema=False, tags=["model"])
+def model_edit(body: ModelEditBody) -> ApiResponse:
+    """Apply one owner correction to the live model.
+
+    The click-through from *seeing* a wrong claim to *fixing* it. Deterministic
+    and LLM-free: the caller names the object, so this route only validates,
+    writes, and invalidates the read cache.
+
+    A Point rewrite mints a new id (the correction supersedes the old fact), so
+    the response returns ``new_id`` for the caller to re-select. A rejected edit
+    is a 400 with a machine-readable reason, never a silent no-op.
+    """
+    from ..model.edit import apply_model_edit
+    from ..store import fts as fts_store
+
+    with fts_store.cursor() as conn:
+        result = apply_model_edit(
+            conn,
+            kind=body.kind,
+            target_id=body.id,
+            op=body.op,
+            replacement=body.replacement,
+            reason=body.reason,
+        )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.reason)
+    # The viewer polls `/model/graph`, which caches for 15s. Without this an
+    # owner would save a correction and watch the old text stay on screen.
+    _clear_model_graph_cache()
+    return ApiResponse(
+        data={
+            "schema_version": body.schema_version,
+            "kind": result.kind,
+            "id": result.target_id,
+            "op": result.op,
+            "new_id": result.new_id,
+            "applied": result.applied,
+            # Non-zero means the markdown layer changed but the Point may not
+            # have moved. The client surfaces this rather than claiming success.
+            "shadow_misses": result.shadow_misses,
+        }
+    )
 
 
 @router.get("/model/evidence", tags=["model"])

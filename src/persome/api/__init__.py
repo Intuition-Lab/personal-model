@@ -27,6 +27,7 @@ from ..security.body_limit import (
     RequestConcurrencyLimitMiddleware,
 )
 from ..trace import generate_trace_id, set_trace_id
+from .models import MODEL_EDIT_MAX_REQUEST_BODY_BYTES
 from .routes import router
 from .routes import set_config as _set_route_config
 
@@ -229,8 +230,11 @@ def build_api_app(cfg: Config | None = None, *, auth_enabled: bool = True) -> Fa
     app.add_middleware(_TraceIdMiddleware)
     app.add_middleware(
         RequestBodyLimitMiddleware,
-        path_limits={"/health-events/import": HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES},
-        strict_json_paths=("/health-events/import",),
+        path_limits={
+            "/health-events/import": HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES,
+            "/model/edit": MODEL_EDIT_MAX_REQUEST_BODY_BYTES,
+        },
+        strict_json_paths=("/health-events/import", "/model/edit"),
     )
     app.add_middleware(RequestConcurrencyLimitMiddleware)
     if auth_enabled:

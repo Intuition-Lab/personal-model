@@ -21,6 +21,12 @@ MAX_HEALTH_EVENTS_PER_REQUEST = 1000
 MAX_HEALTH_METADATA_BYTES = 64 * 1024
 MAX_HEALTH_STRING_VALUE_BYTES = 4 * 1024
 MAX_MOBILE_EVENT_TEXT_BYTES = 512 * 1024
+# An owner correction is one proposition typed by hand, not a document.
+# Kept in step with `model/edit.py`, which enforces the same ceilings for
+# the CLI path.
+MAX_MODEL_EDIT_REPLACEMENT_CHARS = 4_000
+MAX_MODEL_EDIT_REASON_CHARS = 500
+MODEL_EDIT_MAX_REQUEST_BODY_BYTES = 64 * 1024
 
 
 def _json_size(value: Any) -> int:
@@ -248,4 +254,36 @@ class MobileEventIngestBody(BaseModel):
         text_bytes = len((self.text or "").encode("utf-8"))
         if text_bytes > MAX_MOBILE_EVENT_TEXT_BYTES:
             raise ValueError(f"text exceeds {MAX_MOBILE_EVENT_TEXT_BYTES} bytes")
+        return self
+
+
+# ─── Personal model edits ─────────────────────────────────────────────────
+
+
+class ModelEditBody(BaseModel):
+    """One owner correction to a modeled object, addressed by its snapshot id.
+
+    Deliberately narrow: the caller is looking at the object, so it names the
+    object. There is no free-text search, no batch, and no way to author a node
+    that was never derived.
+    """
+
+    schema_version: Literal[1] = 1
+    kind: Literal["point", "face", "volume", "root"]
+    id: str = Field(min_length=1, max_length=512)
+    op: Literal["rewrite", "retire"]
+    replacement: str = Field(default="", max_length=MAX_MODEL_EDIT_REPLACEMENT_CHARS)
+    reason: str = Field(default="", max_length=MAX_MODEL_EDIT_REASON_CHARS)
+
+    @model_validator(mode="after")
+    def _valid_model_edit(self) -> ModelEditBody:
+        replacement = self.replacement.strip()
+        if self.op == "rewrite" and not replacement:
+            raise ValueError("rewrite requires a non-empty replacement")
+        if self.op == "retire" and replacement:
+            raise ValueError("retire must not carry a replacement")
+        if _json_size(self.model_dump(mode="json")) > MODEL_EDIT_MAX_REQUEST_BODY_BYTES:
+            raise ValueError(
+                f"model edit payload exceeds {MODEL_EDIT_MAX_REQUEST_BODY_BYTES} bytes"
+            )
         return self

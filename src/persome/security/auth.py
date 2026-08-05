@@ -230,11 +230,25 @@ def _browser_cookie_values(headers: Headers) -> list[str]:
     return values
 
 
+# HTTP methods the viewer capability may use. The viewer is the owner's own
+# editing surface, so it carries write authority — but that is stated here
+# rather than inherited from the fact that nothing checked the method.
+#
+# What makes granting it defensible: the session cookie is `HttpOnly` and
+# `SameSite=Strict`, so a cross-site page cannot drive it; the path token is 32+
+# unguessable bytes and must match the cookie; the capability expires; the
+# listener is loopback-only; and `_OriginGuardMiddleware` runs in front. A
+# bearer holder keeps full access independently of this set.
+_BROWSER_SESSION_METHODS = frozenset({"GET", "HEAD", "POST"})
+
+
 def _browser_session_rewrite(scope: Scope, headers: Headers) -> tuple[str, str] | None:
     """Validate a viewer cookie/path pair and return ``(route_path, base_path)``."""
     path = scope.get("path", "")
     raw_path = scope.get("raw_path")
     if not path.startswith("/model/"):
+        return None
+    if str(scope.get("method", "")).upper() not in _BROWSER_SESSION_METHODS:
         return None
     try:
         canonical_raw_path = path.encode("ascii")

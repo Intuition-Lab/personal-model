@@ -1754,7 +1754,7 @@ def root_synth(
             res = rs.synthesize_root(cfg, conn)
     typer.echo(f"root-synth: {res.reason}  {res.face_id or '-'}")
     if res.reason != "written":
-        raise typer.Exit(code=0 if res.reason in ("skip_empty_input",) else 1)
+        raise typer.Exit(code=0 if res.reason in ("skip_empty_input", "skip_authored") else 1)
 
 
 @app.command("correct")
