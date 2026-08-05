@@ -143,16 +143,8 @@ def _check_sqlite_indexes() -> tuple[str, list[str]]:
             findings = [str(r[0]) for r in row if str(r[0]) != "ok"]
             if findings:
                 problems.extend(f"quick_check: {f}" for f in findings[:5])
-            for table, external in (("captures_fts", True), ("entries", False)):
-                try:
-                    if external:
-                        conn.execute(
-                            f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)"
-                        )
-                    else:
-                        conn.execute(f"INSERT INTO {table}({table}) VALUES('integrity-check')")
-                except sqlite3.Error as exc:
-                    problems.append(f"{table}: {exc}")
+            for table, exc in fts_store.probe_derived_fts_integrity(conn).items():
+                problems.append(f"{table}: {exc}")
     except sqlite3.Error as exc:
         if is_corruption_error(exc):
             return "corrupt", [str(exc)]

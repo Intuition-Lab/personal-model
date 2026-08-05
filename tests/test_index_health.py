@@ -175,6 +175,23 @@ def test_corrupt_index_is_reported_not_masked(
     assert any("quarantine/recover" in a for a in report["recommended_actions"])
 
 
+def test_non_corruption_fts_probe_failure_is_reported_as_error(
+    ac_root: Path, fresh_counters: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_schema()
+    monkeypatch.setattr(
+        fts,
+        "probe_derived_fts_integrity",
+        lambda _conn: {"captures_fts": sqlite3.OperationalError("database is locked")},
+    )
+
+    report = index_health.build_report(Config())
+
+    assert report["index"]["status"] == "error"
+    assert report["index"]["problems"] == ["captures_fts: database is locked"]
+    assert report["status"] == "degraded"
+
+
 def test_stale_sidecar_is_flagged_for_readers(ac_root: Path, fresh_counters: dict) -> None:
     old = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
     index_health.write_report(
