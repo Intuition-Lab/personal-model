@@ -220,7 +220,11 @@ rollover, with `PASSIVE` otherwise. Every
 its complete connection lifetime; checkpoint and startup migration take the
 exclusive side. This prevents a transaction commit from racing a WAL reset on
 affected SQLite releases while still allowing normal concurrent readers and
-SQLite's single writer. A scheduled checkpoint skips a busy gate and retries
+SQLite's single writer. The owner securely precreates a missing database at
+mode `0600`; later validation of the database and its WAL/SHM sidecars is
+descriptor-free and non-mutating. Opening and closing another descriptor would
+cancel SQLite's advisory locks in the same POSIX process. A scheduled checkpoint
+skips a busy gate and retries
 on the next tick, so task cancellation cannot strand a worker waiting to reopen
 the database after shutdown. Startup integrity recovery and explicit secure
 clean operations use the same reentrant exclusive boundary. The daemon
