@@ -37,6 +37,7 @@ const viewerEl = document.getElementById("viewer");
 const statusEl = document.getElementById("status");
 const detailEl = document.getElementById("detail");
 const detailKindEl = document.getElementById("detail-kind");
+const detailProvenanceEl = document.getElementById("detail-provenance");
 const detailTitleEl = document.getElementById("detail-title");
 const detailSummaryEl = document.getElementById("detail-summary");
 const detailMetaEl = document.getElementById("detail-meta");
@@ -1402,13 +1403,13 @@ function showDetails(kind, item) {
     || item.content || item.signature || item.label || item.predicate || item.kind || item.id
   );
   evidenceTrail = [{ label: detailTitleEl.textContent, data: null }];
+  // "Evidence-backed" is a claim about where the text came from, so it must not
+  // sit above text the owner wrote themselves. The eyebrow is on every tab, so
+  // the distinction follows the object rather than living in one panel.
+  const authored = isAuthored(kind, item);
+  detailProvenanceEl.textContent = authored ? "Your words" : "Evidence-backed";
+  detailProvenanceEl.classList.toggle("detail-authored", authored);
   detailMetaEl.replaceChildren();
-  if (isAuthored(kind, item)) {
-    const badge = document.createElement("span");
-    badge.className = "detail-authored";
-    badge.textContent = "Your words";
-    detailMetaEl.appendChild(badge);
-  }
   appendMeta("Layer", item.layer || item.level);
   appendMeta("Status", item.status);
   appendMeta("Type", item.kind);

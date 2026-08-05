@@ -88,7 +88,7 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
 
     <aside id="detail" class="detail" aria-labelledby="detail-title" aria-live="polite" hidden>
       <button id="close-detail" class="icon-button close" type="button" aria-label="Close details" title="Close details">×</button>
-      <p class="detail-eyebrow"><span id="detail-kind" class="detail-kind"></span><span>Evidence-backed</span></p>
+      <p class="detail-eyebrow"><span id="detail-kind" class="detail-kind"></span><span id="detail-provenance">Evidence-backed</span></p>
       <h1 id="detail-title"></h1>
       <nav id="detail-tabs" class="detail-tabs" role="tablist" aria-label="Detail views">
         <button id="detail-tab-overview" type="button" role="tab" data-detail-tab="overview" aria-controls="detail-overview" aria-selected="true">Overview</button>
