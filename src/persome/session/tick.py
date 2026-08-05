@@ -30,6 +30,7 @@ from ..evomem import inversion as evo_inversion
 from ..logger import get
 from ..store import fts
 from ..store import parser_ticks as parser_ticks_store
+from ..store import tool_ticks as tool_ticks_store
 from ..writer import agent as writer_agent
 from ..writer import classifier as classifier_mod
 from ..writer import (
@@ -47,9 +48,12 @@ _WAL_CHECKPOINT_INTERVAL_SECONDS = 60
 
 
 def _prune_telemetry_tables() -> dict[str, int]:
-    """Bound the parser audit table from the daily safety-net tick."""
+    """Bound the telemetry audit tables from the daily safety-net tick."""
     with fts.cursor() as conn:
-        return {"parser_ticks": parser_ticks_store.prune(conn)}
+        return {
+            "parser_ticks": parser_ticks_store.prune(conn),
+            "tool_ticks": tool_ticks_store.prune(conn),
+        }
 
 
 def recover_stranded_sessions(*, now: datetime | None = None) -> list[session_store.SessionRow]:

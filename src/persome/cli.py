@@ -4126,6 +4126,90 @@ def config() -> None:
     console.print(p.read_text())
 
 
+stats_app = typer.Typer(
+    help=(
+        "Local MCP usage statistics. Everything here is read from index.db on "
+        "this machine; nothing is uploaded (SECURITY_PRIVACY.md). `export` "
+        "writes bare daily call counts you may choose to share by hand."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(stats_app, name="stats")
+
+
+def _tool_tick_stats(days: int) -> tuple[dict, dict]:
+    """(windowed stats, unbounded stats) for the last ``days`` days."""
+    from datetime import date
+
+    from .store import fts
+    from .store import tool_ticks as tool_ticks_store
+
+    since = (date.today() - timedelta(days=days)).isoformat()
+    with fts.cursor() as conn:
+        window = tool_ticks_store.stats(conn, since=since)
+        whole = tool_ticks_store.stats(conn)
+    return window, whole
+
+
+@stats_app.command("show")
+def stats_show(
+    days: int = typer.Option(30, min=1, help="Window size in days."),
+) -> None:
+    """Summarize local MCP tool usage for the last N days."""
+    window, whole = _tool_tick_stats(days)
+    first = (whole["first_ts"] or "")[:10] or "(no calls recorded yet)"
+    typer.echo(f"tool calls, last {days}d: {window['total']} (recording since {first})")
+    typer.echo(f"active days: {len(window['by_day'])}/{days}")
+    for tool, count in sorted(window["by_tool"].items(), key=lambda kv: -kv[1]):
+        typer.echo(f"  {count:6d}  {tool}")
+    if window["by_client"]:
+        clients = ", ".join(
+            f"{name or '(unknown)'}={count}"
+            for name, count in sorted(window["by_client"].items(), key=lambda kv: -kv[1])
+        )
+        typer.echo(f"clients: {clients}")
+
+
+@stats_app.command("export")
+def stats_export(
+    days: int = typer.Option(30, min=1, help="Window size in days."),
+    out: str = typer.Option("", help="Write JSON here instead of stdout."),
+) -> None:
+    """Export bare daily call counts as JSON — for sharing you choose to do.
+
+    The payload contains ONLY: version, the export window, first recorded
+    date, and one integer per day. No tool names, no client names, no
+    content. Zero-days are written explicitly so retention math downstream
+    is unambiguous.
+    """
+    import json as _json
+    from datetime import date
+    from pathlib import Path
+
+    from . import __version__
+
+    window, whole = _tool_tick_stats(days)
+    today = date.today()
+    daily: dict[str, int] = {}
+    for offset in range(days - 1, -1, -1):
+        day = (today - timedelta(days=offset)).isoformat()
+        daily[day] = window["by_day"].get(day, 0)
+    payload = {
+        "persome_version": __version__,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "window_days": days,
+        "first_recorded": (whole["first_ts"] or "")[:10] or None,
+        "days_active": sum(1 for v in daily.values() if v),
+        "daily_calls": daily,
+    }
+    text = _json.dumps(payload, ensure_ascii=False, indent=2)
+    if out:
+        paths.atomic_write_private_text(Path(out), text)
+        typer.echo(f"wrote {out}")
+    else:
+        typer.echo(text)
+
+
 clean_app = typer.Typer(help="Delete past data. Destructive — use with care.")
 app.add_typer(clean_app, name="clean")
 

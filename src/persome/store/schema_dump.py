@@ -99,6 +99,7 @@ def _index_db_steps() -> list[tuple[str, Callable[[sqlite3.Connection], None]]]:
         parser_ticks,
         relation_edges,
         schema_faces,
+        tool_ticks,
     )
 
     return [
@@ -110,6 +111,7 @@ def _index_db_steps() -> list[tuple[str, Callable[[sqlite3.Connection], None]]]:
         ("store/owner_aliases.py", owner_aliases.ensure_schema),
         ("store/parser_ticks.py", parser_ticks.ensure_schema),
         ("store/schema_faces.py", schema_faces.ensure_schema),
+        ("store/tool_ticks.py", tool_ticks.ensure_schema),
         ("source_import.py", source_import.ensure_schema),
         ("evomem/store.py", evo_store.ensure_schema),
         ("evomem/integrity.py", evo_integrity.ensure_check_runs_schema),
