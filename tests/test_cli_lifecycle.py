@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import shlex
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,8 +15,12 @@ from persome import cli
 
 
 class _FakeLock:
-    def __init__(self) -> None:
+    def __init__(self, fd: int = 91) -> None:
         self.closed = False
+        self.fd = fd
+
+    def fileno(self) -> int:
+        return self.fd
 
     def close(self) -> None:
         self.closed = True
@@ -113,7 +120,331 @@ def test_daemon_lifetime_lock_excludes_a_second_start(ac_root) -> None:
     replacement.close()
 
 
-def test_start_lock_failure_never_initializes_or_forks(
+def test_background_exec_adopts_the_same_canonical_lifetime_lock(ac_root) -> None:
+    original = cli._acquire_daemon_lock()
+    inherited_fd = cli.os.dup(original.fileno())
+    adopted = cli._adopt_daemon_lock_fd(inherited_fd)
+    original.close()
+    try:
+        assert cli.fcntl.fcntl(adopted.fileno(), cli.fcntl.F_GETFD) & cli.fcntl.FD_CLOEXEC
+        with pytest.raises(RuntimeError, match="already starting or running"):
+            cli._acquire_daemon_lock()
+    finally:
+        adopted.close()
+
+    replacement = cli._acquire_daemon_lock()
+    replacement.close()
+
+
+def test_background_exec_rejects_a_noncanonical_lock_descriptor(ac_root) -> None:
+    canonical = cli._acquire_daemon_lock()
+    wrong_path = ac_root / "wrong-daemon.lock"
+    wrong_fd = cli.os.open(wrong_path, cli.os.O_CREAT | cli.os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(RuntimeError, match="canonical private lock"):
+            cli._adopt_daemon_lock_fd(wrong_fd)
+        with pytest.raises(OSError):
+            cli.os.fstat(wrong_fd)
+    finally:
+        canonical.close()
+
+
+def test_background_lock_marker_is_private_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(cli._BACKGROUND_DAEMON_LOCK_FD_ENV, "not-a-descriptor")
+
+    with pytest.raises(RuntimeError, match="invalid inherited daemon lock"):
+        cli._inherited_background_lock_fd()
+
+    assert cli._BACKGROUND_DAEMON_LOCK_FD_ENV not in cli.os.environ
+
+
+def test_background_spawn_execs_fresh_interpreter_and_transfers_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = _FakeLock(fd=91)
+    seen: dict[str, object] = {}
+
+    def fake_posix_spawn(
+        executable: str,
+        command: list[str],
+        env: dict[str, str],
+        **kwargs: object,
+    ) -> int:
+        seen.update(executable=executable, command=command, env=env, **kwargs)
+        return 4242
+
+    monkeypatch.delattr(cli.sys, "frozen", raising=False)
+    monkeypatch.setenv("PERSOME_PARENT_PID", "1234")
+    monkeypatch.setattr(cli.os, "posix_spawn", fake_posix_spawn)
+
+    assert cli._spawn_background_runtime(lock, capture_only=True) == 4242
+    command = seen["command"]
+    assert command == [
+        cli.sys.executable,
+        "-m",
+        "persome.cli",
+        "start",
+        "--foreground",
+        "--capture-only",
+    ]
+    assert seen["executable"] == cli.sys.executable
+    assert seen["setsid"] is True
+    assert seen["env"][cli._BACKGROUND_DAEMON_LOCK_FD_ENV] == "3"
+    assert "PERSOME_PARENT_PID" not in seen["env"]
+    assert seen["file_actions"] == [
+        (cli.os.POSIX_SPAWN_DUP2, 91, 3),
+        (cli.os.POSIX_SPAWN_CLOSE, 91),
+        (cli.os.POSIX_SPAWN_OPEN, 0, cli.os.devnull, cli.os.O_RDWR, 0o666),
+        (cli.os.POSIX_SPAWN_DUP2, 0, 1),
+        (cli.os.POSIX_SPAWN_DUP2, 0, 2),
+    ]
+
+
+def test_background_spawn_uses_fd_four_when_parent_lock_is_fd_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_posix_spawn(
+        _executable: str,
+        _command: list[str],
+        env: dict[str, str],
+        **kwargs: object,
+    ) -> int:
+        seen.update(env=env, **kwargs)
+        return 4242
+
+    monkeypatch.setattr(cli.os, "posix_spawn", fake_posix_spawn)
+
+    assert cli._spawn_background_runtime(_FakeLock(fd=3), capture_only=False) == 4242
+    assert seen["env"][cli._BACKGROUND_DAEMON_LOCK_FD_ENV] == "4"
+    assert seen["file_actions"][:2] == [
+        (cli.os.POSIX_SPAWN_DUP2, 3, 4),
+        (cli.os.POSIX_SPAWN_CLOSE, 3),
+    ]
+
+
+def test_background_spawn_transfers_the_real_lock_across_exec(
+    ac_root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready_path = ac_root / "spawn-lock-ready"
+    child_code = (
+        "import os,pathlib,time;"
+        f"os.fstat(int(os.environ[{cli._BACKGROUND_DAEMON_LOCK_FD_ENV!r}]));"
+        f"pathlib.Path({str(ready_path)!r}).touch();"
+        "time.sleep(30)"
+    )
+    monkeypatch.setattr(
+        cli,
+        "_background_daemon_command",
+        lambda *, capture_only: [cli.sys.executable, "-c", child_code],
+    )
+
+    parent_lock = cli._acquire_daemon_lock()
+    spawned_pid = cli._spawn_background_runtime(parent_lock, capture_only=False)
+    parent_lock.close()
+    reaped = False
+    try:
+        deadline = time.monotonic() + 5.0
+        while not ready_path.exists():
+            observed_pid, status = cli.os.waitpid(spawned_pid, cli.os.WNOHANG)
+            if observed_pid == spawned_pid:
+                reaped = True
+                pytest.fail(f"exec child exited before lock proof (wait status {status})")
+            if time.monotonic() >= deadline:
+                pytest.fail("exec child did not publish its lock proof")
+            time.sleep(0.01)
+
+        with pytest.raises(RuntimeError, match="already starting or running"):
+            cli._acquire_daemon_lock()
+    finally:
+        if not reaped:
+            with contextlib.suppress(ProcessLookupError):
+                cli.os.kill(spawned_pid, cli.signal.SIGTERM)
+            with contextlib.suppress(ChildProcessError):
+                cli.os.waitpid(spawned_pid, 0)
+
+    replacement = cli._acquire_daemon_lock()
+    replacement.close()
+
+
+def test_background_daemon_command_reexecs_the_frozen_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.sys, "frozen", True, raising=False)
+
+    assert cli._background_daemon_command(capture_only=False) == [
+        cli.sys.executable,
+        "start",
+        "--foreground",
+    ]
+
+
+def test_background_daemon_command_matches_runtime_identity_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(cli.sys, "frozen", raising=False)
+    command = cli._background_daemon_command(capture_only=False)
+
+    assert cli.runtime_pid.is_runtime_command(
+        shlex.join(command),
+        executable=command[0],
+    )
+
+
+def test_background_exec_child_skips_mutable_integrity_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = _FakeLock()
+    cfg = object()
+    init_kwargs: list[dict[str, bool]] = []
+    runs: list[tuple[object, bool]] = []
+    exits: list[int] = []
+    monkeypatch.setattr(cli, "_adopt_daemon_lock_fd", lambda _fd: lock)
+    monkeypatch.setattr(
+        cli,
+        "_init",
+        lambda **kwargs: init_kwargs.append(kwargs) or cfg,
+    )
+
+    from persome import daemon
+
+    monkeypatch.setattr(
+        daemon,
+        "run",
+        lambda value, *, capture_only: runs.append((value, capture_only)),
+    )
+    monkeypatch.setattr(cli.os, "_exit", lambda code: exits.append(code))
+
+    cli._run_background_exec_child(91, capture_only=True)
+
+    assert init_kwargs == [{"starting_runtime": True, "recover_integrity": False}]
+    assert runs == [(cfg, True)]
+    assert lock.closed is True
+    assert exits == [0]
+
+
+def test_background_probe_rejects_receipt_from_a_different_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other = SimpleNamespace(pid=9002)
+    monkeypatch.setattr(cli.runtime_pid, "resolve_recorded_process", lambda: other)
+
+    state, detail, process = cli._probe_background_runtime(
+        _http_config(),
+        spawned_pid=9001,
+    )
+
+    assert state == "fatal"
+    assert "pid 9002, not spawned pid 9001" in detail
+    assert process is None
+
+
+def test_background_wait_reaps_and_reports_pre_receipt_sigbus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli.os,
+        "waitpid",
+        lambda pid, options: (pid, int(cli.signal.SIGBUS)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_background_runtime",
+        lambda *_args, **_kwargs: pytest.fail("an exited child must be reported before probing"),
+    )
+
+    ready, detail, process = cli._wait_for_background_start(
+        _http_config(),
+        spawned_pid=9001,
+    )
+
+    assert ready is False
+    assert "SIGBUS" in detail
+    assert process is None
+
+
+def test_receiptless_spawned_child_is_terminated_and_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits = iter([False, True])
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_spawned_child_exit",
+        lambda _pid, _timeout: next(waits),
+    )
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    assert cli._terminate_failed_background_start(None, spawned_pid=9001) is True
+    assert signals == [(9001, cli.signal.SIGTERM)]
+
+
+def test_recorded_cleanup_still_requires_direct_child_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = SimpleNamespace(pid=9001)
+    direct_children: list[int] = []
+    monkeypatch.setattr(cli, "_terminate_recorded_background_start", lambda _process: True)
+    monkeypatch.setattr(cli, "_wait_for_spawned_child_exit", lambda _pid, _timeout: False)
+    monkeypatch.setattr(
+        cli,
+        "_terminate_spawned_background_child",
+        lambda pid: direct_children.append(pid) or True,
+    )
+
+    assert cli._terminate_failed_background_start(process, spawned_pid=9001) is True
+    assert direct_children == [9001]
+
+
+def test_failed_start_never_signals_a_mismatched_runtime_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_process = SimpleNamespace(pid=9002)
+    direct_children: list[int] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_recorded_background_start",
+        lambda _process: pytest.fail("a foreign Runtime receipt must not be signaled"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_spawned_background_child",
+        lambda pid: direct_children.append(pid) or True,
+    )
+
+    assert cli._terminate_failed_background_start(other_process, spawned_pid=9001) is True
+    assert direct_children == [9001]
+
+
+def test_background_wait_timeout_keeps_spawned_pid_for_receiptless_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.os, "waitpid", lambda _pid, _options: (0, 0))
+    monkeypatch.setattr(
+        cli,
+        "_probe_background_runtime",
+        lambda _cfg, _expected=None, *, spawned_pid: (
+            "retry",
+            f"waiting for spawned pid {spawned_pid}",
+            None,
+        ),
+    )
+
+    ready, detail, process = cli._wait_for_background_start(
+        _http_config(),
+        spawned_pid=9001,
+        timeout_seconds=0,
+    )
+
+    assert ready is False
+    assert "startup timed out" in detail
+    assert process is None
+
+
+def test_start_lock_failure_never_initializes_or_spawns(
     ac_root, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, "_read_pid", lambda: None)
@@ -236,11 +567,20 @@ def test_background_start_reports_success_only_after_readiness(
     monkeypatch.setattr(cli, "_acquire_daemon_lock", lambda: lock)
     monkeypatch.setattr(cli.env_file_mod, "ensure_local_api_token", lambda _path: "existing")
     monkeypatch.setattr(cli, "_init", lambda **_kwargs: cfg)
-    monkeypatch.setattr(cli.os, "fork", lambda: 4321)
+    spawned: list[tuple[object, bool]] = []
+    monkeypatch.setattr(
+        cli,
+        "_spawn_background_runtime",
+        lambda value, *, capture_only: spawned.append((value, capture_only)) or 4321,
+    )
     monkeypatch.setattr(
         cli,
         "_wait_for_background_start",
-        lambda _cfg: (observed.append("ready") or True, "ready", SimpleNamespace(pid=4242)),
+        lambda _cfg, *, spawned_pid: (
+            observed.append(f"ready:{spawned_pid}") or True,
+            "ready",
+            SimpleNamespace(pid=spawned_pid),
+        ),
     )
     monkeypatch.setattr(
         cli,
@@ -251,7 +591,8 @@ def test_background_start_reports_success_only_after_readiness(
     result = CliRunner().invoke(cli.app, ["start"])
 
     assert result.exit_code == 0, result.output
-    assert observed == ["ready"]
+    assert observed == ["ready:4321"]
+    assert spawned == [(lock, False)]
     assert lock.closed is True
     assert "Persome started in background." in result.output
 
@@ -261,39 +602,111 @@ def test_background_start_failure_stops_child_and_reports_port_owner(
 ) -> None:
     lock = _FakeLock()
     cfg = _http_config()
-    process = SimpleNamespace(pid=4242)
+    process = SimpleNamespace(pid=4321)
     terminated: list[object] = []
     monkeypatch.setattr(cli, "_fail_if_runtime_state_is_ambiguous", lambda: None)
     monkeypatch.setattr(cli, "_read_pid", lambda: None)
     monkeypatch.setattr(cli, "_acquire_daemon_lock", lambda: lock)
     monkeypatch.setattr(cli.env_file_mod, "ensure_local_api_token", lambda _path: "existing")
     monkeypatch.setattr(cli, "_init", lambda **_kwargs: cfg)
-    monkeypatch.setattr(cli.os, "fork", lambda: 4321)
+    monkeypatch.setattr(cli, "_spawn_background_runtime", lambda *_args, **_kwargs: 4321)
     monkeypatch.setattr(
         cli,
         "_wait_for_background_start",
-        lambda _cfg: (
+        lambda _cfg, *, spawned_pid: (
             False,
-            "port 8742 is in use by a different or incompatible service",
+            f"spawned pid {spawned_pid} did not own port 8742",
             process,
         ),
     )
     monkeypatch.setattr(
         cli,
         "_terminate_failed_background_start",
-        lambda value: terminated.append(value) or True,
+        lambda value, *, spawned_pid: terminated.append((value, spawned_pid)) or True,
     )
 
     result = CliRunner().invoke(cli.app, ["start"])
 
     assert result.exit_code == 1, result.output
     assert lock.closed is True
-    assert terminated == [process]
+    assert terminated == [(process, 4321)]
     assert "Persome started in background." not in result.output
     assert "did not start correctly" in result.output
     assert "incomplete background Runtime was stopped" in result.output
     assert "lsof -nP -iTCP:8742 -sTCP:LISTEN" in result.output
     assert "persome doctor" in result.output
+
+
+def test_background_spawn_failure_is_reported_without_waiting(
+    ac_root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = _FakeLock()
+    cfg = _http_config()
+    terminated: list[object] = []
+    monkeypatch.setattr(cli, "_fail_if_runtime_state_is_ambiguous", lambda: None)
+    monkeypatch.setattr(cli, "_read_pid", lambda: None)
+    monkeypatch.setattr(cli, "_acquire_daemon_lock", lambda: lock)
+    monkeypatch.setattr(cli.env_file_mod, "ensure_local_api_token", lambda _path: "existing")
+    monkeypatch.setattr(cli, "_init", lambda **_kwargs: cfg)
+    monkeypatch.setattr(
+        cli,
+        "_spawn_background_runtime",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_background_start",
+        lambda _cfg: pytest.fail("a failed spawn must not enter readiness polling"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_failed_background_start",
+        lambda process, *, spawned_pid: terminated.append((process, spawned_pid)) or True,
+    )
+
+    result = CliRunner().invoke(cli.app, ["start"])
+
+    assert result.exit_code == 1, result.output
+    assert lock.closed is True
+    assert terminated == [(None, None)]
+    assert "could not spawn the background Runtime" in result.output
+    assert "OSError" in result.output
+
+
+def test_background_verification_exception_never_targets_another_receipt(
+    ac_root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = _FakeLock()
+    cfg = _http_config()
+    other_process = SimpleNamespace(pid=9999)
+    terminated: list[tuple[object, int | None]] = []
+    monkeypatch.setattr(cli, "_fail_if_runtime_state_is_ambiguous", lambda: None)
+    monkeypatch.setattr(cli, "_read_pid", lambda: None)
+    monkeypatch.setattr(cli, "_acquire_daemon_lock", lambda: lock)
+    monkeypatch.setattr(cli.env_file_mod, "ensure_local_api_token", lambda _path: "existing")
+    monkeypatch.setattr(cli, "_init", lambda **_kwargs: cfg)
+    monkeypatch.setattr(cli, "_spawn_background_runtime", lambda *_args, **_kwargs: 4321)
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_background_start",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("probe failed")),
+    )
+    monkeypatch.setattr(
+        cli.runtime_pid,
+        "resolve_recorded_process",
+        lambda: other_process,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_failed_background_start",
+        lambda process, *, spawned_pid: terminated.append((process, spawned_pid)) or True,
+    )
+
+    result = CliRunner().invoke(cli.app, ["start"])
+
+    assert result.exit_code == 1, result.output
+    assert terminated == [(None, 4321)]
+    assert "startup verification failed" in result.output
 
 
 def test_failed_background_cleanup_escalates_only_the_observed_generation(

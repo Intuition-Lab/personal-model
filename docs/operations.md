@@ -78,7 +78,7 @@ and old helper path.
 | `.integrity-recovery.pending.json` | crash-resumable full-database quarantine/replay journal |
 | `.integrity-config-recovery.pending.json` | config-quarantine intent retained until database authority is reconciled |
 | `.pid`, `.runtime-state.json` | compatibility PID plus owner-only generation, phase, permission, OCR-worker, and capture/privacy receipt |
-| `.daemon.lock` | lifetime single-Runtime lock inherited across background forks |
+| `.daemon.lock` | lifetime single-Runtime lock transferred into the background exec |
 | `.launchagent-owner` | durable intent that launchd owns Runtime lifecycle |
 | `.update.lock`, `.update-state.json` | exclusive update lock and crash-recovery phase metadata |
 | `native/<source-digest>/` | immutable machine-local AX and Vision OCR binaries; code, not personal data |

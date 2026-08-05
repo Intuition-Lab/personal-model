@@ -17,6 +17,7 @@ import fcntl
 import json
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,7 @@ _DAEMON_STARTUP_RETRY_SECONDS = 0.1
 _DAEMON_STARTUP_HTTP_TIMEOUT_SECONDS = 1.0
 _DAEMON_STARTUP_STOP_TIMEOUT_SECONDS = 5.0
 _DAEMON_STARTUP_KILL_TIMEOUT_SECONDS = 2.0
+_BACKGROUND_DAEMON_LOCK_FD_ENV = "PERSOME_DAEMON_LOCK_FD"
 
 
 def _fail_if_runtime_state_is_ambiguous() -> None:
@@ -77,6 +79,115 @@ def _acquire_daemon_lock():  # type: ignore[no-untyped-def]
             handle.close()
         raise RuntimeError("another Persome Runtime is already starting or running") from exc
     return handle
+
+
+def _adopt_daemon_lock_fd(lock_fd: int):  # type: ignore[no-untyped-def]
+    """Adopt the canonical lifetime lock handed across a background exec."""
+    try:
+        inherited = os.fstat(lock_fd)
+        linked = paths.daemon_lock_file().lstat()
+        if (
+            lock_fd <= 2
+            or not stat.S_ISREG(inherited.st_mode)
+            or inherited.st_uid != os.getuid()
+            or inherited.st_nlink != 1
+            or not stat.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.getuid()
+            or linked.st_nlink != 1
+            or (inherited.st_dev, inherited.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise RuntimeError("inherited daemon lock does not name the canonical private lock")
+        os.fchmod(lock_fd, 0o600)
+        # This is a no-op for the inherited open-file description, but fails
+        # closed if an invalid launcher handed us a competing descriptor.
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # POSIX_SPAWN_DUP2 deliberately clears close-on-exec for this handoff.
+        # Restore it now so OCR/native subprocesses cannot extend the daemon's
+        # lifetime lock after the Runtime owner exits.
+        descriptor_flags = fcntl.fcntl(lock_fd, fcntl.F_GETFD)
+        fcntl.fcntl(lock_fd, fcntl.F_SETFD, descriptor_flags | fcntl.FD_CLOEXEC)
+        return os.fdopen(lock_fd, "a+b")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(lock_fd)
+        raise
+
+
+def _background_daemon_command(*, capture_only: bool) -> list[str]:
+    """Return the same-package command used for the fresh daemon exec."""
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "start", "--foreground"]
+    else:
+        command = [sys.executable, "-m", "persome.cli", "start", "--foreground"]
+    if capture_only:
+        command.append("--capture-only")
+    return command
+
+
+def _spawn_background_runtime(daemon_lock, *, capture_only: bool) -> int:  # type: ignore[no-untyped-def]
+    """Spawn a fresh interpreter while transferring the held lifetime lock.
+
+    ``posix_spawn`` keeps all Python and SQLite work on the parent side of the
+    process boundary. The child begins only after ``exec``, so it cannot run
+    daemon code inside a fork-cloned SQLite/WAL state.
+    """
+    parent_lock_fd = daemon_lock.fileno()
+    child_lock_fd = 4 if parent_lock_fd == 3 else 3
+    command = _background_daemon_command(capture_only=capture_only)
+    env = dict(os.environ)
+    # Unlike ``start --foreground`` owned by the Desktop app, plain background
+    # start has always outlived its launching shell/app. Do not let the fresh
+    # exec accidentally opt into the foreground parent-death watcher.
+    env.pop("PERSOME_PARENT_PID", None)
+    env[_BACKGROUND_DAEMON_LOCK_FD_ENV] = str(child_lock_fd)
+    file_actions: list[tuple] = [
+        # Duplicate first: the lock can occupy fd 0 when a caller starts with
+        # closed stdio, and the following devnull action intentionally replaces it.
+        (os.POSIX_SPAWN_DUP2, parent_lock_fd, child_lock_fd),
+    ]
+    if parent_lock_fd > 2:
+        file_actions.append((os.POSIX_SPAWN_CLOSE, parent_lock_fd))
+    file_actions.extend(
+        [
+            (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDWR, 0o666),
+            (os.POSIX_SPAWN_DUP2, 0, 1),
+            (os.POSIX_SPAWN_DUP2, 0, 2),
+        ]
+    )
+    return os.posix_spawn(
+        command[0],
+        command,
+        env,
+        file_actions=file_actions,
+        setsid=True,
+    )
+
+
+def _inherited_background_lock_fd() -> int | None:
+    """Consume the private marker used only by the background daemon exec."""
+    raw = os.environ.pop(_BACKGROUND_DAEMON_LOCK_FD_ENV, None)
+    if raw is None:
+        return None
+    try:
+        lock_fd = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("invalid inherited daemon lock descriptor") from exc
+    if lock_fd <= 2:
+        raise RuntimeError("invalid inherited daemon lock descriptor")
+    return lock_fd
+
+
+def _run_background_exec_child(lock_fd: int, *, capture_only: bool) -> None:
+    """Run the daemon after a fresh exec without repeating mutable DB recovery."""
+    daemon_lock = _adopt_daemon_lock_fd(lock_fd)
+    try:
+        cfg = _init(starting_runtime=True, recover_integrity=False)
+        from . import daemon
+
+        daemon.run(cfg, capture_only=capture_only)
+    finally:
+        daemon_lock.close()
+    os._exit(0)
 
 
 def _daemon_lock_is_held() -> bool:
@@ -336,6 +447,8 @@ def _same_runtime_process(
 def _probe_background_runtime(
     cfg: config_mod.Config,
     expected_process: runtime_pid.ProcessIdentity | None = None,
+    *,
+    spawned_pid: int | None = None,
 ) -> tuple[str, str, runtime_pid.ProcessIdentity | None]:
     """Probe one background-start attempt.
 
@@ -349,6 +462,14 @@ def _probe_background_runtime(
         if expected_process is not None:
             return "fatal", "the new Runtime process exited during startup", expected_process
         return "retry", "waiting for the new Runtime process receipt", None
+    if spawned_pid is not None and process.pid != spawned_pid:
+        # Never hand another process to failed-start cleanup. The caller owns
+        # only the direct child returned by posix_spawn.
+        return (
+            "fatal",
+            f"the Runtime receipt names pid {process.pid}, not spawned pid {spawned_pid}",
+            None,
+        )
     if process.generation is None or process.runtime_started_at is None:
         return "retry", "waiting for the generation-bound Runtime receipt", process
     if expected_process is not None and not _same_runtime_process(process, expected_process):
@@ -417,6 +538,7 @@ def _probe_background_runtime(
 def _wait_for_background_start(
     cfg: config_mod.Config,
     *,
+    spawned_pid: int | None = None,
     timeout_seconds: float = _DAEMON_STARTUP_TIMEOUT_SECONDS,
 ) -> tuple[bool, str, runtime_pid.ProcessIdentity | None]:
     """Wait a bounded time for one exact daemon generation to become usable."""
@@ -425,7 +547,18 @@ def _wait_for_background_start(
     last_process: runtime_pid.ProcessIdentity | None = None
     detail = "the Runtime did not publish a readiness receipt"
     while True:
-        state, detail, process = _probe_background_runtime(cfg, expected_process)
+        if spawned_pid is not None:
+            exit_detail = _reap_exited_background_child(spawned_pid)
+            if exit_detail is not None:
+                return False, exit_detail, expected_process or last_process
+        if spawned_pid is None:
+            state, detail, process = _probe_background_runtime(cfg, expected_process)
+        else:
+            state, detail, process = _probe_background_runtime(
+                cfg,
+                expected_process,
+                spawned_pid=spawned_pid,
+            )
         if process is not None:
             last_process = process
         if (
@@ -445,12 +578,57 @@ def _wait_for_background_start(
         time.sleep(min(_DAEMON_STARTUP_RETRY_SECONDS, remaining))
 
 
+def _reap_exited_background_child(pid: int) -> str | None:
+    """Reap a direct spawn child that exited before publishing readiness."""
+    try:
+        reaped_pid, status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return None
+    if reaped_pid == 0:
+        return None
+    if os.WIFEXITED(status):
+        return f"the background Runtime exited before readiness (status {os.WEXITSTATUS(status)})"
+    if os.WIFSIGNALED(status):
+        signum = os.WTERMSIG(status)
+        with contextlib.suppress(ValueError):
+            return (
+                "the background Runtime exited before readiness "
+                f"(signal {signum} {signal.Signals(signum).name})"
+            )
+        return f"the background Runtime exited before readiness (signal {signum})"
+    return "the background Runtime exited before readiness"
+
+
 def _terminate_failed_background_start(
     process: runtime_pid.ProcessIdentity | None,
+    *,
+    spawned_pid: int | None = None,
 ) -> bool:
     """Stop only the generation observed during this failed start attempt."""
     if process is None:
+        if spawned_pid is not None:
+            return _terminate_spawned_background_child(spawned_pid)
         return not _daemon_lock_is_held()
+    if spawned_pid is not None and process.pid != spawned_pid:
+        # Defensive boundary: even if a future probe accidentally returns a
+        # concurrent Runtime identity, this start owns only its direct child.
+        return _terminate_spawned_background_child(spawned_pid)
+    cleaned = _terminate_recorded_background_start(process)
+    if spawned_pid is not None and process.pid == spawned_pid:
+        if cleaned:
+            # The identity-bound wait proved exit; reap the direct child if it
+            # has become waitable so it cannot linger as a zombie until CLI
+            # exit. If the kernel still reports it alive, direct child
+            # ownership is the final authority and cleanup must continue.
+            if not _wait_for_spawned_child_exit(spawned_pid, 0.0):
+                cleaned = _terminate_spawned_background_child(spawned_pid)
+        else:
+            cleaned = _terminate_spawned_background_child(spawned_pid)
+    return cleaned
+
+
+def _terminate_recorded_background_start(process: runtime_pid.ProcessIdentity) -> bool:
+    """Stop a failed start through its generation-bound Runtime receipt."""
     if not runtime_pid.signal_process(process, signal.SIGTERM):
         return runtime_pid.resolve_recorded_process() is None and _clear_failed_background_receipts(
             process
@@ -469,6 +647,43 @@ def _terminate_failed_background_start(
     if not runtime_pid.wait_for_exit(process, _DAEMON_STARTUP_KILL_TIMEOUT_SECONDS):
         return False
     return _clear_failed_background_receipts(process)
+
+
+def _wait_for_spawned_child_exit(pid: int, timeout_seconds: float) -> bool:
+    """Wait for and reap one direct spawn child without admitting PID reuse."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if reaped_pid == pid:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_DAEMON_STARTUP_RETRY_SECONDS, remaining))
+
+
+def _terminate_spawned_background_child(pid: int) -> bool:
+    """Stop a receipt-less direct child, whose unreaped PID cannot be reused."""
+    if _wait_for_spawned_child_exit(pid, 0.0):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return _wait_for_spawned_child_exit(pid, _DAEMON_STARTUP_RETRY_SECONDS)
+    except OSError:
+        return False
+    if _wait_for_spawned_child_exit(pid, _DAEMON_STARTUP_STOP_TIMEOUT_SECONDS):
+        return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return _wait_for_spawned_child_exit(pid, _DAEMON_STARTUP_RETRY_SECONDS)
+    except OSError:
+        return False
+    return _wait_for_spawned_child_exit(pid, _DAEMON_STARTUP_KILL_TIMEOUT_SECONDS)
 
 
 def _clear_failed_background_receipts(process: runtime_pid.ProcessIdentity) -> bool:
@@ -519,6 +734,15 @@ def start(
     capture_only: bool = typer.Option(False, "--capture-only", help="Skip the writer loop."),
 ) -> None:
     """Start the Persome daemon."""
+    inherited_lock_fd = _inherited_background_lock_fd()
+    if inherited_lock_fd is not None:
+        if not foreground:
+            with contextlib.suppress(OSError):
+                os.close(inherited_lock_fd)
+            raise RuntimeError("background daemon exec must use foreground process ownership")
+        _run_background_exec_child(inherited_lock_fd, capture_only=capture_only)
+        return
+
     # Avoid even configuration/integrity writes when the caller only asked to
     # start an already-running daemon. This is also the cross-process guard for
     # editor-launched MCP clients that share the same local database.
@@ -542,9 +766,9 @@ def start(
         console.print(f"[yellow]Already running (pid {pid})[/yellow]")
         raise typer.Exit(1)
 
-    from . import daemon
-
     if foreground:
+        from . import daemon
+
         console.print("[bold]Persome starting in foreground[/bold] — Ctrl+C to stop.")
         _watch_parent_death()  # exit if the Persome app that spawned us (--foreground child) dies
         daemon.run(cfg, capture_only=capture_only)
@@ -562,58 +786,54 @@ def start(
         # below already hard-exits for the same reason; mirror it here.
         os._exit(0)
 
-    # Background: double-fork. The parent stays alive just long enough to prove
-    # that this exact new generation owns its PID receipt and authenticated HTTP
-    # endpoint. Its copy of the lifetime lock is closed before polling; the
-    # grandchild retains the inherited file description for its whole life.
-    first_child_pid = os.fork()
-    if first_child_pid != 0:
+    # Background: start a new session through spawn+exec. The parent stays alive
+    # just long enough to prove that this exact new generation owns its PID
+    # receipt and authenticated HTTP endpoint. The exec child adopts the same
+    # held open-file description, so there is no unlocked takeover window.
+    spawned_pid: int | None = None
+    try:
+        spawned_pid = _spawn_background_runtime(daemon_lock, capture_only=capture_only)
+    except OSError as exc:
+        daemon_lock.close()
+        ready = False
+        detail = f"could not spawn the background Runtime ({type(exc).__name__})"
+        process = None
+    else:
         daemon_lock.close()
         try:
-            ready, detail, process = _wait_for_background_start(cfg)
+            ready, detail, process = _wait_for_background_start(cfg, spawned_pid=spawned_pid)
         except Exception as exc:  # noqa: BLE001 - startup still needs safe cleanup
             ready = False
             detail = f"startup verification failed ({type(exc).__name__})"
             process = None
             with contextlib.suppress(Exception):
-                process = runtime_pid.resolve_recorded_process()
-        if ready:
-            console.print("[green]Persome started in background.[/green]")
-            console.print(f"Logs: {paths.logs_dir()}")
-            return
-        try:
-            cleaned = _terminate_failed_background_start(process)
-        except Exception:  # noqa: BLE001 - preserve the actionable failure path
-            cleaned = False
-        console.print(f"[red]Persome did not start correctly:[/red] {detail}")
-        if cleaned:
-            console.print("[yellow]The incomplete background Runtime was stopped.[/yellow]")
-        else:
-            console.print(
-                "[yellow]Persome could not confirm that the incomplete Runtime stopped; "
-                "run `persome stop` before retrying.[/yellow]"
-            )
-        if cfg.mcp.auto_start and cfg.mcp.transport in {"sse", "streamable-http"}:
-            console.print(
-                f"Check port {cfg.mcp.port} with "
-                f"`lsof -nP -iTCP:{cfg.mcp.port} -sTCP:LISTEN`, then retry."
-            )
+                observed = runtime_pid.resolve_recorded_process()
+                if observed is not None and observed.pid == spawned_pid:
+                    process = observed
+    if ready:
+        console.print("[green]Persome started in background.[/green]")
         console.print(f"Logs: {paths.logs_dir()}")
-        console.print("Next: persome doctor")
-        raise typer.Exit(1)
-    os.setsid()
-    if os.fork() != 0:
-        os._exit(0)
-    # Redirect stdio to /dev/null. After dup2 the original fd is no longer
-    # needed; closing it avoids leaking one descriptor per daemon start.
-    devnull = os.open(os.devnull, os.O_RDWR)
-    for fd in (0, 1, 2):
-        os.dup2(devnull, fd)
-    if devnull > 2:
-        os.close(devnull)
-    daemon.run(cfg, capture_only=capture_only)
-    daemon_lock.close()
-    os._exit(0)
+        return
+    try:
+        cleaned = _terminate_failed_background_start(process, spawned_pid=spawned_pid)
+    except Exception:  # noqa: BLE001 - preserve the actionable failure path
+        cleaned = False
+    console.print(f"[red]Persome did not start correctly:[/red] {detail}")
+    if cleaned:
+        console.print("[yellow]The incomplete background Runtime was stopped.[/yellow]")
+    else:
+        console.print(
+            "[yellow]Persome could not confirm that the incomplete Runtime stopped; "
+            "run `persome stop` before retrying.[/yellow]"
+        )
+    if cfg.mcp.auto_start and cfg.mcp.transport in {"sse", "streamable-http"}:
+        console.print(
+            f"Check port {cfg.mcp.port} with "
+            f"`lsof -nP -iTCP:{cfg.mcp.port} -sTCP:LISTEN`, then retry."
+        )
+    console.print(f"Logs: {paths.logs_dir()}")
+    console.print("Next: persome doctor")
+    raise typer.Exit(1)
 
 
 @app.command()
@@ -3411,12 +3631,13 @@ def model_open(
                 )
                 break
             except httpx.ConnectError:
-                # `persome start` returns after forking, just before uvicorn has
-                # necessarily bound its loopback socket. Retry only that
-                # connection-refused startup race. Any HTTP response (notably
-                # 401/403) is handled below immediately instead of being hidden
-                # behind retries. A genuinely stopped Runtime fails
-                # immediately instead of looking like another CLI hang.
+                # Another concurrent start can hold the lifetime lock and
+                # publish its PID before uvicorn has bound the loopback socket.
+                # Retry only that connection-refused startup race. Any HTTP
+                # response (notably 401/403) is handled below immediately
+                # instead of being hidden behind retries. A genuinely stopped
+                # Runtime fails immediately instead of looking like another
+                # CLI hang.
                 runtime_starting = _read_pid() is not None or _daemon_lock_is_held()
                 if not runtime_starting or attempt + 1 == _MODEL_VIEWER_STARTUP_ATTEMPTS:
                     raise

@@ -34,20 +34,24 @@ def test_does_not_overwrite_existing(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert os.environ["KEEP_ME"] == "shell-wins"
 
 
-def test_owner_env_cannot_redirect_persome_root(
+def test_owner_env_cannot_set_process_bootstrap_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A file under one root cannot redirect initialization to another root."""
+    """The owner file cannot redirect the root or forge an internal lock handoff."""
     monkeypatch.delenv("PERSOME_ROOT", raising=False)
+    monkeypatch.delenv("PERSOME_DAEMON_LOCK_FD", raising=False)
     monkeypatch.delenv("SAFE_OWNER_KEY", raising=False)
     path = tmp_path / "env"
     path.write_text(
-        f"PERSOME_ROOT={tmp_path / 'different-root'}\nSAFE_OWNER_KEY=loaded\n",
+        f"PERSOME_ROOT={tmp_path / 'different-root'}\n"
+        "PERSOME_DAEMON_LOCK_FD=3\n"
+        "SAFE_OWNER_KEY=loaded\n",
         encoding="utf-8",
     )
 
     assert load_env_file(path) == 1
     assert "PERSOME_ROOT" not in os.environ
+    assert "PERSOME_DAEMON_LOCK_FD" not in os.environ
     assert os.environ["SAFE_OWNER_KEY"] == "loaded"
 
 

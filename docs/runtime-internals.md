@@ -63,8 +63,10 @@ call. Reconciliation emits a forming placeholder when no Root exists and
 refuses to replace an unmarked file at that path.
 
 `start` holds `<PERSOME_ROOT>/.daemon.lock` from preflight through the entire
-foreground or double-forked daemon lifetime. This prevents two concurrent
-starters from both passing the PID check. The daemon writes a numeric `.pid` for
+foreground or background daemon lifetime. Background start transfers that held
+lock into a fresh `posix_spawn`/exec process instead of running Runtime code in a
+fork-cloned Python/SQLite process. This prevents two concurrent starters from
+both passing the PID check. The daemon writes a numeric `.pid` for
 one-release compatibility plus an owner-only `.runtime-state.json` containing
 its random generation, start/update times, readiness phase, effective capture
 and OCR policy, native permission probes, and the last capture/privacy receipt.
@@ -105,7 +107,7 @@ labels, ports, and data roots do not belong in core.
 | `config.toml` | runtime configuration |
 | `.pid` | compatibility PID receipt; never sufficient by itself for signaling |
 | `.runtime-state.json` | owner-only generation, phase, permission, OCR, and capture receipt |
-| `.daemon.lock` | lifetime single-Runtime lock inherited across background forks |
+| `.daemon.lock` | lifetime single-Runtime lock transferred into the background exec |
 | `.launchagent-owner` | durable launchd lifecycle intent |
 | `.update.lock`, `.update-state.json` | exclusive updater lock and crash-recovery transaction |
 | `venv/` | active installed Runtime |

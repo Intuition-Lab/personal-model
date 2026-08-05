@@ -236,8 +236,9 @@ validation, one-operation directory exchange, crash recovery before/after that
 exchange, rejection of absolute candidate shebangs, execution of the relocated
 CLI after old-venv cleanup, signal-safe rollback, and final
 background/LaunchAgent ownership.
-Lifecycle tests also cover daemon lifetime locking, PID reuse, malformed live
-generation state, and owner-marker handoff. `tests/test_onboarding.py`,
+Lifecycle tests also cover real daemon lifetime-lock transfer across background
+exec, spawned-PID readiness binding, pre-receipt child cleanup, PID reuse,
+malformed live generation state, and owner-marker handoff. `tests/test_onboarding.py`,
 `tests/test_launchagent.py`, `tests/test_ax_capture.py`, and
 `tests/test_ocr_subprocess.py` cover the permission/mode cross-product,
 source-versioned helper reuse, durable `ocr_policy`, progress reporting, and
