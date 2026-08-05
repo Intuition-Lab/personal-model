@@ -1933,14 +1933,19 @@ def test_external_content_fts_drift_is_rebuilt_without_quarantine(ac_root: Path)
         ).fetchone()
         assert row is not None
         # Remove only the derived tokens while retaining the canonical capture.
-        # This is internally valid FTS, so PRAGMA alone cannot see the drift.
+        # SQLite builds differ here: some surface the derived-table mismatch in
+        # PRAGMA, while the macOS build from the reported incident returned ok.
+        # The FTS5 rank=1 probe must identify it either way.
         conn.execute(
             "INSERT INTO captures_fts("
             "captures_fts, rowid, app_name, window_title, focused_value, visible_text, url"
             ") VALUES('delete', ?, ?, ?, ?, ?, ?)",
             tuple(row),
         )
-        assert [item[0] for item in conn.execute("PRAGMA integrity_check(100)")] == ["ok"]
+        pragma_results = [item[0] for item in conn.execute("PRAGMA integrity_check(100)")]
+        assert pragma_results == ["ok"] or all(
+            "captures_fts" in result for result in pragma_results
+        )
         failures = fts.probe_derived_fts_integrity(conn)
         assert set(failures) == {"captures_fts"}
         assert "malformed" in str(failures["captures_fts"]).lower()
