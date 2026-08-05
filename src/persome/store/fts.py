@@ -104,6 +104,37 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     )
 
 
+def probe_derived_fts_integrity(conn: sqlite3.Connection) -> dict[str, sqlite3.Error]:
+    """Return per-table failures from the strongest available FTS5 checks.
+
+    ``PRAGMA integrity_check`` can report ``ok`` while an external-content
+    FTS5 table has drifted from its canonical rows.  The FTS5 ``rank=1`` form
+    reconciles ``captures_fts`` against ``captures`` and closes that gap.  The
+    ordinary command validates the self-contained ``entries`` index.
+
+    Missing projections are not corruption: a new database and an interrupted
+    narrow rebuild legitimately omit them until owner initialization recreates
+    the schema.  Callers retain responsibility for classifying returned SQLite
+    errors as corruption or environmental failures.
+    """
+    commands = (
+        (
+            "captures_fts",
+            "INSERT INTO captures_fts(captures_fts, rank) VALUES('integrity-check', 1)",
+        ),
+        ("entries", "INSERT INTO entries(entries) VALUES('integrity-check')"),
+    )
+    failures: dict[str, sqlite3.Error] = {}
+    for table, command in commands:
+        if not _table_exists(conn, table):
+            continue
+        try:
+            conn.execute(command)
+        except sqlite3.Error as exc:
+            failures[table] = exc
+    return failures
+
+
 def _schema_fingerprint(conn: sqlite3.Connection) -> str:
     """Hash the exact stored schema, including legacy objects retained in place."""
     rows = conn.execute(

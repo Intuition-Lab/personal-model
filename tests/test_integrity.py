@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from persome import config as config_mod
-from persome import integrity, paths
+from persome import index_health, integrity, paths
 from persome.evomem import backup
 from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.evomem.store import NodeStore
@@ -1908,6 +1908,113 @@ def test_malformed_derived_captures_fts_is_rebuilt_without_quarantine(ac_root: P
         assert conn.execute("SELECT count(*) FROM captures").fetchone()[0] == 1
         hits = fts.search_captures(conn, query="needle")
     assert [hit.id for hit in hits] == ["capture-derived-fts-test"]
+
+
+def test_external_content_fts_drift_is_rebuilt_without_quarantine(ac_root: Path) -> None:
+    _make_healthy_db()
+    config_mod.write_default_if_missing()
+    with fts.cursor() as conn:
+        fts.insert_capture(
+            conn,
+            id="capture-external-content-drift",
+            timestamp="2026-07-12T00:00:00+00:00",
+            app_name="Test App",
+            bundle_id="com.persome.test",
+            window_title="External content drift recovery",
+            focused_role="AXTextArea",
+            focused_value="needle",
+            visible_text="needle survives an external-content FTS rebuild",
+            url="https://example.test/external-content-drift",
+        )
+        row = conn.execute(
+            "SELECT rowid, app_name, window_title, focused_value, visible_text, url "
+            "FROM captures WHERE id=?",
+            ("capture-external-content-drift",),
+        ).fetchone()
+        assert row is not None
+        # Remove only the derived tokens while retaining the canonical capture.
+        # SQLite builds differ here: some surface the derived-table mismatch in
+        # PRAGMA, while the macOS build from the reported incident returned ok.
+        # The FTS5 rank=1 probe must identify it either way.
+        conn.execute(
+            "INSERT INTO captures_fts("
+            "captures_fts, rowid, app_name, window_title, focused_value, visible_text, url"
+            ") VALUES('delete', ?, ?, ?, ?, ?, ?)",
+            tuple(row),
+        )
+        pragma_results = [item[0] for item in conn.execute("PRAGMA integrity_check(100)")]
+        assert pragma_results == ["ok"] or all(
+            "captures_fts" in result for result in pragma_results
+        )
+        failures = fts.probe_derived_fts_integrity(conn)
+        assert set(failures) == {"captures_fts"}
+        assert "malformed" in str(failures["captures_fts"]).lower()
+
+    before_status, before_problems = index_health._check_sqlite_indexes()
+    assert before_status == "corrupt"
+    assert any(problem.startswith("captures_fts:") for problem in before_problems)
+    assert "captures_fts" in (integrity._db_corruption_reason(paths.index_db()) or "")
+
+    recovered = integrity.check_and_recover()
+
+    assert recovered == []
+    assert paths.index_db().exists()
+    assert not paths.integrity_recovery_marker().exists()
+    assert not paths.integrity_recovery_pending().exists()
+    assert list(ac_root.glob("index.db.corrupt.*")) == []
+    after_status, after_problems = index_health._check_sqlite_indexes()
+    assert (after_status, after_problems) == ("ok", [])
+    with fts.cursor() as conn:
+        assert [item[0] for item in conn.execute("PRAGMA integrity_check(100)")] == ["ok"]
+        assert fts.probe_derived_fts_integrity(conn) == {}
+        assert conn.execute("SELECT count(*) FROM captures").fetchone()[0] == 1
+        hits = fts.search_captures(conn, query="needle")
+    assert [hit.id for hit in hits] == ["capture-external-content-drift"]
+
+
+def test_non_corruption_fts_probe_error_defers_without_quarantine(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_healthy_db()
+    config_mod.write_default_if_missing()
+    probe_error = sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(
+        fts,
+        "probe_derived_fts_integrity",
+        lambda _conn: {"captures_fts": probe_error},
+    )
+    monkeypatch.setattr(
+        integrity,
+        "_rebuild_captures_fts_via_schema_reset",
+        lambda _path: pytest.fail("an environmental probe error must not rebuild or quarantine"),
+    )
+
+    recovered = integrity.check_and_recover()
+
+    assert recovered == []
+    assert paths.index_db().exists()
+    assert not paths.integrity_recovery_marker().exists()
+    assert not paths.integrity_recovery_pending().exists()
+    assert list(ac_root.glob("index.db.corrupt.*")) == []
+
+
+def test_derived_fts_rebuild_postvalidates_shared_probe(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_healthy_db()
+    probe_calls = 0
+
+    def still_corrupt(_conn: sqlite3.Connection) -> dict[str, sqlite3.Error]:
+        nonlocal probe_calls
+        probe_calls += 1
+        return {"captures_fts": sqlite3.DatabaseError("database disk image is malformed")}
+
+    monkeypatch.setattr(fts, "probe_derived_fts_integrity", still_corrupt)
+    monkeypatch.setattr(integrity, "_rebuild_captures_fts_via_schema_reset", lambda _path: None)
+
+    assert integrity._try_rebuild_derived_fts(paths.index_db()) is None
+    assert probe_calls == 2
+    assert list(ac_root.glob("index.db.corrupt.*")) == []
 
 
 def test_schema_reset_rebuilds_unloadable_derived_captures_fts(ac_root: Path) -> None:

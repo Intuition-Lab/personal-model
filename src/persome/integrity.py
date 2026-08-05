@@ -53,6 +53,7 @@ _DERIVED_FTS_INTEGRITY_RE = re.compile(
     r'^fts5: .* table "(' + "|".join(sorted(_DERIVED_FTS_TABLES)) + r')"$'
 )
 _GENERIC_MALFORMED_DB_ERROR = "database disk image is malformed"
+_SQLITE_CORRUPTION_MARKERS = ("malformed", "corrupt", "not a database", "disk image")
 _SNAPSHOT_NAME_RE = re.compile(r"^evo-\d{8}\.db$")
 _PERSOME_SNAPSHOT_COLUMNS = {
     "files": frozenset(
@@ -135,6 +136,14 @@ class QuarantinedFile:
 
 class _WriteAuthorityUnresolved(RuntimeError):
     """Recovery found multiple intact sources but no unique canonical one."""
+
+
+def _is_sqlite_corruption_error(error: BaseException) -> bool:
+    """Classify only positive SQLite corruption signals, never environment errors."""
+    if not isinstance(error, sqlite3.Error):
+        return False
+    message = str(error).lower()
+    return any(marker in message for marker in _SQLITE_CORRUPTION_MARKERS)
 
 
 def _semantic_sequence(value: object) -> tuple[object, ...]:
@@ -322,11 +331,19 @@ def _db_corruption_reason(db_path: Path) -> str | None:
         return None
     conn: sqlite3.Connection | None = None
     try:
+        from .store import fts
+
         conn = sqlite3.connect(db_path, timeout=5.0)
         rows = conn.execute(f"PRAGMA integrity_check({_INTEGRITY_CHECK_LIMIT})").fetchall()
         results = [str(r[0]) for r in rows]
         if results == ["ok"]:
-            return None
+            derived_failures = fts.probe_derived_fts_integrity(conn)
+            if not derived_failures:
+                return None
+            joined = "; ".join(
+                f"{table}: {error}" for table, error in list(derived_failures.items())[:5]
+            )
+            return f"derived FTS integrity_check: {joined}"
         # Trim so a flood of problems doesn't bloat the log line / marker.
         joined = "; ".join(results[:5])
         return f"integrity_check: {joined}"
@@ -451,6 +468,8 @@ def _try_rebuild_derived_fts(db_path: Path) -> bool | None:
     # the corrupt main file and its sidecars together for recovery/analysis.
     if _db_header_corruption_reason(db_path) is not None:
         return False
+    from .store import fts
+
     conn: sqlite3.Connection | None = None
     damaged_fts: set[str] | None = None
     requires_full_schema_reset = False
@@ -477,6 +496,26 @@ def _try_rebuild_derived_fts(db_path: Path) -> bool | None:
                 raise
         else:
             damaged_fts = _derived_fts_damage(results)
+            if results == ["ok"]:
+                probe_failures = fts.probe_derived_fts_integrity(conn)
+                if probe_failures:
+                    corrupt_failures = {
+                        table
+                        for table, error in probe_failures.items()
+                        if _is_sqlite_corruption_error(error)
+                    }
+                    if len(corrupt_failures) != len(probe_failures):
+                        _log.warning(
+                            "integrity: derived FTS probe deferred",
+                            extra={
+                                "path": str(db_path),
+                                "errors": {
+                                    table: str(error) for table, error in probe_failures.items()
+                                },
+                            },
+                        )
+                        return None
+                    damaged_fts = corrupt_failures
         if not damaged_fts:
             return False
 
@@ -507,6 +546,8 @@ def _try_rebuild_derived_fts(db_path: Path) -> bool | None:
         ]
         if repaired != ["ok"]:
             return None if _derived_fts_damage(repaired) else False
+        if fts.probe_derived_fts_integrity(conn):
+            return None
         return True
     except (RuntimeError, sqlite3.DatabaseError) as exc:
         if conn is not None and conn.in_transaction:
@@ -520,7 +561,7 @@ def _try_rebuild_derived_fts(db_path: Path) -> bool | None:
         # not evidence that the authority DB should be quarantined. Defer it.
         # Whole-file header damage is classified before this function opens
         # SQLite and therefore cannot reach this conservative branch.
-        return None if damaged_fts else False
+        return None if damaged_fts or not _is_sqlite_corruption_error(exc) else False
     finally:
         if conn is not None:
             conn.close()
