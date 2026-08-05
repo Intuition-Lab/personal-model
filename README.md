@@ -1,5 +1,7 @@
 # Personal Model: local-first AI memory for coding agents
 
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.Intuition-Lab%2Fpersonal-model.svg)](https://mcptoplist.com/server/io.github.Intuition-Lab%2Fpersonal-model)
+
 <p align="center">
   <a href="https://github.com/Intuition-Lab/personal-model/releases/tag/v0.3.2">
     <img src="docs/assets/readme/demo-preview.gif" alt="Looping 10-second preview of the Personal Model viewer orbiting an evidence-linked model" width="100%">
