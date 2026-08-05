@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -145,6 +148,113 @@ def test_private_file_retries_lstat_inode_already_unlinked_by_sqlite(
     assert paths.ensure_private_file(sidecar) == sidecar
     assert calls == 1
     assert sidecar.exists()
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+def test_sqlite_path_validation_does_not_cancel_posix_record_lock(
+    ac_root: Path, suffix: str
+) -> None:
+    database = paths.index_db()
+    database.write_bytes(b"database placeholder")
+    database.chmod(0o600)
+    locked_path = database.with_name(f"{database.name}{suffix}")
+    if suffix:
+        locked_path.write_bytes(b"sidecar placeholder")
+        locked_path.chmod(0o600)
+    probe = """
+import errno
+import fcntl
+import sys
+
+with open(sys.argv[1], "r+b") as handle:
+    try:
+        fcntl.lockf(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            raise SystemExit(0)
+        raise
+    raise SystemExit(1)
+"""
+
+    with locked_path.open("r+b") as handle:
+        fcntl.lockf(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        assert fts._prepare_database_path(database)  # noqa: SLF001
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(locked_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert _mode(locked_path) == 0o600
+
+
+def test_sqlite_path_validation_refuses_loose_mode_without_mutating(ac_root: Path) -> None:
+    database = paths.index_db()
+    database.write_bytes(b"database placeholder")
+    database.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match=r"owner-only \(mode 0600\)"):
+        fts._prepare_database_path(database)  # noqa: SLF001
+
+    assert _mode(database) == 0o644
+
+
+def test_sqlite_path_validation_tolerates_disappearing_sidecar(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = paths.index_db()
+    database.write_bytes(b"database placeholder")
+    database.chmod(0o600)
+    sidecar = database.with_name(f"{database.name}-wal")
+    sidecar.write_bytes(b"ephemeral SQLite pages")
+    sidecar.chmod(0o600)
+    real_lstat = Path.lstat
+    calls = 0
+
+    def lstat_then_unlink(path: Path):  # noqa: ANN202
+        nonlocal calls
+        metadata = real_lstat(path)
+        if path == sidecar and calls == 0:
+            calls += 1
+            path.unlink()
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", lstat_then_unlink)
+
+    assert fts._prepare_database_path(database)  # noqa: SLF001
+    assert calls == 1
+    assert not sidecar.exists()
+
+
+def test_owner_database_is_private_before_sqlite_opens(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_connect = sqlite3.connect
+    observed_modes: list[int] = []
+
+    def connect_spy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        observed_modes.append(_mode(paths.index_db()))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(fts.sqlite3, "connect", connect_spy)
+    old_umask = os.umask(0o022)
+    try:
+        with fts.cursor() as conn:
+            conn.execute("SELECT 1").fetchone()
+    finally:
+        os.umask(old_umask)
+
+    assert observed_modes and set(observed_modes) == {0o600}
+    for artifact in (
+        paths.index_db(),
+        paths.index_db().with_name(f"{paths.index_db().name}-wal"),
+        paths.index_db().with_name(f"{paths.index_db().name}-shm"),
+    ):
+        if artifact.exists():
+            assert _mode(artifact) == 0o600
 
 
 def test_permission_migration_refuses_hard_link_without_chmodding_victim(ac_root: Path) -> None:
@@ -340,6 +450,7 @@ def test_connect_purges_terms_deleted_by_legacy_fts_settings(ac_root: Path) -> N
         conn.execute("DELETE FROM captures WHERE id='legacy-capture'")
         conn.commit()
         conn.execute("VACUUM")
+    db.chmod(0o600)
     legacy_bytes = db.read_bytes()
     assert entry_secret.encode() in legacy_bytes
     assert capture_secret.encode() in legacy_bytes
@@ -574,6 +685,7 @@ def test_clean_all_removes_quarantined_personal_data(ac_root: Path) -> None:
     quarantined.write_text("private remnants", encoding="utf-8")
     journal = paths.root() / "index.db-journal"
     journal.write_text("private journal pages", encoding="utf-8")
+    journal.chmod(0o600)
 
     cli.clean_all(yes=True)
 

@@ -219,6 +219,7 @@ def test_evo_projection_mismatch_detected_when_nonempty(evo_table: Path) -> None
 def test_quick_check_on_garbage_db(ac_root: Path, alerts: list) -> None:
     garbage = ac_root / "garbage.db"
     garbage.write_bytes(b"this is not a sqlite database at all" * 64)
+    garbage.chmod(0o600)
     violations = integrity.check_and_handle(source="test", db_path=garbage)
     assert _checks_named(violations, "quick_check")
     assert any(p["check"] == "quick_check" for _, _, p in alerts)

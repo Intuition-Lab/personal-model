@@ -50,6 +50,7 @@ def _seed_legacy_db(db: Path, *, entry_secret: str, capture_secret: str) -> None
             "VALUES('live-capture','2026','TestApp','still here')"
         )
         conn.commit()
+    db.chmod(0o600)
 
 
 def _user_version(db: Path) -> int:

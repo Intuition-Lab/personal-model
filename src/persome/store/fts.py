@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import os
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Iterable, Iterator
@@ -45,6 +47,7 @@ _SECURE_FTS_COMPACT_VERSION = 20260714
 # connection's 10s busy timeout: a loser of the migration race must defer,
 # not queue a second full-database rewrite behind the winner.
 _PURGE_BUSY_TIMEOUT_MS = 100
+_PRIVATE_SQLITE_FILE_MODE = 0o600
 # Bump whenever a daemon-owned schema step changes. This is deliberately
 # independent from PRAGMA user_version, which already tracks the secure-FTS
 # migration. Clients require an exact match: an older binary must not assume a
@@ -645,6 +648,103 @@ def _disable_checkpoint_on_close(conn: sqlite3.Connection) -> None:
         raise RuntimeError("SQLite refused to disable checkpoint-on-close")
 
 
+def _sqlite_artifacts(db_path: Path) -> tuple[Path, ...]:
+    return (
+        db_path,
+        db_path.with_name(f"{db_path.name}-wal"),
+        db_path.with_name(f"{db_path.name}-shm"),
+        db_path.with_name(f"{db_path.name}-journal"),
+    )
+
+
+def _validate_private_sqlite_artifact(path: Path, *, required: bool = False) -> bool:
+    """Validate one SQLite inode without opening or mutating it.
+
+    Closing any separately opened descriptor cancels the process's POSIX locks
+    on that inode, including locks owned by live SQLite connections.  Repeated
+    lstat calls preserve those locks while still rejecting links, special
+    files, loose permissions, and racing pathname replacement.
+    """
+    for _attempt in range(10):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            if required:
+                raise RuntimeError(f"required SQLite data file disappeared: {path}") from None
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"private data file must not be a symlink: {path}")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"private data path is not a regular file: {path}")
+        if metadata.st_nlink == 0:
+            continue
+        if metadata.st_nlink != 1:
+            raise RuntimeError(f"private data file must not be hard-linked: {path}")
+        if stat.S_IMODE(metadata.st_mode) != _PRIVATE_SQLITE_FILE_MODE:
+            raise RuntimeError(
+                f"SQLite data file must be owner-only (mode 0600): {path}. "
+                "Stop Persome before repairing it with `chmod 600`."
+            )
+        try:
+            confirmed = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(confirmed.st_mode):
+            raise RuntimeError(f"private data file must not be a symlink: {path}")
+        if not stat.S_ISREG(confirmed.st_mode):
+            raise RuntimeError(f"private data path is not a regular file: {path}")
+        if confirmed.st_nlink == 0 or (confirmed.st_dev, confirmed.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            continue
+        if confirmed.st_nlink != 1:
+            raise RuntimeError(f"private data file must not be hard-linked: {path}")
+        if stat.S_IMODE(confirmed.st_mode) != _PRIVATE_SQLITE_FILE_MODE:
+            continue
+        return True
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise RuntimeError(f"required SQLite data file disappeared: {path}") from None
+        return False
+    raise RuntimeError(f"SQLite data file changed during safety validation: {path}")
+
+
+def _create_private_database_file(db_path: Path) -> None:
+    """Create an owner database securely before SQLite acquires any locks."""
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(db_path, flags, _PRIVATE_SQLITE_FILE_MODE)
+    except FileExistsError:
+        return
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError(f"private SQLite target must be one regular inode: {db_path}")
+        os.fchmod(fd, _PRIVATE_SQLITE_FILE_MODE)
+    finally:
+        os.close(fd)
+
+
+def _validate_open_database_artifacts(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Fail closed, and close ``conn``, if SQLite published an unsafe artifact."""
+    try:
+        _validate_private_sqlite_artifact(db_path, required=True)
+        for artifact in _sqlite_artifacts(db_path)[1:]:
+            _validate_private_sqlite_artifact(artifact)
+    except BaseException:
+        conn.close()
+        raise
+
+
 def _prepare_database_path(db_path: Path) -> bool:
     """Validate a SQLite target before any library open; return root ownership."""
     try:
@@ -664,14 +764,12 @@ def _prepare_database_path(db_path: Path) -> bool:
     paths.ensure_private_dir(db_path.parent)
     # SQLite opens predictable sidecar names itself. Reject any pre-existing
     # link/special file before the library can follow it outside the private
-    # data root or block on a FIFO.
-    for artifact in (
-        db_path,
-        db_path.with_name(f"{db_path.name}-wal"),
-        db_path.with_name(f"{db_path.name}-shm"),
-        db_path.with_name(f"{db_path.name}-journal"),
-    ):
-        paths.ensure_private_file(artifact)
+    # data root or block on a FIFO. Never open an existing SQLite artifact here:
+    # a close in this process would cancel locks held by another live connection.
+    artifacts = _sqlite_artifacts(db_path)
+    _validate_private_sqlite_artifact(db_path)
+    for artifact in artifacts[1:]:
+        _validate_private_sqlite_artifact(artifact)
     return True
 
 
@@ -683,17 +781,25 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
             f"Persome requires SQLite {required}+ so deleted FTS5 text cannot be reconstructed"
         )
     within_data_root = _prepare_database_path(db_path)
-    if _CLIENT_PROCESS and not db_path.exists():
+    database_exists = (
+        _validate_private_sqlite_artifact(db_path) if within_data_root else db_path.exists()
+    )
+    if _CLIENT_PROCESS and not database_exists:
         raise RuntimeError(
             "index database is missing; start the Persome daemon (`persome start`) "
             "once to create and migrate it before connecting MCP clients"
         )
-    # ``mode=rw`` is important for clients: plain sqlite3.connect() creates a
-    # missing database before the schema check below can reject it. A client
-    # must not leave behind a new, empty index that later looks like damage.
+    if within_data_root and not _CLIENT_PROCESS:
+        if not database_exists:
+            _create_private_database_file(db_path)
+        _validate_private_sqlite_artifact(db_path, required=True)
+    # ``mode=rw`` is important for every internal connection: the owner securely
+    # precreates a missing main file above, while clients must never create one.
+    # If the path disappears between validation and open, SQLite therefore
+    # fails closed instead of recreating an unvalidated database.
     target: str | Path = db_path
     connect_kwargs: dict[str, bool] = {}
-    if _CLIENT_PROCESS:
+    if _CLIENT_PROCESS or within_data_root:
         target = f"{db_path.absolute().as_uri()}?mode=rw"
         connect_kwargs["uri"] = True
     conn = sqlite3.connect(
@@ -795,7 +901,7 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
         # accidentally attempts DDL or maintenance outside those helpers.
         conn.set_authorizer(_client_authorizer)
         if within_data_root:
-            paths.ensure_private_file(db_path)
+            _validate_open_database_artifacts(conn, db_path)
         return conn
     # Personal text must not survive ordinary DELETE operations in free pages.
     # Explicit wipe paths additionally VACUUM + truncate WAL below.
@@ -851,9 +957,7 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
 
         entries_mod.rebuild_index(conn)
     if within_data_root:
-        paths.ensure_private_file(db_path)
-        paths.ensure_private_file(db_path.with_name(f"{db_path.name}-wal"))
-        paths.ensure_private_file(db_path.with_name(f"{db_path.name}-shm"))
+        _validate_open_database_artifacts(conn, db_path)
     return conn
 
 
