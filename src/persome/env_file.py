@@ -4,7 +4,7 @@ Runtime secrets live in ``~/.persome/env``. A user may edit that owner-only
 file directly, or an embedding product may mirror secrets from its own secure
 store. Business code stays on ``os.environ.get(...)``; initialized CLI commands
 merge the file's contents into ``os.environ`` before doing work, and ``start``
-does so before forking.
+does so before spawning the daemon process.
 
 Semantics:
 
@@ -33,7 +33,7 @@ LOCAL_API_TOKEN_ENV = "PERSOME_LOCAL_API_TOKEN"
 _LOCAL_API_TOKEN_MIN_BYTES = 32
 _LOCAL_API_TOKEN_MAX_BYTES = 512
 _LOCAL_API_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
-_OWNER_ENV_BLOCKED_KEYS = frozenset({"PERSOME_ROOT"})
+_OWNER_ENV_BLOCKED_KEYS = frozenset({"PERSOME_ROOT", "PERSOME_DAEMON_LOCK_FD"})
 
 ScreenshotKeyStatus = Literal["existing", "generated"]
 LocalAPITokenStatus = Literal["existing", "generated"]

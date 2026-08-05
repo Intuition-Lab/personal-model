@@ -84,7 +84,7 @@ def config_file() -> Path:
 
 
 def env_file() -> Path:
-    """Owner-only dotenv secret store sourced before the daemon forks."""
+    """Owner-only dotenv secret store sourced before daemon spawn."""
     return root() / "env"
 
 
@@ -102,7 +102,7 @@ def runtime_state_file() -> Path:
 
 
 def daemon_lock_file() -> Path:
-    """Lifetime single-writer lock inherited by the foreground/background daemon."""
+    """Lifetime single-writer lock retained by foreground or background exec."""
     return root() / ".daemon.lock"
 
 

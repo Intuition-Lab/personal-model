@@ -57,8 +57,9 @@ flowchart LR
 ### Runtime readiness and ownership
 
 The control path is generation-bound. `.daemon.lock` is acquired before start
-preflight and inherited for the complete foreground or double-forked daemon
-lifetime. The daemon publishes `.runtime-state.json` with `starting`/`ready`
+preflight and held for the complete foreground or background daemon lifetime;
+background start transfers it into a fresh spawn/exec process. The daemon
+publishes `.runtime-state.json` with `starting`/`ready`
 phase, random generation, current permission probes, OCR policy/worker state,
 and its last fresh-capture, ingest-readiness, paused, or locked receipt. HTTP
 onboarding reads the same data through authenticated endpoints; HTTP-disabled

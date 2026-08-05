@@ -56,8 +56,8 @@ def build_plist(binary: str) -> dict[str, object]:
     """Return the plist dict for the daemon, parameterised by the daemon
     ``binary`` path (the bundled ``persome`` executable).
 
-    ``--foreground`` keeps the process in launchd's control group (no
-    double-fork); ``KeepAlive=true`` provides crash-relaunch; ``RunAtLoad=true``
+    ``--foreground`` keeps the process directly owned by launchd without
+    detaching; ``KeepAlive=true`` provides crash-relaunch; ``RunAtLoad=true``
     starts it as soon as the agent is bootstrapped and on every login.
     """
     env: dict[str, str] = {}
