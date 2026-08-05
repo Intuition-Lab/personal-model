@@ -84,3 +84,37 @@ def test_workflows_never_implicitly_build_project_before_hash_verification() -> 
         assert "uv pip install --python .venv/bin/python --no-deps --force-reinstall" in workflow
         assert "uv run --no-sync" in workflow
         assert "uv sync --all-extras --locked\n" not in workflow
+
+
+def test_intel_crypto_audit_exceptions_match_narrow_usage() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    guard = 'if [[ "${{ matrix.os }}" == "macos-15-intel" ]]; then\n'
+    before, guarded_and_after = workflow.split(guard, 1)
+    guarded, after = guarded_and_after.split("          fi\n", 1)
+    advisory_ids = {
+        "PYSEC-2026-3552",
+        "PYSEC-2026-3553",
+        "PYSEC-2026-3554",
+    }
+
+    assert set(re.findall(r"PYSEC-\d{4}-\d+", workflow)) == advisory_ids
+    assert workflow.count("--ignore-vuln") == len(advisory_ids)
+    assert all(advisory_id in guarded for advisory_id in advisory_ids)
+    assert "--ignore-vuln" not in before + after
+
+    crypto_imports = []
+    for path in sorted((ROOT / "src").rglob("*.py")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if re.match(r"\s*(?:from|import) cryptography(?:\.|\s|$)", line):
+                crypto_imports.append((path.relative_to(ROOT).as_posix(), line.strip()))
+
+    assert crypto_imports == [
+        (
+            "src/persome/capture/screenshot_crypto.py",
+            "from cryptography.exceptions import InvalidTag",
+        ),
+        (
+            "src/persome/capture/screenshot_crypto.py",
+            "from cryptography.hazmat.primitives.ciphers.aead import AESGCM",
+        ),
+    ]

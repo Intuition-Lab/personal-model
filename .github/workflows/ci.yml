@@ -57,7 +57,7 @@ jobs:
           # decryption and X.509 verification; Persome imports only AESGCM and
           # InvalidTag for local screenshot encryption. Keep this exception
           # platform-scoped and revisit it if Intel support or crypto usage grows.
-          if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "x86_64" ]]; then
+          if [[ "${{ matrix.os }}" == "macos-15-intel" ]]; then
             audit_args+=(
               --ignore-vuln PYSEC-2026-3552
               --ignore-vuln PYSEC-2026-3553

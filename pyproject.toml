@@ -40,7 +40,7 @@ dependencies = [
     # newest line that still ships a binary so locked `--no-build` installs stay
     # reproducible; other platforms continue receiving the current release.
     "cryptography>=42.0,<49; platform_system == 'Darwin' and platform_machine == 'x86_64'",
-    "cryptography>=42.0; platform_system != 'Darwin' or platform_machine != 'x86_64'",
+    "cryptography>=50.0.0; platform_system != 'Darwin' or platform_machine != 'x86_64'",
     "anthropic>=0.50",
     "openai>=1.75,<3",
     "tomlkit>=0.13,<1",
