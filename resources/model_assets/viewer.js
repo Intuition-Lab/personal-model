@@ -1284,19 +1284,33 @@ async function submitEdit(kind, item, op, replacement, reason) {
     // A Point rewrite supersedes the old fact, so the object the owner was
     // looking at now has a new id. Re-target the drawer or it closes on reload.
     const nextId = data.new_id || item.id;
+    // A correction is a statement about the present, and the successor Point is
+    // stamped now. If the owner is time-travelling, that Point sits past the
+    // cutoff and would never appear — the save would look like it failed, and a
+    // second attempt would follow. Return to Now so they see what they wrote.
+    if (Number(slider.value) < 100) {
+      slider.value = "100";
+      updateCutoff();
+    }
     await loadModel(true);
+    // The awaits above can span seconds. If the owner selected something else
+    // meanwhile, that selection is theirs — stealing the drawer back would
+    // discard a correction they had started typing on another node. The same
+    // guard the evidence loader applies before touching the DOM.
+    if (!selected || selected.kind !== kind || selected.id !== item.id) return;
     if (op === "retire") {
       clearSelection();
       return;
     }
     const refreshed = items.get(selectionKey(kind, nextId));
-    if (refreshed) {
-      showDetails(kind, refreshed);
-      setDetailTab("edit");
-    } else {
-      clearSelection();
+    if (!refreshed) {
+      // The write committed; only the re-selection failed. Leave the drawer
+      // where it is rather than closing it on a success.
+      setEditStatus("Saved. Reopen the node to see the update.", "ok");
       return;
     }
+    showDetails(kind, refreshed);
+    setDetailTab("edit");
     if (data.shadow_misses) {
       // The markdown layer changed but the Point may not have moved. Saying
       // "saved" here would be a lie the owner cannot see through.

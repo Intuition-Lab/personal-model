@@ -270,7 +270,11 @@ class ModelEditBody(BaseModel):
 
     schema_version: Literal[1] = 1
     kind: Literal["point", "face", "volume", "root"]
-    id: str = Field(min_length=1, max_length=512)
+    # Object ids are opaque single-line tokens (`face-<hex>`, `<date>-<hex>`).
+    # Control characters are rejected rather than escaped: an id carrying a
+    # newline has no legitimate reading, and letting one through would let a
+    # caller forge lines in the audit log.
+    id: str = Field(min_length=1, max_length=512, pattern=r"^[^\x00-\x1f\x7f]+$")
     op: Literal["rewrite", "retire"]
     replacement: str = Field(default="", max_length=MAX_MODEL_EDIT_REPLACEMENT_CHARS)
     reason: str = Field(default="", max_length=MAX_MODEL_EDIT_REASON_CHARS)

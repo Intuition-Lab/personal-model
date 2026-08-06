@@ -99,18 +99,25 @@ def _point_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         _select("valid_until", columns),
         _select("gmt_created", columns),
     ]
-    # A Point that was retired without a successor has been withdrawn by its
-    # owner, so it leaves the live model the way a closed Line or an archived
-    # Face does. A Point that was *superseded* also carries ``valid_until``, but
-    # it names its successor in ``superseded_by`` and must stay: it is the tail
-    # of an evolution Line and the model's own record of how a belief changed.
-    # Lines and Faces already filter on their validity window here; Points did
-    # not, which is why a forgotten memory used to keep rendering.
+    # A Point the owner retired has been withdrawn, so it leaves the live model
+    # the way a closed Line or an archived Face does. Identifying one takes all
+    # three conditions, because ``valid_until`` alone means several things:
+    #
+    # - a *superseded* Point carries ``valid_until`` too, but names its
+    #   successor in ``superseded_by``. It stays — it is the tail of an
+    #   evolution Line and the model's record of how a belief changed.
+    # - an *ended* fact ("worked at Acme until March") carries ``valid_until``
+    #   while remaining ``is_latest``. It stays — the relationship ended, the
+    #   fact did not stop being true of the owner's history.
+    #
+    # Only a Point that is end-dated, no longer current, and has no successor
+    # was actually withdrawn.
     return list(
         conn.execute(
             f"SELECT {', '.join(selected)} FROM evo_nodes "
             "WHERE status != 'archived' "
-            "AND (valid_until IS NULL OR (superseded_by IS NOT NULL AND superseded_by != '[]')) "
+            "AND NOT (valid_until IS NOT NULL AND is_latest = 0 "
+            "         AND (superseded_by IS NULL OR superseded_by = '[]')) "
             "ORDER BY node_id"
         ).fetchall()
     )
@@ -285,7 +292,13 @@ def build_snapshot(
         file_name = redactor.text(row["file_name"]) or ""
         receipt = f"⟨{node_id}:{file_name}⟩"
         point_receipts[node_id] = receipt
+        # Register the key for both readings of the body. Faces store
+        # `member_key(fact)` computed by the schema miner, which reads entries
+        # verbatim — including the supersede marker that `_visible_content`
+        # strips for display. Recording both keeps a corrected Point findable
+        # whichever body its Face was mined from.
         point_receipts.setdefault(member_key(raw_content[node_id]), receipt)
+        point_receipts.setdefault(member_key(str(row["content"] or "")), receipt)
         receipts[receipt] = {
             "receipt": receipt,
             "source_kind": "point",
@@ -317,16 +330,30 @@ def build_snapshot(
     # body. Rewriting a Point therefore changes the key its Faces recorded, and
     # each Face would resolve that stale key to the wording the owner just
     # corrected — or, once the predecessor ages out, to nothing at all. Point
-    # every predecessor's key at its successor's receipt so a Face keeps
-    # citing the current wording of its own evidence. Written after the loop
-    # above, and as an assignment rather than `setdefault`, so a successor
-    # deliberately outranks the predecessor's self-registration. The supersede
-    # relationship itself is not lost: it is the evolution Line built below.
-    for point in points:
-        for old_id in point["supersedes"]:
-            previous = raw_content.get(old_id)
-            if previous:
-                point_receipts[member_key(previous)] = point["receipt"]
+    # every predecessor's key at its successor's receipt so a Face keeps citing
+    # the current wording of its own evidence. Assignment rather than
+    # `setdefault`, so a successor deliberately outranks the predecessor's
+    # self-registration. The supersede relationship itself is not lost: it is
+    # the evolution Line built below.
+    #
+    # Corrections chain — a fact revised twice gives A -> B -> C — so each key
+    # must land on the *current* wording rather than the intermediate. Walking
+    # newest-first and reusing the alias already recorded for the successor
+    # collapses the whole chain in one pass.
+    successor_of = {old_id: point["id"] for point in points for old_id in point["supersedes"]}
+    receipt_by_id = {point["id"]: point["receipt"] for point in points}
+
+    def _current_receipt(node: str, seen: set[str]) -> str | None:
+        while node in successor_of and node not in seen:
+            seen.add(node)
+            node = successor_of[node]
+        return receipt_by_id.get(node)
+
+    for old_id in successor_of:
+        previous = raw_content.get(old_id)
+        current = _current_receipt(old_id, set())
+        if previous and current:
+            point_receipts[member_key(previous)] = current
 
     lines: list[dict[str, Any]] = []
     for point in points:

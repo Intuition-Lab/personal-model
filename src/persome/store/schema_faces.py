@@ -315,10 +315,39 @@ def retire_face(conn: sqlite3.Connection, *, face_id: str) -> str | None:
     if row is None:
         return None
     conn.execute(
-        "UPDATE schema_faces SET status = ? WHERE face_id = ?",
-        (MemoryStatus.ARCHIVED.value, face_id),
+        # Closing validity is what makes the rejection stick. Archiving alone
+        # left the row live to `_find_match`, so the next re-mine folded onto
+        # it, bumped its observations, and `maybe_promote` handed it straight
+        # back to ACTIVE — the owner's rejection undone by the next tick.
+        # Closing `valid_to` also records *when* the owner withdrew it, which
+        # `maybe_promote` already treats as disqualifying.
+        "UPDATE schema_faces SET status = ?, provenance = ?, valid_to = ? WHERE face_id = ?",
+        (MemoryStatus.ARCHIVED.value, PROVENANCE_AUTHORED, _now(), face_id),
     )
     return str(row[0] or "")
+
+
+def owner_decided_root(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """Return the apex the owner settled by hand, live or withdrawn.
+
+    Root has no stable id — ``upsert_root`` mints a new one on every synthesis
+    — so an owner decision about the apex is keyed on the singleton rather than
+    on a row. The newest level-3 row is inspected whatever its status: a
+    rewritten apex is ACTIVE, a rejected one is ARCHIVED, and treating the
+    second as absence would let the next synthesis resurrect what the owner
+    just removed.
+
+    Returns ``None`` when the apex is still the model's own to write.
+    """
+    ensure_schema(conn)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM schema_faces WHERE level = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (ROOT_LEVEL,),
+    ).fetchone()
+    if row is None or row["provenance"] != PROVENANCE_AUTHORED:
+        return None
+    return row
 
 
 def maybe_promote(

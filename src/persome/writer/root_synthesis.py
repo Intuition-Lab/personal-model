@@ -194,14 +194,17 @@ def synthesize_root(
     is a healthy no-op, not a failure, and it spends no LLM budget."""
     budget = int(budget if budget is not None else getattr(cfg.schema, "root_token_budget", 1500))
     try:
-        # gate 0: the owner wrote this apex by hand. `upsert_root` does not
-        # update — it closes every live level-3 row and inserts a fresh one — so
-        # without this gate the next nightly pass would discard the owner's text
-        # and there would be no row left to key a preference off. Checked before
-        # gathering so an authored root costs no LLM call at all.
-        live_root = schema_faces.resident_root(conn)
-        if live_root is not None and live_root["provenance"] == schema_faces.PROVENANCE_AUTHORED:
-            return RootResult(str(live_root["face_id"]), "skip_authored")
+        # gate 0: the owner already decided what this apex says, or that it
+        # should not exist. `upsert_root` does not update — it closes every live
+        # level-3 row and inserts a fresh one — so without this gate the next
+        # nightly pass would discard an owner-written apex, or resurrect one the
+        # owner rejected. The newest level-3 row is consulted regardless of
+        # status, because a rejected apex is archived and would otherwise look
+        # like a cold start. Checked before gathering, so an owner decision
+        # costs no LLM call at all.
+        decided = schema_faces.owner_decided_root(conn)
+        if decided is not None:
+            return RootResult(str(decided["face_id"]), "skip_authored")
 
         bodies = _active(conn, 2)
         faces = _active(conn, 1, _TOP_FACES)

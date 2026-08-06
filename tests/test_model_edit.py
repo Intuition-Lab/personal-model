@@ -465,3 +465,115 @@ def test_corrections_are_visible_through_the_mcp_snapshot(ac_root) -> None:
     face = next(item for item in snapshot["faces"] if item["id"] == face_id)
     assert face["signature"] == "I work late by choice."
     assert face["provenance"] == sf.PROVENANCE_AUTHORED
+
+
+# ── regressions found by adversarial review ───────────────────────────────
+
+
+def test_an_ended_fact_is_not_mistaken_for_a_withdrawn_one(ac_root) -> None:
+    """`valid_until` also marks a relationship that ended, not just a retirement.
+
+    Those Points stay `is_latest`, and dropping them would delete real history
+    from the model the first time someone stopped working somewhere.
+    """
+    point_id = _seed_point("Alex worked at Acme.")
+    with fts.cursor() as conn:
+        conn.execute(
+            "UPDATE evo_nodes SET valid_until = ? WHERE node_id = ?",
+            ("2026-08-01T00:00:00+00:00", point_id),
+        )
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert any(point["id"] == point_id for point in snapshot["points"])
+
+
+def test_a_rejected_face_is_not_resurrected_by_the_next_mine(ac_root) -> None:
+    """Archiving alone left the row live to `_find_match`, and `maybe_promote`
+    handed it straight back to ACTIVE on the next tick."""
+    face_id = _seed_face("Alex works late.")
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="face", target_id=face_id, op="retire").ok
+        sf.record_face(
+            conn,
+            source=sf.PROVENANCE_EMERGENT,
+            signature="Alex works late.",
+            members=["m1", "m2", "m3"],
+        )
+        sf.maybe_promote(conn, face_id)
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert all(face["id"] != face_id for face in snapshot["faces"])
+
+
+def test_a_rejected_root_is_not_regenerated_by_the_next_synthesis(ac_root) -> None:
+    from persome import config as config_mod
+    from persome.writer import root_synthesis
+
+    root_id = _seed_face("A person becoming more deliberate.", level=3)
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="root", target_id=root_id, op="retire").ok
+        result = root_synthesis.synthesize_root(
+            cfg := config_mod.load(),
+            conn,
+            llm_call=lambda _m: pytest.fail("a rejected root must not be re-synthesized"),
+        )
+        assert cfg is not None
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert result.reason == "skip_authored"
+    assert snapshot["root"] is None
+
+
+def test_correcting_a_superseded_point_is_refused(ac_root) -> None:
+    """Two live corrections of one fact would each claim to be current."""
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="First correction."
+        )
+        assert first.ok
+        second = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="Second correction."
+        )
+    assert not second.ok
+    assert second.reason == "point_superseded"
+
+
+def test_a_twice_corrected_fact_resolves_to_its_current_wording(ac_root) -> None:
+    """A -> B -> C: the Face that mined A must cite C, not the intermediate."""
+    original = "Alex reserves mornings for focused writing."
+    point_id = _seed_point(original)
+
+    with fts.cursor() as conn:
+        face_id = sf.record_face(
+            conn,
+            source=sf.PROVENANCE_MINED,
+            signature="Alex protects deep work.",
+            members=[sf.member_key(original)],
+        )
+        conn.execute("UPDATE schema_faces SET status = 'active' WHERE face_id = ?", (face_id,))
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        second = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=first.new_id,
+            op="rewrite",
+            replacement="I write before anyone else is awake.",
+        )
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert second.ok
+    face = next(item for item in snapshot["faces"] if item["id"] == face_id)
+    assert any(second.new_id in receipt for receipt in face["member_receipts"])
+
+
+def test_a_point_in_an_append_only_log_is_refused(ac_root) -> None:
+    """A supersede there rewrites markdown and never moves the Point, so
+    reporting success would be a lie."""
+    from persome.model.edit import _point_file_is_editable
+
+    assert _point_file_is_editable("person-alex.md")
+    assert not _point_file_is_editable("event-2026-08-05.md")
+    assert not _point_file_is_editable("skills/writing.md")

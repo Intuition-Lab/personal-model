@@ -79,9 +79,52 @@ class EditResult:
     applied: list[str] = field(default_factory=list)
 
 
+def _loggable(value: str, limit: int = 128) -> str:
+    """Flatten a caller-supplied value so it cannot forge log lines.
+
+    Ids reaching the HTTP route are already rejected for control characters,
+    but the CLI reaches this module directly and an audit log that a caller can
+    write arbitrary lines into is not an audit log.
+    """
+    flattened = "".join(
+        " " if character < " " or character == "\x7f" else character for character in str(value)
+    )
+    return flattened[:limit]
+
+
 def _reject(kind: str, target_id: str, op: str, reason: str) -> EditResult:
-    logger.info("model edit rejected: %s %s %s — %s", kind, target_id, op, reason)
+    logger.info(
+        "model edit rejected: %s %s %s — %s",
+        _loggable(kind),
+        _loggable(target_id),
+        _loggable(op),
+        reason,
+    )
     return EditResult(ok=False, kind=kind, target_id=target_id, op=op, reason=reason)
+
+
+def _point_file_is_editable(file_name: str) -> bool:
+    """Whether a correction to a Point in this file can actually reach the model.
+
+    Mirrors the structural half of ``evomem.inversion.routes_to_engine`` — but
+    not its ``evomem_active()`` term, which describes the configured write
+    authority rather than the file. Under markdown authority every ordinary
+    memory file is still perfectly editable; it simply takes the markdown path.
+
+    What is *not* editable: ``skills/**`` projections, which cannot route into
+    subdirectories, and append-only ``event-*.md`` logs, which never enter
+    ``evo_nodes``. A supersede there would rewrite the markdown and leave the
+    Point exactly where it was, so the owner would be told a correction landed
+    that their model never reflects.
+    """
+    from ..store import files as files_mod
+
+    if "/" in file_name:
+        return False
+    try:
+        return files_mod.validate_prefix(file_name) != "event"
+    except ValueError:
+        return False
 
 
 def _semantic_tags(raw: str) -> list[str]:
@@ -152,7 +195,7 @@ def _edit_point(
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
-            "SELECT file_name, content, tags, status, valid_until, superseded_by"
+            "SELECT file_name, content, tags, status, valid_until, superseded_by, is_latest"
             " FROM evo_nodes WHERE node_id = ? LIMIT 1",
             (target_id,),
         ).fetchone()
@@ -166,11 +209,18 @@ def _edit_point(
         # Without a file the supersede has nowhere to land and the receipt would
         # degenerate to `⟨id:⟩`, which resolves to nothing.
         return _reject("point", target_id, op, "point_has_no_file")
+    if not _point_file_is_editable(file_name):
+        return _reject("point", target_id, op, "point_not_editable_in_this_file")
     if str(row["status"] or "") == "archived":
         return _reject("point", target_id, op, "point_archived")
     already_retired = bool(row["valid_until"]) and str(row["superseded_by"] or "[]") == "[]"
     if already_retired:
         return _reject("point", target_id, op, "point_already_retired")
+    if not int(row["is_latest"] or 0):
+        # Correcting an already-superseded version would fork the chain: two
+        # live successors of one fact, each claiming to be the current wording.
+        # The owner means the version they can see, which is the chain head.
+        return _reject("point", target_id, op, "point_superseded")
 
     prior_text = str(row["content"] or "")
     tags = _semantic_tags(row["tags"])
@@ -326,11 +376,13 @@ def apply_model_edit(
         logger.warning(
             "owner edit on %s %s completed with %d shadow-write miss(es);"
             " the markdown layer changed but the Point may not have moved",
-            kind,
-            target_id,
+            _loggable(kind),
+            _loggable(target_id),
             misses,
         )
-    logger.info("owner edit applied: %s %s %s", kind, target_id, op)
+    logger.info(
+        "owner edit applied: %s %s %s", _loggable(kind), _loggable(target_id), _loggable(op)
+    )
     return EditResult(
         ok=True,
         kind=result.kind,
