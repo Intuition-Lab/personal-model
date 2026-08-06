@@ -933,12 +933,12 @@ def test_compaction_refuses_to_unstrike_a_rejected_entry(ac_root) -> None:
     assert _owner_authorship_lost(before, before) == ""
 
 
-def test_a_point_whose_markdown_is_gone_is_refused_not_a_500(ac_root) -> None:
-    """`evo_nodes` can outlive the Markdown it projects — a partly restored
-    backup leaves rows whose source of truth is missing. Under Markdown
-    authority the supersede raises FileNotFoundError from deep in the store,
-    which reached the owner as "HTTP 500" on the one surface whose job is
-    telling them what happened to their model.
+def test_a_point_whose_markdown_is_gone_is_still_correctable(ac_root) -> None:
+    """Losing the Markdown does not lose the Point.
+
+    While a `files` row remains, the Point is still addressable through the
+    evomem engine, so a correction goes there rather than raising
+    FileNotFoundError from the Markdown path.
     """
     from persome.store import files as files_mod
 
@@ -946,13 +946,10 @@ def test_a_point_whose_markdown_is_gone_is_refused_not_a_500(ac_root) -> None:
     files_mod.memory_path("person-alex.md").unlink()
 
     with fts.cursor() as conn:
-        rewrite = apply_model_edit(
+        result = apply_model_edit(
             conn, kind="point", target_id=point_id, op="rewrite", replacement="Mine."
         )
-        retire = apply_model_edit(conn, kind="point", target_id=point_id, op="retire")
-
-    assert not rewrite.ok and rewrite.reason == "point_file_missing"
-    assert not retire.ok and retire.reason == "point_file_missing"
+    assert result.ok, f"expected a correction, got {result.reason}"
 
 
 def test_the_route_reports_a_storage_failure_instead_of_a_bare_500(ac_root, monkeypatch) -> None:
@@ -970,3 +967,74 @@ def test_the_route_reports_a_storage_failure_instead_of_a_bare_500(ac_root, monk
     )
     assert response.status_code == 500
     assert response.json()["detail"] == "edit_failed: OSError"
+
+
+def _seed_evo_native_point(content: str = "Alex mentors two engineers.") -> tuple[str, str]:
+    """A Point as `delta_apply` actually mints one: straight into evo_nodes,
+    with a files row but no Markdown. This is the shape of most real Points."""
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.models import MemoryLayer
+    from persome.store import fts as fts_mod
+
+    _seed_point()  # establishes the evo_nodes baseline
+    node_id = EvoMemory().add_direct(
+        content, layer=MemoryLayer.L5_KNOWLEDGE, file_name="person-sam", tags="fact"
+    )
+    with fts.cursor() as conn:
+        fts_mod.upsert_file(
+            conn,
+            fts_mod.FileRow(
+                path="person-sam.md",
+                prefix="person",
+                description="Sam",
+                tags="",
+                status="active",
+                entry_count=1,
+                created="2026-08-06",
+                updated="2026-08-06",
+                needs_compact=0,
+            ),
+        )
+    return node_id, "person-sam.md"
+
+
+def test_an_evo_native_point_is_correctable(ac_root) -> None:
+    """`delta_apply` mints entity and assertion Points directly into evo_nodes
+    and never projects Markdown, so on a real install almost every Point has no
+    file behind it. Routing those down the Markdown path raised FileNotFoundError
+    from inside the store and surfaced as HTTP 500."""
+    from persome.store import files as files_mod
+
+    node_id, file_name = _seed_evo_native_point()
+    assert not files_mod.memory_path(file_name).is_file(), "precondition: no Markdown"
+
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=node_id,
+            op="rewrite",
+            replacement="I mentor two engineers, by choice.",
+        )
+    assert result.ok, f"an evo-native Point must be correctable, got {result.reason}"
+
+    with fts.cursor() as conn:
+        row = conn.execute(
+            "SELECT content, tags FROM evo_nodes WHERE node_id = ?", (result.new_id,)
+        ).fetchone()
+    assert row is not None
+    assert OWNER_EDIT_TAG in str(row[1]).split()
+
+
+def test_a_point_backed_by_nothing_is_refused(ac_root) -> None:
+    """No Markdown and no files row means the Point is a remnant."""
+    point_id = _seed_point()
+    from persome.store import files as files_mod
+
+    files_mod.memory_path("person-alex.md").unlink()
+    with fts.cursor() as conn:
+        conn.execute("DELETE FROM files WHERE path = 'person-alex.md'")
+        result = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="Mine."
+        )
+    assert not result.ok and result.reason == "point_file_missing"

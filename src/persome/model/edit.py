@@ -150,12 +150,27 @@ def _point_file_is_editable(file_name: str) -> bool:
         return False
 
 
-def _point_file_exists(file_name: str) -> bool:
-    """Whether the Markdown this Point projects is actually on disk."""
+def _point_backing(conn: sqlite3.Connection, file_name: str) -> str | None:
+    """Where this Point's canonical text lives: ``"markdown"``, ``"evomem"``, or
+    ``None`` when nothing backs it.
+
+    Markdown wins when the file is on disk, because there it is the source of
+    truth and the supersede must go through it. Otherwise a ``files`` row means
+    the Point is evo-native — created by the delta-apply path, which writes
+    ``evo_nodes`` directly — and the evomem engine is the only place it can be
+    corrected. Neither means the Point is a remnant of something removed, and
+    there is nothing to correct.
+    """
     try:
-        return files_mod.memory_path(file_name).is_file()
+        if files_mod.memory_path(file_name).is_file():
+            return "markdown"
     except Exception:  # noqa: BLE001 — an unresolvable name is not editable either
-        return False
+        return None
+    try:
+        row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (file_name,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return "evomem" if row is not None else None
 
 
 def _semantic_tags(raw: str) -> list[str]:
@@ -223,6 +238,7 @@ def _mark_structure_dirty(conn: sqlite3.Connection) -> None:
 def _edit_point(
     conn: sqlite3.Connection, *, target_id: str, op: str, replacement: str, reason: str
 ) -> EditResult:
+    from ..evomem import inversion as evo_inversion
     from ..store import entries
 
     conn.row_factory = sqlite3.Row
@@ -244,13 +260,15 @@ def _edit_point(
         return _reject("point", target_id, op, "point_has_no_file")
     if not _point_file_is_editable(file_name):
         return _reject("point", target_id, op, "point_not_editable_in_this_file")
-    if not _point_file_exists(file_name):
-        # `evo_nodes` can outlive the Markdown it projects — a partially restored
-        # backup, a recovered index, or a file removed by hand all leave rows
-        # whose source of truth is gone. Under Markdown authority the supersede
-        # would raise `FileNotFoundError` from deep in the store and surface as
-        # an opaque 500. A named refusal says which file is missing, which is
-        # the thing the owner can actually act on.
+    # Most Points never had a Markdown file. `delta_apply` mints entity and
+    # assertion Points straight into `evo_nodes` through `EvoMemory`, which does
+    # not consult the configured write authority and does not project Markdown —
+    # so every `person-*`, `org-*`, `project-*`, and `tool-*` Point is
+    # evo-native. Sending those down the Markdown path raises `FileNotFoundError`
+    # from inside the store, which is what turned an ordinary correction into an
+    # opaque 500. Correct each Point where it actually lives.
+    backing = _point_backing(conn, file_name)
+    if backing is None:
         return _reject("point", target_id, op, "point_file_missing")
     if str(row["status"] or "") == "archived":
         return _reject("point", target_id, op, "point_archived")
@@ -274,8 +292,10 @@ def _edit_point(
     prior_text = str(row["content"] or "")
     tags = _semantic_tags(row["tags"])
 
+    writer = entries if backing == "markdown" else evo_inversion
+
     if op == "rewrite":
-        new_id = entries.supersede_entry(
+        new_id = writer.supersede_entry(
             conn,
             name=file_name,
             old_entry_id=target_id,
@@ -297,7 +317,7 @@ def _edit_point(
             applied=[f"superseded {target_id} -> {new_id} in {file_name}"],
         )
 
-    entries.mark_entry_deleted(conn, name=file_name, entry_id=target_id)
+    writer.mark_entry_deleted(conn, name=file_name, entry_id=target_id)
     return EditResult(
         ok=True,
         kind="point",
