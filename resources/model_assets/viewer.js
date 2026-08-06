@@ -980,14 +980,20 @@ function appendMeta(label, value) {
 }
 
 function setDetailTab(tab, focus = false) {
+  // A hidden tab must never hold the tablist's single tab stop, or keyboard
+  // users lose their way back into the drawer entirely.
+  const shown = detailTabEls.filter((button) => !button.hidden);
+  const target = shown.some((button) => button.dataset.detailTab === tab)
+    ? tab
+    : (shown[0]?.dataset.detailTab ?? tab);
   detailTabEls.forEach((button) => {
-    const active = button.dataset.detailTab === tab;
+    const active = button.dataset.detailTab === target;
     button.setAttribute("aria-selected", String(active));
-    button.tabIndex = active ? 0 : -1;
-    if (active && focus) button.focus();
+    button.tabIndex = active && !button.hidden ? 0 : -1;
+    if (active && focus && !button.hidden) button.focus();
   });
   detailPanelEls.forEach((panel) => {
-    panel.hidden = panel.id !== `detail-${tab}`;
+    panel.hidden = panel.id !== `detail-${target}`;
   });
 }
 
@@ -1292,25 +1298,34 @@ async function submitEdit(kind, item, op, replacement, reason) {
       slider.value = "100";
       updateCutoff();
     }
-    await loadModel(true);
+    const refreshed = await loadModel(true);
     // The awaits above can span seconds. If the owner selected something else
     // meanwhile, that selection is theirs — stealing the drawer back would
     // discard a correction they had started typing on another node. The same
     // guard the evidence loader applies before touching the DOM.
     if (!selected || selected.kind !== kind || selected.id !== item.id) return;
+    if (refreshed === false) {
+      // The write landed; the reload did not. Re-rendering the drawer now would
+      // put "Saved." beside the text the owner just replaced.
+      setEditStatus("Saved, but the view could not refresh. Reload to see it.", "warn");
+      return;
+    }
     if (op === "retire") {
       clearSelection();
       return;
     }
-    const refreshed = items.get(selectionKey(kind, nextId));
-    if (!refreshed) {
+    const nextItem = items.get(selectionKey(kind, nextId));
+    if (!nextItem) {
       // The write committed; only the re-selection failed. Leave the drawer
       // where it is rather than closing it on a success.
       setEditStatus("Saved. Reopen the node to see the update.", "ok");
       return;
     }
-    showDetails(kind, refreshed);
-    setDetailTab("edit");
+    showDetails(kind, nextItem);
+    // `showDetails` rebuilds the panel, so the button the owner activated is
+    // gone and focus has fallen to the document body. Put it back on the tab
+    // rather than making them walk the whole viewer to return.
+    setDetailTab("edit", true);
     if (data.shadow_misses) {
       // The markdown layer changed but the Point may not have moved. Saying
       // "saved" here would be a lie the owner cannot see through.
@@ -1383,6 +1398,11 @@ function renderEditor(kind, item) {
 
   const status = document.createElement("p");
   status.className = "edit-status";
+  // `#detail-edit` sets `aria-live="off"` so a half-typed correction is not
+  // read out keystroke by keystroke. That silenced the save result too, on the
+  // one panel that actually writes to the owner's memory. `role="status"` makes
+  // this paragraph its own polite region, independent of the ancestor.
+  status.setAttribute("role", "status");
 
   save.addEventListener("click", () => {
     const replacement = textarea.value.trim();
@@ -1537,7 +1557,7 @@ async function loadModelOnce(force) {
     }
     errorEl.hidden = true;
     const nextFingerprint = fingerprint(payload.model);
-    if (!force && nextFingerprint === modelFingerprint) return;
+    if (!force && nextFingerprint === modelFingerprint) return true;
     model = payload.model;
     modelGeneratedAt = payload.generated_at || "";
     modelFingerprint = nextFingerprint;
@@ -1548,21 +1568,35 @@ async function loadModelOnce(force) {
     setShareBusy(false);
     updateTimelineBounds();
     buildScene();
+    return true;
   } catch (error) {
     shareReady = false;
     setShareBusy(false);
     showModelLoadError(error);
+    // Reported rather than swallowed: a caller that just wrote to the model
+    // needs to know it is still looking at pre-write state.
+    return false;
   } finally {
     window.clearTimeout(timeout);
   }
 }
 
 function loadModel(force = false) {
-  if (modelLoadPromise) return modelLoadPromise;
-  modelLoadPromise = loadModelOnce(force).finally(() => {
-    modelLoadPromise = null;
+  // A forced load must actually observe the server again. Returning an
+  // in-flight promise silently dropped `force`, so a poll issued microseconds
+  // before a correction was saved would satisfy the reload that follows the
+  // save — and the drawer would re-render from the pre-edit snapshot while
+  // reporting success. A forced load now queues behind whatever is running.
+  if (modelLoadPromise && !force) return modelLoadPromise;
+  const run = () => loadModelOnce(force);
+  const started = modelLoadPromise ? modelLoadPromise.then(run, run) : run();
+  const chained = started.finally(() => {
+    // Only the newest load clears the slot; an older one finishing later must
+    // not blank out a load that is still running.
+    if (modelLoadPromise === chained) modelLoadPromise = null;
   });
-  return modelLoadPromise;
+  modelLoadPromise = chained;
+  return chained;
 }
 
 function frameLayout(force) {
@@ -1749,14 +1783,21 @@ lineSelectEl.addEventListener("change", () => {
   if (item) showDetails("line", item);
 });
 
-detailTabEls.forEach((button, index) => {
+detailTabEls.forEach((button) => {
   button.addEventListener("click", () => setDetailTab(button.dataset.detailTab));
   button.addEventListener("keydown", (event) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
+    // Walk only the tabs that are actually on screen. The Correct tab is hidden
+    // for objects that have nothing stored to correct, and stepping onto it
+    // would hide every real panel, focus a `display:none` button, and leave the
+    // whole tablist out of the tab order — unreachable without a mouse.
+    const shown = detailTabEls.filter((tab) => !tab.hidden);
+    const here = shown.indexOf(button);
+    if (here < 0 || shown.length < 2) return;
     const direction = event.key === "ArrowRight" ? 1 : -1;
-    const next = (index + direction + detailTabEls.length) % detailTabEls.length;
-    setDetailTab(detailTabEls[next].dataset.detailTab, true);
+    const next = (here + direction + shown.length) % shown.length;
+    setDetailTab(shown[next].dataset.detailTab, true);
   });
 });
 
