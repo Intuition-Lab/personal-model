@@ -30,8 +30,8 @@ with Persome's projection marker. If an unrecognized, self-authored
 `HUMAN.md` already occupies the path, Persome preserves it and reports the
 conflict instead of overwriting it. Direct edits to a managed projection are
 not a correction interface and may be replaced. Correct the model through
-`persome correct` (natural language, LLM-mediated), the viewer's Correct panel,
-or `persome model edit` (both deterministic and object-addressed).
+`persome correct` (natural language, LLM-mediated), the viewer (click a claim to
+rewrite it), or `persome model edit` (both deterministic and object-addressed).
 
 `model build` uses an exclusive `<PERSOME_ROOT>/model-build.lock`. It waits up to 30 seconds by
 default; `--wait-seconds` changes the bound and `--no-wait` returns `busy` immediately. The kernel

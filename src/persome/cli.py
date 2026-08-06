@@ -3577,7 +3577,7 @@ def model_edit_cmd(
 ) -> None:
     """Correct one modeled object by hand.
 
-    The scriptable twin of the viewer's Correct panel: same writer, same
+    The scriptable twin of editing a claim in the viewer: same writer, same
     guarantees, no LLM. A Point rewrite supersedes the observed fact and keeps
     the original in history; a Face, Volume, or Root rewrite marks the object
     owner-authored so derivation stops overwriting it.
