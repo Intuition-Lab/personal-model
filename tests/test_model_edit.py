@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -732,3 +733,38 @@ def test_ipv6_loopback_is_accepted_by_the_origin_guard(ac_root) -> None:
     assert _is_local_host("::1")
     assert _is_local_host("[::1]:8742")
     assert not _is_local_host("evil.com")
+
+
+def test_a_root_correction_made_mid_synthesis_is_not_overwritten(ac_root) -> None:
+    """Synthesis spends seconds in an LLM call. An apex the owner settles during
+    that window must not be replaced by the answer that was already in flight."""
+    from persome import config as config_mod
+    from persome.writer import root_synthesis
+
+    _seed_face("Alex structures time deliberately.", level=2)  # so synthesis has input
+    root_id = _seed_face("A person becoming more deliberate.", level=3)
+
+    def _llm_that_edits_meanwhile(_messages):
+        with fts.cursor() as inner:
+            apply_model_edit(
+                conn=inner,
+                kind="root",
+                target_id=root_id,
+                op="rewrite",
+                replacement="I am not that person.",
+            )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content='{"apex": "A machine apex."}'))
+            ]
+        )
+
+    with fts.cursor() as conn:
+        result = root_synthesis.synthesize_root(
+            config_mod.load(), conn, llm_call=_llm_that_edits_meanwhile
+        )
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert result.reason == "skip_authored"
+    assert snapshot["root"]["signature"] == "I am not that person."
+    assert snapshot["root"]["provenance"] == sf.PROVENANCE_AUTHORED

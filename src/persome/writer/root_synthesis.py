@@ -239,6 +239,16 @@ def synthesize_root(
 
         anchors = sorted(root_entities)
         members = [b["face_id"] for b in bodies]
+        # Re-check gate 0 immediately before writing. The LLM call above can
+        # take many seconds, and the owner may have settled the apex by hand in
+        # the meantime — from the viewer or the CLI, both of which write on a
+        # different connection. `upsert_root` closes every live level-3 row, so
+        # without this the machine apex would overwrite a correction made
+        # moments earlier and the owner would never be told.
+        decided = schema_faces.owner_decided_root(conn)
+        if decided is not None:
+            return RootResult(str(decided["face_id"]), "skip_authored")
+
         face_id = schema_faces.upsert_root(
             conn, signature=apex, members=members, anchors=anchors, confidence=1.0
         )
