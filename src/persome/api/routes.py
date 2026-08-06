@@ -894,15 +894,24 @@ def model_edit(body: ModelEditBody) -> ApiResponse:
     from ..model.edit import apply_model_edit
     from ..store import fts as fts_store
 
-    with fts_store.cursor() as conn:
-        result = apply_model_edit(
-            conn,
-            kind=body.kind,
-            target_id=body.id,
-            op=body.op,
-            replacement=body.replacement,
-            reason=body.reason,
-        )
+    try:
+        with fts_store.cursor() as conn:
+            result = apply_model_edit(
+                conn,
+                kind=body.kind,
+                target_id=body.id,
+                op=body.op,
+                replacement=body.replacement,
+                reason=body.reason,
+            )
+    except Exception as exc:  # noqa: BLE001
+        # A correction that cannot be applied must still say something the owner
+        # can act on. Letting a storage error escape produces a bare 500 whose
+        # only visible form is "Could not save: HTTP 500" — indistinguishable
+        # from the feature being broken, on a surface whose entire purpose is
+        # telling the owner what happened to their model.
+        logger.exception("model edit failed: %s %s %s", body.kind, body.id, body.op)
+        raise HTTPException(status_code=500, detail=f"edit_failed: {type(exc).__name__}") from exc
     if not result.ok:
         raise HTTPException(status_code=400, detail=result.reason)
     # The viewer polls `/model/graph`, which caches for 15s. Without this an

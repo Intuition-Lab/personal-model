@@ -931,3 +931,110 @@ def test_compaction_refuses_to_unstrike_a_rejected_entry(ac_root) -> None:
     unstruck = before.replace("~~", "")
     assert "strike markers" in _owner_authorship_lost(before, unstruck)
     assert _owner_authorship_lost(before, before) == ""
+
+
+def test_a_point_whose_markdown_is_gone_is_still_correctable(ac_root) -> None:
+    """Losing the Markdown does not lose the Point.
+
+    While a `files` row remains, the Point is still addressable through the
+    evomem engine, so a correction goes there rather than raising
+    FileNotFoundError from the Markdown path.
+    """
+    from persome.store import files as files_mod
+
+    point_id = _seed_point()
+    files_mod.memory_path("person-alex.md").unlink()
+
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="Mine."
+        )
+    assert result.ok, f"expected a correction, got {result.reason}"
+
+
+def test_the_route_reports_a_storage_failure_instead_of_a_bare_500(ac_root, monkeypatch) -> None:
+    from persome.api import routes as routes_mod
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(routes_mod, "apply_model_edit", boom, raising=False)
+    monkeypatch.setattr("persome.model.edit.apply_model_edit", boom)
+    client = TestClient(build_api_app(auth_enabled=False))
+    response = client.post(
+        "/model/edit",
+        json={"schema_version": 1, "kind": "face", "id": "f", "op": "retire"},
+    )
+    assert response.status_code == 500
+    assert response.json()["detail"] == "edit_failed: OSError"
+
+
+def _seed_evo_native_point(content: str = "Alex mentors two engineers.") -> tuple[str, str]:
+    """A Point as `delta_apply` actually mints one: straight into evo_nodes,
+    with a files row but no Markdown. This is the shape of most real Points."""
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.models import MemoryLayer
+    from persome.store import fts as fts_mod
+
+    _seed_point()  # establishes the evo_nodes baseline
+    node_id = EvoMemory().add_direct(
+        content, layer=MemoryLayer.L5_KNOWLEDGE, file_name="person-sam", tags="fact"
+    )
+    with fts.cursor() as conn:
+        fts_mod.upsert_file(
+            conn,
+            fts_mod.FileRow(
+                path="person-sam.md",
+                prefix="person",
+                description="Sam",
+                tags="",
+                status="active",
+                entry_count=1,
+                created="2026-08-06",
+                updated="2026-08-06",
+                needs_compact=0,
+            ),
+        )
+    return node_id, "person-sam.md"
+
+
+def test_an_evo_native_point_is_correctable(ac_root) -> None:
+    """`delta_apply` mints entity and assertion Points directly into evo_nodes
+    and never projects Markdown, so on a real install almost every Point has no
+    file behind it. Routing those down the Markdown path raised FileNotFoundError
+    from inside the store and surfaced as HTTP 500."""
+    from persome.store import files as files_mod
+
+    node_id, file_name = _seed_evo_native_point()
+    assert not files_mod.memory_path(file_name).is_file(), "precondition: no Markdown"
+
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=node_id,
+            op="rewrite",
+            replacement="I mentor two engineers, by choice.",
+        )
+    assert result.ok, f"an evo-native Point must be correctable, got {result.reason}"
+
+    with fts.cursor() as conn:
+        row = conn.execute(
+            "SELECT content, tags FROM evo_nodes WHERE node_id = ?", (result.new_id,)
+        ).fetchone()
+    assert row is not None
+    assert OWNER_EDIT_TAG in str(row[1]).split()
+
+
+def test_a_point_backed_by_nothing_is_refused(ac_root) -> None:
+    """No Markdown and no files row means the Point is a remnant."""
+    point_id = _seed_point()
+    from persome.store import files as files_mod
+
+    files_mod.memory_path("person-alex.md").unlink()
+    with fts.cursor() as conn:
+        conn.execute("DELETE FROM files WHERE path = 'person-alex.md'")
+        result = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="Mine."
+        )
+    assert not result.ok and result.reason == "point_file_missing"
