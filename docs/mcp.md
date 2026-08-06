@@ -61,7 +61,7 @@ Example stdio client configuration:
 | `entity_graph` | Read the entity/relation graph; retained as a compatibility model view. |
 | `verify_fact` | Check a claim's freshness and explain existing open contradiction ledger rows. |
 | `remember` | Append an explicit, auditable memory. |
-| `correct_memory` | Supersede or revoke memory through the correction workflow. |
+| `correct_memory` | Supersede or revoke memory through the correction workflow. The result separates successful `applied` operations from `errors`; `ok` is true only when the writes and immediate model refresh complete. |
 | `process_pending_model_work` | Process a bounded number of pending sessions with the connected client's model allowance through MCP Sampling. |
 | `get_pending_model_work` | Inspect the semantic session backlog without invoking a model. |
 

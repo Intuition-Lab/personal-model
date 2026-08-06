@@ -48,6 +48,7 @@ class UpdateResult:
     applied: list[str] = field(default_factory=list)  # human-readable of what changed
     reason: str = ""
     ok: bool = False
+    errors: list[str] = field(default_factory=list)
 
 
 def _content_of(resp: Any) -> str:
@@ -69,6 +70,23 @@ def _build_llm_call(cfg: Any) -> Callable[[list[dict]], Any]:
 _IDENTITY_PREFIXES = ("user-", "person-", "org-", "project-", "tool-", "topic-", "schema-")
 
 
+def _target_is_writable(name: str) -> bool:
+    """Return whether a correction target has an authoritative write surface.
+
+    Under Markdown authority, SQLite is only a derived mirror. A live-looking row
+    whose Markdown file has disappeared is stale and cannot be corrected through
+    the normal supersede choke point. Under evomem authority, the canonical node
+    store remains writable even when its Markdown projection is temporarily absent.
+    """
+    try:
+        from ..evomem import inversion
+        from ..store import files as files_mod
+
+        return inversion.routes_to_engine(name) or files_mod.memory_path(name).exists()
+    except (OSError, ValueError):
+        return False
+
+
 def _candidates(cfg: Any, conn: sqlite3.Connection, query: str, cap: int = 16) -> list[Any]:
     """Credit assignment (backprop): trace the wrong output back to the SOURCE fact entries.
 
@@ -80,7 +98,7 @@ def _candidates(cfg: Any, conn: sqlite3.Connection, query: str, cap: int = 16) -
     out: dict[str, Any] = {}
 
     def _add(eid: str, path: str, content: str) -> None:
-        if eid and eid not in out:
+        if eid and eid not in out and _target_is_writable(path):
             out[eid] = SimpleNamespace(id=eid, path=path, content=content)
 
     try:
@@ -91,8 +109,8 @@ def _candidates(cfg: Any, conn: sqlite3.Connection, query: str, cap: int = 16) -
                 "SELECT id, path, content FROM entries WHERE superseded = 0 AND content LIKE ?"
                 " ORDER BY (CASE WHEN "
                 + " OR ".join(f"path LIKE '{p}%'" for p in _IDENTITY_PREFIXES)
-                + " THEN 0 ELSE 1 END), timestamp DESC LIMIT 12",
-                (f"%{ent}%",),
+                + " THEN 0 ELSE 1 END), timestamp DESC LIMIT ?",
+                (f"%{ent}%", max(12, cap * 4)),
             ).fetchall()
             for r in rows:
                 _add(str(r[0]), str(r[1]), str(r[2]))
@@ -100,14 +118,97 @@ def _candidates(cfg: Any, conn: sqlite3.Connection, query: str, cap: int = 16) -
         logger.debug("entity credit-assignment failed", exc_info=True)
 
     try:  # lexical fallback (also covers corrections that name no roster entity)
-        for h in fts.search(conn, query=query, top_k=8):
+        for h in fts.search(conn, query=query, top_k=max(8, cap * 4)):
             _add(h.id, h.path, h.content)
     except Exception:  # noqa: BLE001
         pass
     return list(out.values())[:cap]
 
 
-def _log_update(signal: str, kind: str, applied: list[str], reason: str, source: str) -> None:
+def _normalize_supersedes(
+    conn: sqlite3.Connection, planned: list[dict]
+) -> tuple[list[dict], list[str]]:
+    """Bind LLM-planned targets to the authoritative live SQLite receipt.
+
+    The model is allowed to select only supplied ``file#entry_id`` candidates,
+    but the entry id is the stable handle. Resolve its path again at apply time
+    so a mistyped file cannot redirect a correction, and reject stale DB rows
+    whose Markdown authority has disappeared.
+    """
+    normalized: list[dict] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for item in planned:
+        eid = str(item.get("entry_id", "")).strip()
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        row = conn.execute(
+            "SELECT path, superseded, content FROM entries WHERE id = ? LIMIT 1",
+            (eid,),
+        ).fetchone()
+        if row is None:
+            errors.append(f"supersede {eid}: receipt is missing from the index")
+            continue
+        name = str(row[0])
+        if bool(row[1]):
+            errors.append(f"supersede {name}#{eid}: receipt is already superseded")
+            continue
+        if not _target_is_writable(name):
+            errors.append(
+                f"supersede {name}#{eid}: authoritative memory file is missing; "
+                "rebuild the index before retrying"
+            )
+            continue
+        target = dict(item)
+        target["file"] = name
+        target["_previous_content"] = str(row[2] or "")
+        normalized.append(target)
+    return normalized, errors
+
+
+def _schema_signature(content: str) -> str:
+    """Extract the modeled proposition from a schema body or direct correction."""
+    lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("central:"):
+            return line.split(":", 1)[1].strip()
+    for line in lines:
+        if not line.startswith(("summary:", "inferences:", "-", "<!--")):
+            return line
+    return ""
+
+
+def _update_direct_schema_geometry(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    previous_content: str,
+    replacement: str,
+) -> list[str]:
+    """Keep schema geometry aligned when a derived schema is corrected directly."""
+    if not name.startswith("schema-"):
+        return []
+    from ..store import schema_faces
+
+    changed = schema_faces.supersede_signature(
+        conn,
+        old_signature=_schema_signature(previous_content),
+        new_signature=_schema_signature(replacement),
+    )
+    if not changed:
+        return []
+    return [f"updated derived model geometry for {name} ({len(changed)} nodes)"]
+
+
+def _log_update(
+    signal: str,
+    kind: str,
+    applied: list[str],
+    reason: str,
+    source: str,
+    errors: list[str] | None = None,
+) -> None:
     """Append to ``logs/memory-updates.jsonl`` — the RLHF reward signal (a user 'this is wrong'
     is the most valuable label). Fail-open."""
     try:
@@ -119,6 +220,7 @@ def _log_update(signal: str, kind: str, applied: list[str], reason: str, source:
             "signal": signal[:500],
             "kind": kind,
             "applied": applied,
+            "errors": list(errors or []),
             "reason": reason[:300],
             "source": source,  # user (supervised) | agent | observation
         }
@@ -188,30 +290,45 @@ def _apply_entity_op(
         return []
 
 
-def _reforward(cfg: Any, conn: sqlite3.Connection, files: set[str]) -> list[str]:
+def _reforward(cfg: Any, conn: sqlite3.Connection, files: set[str]) -> tuple[list[str], list[str]]:
     """Re-run the FORWARD pass on the affected path after a weight (fact) update — the closed
     loop: update the weight → re-run forward so the change propagates to the resident apex NOW,
     not on the next daily tick. For each file whose facts changed, re-derive its schema (targeted
     re-mine, reading the CORRECTED ``entries`` projection so it sees the supersede), then
-    re-synthesize the level-3 root apex (top of the forward pass). Fail-open."""
+    re-synthesize the level-3 root apex (top of the forward pass). A failed propagation is
+    returned to the caller instead of being reported as a successful real-time correction."""
     done: list[str] = []
+    errors: list[str] = []
     try:
         from ..writer import root_synthesis
         from ..writer import schema_miner_stage as sm
 
         # from_evomem=False: read the entries projection, which the choke-point supersede just
         # updated (superseded=1) — evo_nodes may not reflect a markdown-authority correction.
+        fact_files = {name for name in files if not name.startswith("schema-")}
         bundles = [
-            b for b in sm.collect_fact_bundles(conn, from_evomem=False) if b.source_path in files
+            b
+            for b in sm.collect_fact_bundles(conn, from_evomem=False)
+            if b.source_path in fact_files
         ]
         if bundles:
-            sm.mine_bundles_and_write(cfg, conn, bundles)
-            done.append(f"re-derived schema for {sorted(b.source_path for b in bundles)}")
+            run = sm.mine_bundles_and_write(cfg, conn, bundles)
+            written = {w.path for w in run.written}
+            expected = {sm.schema_name_for(b.source_path) for b in bundles}
+            missing = sorted(expected - written)
+            if missing:
+                errors.append(f"schema refresh produced no replacement for {missing}")
+            else:
+                done.append(f"re-derived schema for {sorted(b.source_path for b in bundles)}")
         rr = root_synthesis.run_root_synthesis(cfg, conn)  # re-synth the apex (top of forward)
-        done.append(f"re-synth root apex ({rr.reason})")
-    except Exception:  # noqa: BLE001 — the forward re-run never fails the update
+        if rr.reason in {"written", "disabled"}:
+            done.append(f"re-synth root apex ({rr.reason})")
+        else:
+            errors.append(f"root apex refresh did not produce a replacement ({rr.reason})")
+    except Exception as exc:  # noqa: BLE001 — source correction remains durable
         logger.exception("reforward failed")
-    return done
+        errors.append(f"forward refresh failed: {exc}")
+    return done, errors
 
 
 def update_memory(
@@ -248,40 +365,67 @@ def update_memory(
             },
         ]
         parsed = parse_json_object(_content_of(call(messages))) or {}
-        supersede = [s for s in (parsed.get("supersede") or []) if isinstance(s, dict)]
+        planned_supersede = [s for s in (parsed.get("supersede") or []) if isinstance(s, dict)]
         entity_op = parsed.get("entity_op") if isinstance(parsed.get("entity_op"), dict) else None
         reason = str(parsed.get("reason", signal))[:300]
 
-        if not supersede and not (entity_op and entity_op.get("op") in _ENTITY_OPS):
+        if not planned_supersede and not (entity_op and entity_op.get("op") in _ENTITY_OPS):
             return UpdateResult("noop", reason=reason, ok=False)
+        supersede, errors = _normalize_supersedes(conn, planned_supersede)
         if dry_run:
             return UpdateResult(
-                "update", applied=_plan(supersede, entity_op), reason=reason, ok=False
+                "error" if errors else "update",
+                applied=_plan(supersede, entity_op),
+                reason=reason,
+                ok=False,
+                errors=errors,
             )
 
         applied: list[str] = []
         kind = "update"
         touched_files: set[str] = set()
         if supersede:  # fact/point layer → reuse the shared update executor (delta_apply ⊖ leg)
-            r = delta_apply.apply_delta(conn, cfg, {"supersede": supersede})
             for s in supersede:
-                if s.get("entry_id"):
-                    applied.append(f"superseded {s.get('file')}#{s.get('entry_id')}")
-                    if s.get("file"):
-                        touched_files.add(str(s["file"]))
-            if r.errors:
-                applied.append(f"errors: {r.errors}")
+                delta_item = {k: v for k, v in s.items() if not k.startswith("_")}
+                r = delta_apply.apply_delta(conn, cfg, {"supersede": [delta_item]})
+                name = str(s["file"])
+                eid = str(s["entry_id"])
+                if r.supersedes_applied:
+                    applied.append(f"superseded {name}#{eid}")
+                    touched_files.add(name)
+                    try:
+                        applied += _update_direct_schema_geometry(
+                            conn,
+                            name=name,
+                            previous_content=str(s.get("_previous_content", "")),
+                            replacement=str(s.get("replacement", "")),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — source correction remains durable
+                        logger.exception("direct schema geometry refresh failed")
+                        errors.append(f"derived geometry refresh failed for {name}: {exc}")
+                else:
+                    errors.extend(r.errors or [f"supersede {name}#{eid}: no change applied"])
         if entity_op and entity_op.get("op") in _ENTITY_OPS:  # entity layer → retype verbs
             applied += _apply_entity_op(entity_op, cfg, conn, signal=signal, source=source)
             kind = "entity_update" if not supersede else "update"
 
         # Closed loop: weight update (backward) → re-run the forward pass on the affected path so
         # the correction reaches the resident apex immediately (not on the next daily tick).
-        if reforward and touched_files and any("superseded" in a for a in applied):
-            applied += _reforward(cfg, conn, touched_files)
+        if reforward and touched_files:
+            forward_applied, forward_errors = _reforward(cfg, conn, touched_files)
+            applied += forward_applied
+            errors += forward_errors
 
-        _log_update(signal, kind, applied, reason, source)
-        return UpdateResult(kind, applied=applied, reason=reason, ok=bool(applied))
+        if errors:
+            kind = "error"
+        _log_update(signal, kind, applied, reason, source, errors)
+        return UpdateResult(
+            kind,
+            applied=applied,
+            reason=reason,
+            ok=bool(applied) and not errors,
+            errors=errors,
+        )
     except Exception:  # noqa: BLE001 — a bad update never crashes the caller
         logger.exception("update_memory failed")
         return UpdateResult("error", ok=False)

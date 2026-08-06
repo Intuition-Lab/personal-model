@@ -269,8 +269,12 @@ persome entity-retype --help
 ```
 
 Trusted agents can call MCP `remember` and `correct_memory`. Correction keeps
-the prior state and receipts so the change remains auditable. Use erasure, not
-correction, when history itself must be deleted.
+the prior state and receipts so the change remains auditable. Its result
+separates successful writes from errors and reports success only after the
+immediate schema/Root refresh completes. When a derived schema is the only
+remaining writable receipt, correction also supersedes its matching active
+Face or Volume so the retired belief cannot continue feeding Root synthesis.
+Use erasure, not correction, when history itself must be deleted.
 
 ## Export
 
