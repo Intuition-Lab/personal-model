@@ -38,6 +38,34 @@ def _unique_tokens(text: str) -> set[str]:
     return {t.lower() for t in _UNIQUE_TOKEN_RE.findall(text)}
 
 
+def _owner_authorship_lost(before: str, after: str) -> str:
+    """Describe any owner authorship the rewrite would drop, or ``""``.
+
+    Compaction is an LLM rewriting a whole memory file, and it has no reason to
+    treat the owner's own corrections differently from anything else it is
+    summarising. Two markers are load-bearing and must survive verbatim:
+
+    ``#source:owner-edit`` — this fact is the owner's wording, not an
+    observation. Losing it makes an assertion indistinguishable from something
+    the Runtime saw.
+
+    ``#superseded-by:<id>`` — this entry lost to a correction. Losing it
+    reinstates the claim the owner corrected away, live and current again.
+
+    Counting is per marker: a compaction that legitimately merges two entries
+    may reduce other content, but it can never have a reason to end up with
+    fewer owner markers than it started with.
+    """
+    losses = []
+    for label, marker in (
+        ("owner-edit tags", "#source:owner-edit"),
+        ("supersede markers", "#superseded-by:"),
+    ):
+        if after.count(marker) < before.count(marker):
+            losses.append(f"{before.count(marker) - after.count(marker)} {label}")
+    return ", ".join(losses)
+
+
 def compact_file(cfg: Config, conn: sqlite3.Connection, *, name: str) -> CompactResult:
     path = files_mod.memory_path(name)
     if not path.exists():
@@ -107,6 +135,28 @@ def compact_file(cfg: Config, conn: sqlite3.Connection, *, name: str) -> Compact
     after_unique = _unique_tokens(new_text)
     preserved = len(before_unique & after_unique)
     ratio = preserved / len(before_unique) if before_unique else 1.0
+
+    lost = _owner_authorship_lost(original, new_text)
+    if lost:
+        # The token gate cannot see this. Dropping a `#source:owner-edit` tag or
+        # a `#superseded-by` marker costs a handful of unique tokens out of
+        # hundreds, so a rewrite that reinstates a claim the owner corrected
+        # away still scores well above the threshold. What is lost is not volume
+        # but authority: whose words these are, and which of two versions the
+        # owner chose.
+        logger.warning(
+            "compact rejected: owner-authored content would be lost — %s (%s)", name, lost
+        )
+        return CompactResult(
+            name,
+            False,
+            before_tokens,
+            len(new_text) // 4,
+            len(before_unique),
+            len(after_unique),
+            ratio,
+            f"rejected: owner-authored content would be lost ({lost})",
+        )
 
     if ratio < _PRESERVATION_THRESHOLD:
         logger.warning(

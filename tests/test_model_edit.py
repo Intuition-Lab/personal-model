@@ -768,3 +768,66 @@ def test_a_root_correction_made_mid_synthesis_is_not_overwritten(ac_root) -> Non
     assert result.reason == "skip_authored"
     assert snapshot["root"]["signature"] == "I am not that person."
     assert snapshot["root"]["provenance"] == sf.PROVENANCE_AUTHORED
+
+
+def test_a_withdrawn_fact_is_not_re_minted_by_the_next_observation(ac_root) -> None:
+    """The dedupe guard only sees is_latest rows, so a rejected Point used to
+    come back the next time the owner did the thing."""
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    text = "Alex works at Acme as a staff engineer."
+    point_id = _seed_point(text)
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="point", target_id=point_id, op="retire").ok
+
+    delta = {
+        "entities": [{"canonical": "Alex", "kind": "person"}],
+        "assertions": [{"subject": {"canonical": "Alex"}, "text": text}],
+    }
+    with fts.cursor() as conn:
+        result = delta_apply.apply_delta(conn, config_mod.load(), delta)
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert result.assertions_minted == 0, "a withdrawn fact must not be re-minted"
+    assert all(point["content"] != text for point in snapshot["points"])
+
+
+def test_a_differently_worded_observation_still_lands(ac_root) -> None:
+    """Withdrawal suppresses the exact claim, not the subject."""
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    point_id = _seed_point("Alex works at Acme as a staff engineer.")
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="point", target_id=point_id, op="retire").ok
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {
+                "entities": [{"canonical": "Alex", "kind": "person"}],
+                "assertions": [
+                    {"subject": {"canonical": "Alex"}, "text": "Alex mentors two new engineers."}
+                ],
+            },
+        )
+    assert result.assertions_minted == 1
+
+
+def test_compaction_refuses_to_strip_owner_authorship(ac_root) -> None:
+    """The 95% token gate is blind to this: dropping a tag costs a few tokens
+    out of hundreds while reinstating a claim the owner corrected away."""
+    from persome.writer.compact import _owner_authorship_lost
+
+    before = (
+        "## [t] {id: a} #fact #source:owner-edit\nMy own wording.\n"
+        "## [t] {id: b} #fact #superseded-by:a\n~~The old claim.~~\n"
+    )
+    assert _owner_authorship_lost(before, before) == ""
+    stripped_tag = before.replace(" #source:owner-edit", "")
+    assert "owner-edit tags" in _owner_authorship_lost(before, stripped_tag)
+    reinstated = before.replace(" #superseded-by:a", "").replace("~~", "")
+    assert "supersede markers" in _owner_authorship_lost(before, reinstated)
+    # Ordinary compression that keeps both markers is unaffected.
+    compressed = before.replace("My own wording.", "My wording.")
+    assert _owner_authorship_lost(before, compressed) == ""

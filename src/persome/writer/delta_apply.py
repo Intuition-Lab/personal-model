@@ -148,6 +148,33 @@ def _assertion_exists(conn: sqlite3.Connection, stored: str, text: str) -> bool:
         return False
 
 
+def _owner_withdrew(conn: sqlite3.Connection, stored: str, text: str) -> bool:
+    """Whether the owner already rejected this exact assertion.
+
+    A withdrawn Point is not ``is_latest``, so the dedupe check above does not
+    see it and the next observation of the same behaviour mints the claim again.
+    "This is wrong about me" then lasts until the next time the owner does the
+    thing — which is no rejection at all.
+
+    Re-observation is not new information here: the owner did not dispute that
+    the behaviour occurred, they disputed that it belongs in their model. A
+    differently-worded observation is unaffected, and the owner can always
+    re-add the fact deliberately.
+    """
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM evo_nodes"
+            " WHERE file_name = ? AND content = ? AND is_latest = 0"
+            "   AND valid_until IS NOT NULL"
+            "   AND (superseded_by IS NULL OR superseded_by = '[]')"
+            " LIMIT 1",
+            (stored, text),
+        ).fetchone()
+        return row is not None
+    except Exception:  # noqa: BLE001 — a dedupe miss must never break ingestion
+        return False
+
+
 def _apply_assertions(
     conn: sqlite3.Connection, mem: EvoMemory, clean: dict, kinds: dict[str, str], r: ApplyResult
 ) -> None:
@@ -163,6 +190,9 @@ def _apply_assertions(
             if stem is None:
                 continue
             if _assertion_exists(conn, f"{stem}.md", text):
+                r.assertions_seen += 1
+                continue
+            if _owner_withdrew(conn, f"{stem}.md", text):
                 r.assertions_seen += 1
                 continue
             tags = "fact"
