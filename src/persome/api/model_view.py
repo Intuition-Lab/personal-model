@@ -81,6 +81,7 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       <p>How to read your model</p>
       <div><span class="swatch point"></span><b>Point</b><span>observed fact</span></div>
       <div><span class="swatch line"></span><b>Line</b><span>evolution or relation</span></div>
+      <div><span class="swatch context"></span><b>Entity</b><span>the other end of a relation</span></div>
       <div><span class="swatch face"></span><b>Face</b><span>stable pattern</span></div>
       <div><span class="swatch volume"></span><b>Volume</b><span>cross-pattern structure</span></div>
       <div><span class="swatch root"></span><b>Root</b><span>current personal model</span></div>

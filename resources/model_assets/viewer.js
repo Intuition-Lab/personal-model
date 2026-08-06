@@ -1409,6 +1409,19 @@ detailRejectEl.addEventListener("click", () => {
   submitEdit(selected.kind, selectedItem, "retire", "", "");
 });
 
+function uneditableNote(kind) {
+  if (kind === "context") {
+    return "An entity your model refers to — a person, project, tool, or file."
+      + " It is the far end of a relation, not a claim about you, so there is"
+      + " nothing here to correct.";
+  }
+  if (kind === "line") {
+    return "A relation between two things your model knows."
+      + " Lines are derived from what they connect, so correct those instead.";
+  }
+  return "";
+}
+
 function renderEditor(kind, item) {
   endEditing();
   setEditStatus("", null);
@@ -1419,10 +1432,13 @@ function renderEditor(kind, item) {
   const editable = isEditable(kind, item);
   detailTitleEl.dataset.editable = String(editable);
   detailActionsEl.hidden = !editable;
+  // Say what a node IS when it cannot be corrected. "Nothing to edit here" only
+  // tells the owner what they cannot do; an entity or a Line is not a claim
+  // about them at all, and that is the useful thing to know.
   detailHintEl.innerHTML = editable
-    ? 'Click the text to rewrite it in your own words.'
-    : "";
-  detailHintEl.hidden = !editable;
+    ? "Click the text to rewrite it in your own words."
+    : uneditableNote(kind);
+  detailHintEl.hidden = !detailHintEl.innerHTML;
   if (editable) {
     detailTitleEl.setAttribute("role", "button");
     detailTitleEl.setAttribute("title", "Click to correct this in your own words");
@@ -1441,7 +1457,7 @@ function showDetails(kind, item) {
   pauseAutoRotate();
   syncSelectionState();
   detailEl.dataset.kind = kind;
-  detailKindEl.textContent = kind;
+  detailKindEl.textContent = kind === "context" ? "entity" : kind;
   detailTitleEl.textContent = (
     lineDetail?.title
     || item.content || item.signature || item.label || item.predicate || item.kind || item.id
@@ -1450,7 +1466,9 @@ function showDetails(kind, item) {
   // "Evidence-backed" is a claim about where the text came from, so it must not
   // sit above text the owner wrote themselves.
   const authored = isAuthored(kind, item);
-  detailProvenanceEl.textContent = authored ? "Your words" : "Evidence-backed";
+  detailProvenanceEl.textContent = kind === "context"
+    ? "Referenced by your model"
+    : (authored ? "Your words" : "Evidence-backed");
   detailProvenanceEl.classList.toggle("detail-authored", authored);
   detailMetaEl.replaceChildren();
   appendMeta("Layer", item.layer || item.level);

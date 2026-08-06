@@ -413,6 +413,10 @@ class TestViewPage:
         assert 'id="detail-evidence-fold"' in body
         assert 'id="detail-history-fold"' in body
         assert 'id="detail-reject"' in body
+        # Entities are the most numerous thing on screen; the legend must name
+        # them rather than leaving a sixth unexplained visual class.
+        assert 'class="swatch context"' in body
+        assert "the other end of a relation" in body
         assert 'id="evidence-breadcrumbs"' in body
 
     def test_bundled_viewer_assets_are_served(self, ac_root):

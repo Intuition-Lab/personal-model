@@ -600,6 +600,15 @@ button {
 .swatch.line { color: var(--line); height: 1px; border-radius: 0; background: var(--line); }
 .swatch.face { color: var(--face); border-radius: 1px; background: var(--face); transform: rotate(45deg); }
 .swatch.volume { color: var(--volume); border: 1px solid var(--volume); background: transparent; }
+/* Entities render as small grey cubes, so the swatch is a square rather than a
+   dot and carries no glow — they are context, not a claim about the owner. */
+.swatch.context {
+  color: var(--muted);
+  border-radius: 1px;
+  background: var(--muted);
+  box-shadow: none;
+  opacity: 0.8;
+}
 .swatch.root { color: var(--root); background: var(--root); transform: rotate(45deg); border-radius: 2px; }
 
 .line-explorer {
