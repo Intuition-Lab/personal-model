@@ -1,6 +1,7 @@
 import fcntl
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import textwrap
@@ -65,6 +66,7 @@ def test_connect_names_recovery_path_on_corrupt_header(ac_root: Path) -> None:
     # actionable, still-catchable DatabaseError naming the recovery path.
     db = ac_root / "index.db"
     db.write_bytes(b"\x0d\x00\x00\x00" + b"\x00" * 4092)
+    db.chmod(0o600)
 
     with pytest.raises(fts.CorruptDatabaseError, match="persome start") as raised:
         fts.connect(db)
@@ -75,12 +77,25 @@ def test_connect_does_not_claim_startup_recovery_for_external_database(ac_root: 
     db = ac_root / "exports" / "damaged-snapshot.db"
     db.parent.mkdir()
     db.write_bytes(b"\x0d\x00\x00\x00" + b"\x00" * 4092)
+    db.chmod(0o600)
 
     with pytest.raises(fts.CorruptDatabaseError) as raised:
         fts.connect(db)
     message = str(raised.value)
     assert "persome start" not in message
     assert "automatic daemon-start recovery applies only to the live index.db" in message
+
+
+def test_canonical_read_cursor_initializes_a_missing_owner_database(ac_root: Path) -> None:
+    assert not paths.index_db().exists()
+
+    with fts.canonical_read_cursor() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='captures'"
+        ).fetchone()
+
+    assert paths.index_db().exists()
+    assert stat.S_IMODE(paths.index_db().stat().st_mode) == 0o600
 
 
 def test_create_append_search(ac_root: Path) -> None:
@@ -703,6 +718,11 @@ def test_client_connect_requires_daemon_created_schema(
     ac_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    monkeypatch.setattr(
+        fts,
+        "_create_private_database_file",
+        lambda _path: pytest.fail("a client must never create index.db"),
+    )
     with pytest.raises(RuntimeError, match="start the Persome daemon"):
         fts.connect()
     assert not paths.index_db().exists()
