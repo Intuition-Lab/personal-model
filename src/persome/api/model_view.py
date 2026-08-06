@@ -121,6 +121,11 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
 
     <div id="error" class="error" role="alert" hidden></div>
 
+    <!-- Owned by the editor, not the loader. `#error` is cleared by every
+         successful model poll, which would silently erase a save failure the
+         owner has not read yet. -->
+    <div id="edit-alert" class="error edit-alert" role="alert" hidden></div>
+
     <div id="share-notice" class="share-notice" role="status" aria-live="polite" hidden>
       <span aria-hidden="true">↓</span>
       <div><strong>HUMAN.md Card downloaded</strong><small>Detected secrets, PII, paths, IDs, and evidence receipts were excluded. Review summaries before sharing.</small></div>

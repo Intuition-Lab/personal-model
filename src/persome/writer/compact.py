@@ -52,17 +52,26 @@ def _owner_authorship_lost(before: str, after: str) -> str:
     ``#superseded-by:<id>`` — this entry lost to a correction. Losing it
     reinstates the claim the owner corrected away, live and current again.
 
-    Counting is per marker: a compaction that legitimately merges two entries
-    may reduce other content, but it can never have a reason to end up with
-    fewer owner markers than it started with.
+    Counting is per marker. That is not a stricter bar than compaction already
+    accepts: ``prompts/compact.md`` instructs it to "preserve all supersede
+    chains — never delete struck-through entries". A run that drops one has
+    violated its own contract, so rejecting it is enforcement rather than a new
+    constraint. Merging redundant entries stays available; it just cannot be
+    paid for with the owner's authorship.
     """
     losses = []
     for label, marker in (
         ("owner-edit tags", "#source:owner-edit"),
         ("supersede markers", "#superseded-by:"),
+        # The strike is what retires an entry. Keeping `#superseded-by:` while
+        # dropping the `~~` around the body scores 100% on the token gate and
+        # still stands the rejected claim back up as live text, so it has to be
+        # counted in its own right rather than trusted to follow the tag.
+        ("strike markers", "~~"),
     ):
-        if after.count(marker) < before.count(marker):
-            losses.append(f"{before.count(marker) - after.count(marker)} {label}")
+        missing = before.count(marker) - after.count(marker)
+        if missing > 0:
+            losses.append(f"{missing} {label}")
     return ", ".join(losses)
 
 

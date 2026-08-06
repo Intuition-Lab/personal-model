@@ -53,6 +53,7 @@ const detailEvidenceFoldEl = document.getElementById("detail-evidence-fold");
 const detailHistoryFoldEl = document.getElementById("detail-history-fold");
 const emptyEl = document.getElementById("empty");
 const errorEl = document.getElementById("error");
+const editAlertEl = document.getElementById("edit-alert");
 const modelIdentityEl = document.getElementById("model-identity");
 const slider = document.getElementById("as-of");
 const sliderLabel = document.getElementById("as-of-label");
@@ -163,6 +164,7 @@ const MIN_LINE_HIT_RADIUS_PX = 8;
 const ZOOM_MIN_PERCENT = 50;
 const ZOOM_MAX_PERCENT = 400;
 const ZOOM_STEP_PERCENT = 25;
+const EVIDENCE_CARD_LIMIT = 12;
 const MODEL_GRAPH_TIMEOUT_MS = 45_000;
 const SHARE_CARD_TIMEOUT_MS = 15_000;
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -974,7 +976,10 @@ function applyLayerVisibility() {
 }
 
 function humaneMeta(label, value) {
-  if (!/^(Valid from|From|To)$/.test(label)) return value;
+  // Only genuine timestamps. A Line's "From"/"To" carry entity labels, and
+  // `new Date("March")` happily returns a date — replacing someone's name with
+  // a fabricated one.
+  if (label !== "Valid from") return value;
   const parsed = new Date(String(value));
   if (Number.isNaN(parsed.getTime())) return value;
   return parsed.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
@@ -1162,11 +1167,18 @@ function renderNodeEvidence(kind, item) {
   renderBreadcrumbs();
 
   const cards = nodeEvidenceCards(item, model);
+  const shown = Math.min(cards.length, EVIDENCE_CARD_LIMIT);
+  const countEl = document.getElementById("detail-evidence-count");
+  // Say what is actually on screen. Claiming 34 and rendering 12 is the kind of
+  // small dishonesty this viewer exists not to commit.
+  if (countEl) {
+    countEl.textContent = cards.length > shown ? `${shown} of ${cards.length}` : (cards.length || "");
+  }
   if (cards.length) {
     const heading = document.createElement("strong");
     heading.textContent = "Direct evidence";
     detailReceiptsEl.appendChild(heading);
-    cards.slice(0, 12).forEach((card) => {
+    cards.slice(0, EVIDENCE_CARD_LIMIT).forEach((card) => {
       detailReceiptsEl.appendChild(evidenceCard(card));
     });
   } else {
@@ -1201,9 +1213,7 @@ function renderOverview(kind, item) {
   detailSummaryEl.append(copy);
   // `overview.highlights` is the first three of exactly the cards the Evidence
   // fold renders, so showing them here too buried the rest of the drawer under
-  // a duplicate. The count moves to the fold's own summary instead.
-  const count = document.getElementById("detail-evidence-count");
-  if (count) count.textContent = overview.highlights.length ? String(nodeEvidenceCards(item, model).length) : "";
+  // a duplicate. `renderNodeEvidence` owns the fold's count.
 }
 
 function renderNodeHistory(item) {
@@ -1250,9 +1260,30 @@ function editableText(kind, item) {
 }
 
 function setEditStatus(message, tone) {
+  // The drawer may already be closed: committing by clicking away — the gesture
+  // the editor itself advertises — both saves and closes. Writing a failure
+  // into a `display:none` panel reports it to nobody, and the next selection
+  // clears it before it could ever be read. Anything the owner must act on goes
+  // to the viewport-level alert instead.
+  if (detailEl.hidden && (tone === "error" || tone === "warn")) {
+    showEditAlert(message);
+    return;
+  }
   detailStatusEl.textContent = message || "";
   if (tone) detailStatusEl.dataset.tone = tone;
   else delete detailStatusEl.dataset.tone;
+}
+
+function showEditAlert(message) {
+  if (!message) return;
+  const text = document.createElement("p");
+  text.textContent = message;
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.textContent = "Dismiss";
+  dismiss.addEventListener("click", () => { editAlertEl.hidden = true; });
+  editAlertEl.replaceChildren(text, dismiss);
+  editAlertEl.hidden = false;
 }
 
 // ── Editing in place ──────────────────────────────────────────────────────
@@ -1369,6 +1400,13 @@ function commitEditing() {
   if (!editingItem) return;
   const next = detailClaimInputEl.value.trim();
   const { kind, id, original } = editingItem;
+  if (editInFlight && next && next !== original.trim()) {
+    // Keep the editor open with the owner's text rather than discarding it.
+    // Closing it here would drop the correction on the floor and then report
+    // "Saved." for the previous one.
+    setEditStatus("Still saving the last change — try again in a moment.", "warn");
+    return;
+  }
   endEditing();
   if (!next || next === original.trim()) return;
   const item = items.get(selectionKey(kind, id));
@@ -1376,7 +1414,14 @@ function commitEditing() {
 }
 
 detailClaimInputEl.addEventListener("input", autoGrow);
-detailClaimInputEl.addEventListener("blur", commitEditing);
+detailClaimInputEl.addEventListener("blur", () => {
+  // "Click away to save" means clicking somewhere else on this page. Cmd-Tab to
+  // check a wording in another app also fires blur, and committing there would
+  // save a half-typed sentence as the owner's own words. Focus leaving the
+  // window is not an intent signal, so the editor simply stays open.
+  if (!document.hasFocus()) return;
+  commitEditing();
+});
 detailClaimInputEl.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     event.stopPropagation();
@@ -1385,6 +1430,9 @@ detailClaimInputEl.addEventListener("keydown", (event) => {
   } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
     commitEditing();
+    // Symmetric with the Escape path: a keyboard commit must not strand focus
+    // on the document body.
+    if (!detailEl.hidden && !detailTitleEl.hidden) detailTitleEl.focus();
   }
 });
 
@@ -1427,7 +1475,7 @@ function renderEditor(kind, item) {
   setEditStatus("", null);
   delete detailRejectEl.dataset.armed;
   detailRejectEl.textContent = "This is wrong about me";
-  detailRejectEl.disabled = false;
+  detailRejectEl.disabled = editInFlight;
 
   const editable = isEditable(kind, item);
   detailTitleEl.dataset.editable = String(editable);
@@ -1489,6 +1537,7 @@ function showDetails(kind, item) {
   renderNodeEvidence(kind, item);
   renderNodeHistory(item);
   renderEditor(kind, item);
+  editAlertEl.hidden = true;
   // Folds start closed on every selection: the claim is what the owner came to
   // read, and provenance is one click away rather than one of four places the
   // content might be hiding.

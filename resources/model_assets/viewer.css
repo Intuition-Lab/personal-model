@@ -717,13 +717,9 @@ button {
   color: var(--detail-accent, var(--root));
 }
 
-.detail h1 {
-  margin: 0 0 16px;
-  font-size: 20px;
-  font-weight: 630;
-  letter-spacing: -0.025em;
-  line-height: 1.3;
-}
+/* The claim's box lives on `.detail-claim` alone, so the heading and the
+   textarea that replaces it are pixel-identical. A `.detail h1` rule here would
+   out-specify that single class and make the drawer jump on every edit. */
 
 .detail-summary {
   margin-bottom: 12px;
@@ -1469,11 +1465,16 @@ button {
   cursor: text;
 }
 
-.detail-claim[data-editable="true"]:hover,
-.detail-claim[data-editable="true"]:focus-visible {
+.detail-claim[data-editable="true"]:hover {
   border-color: rgba(255, 255, 255, 0.1);
   background: rgba(255, 255, 255, 0.045);
-  outline: none;
+}
+
+.detail-claim[data-editable="true"]:focus-visible {
+  border-color: var(--detail-accent, var(--border-bright));
+  background: rgba(255, 255, 255, 0.045);
+  outline: 2px solid var(--detail-accent, var(--border-bright));
+  outline-offset: 2px;
 }
 
 .detail-claim-input {
@@ -1653,4 +1654,10 @@ button {
 
 .detail-authored {
   color: #96e2b2;
+}
+
+/* Sits above the model-load banner so a save failure is never stacked
+   underneath an unrelated one. */
+.edit-alert {
+  z-index: 20;
 }

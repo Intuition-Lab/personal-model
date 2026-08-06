@@ -869,3 +869,65 @@ def test_an_orphan_reaped_fact_is_still_free_to_come_back(ac_root) -> None:
         )
 
     assert result.assertions_minted == 1, "an aged-out fact must be free to return"
+
+
+def test_a_rewritten_wording_is_not_re_minted_either(ac_root) -> None:
+    """A rewrite rejects the old wording as surely as a retire does.
+
+    The superseded Point is no longer `is_latest`, so re-observing the text the
+    owner replaced would mint it again and stand the discarded version back up
+    beside the correction.
+    """
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    original = "Alex works at Acme as a staff engineer."
+    point_id = _seed_point(original)
+    with fts.cursor() as conn:
+        assert apply_model_edit(
+            conn,
+            kind="point",
+            target_id=point_id,
+            op="rewrite",
+            replacement="I lead the platform team at Acme.",
+        ).ok
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {
+                "entities": [{"canonical": "Alex", "kind": "person"}],
+                "assertions": [{"subject": {"canonical": "Alex"}, "text": original}],
+            },
+        )
+    assert result.assertions_minted == 0
+
+
+def test_a_rejection_is_scoped_to_its_subject(ac_root) -> None:
+    """The same sentence about someone else is a different claim."""
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    text = "Prefers written proposals."
+    point_id = _seed_point(text)
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="point", target_id=point_id, op="retire").ok
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {
+                "entities": [{"canonical": "Sam", "kind": "person"}],
+                "assertions": [{"subject": {"canonical": "Sam"}, "text": text}],
+            },
+        )
+    assert result.assertions_minted == 1, "one rejection must not silence every subject"
+
+
+def test_compaction_refuses_to_unstrike_a_rejected_entry(ac_root) -> None:
+    """Keeping `#superseded-by:` while dropping the `~~` scores 100% on the
+    token gate and still stands the rejected claim back up as live text."""
+    from persome.writer.compact import _owner_authorship_lost
+
+    before = "## [t] {id: b} #fact #superseded-by:a\n~~The old claim.~~\n"
+    unstruck = before.replace("~~", "")
+    assert "strike markers" in _owner_authorship_lost(before, unstruck)
+    assert _owner_authorship_lost(before, before) == ""

@@ -77,6 +77,10 @@ class EditResult:
     op: str
     new_id: str = ""
     prior_text: str = ""
+    # Memory file the decision applies to, for Point edits. A rejection is
+    # scoped to its subject: the same sentence about someone else is a
+    # different claim.
+    file_name: str = ""
     reason: str = ""
     shadow_misses: int = 0
     applied: list[str] = field(default_factory=list)
@@ -165,6 +169,7 @@ def _audit(
     new_text: str,
     reason: str,
     new_id: str,
+    file_name: str,
 ) -> None:
     """Record what this edit displaced. Never fatal — the edit itself has landed."""
     from ..store import memory_deltas
@@ -182,6 +187,7 @@ def _audit(
                     "new_text": new_text,
                     "reason": reason,
                     "new_id": new_id,
+                    "file_name": file_name,
                 }
             },
             status="active",
@@ -271,6 +277,7 @@ def _edit_point(
             op=op,
             new_id=str(new_id),
             prior_text=prior_text,
+            file_name=file_name,
             applied=[f"superseded {target_id} -> {new_id} in {file_name}"],
         )
 
@@ -282,6 +289,7 @@ def _edit_point(
         op=op,
         new_id=target_id,
         prior_text=prior_text,
+        file_name=file_name,
         applied=[f"retired {target_id} in {file_name}"],
     )
 
@@ -404,6 +412,7 @@ def apply_model_edit(
         new_text=replacement,
         reason=reason,
         new_id=result.new_id,
+        file_name=result.file_name,
     )
     _mark_structure_dirty(conn)
 
@@ -426,6 +435,7 @@ def apply_model_edit(
         op=result.op,
         new_id=result.new_id,
         prior_text=result.prior_text,
+        file_name=result.file_name,
         shadow_misses=misses,
         applied=result.applied,
     )

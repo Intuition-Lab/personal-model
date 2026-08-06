@@ -173,17 +173,29 @@ def _owner_withdrew(conn: sqlite3.Connection, stored: str, text: str) -> bool:
         ).fetchall()
     except Exception:  # noqa: BLE001 — a dedupe miss must never break ingestion
         return False
+    wanted = text.strip()
     for (payload,) in rows:
         try:
             edit = json.loads(payload or "{}").get("owner_edit") or {}
         except (TypeError, ValueError):
             continue
-        if (
-            edit.get("kind") == "point"
-            and edit.get("op") == "retire"
-            and str(edit.get("prior_text") or "").strip() == text.strip()
-        ):
-            return True
+        if edit.get("kind") != "point":
+            continue
+        # A rewrite is a rejection of the old wording just as much as a retire
+        # is. The superseded Point is no longer `is_latest`, so re-observing the
+        # text the owner replaced would mint it again and stand the discarded
+        # version back up beside the correction.
+        if edit.get("op") not in ("retire", "rewrite"):
+            continue
+        if str(edit.get("prior_text") or "").strip() != wanted:
+            continue
+        # Scoped to the file the decision was made in. The same sentence about a
+        # different subject is a different claim, and one rejection must not
+        # silence it everywhere.
+        edited_file = str(edit.get("file_name") or "")
+        if edited_file and edited_file != stored:
+            continue
+        return True
     return False
 
 
