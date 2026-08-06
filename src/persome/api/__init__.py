@@ -27,6 +27,7 @@ from ..security.body_limit import (
     RequestConcurrencyLimitMiddleware,
 )
 from ..trace import generate_trace_id, set_trace_id
+from .models import MODEL_EDIT_MAX_REQUEST_BODY_BYTES
 from .routes import router
 from .routes import set_config as _set_route_config
 
@@ -37,13 +38,22 @@ _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 
 def _hostname_of(host: str | None) -> str | None:
-    """Lower-cased hostname with any ``:port`` stripped; ``[::1]`` kept whole."""
+    """Lower-cased hostname with any ``:port`` stripped; ``[::1]`` kept whole.
+
+    A bare IPv6 literal is not bracketed once it has been through
+    ``urlsplit().hostname``, and every colon in it belongs to the address. Port
+    stripping therefore only applies when at most one colon is present —
+    otherwise ``::1`` was truncated to ``::`` and loopback over IPv6 was refused
+    even though ``_LOCAL_HOSTS`` lists it.
+    """
     if not host:
         return None
     if host.startswith("["):
         hostname = host.split("]", 1)[0] + "]" if "]" in host else host
+    elif host.count(":") == 1:
+        hostname = host.rsplit(":", 1)[0]
     else:
-        hostname = host.rsplit(":", 1)[0] if ":" in host else host
+        hostname = host
     return hostname.strip().lower() or None
 
 
@@ -229,8 +239,11 @@ def build_api_app(cfg: Config | None = None, *, auth_enabled: bool = True) -> Fa
     app.add_middleware(_TraceIdMiddleware)
     app.add_middleware(
         RequestBodyLimitMiddleware,
-        path_limits={"/health-events/import": HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES},
-        strict_json_paths=("/health-events/import",),
+        path_limits={
+            "/health-events/import": HEALTH_IMPORT_MAX_REQUEST_BODY_BYTES,
+            "/model/edit": MODEL_EDIT_MAX_REQUEST_BODY_BYTES,
+        },
+        strict_json_paths=("/health-events/import", "/model/edit"),
     )
     app.add_middleware(RequestConcurrencyLimitMiddleware)
     if auth_enabled:

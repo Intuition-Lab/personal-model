@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from ..evomem.engine import EvoMemory
 from ..evomem.models import MemoryLayer
 from ..evomem.person_graph import _slug as _entity_slug
 from ..logger import get
+from ..model.edit import AUDIT_SESSION_ID as _OWNER_EDIT_SESSION
 from ..store import entries as entries_store
 from ..store import relation_edges as edges_store
 from ..store.relation_edges import EntityKind, Predicate
@@ -148,6 +150,55 @@ def _assertion_exists(conn: sqlite3.Connection, stored: str, text: str) -> bool:
         return False
 
 
+def _owner_withdrew(conn: sqlite3.Connection, stored: str, text: str) -> bool:
+    """Whether the owner explicitly rejected this exact assertion.
+
+    A withdrawn Point is not ``is_latest``, so the dedupe check above does not
+    see it and the next observation of the same behaviour mints the claim again.
+    "This is wrong about me" then lasts until the next time the owner does the
+    thing — which is no rejection at all.
+
+    Intent is read from the owner-edit audit trail rather than inferred from the
+    row's shape. A retired Point is ``shadow`` with a ``valid_until`` and no
+    successor — but so is one the orphan reaper collected after its TTL, and so
+    is anything else that retires a node without replacing it. Those are
+    housekeeping, not decisions: a fact that aged out must be free to come back
+    when the owner starts doing it again. Only an explicit rejection suppresses
+    re-minting, and only of the wording the owner actually rejected.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT payload FROM memory_deltas WHERE session_id = ?",
+            (_OWNER_EDIT_SESSION,),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — a dedupe miss must never break ingestion
+        return False
+    wanted = text.strip()
+    for (payload,) in rows:
+        try:
+            edit = json.loads(payload or "{}").get("owner_edit") or {}
+        except (TypeError, ValueError):
+            continue
+        if edit.get("kind") != "point":
+            continue
+        # A rewrite is a rejection of the old wording just as much as a retire
+        # is. The superseded Point is no longer `is_latest`, so re-observing the
+        # text the owner replaced would mint it again and stand the discarded
+        # version back up beside the correction.
+        if edit.get("op") not in ("retire", "rewrite"):
+            continue
+        if str(edit.get("prior_text") or "").strip() != wanted:
+            continue
+        # Scoped to the file the decision was made in. The same sentence about a
+        # different subject is a different claim, and one rejection must not
+        # silence it everywhere.
+        edited_file = str(edit.get("file_name") or "")
+        if edited_file and edited_file != stored:
+            continue
+        return True
+    return False
+
+
 def _apply_assertions(
     conn: sqlite3.Connection, mem: EvoMemory, clean: dict, kinds: dict[str, str], r: ApplyResult
 ) -> None:
@@ -163,6 +214,9 @@ def _apply_assertions(
             if stem is None:
                 continue
             if _assertion_exists(conn, f"{stem}.md", text):
+                r.assertions_seen += 1
+                continue
+            if _owner_withdrew(conn, f"{stem}.md", text):
                 r.assertions_seen += 1
                 continue
             tags = "fact"

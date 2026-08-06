@@ -37,16 +37,23 @@ const viewerEl = document.getElementById("viewer");
 const statusEl = document.getElementById("status");
 const detailEl = document.getElementById("detail");
 const detailKindEl = document.getElementById("detail-kind");
+const detailProvenanceEl = document.getElementById("detail-provenance");
 const detailTitleEl = document.getElementById("detail-title");
 const detailSummaryEl = document.getElementById("detail-summary");
 const detailMetaEl = document.getElementById("detail-meta");
 const detailReceiptsEl = document.getElementById("detail-receipts");
 const detailHistoryEl = document.getElementById("detail-history-list");
 const evidenceBreadcrumbsEl = document.getElementById("evidence-breadcrumbs");
-const detailTabEls = [...document.querySelectorAll("[data-detail-tab]")];
-const detailPanelEls = [...document.querySelectorAll(".detail-panel")];
+const detailClaimInputEl = document.getElementById("detail-claim-input");
+const detailHintEl = document.getElementById("detail-hint");
+const detailStatusEl = document.getElementById("detail-status");
+const detailActionsEl = document.getElementById("detail-actions");
+const detailRejectEl = document.getElementById("detail-reject");
+const detailEvidenceFoldEl = document.getElementById("detail-evidence-fold");
+const detailHistoryFoldEl = document.getElementById("detail-history-fold");
 const emptyEl = document.getElementById("empty");
 const errorEl = document.getElementById("error");
+const editAlertEl = document.getElementById("edit-alert");
 const modelIdentityEl = document.getElementById("model-identity");
 const slider = document.getElementById("as-of");
 const sliderLabel = document.getElementById("as-of-label");
@@ -157,6 +164,7 @@ const MIN_LINE_HIT_RADIUS_PX = 8;
 const ZOOM_MIN_PERCENT = 50;
 const ZOOM_MAX_PERCENT = 400;
 const ZOOM_STEP_PERCENT = 25;
+const EVIDENCE_CARD_LIMIT = 12;
 const MODEL_GRAPH_TIMEOUT_MS = 45_000;
 const SHARE_CARD_TIMEOUT_MS = 15_000;
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -967,8 +975,19 @@ function applyLayerVisibility() {
   syncSelectionState();
 }
 
+function humaneMeta(label, value) {
+  // Only genuine timestamps. A Line's "From"/"To" carry entity labels, and
+  // `new Date("March")` happily returns a date — replacing someone's name with
+  // a fabricated one.
+  if (label !== "Valid from") return value;
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
 function appendMeta(label, value) {
   if (value === null || value === undefined || value === "") return;
+  value = humaneMeta(label, value);
   const row = document.createElement("div");
   const name = document.createElement("strong");
   name.textContent = `${label}: `;
@@ -976,17 +995,6 @@ function appendMeta(label, value) {
   detailMetaEl.appendChild(row);
 }
 
-function setDetailTab(tab, focus = false) {
-  detailTabEls.forEach((button) => {
-    const active = button.dataset.detailTab === tab;
-    button.setAttribute("aria-selected", String(active));
-    button.tabIndex = active ? 0 : -1;
-    if (active && focus) button.focus();
-  });
-  detailPanelEls.forEach((panel) => {
-    panel.hidden = panel.id !== `detail-${tab}`;
-  });
-}
 
 function technicalDetails(link) {
   const details = document.createElement("details");
@@ -1021,7 +1029,7 @@ function evidenceCard(link, { drill = true } = {}) {
   }
   if (drill && (link.reference || link.id)) {
     button.addEventListener("click", () => {
-      setDetailTab("evidence");
+      detailEvidenceFoldEl.open = true;
       loadEvidence(link.reference || link.id);
     });
   } else {
@@ -1159,11 +1167,18 @@ function renderNodeEvidence(kind, item) {
   renderBreadcrumbs();
 
   const cards = nodeEvidenceCards(item, model);
+  const shown = Math.min(cards.length, EVIDENCE_CARD_LIMIT);
+  const countEl = document.getElementById("detail-evidence-count");
+  // Say what is actually on screen. Claiming 34 and rendering 12 is the kind of
+  // small dishonesty this viewer exists not to commit.
+  if (countEl) {
+    countEl.textContent = cards.length > shown ? `${shown} of ${cards.length}` : (cards.length || "");
+  }
   if (cards.length) {
     const heading = document.createElement("strong");
     heading.textContent = "Direct evidence";
     detailReceiptsEl.appendChild(heading);
-    cards.slice(0, 12).forEach((card) => {
+    cards.slice(0, EVIDENCE_CARD_LIMIT).forEach((card) => {
       detailReceiptsEl.appendChild(evidenceCard(card));
     });
   } else {
@@ -1193,19 +1208,19 @@ function renderNodeEvidence(kind, item) {
 function renderOverview(kind, item) {
   detailSummaryEl.replaceChildren();
   const overview = evidenceOverview(kind, item, model);
-  const heading = document.createElement("strong");
-  heading.textContent = overview.title;
   const copy = document.createElement("p");
   copy.textContent = overview.copy;
-  detailSummaryEl.append(heading, copy);
-  overview.highlights.forEach((card) => {
-    detailSummaryEl.appendChild(evidenceCard(card));
-  });
+  detailSummaryEl.append(copy);
+  // `overview.highlights` is the first three of exactly the cards the Evidence
+  // fold renders, so showing them here too buried the rest of the drawer under
+  // a duplicate. `renderNodeEvidence` owns the fold's count.
 }
 
 function renderNodeHistory(item) {
   detailHistoryEl.replaceChildren();
   const history = nodeHistoryCards(item, model);
+  const count = document.getElementById("detail-history-count");
+  if (count) count.textContent = history.length ? String(history.length) : "";
   if (!history.length) {
     const empty = document.createElement("p");
     empty.className = "evidence-note";
@@ -1230,6 +1245,261 @@ function appendLineTechnicalDetails(item) {
   detailSummaryEl.appendChild(details);
 }
 
+// Kinds that map to a durable row the owner can correct. Evolution lines are
+// synthesized from supersede chains and relation lines are derived edges —
+// neither is an object with an editable proposition. Context nodes are
+// fabricated in this file from relation endpoints and have no server row at all.
+const EDITABLE_KINDS = new Set(["point", "face", "volume", "root"]);
+
+function isEditable(kind, item) {
+  return Boolean(item) && EDITABLE_KINDS.has(kind) && Boolean(item.id);
+}
+
+function editableText(kind, item) {
+  return kind === "point" ? item.content || "" : item.signature || "";
+}
+
+function setEditStatus(message, tone) {
+  // The drawer may already be closed: committing by clicking away — the gesture
+  // the editor itself advertises — both saves and closes. Writing a failure
+  // into a `display:none` panel reports it to nobody, and the next selection
+  // clears it before it could ever be read. Anything the owner must act on goes
+  // to the viewport-level alert instead.
+  if (detailEl.hidden && (tone === "error" || tone === "warn")) {
+    showEditAlert(message);
+    return;
+  }
+  detailStatusEl.textContent = message || "";
+  if (tone) detailStatusEl.dataset.tone = tone;
+  else delete detailStatusEl.dataset.tone;
+}
+
+function showEditAlert(message) {
+  if (!message) return;
+  const text = document.createElement("p");
+  text.textContent = message;
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.textContent = "Dismiss";
+  dismiss.addEventListener("click", () => { editAlertEl.hidden = true; });
+  editAlertEl.replaceChildren(text, dismiss);
+  editAlertEl.hidden = false;
+}
+
+// ── Editing in place ──────────────────────────────────────────────────────
+// The claim is the content, so correcting it happens on the claim itself:
+// click the text, it becomes editable, blur or Cmd+Enter commits, Escape
+// reverts. No mode to enter, no form to find, no second copy of the text to
+// keep in sync with the first.
+
+let editingItem = null;
+let editInFlight = false;
+
+async function submitEdit(kind, item, op, replacement, reason) {
+  if (editInFlight) return;
+  editInFlight = true;
+  detailRejectEl.disabled = true;
+  setEditStatus(op === "retire" ? "Removing…" : "Saving…", null);
+  try {
+    const response = await fetch("./edit", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        kind,
+        id: item.id,
+        op,
+        replacement: op === "retire" ? "" : replacement,
+        reason,
+      }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setEditStatus(`Could not save: ${payload?.detail || `HTTP ${response.status}`}`, "error");
+      return;
+    }
+    const data = payload?.data || {};
+    const nextId = data.new_id || item.id;
+    // A correction is a statement about the present, and the successor Point is
+    // stamped now. If the owner is time-travelling, that Point sits past the
+    // cutoff and would never appear — the save would look like it failed.
+    if (Number(slider.value) < 100) {
+      slider.value = "100";
+      updateCutoff();
+    }
+    const refreshed = await loadModel(true);
+    // The awaits above can span seconds. If the owner selected something else
+    // meanwhile, that selection is theirs.
+    if (!selected || selected.kind !== kind || selected.id !== item.id) return;
+    if (refreshed === false) {
+      setEditStatus("Saved, but the view could not refresh. Reload to see it.", "warn");
+      return;
+    }
+    if (op === "retire") {
+      clearSelection();
+      return;
+    }
+    const nextItem = items.get(selectionKey(kind, nextId));
+    if (!nextItem) {
+      setEditStatus("Saved. Reopen the node to see the update.", "ok");
+      return;
+    }
+    showDetails(kind, nextItem);
+    if (data.shadow_misses) {
+      // The markdown layer changed but the Point may not have moved. Saying
+      // "saved" here would be a lie the owner cannot see through.
+      setEditStatus(
+        "Saved to memory, but the model layer did not pick it up."
+        + " Run `persome doctor` — the model may need a rebuild.",
+        "warn",
+      );
+    } else {
+      setEditStatus("Saved.", "ok");
+    }
+  } catch (error) {
+    setEditStatus(`Could not save: ${error?.message || error}`, "error");
+  } finally {
+    editInFlight = false;
+    detailRejectEl.disabled = false;
+  }
+}
+
+
+function autoGrow() {
+  detailClaimInputEl.style.height = "auto";
+  detailClaimInputEl.style.height = `${detailClaimInputEl.scrollHeight}px`;
+}
+
+function beginEditing(kind, item) {
+  if (!isEditable(kind, item) || editingItem) return;
+  editingItem = { kind, id: item.id, original: editableText(kind, item) };
+  detailClaimInputEl.value = editingItem.original;
+  detailClaimInputEl.hidden = false;
+  detailTitleEl.hidden = true;
+  detailHintEl.innerHTML = "<kbd>\u2318</kbd><kbd>\u21a9</kbd> or click away to save · <kbd>Esc</kbd> to discard";
+  detailHintEl.hidden = false;
+  autoGrow();
+  detailClaimInputEl.focus();
+  detailClaimInputEl.setSelectionRange(
+    detailClaimInputEl.value.length,
+    detailClaimInputEl.value.length,
+  );
+}
+
+function endEditing() {
+  editingItem = null;
+  detailClaimInputEl.hidden = true;
+  detailTitleEl.hidden = false;
+  const editable = detailTitleEl.dataset.editable === "true";
+  detailHintEl.innerHTML = editable ? "Click the text to rewrite it in your own words." : "";
+  detailHintEl.hidden = !editable;
+}
+
+function commitEditing() {
+  if (!editingItem) return;
+  const next = detailClaimInputEl.value.trim();
+  const { kind, id, original } = editingItem;
+  if (editInFlight && next && next !== original.trim()) {
+    // Keep the editor open with the owner's text rather than discarding it.
+    // Closing it here would drop the correction on the floor and then report
+    // "Saved." for the previous one.
+    setEditStatus("Still saving the last change — try again in a moment.", "warn");
+    return;
+  }
+  endEditing();
+  if (!next || next === original.trim()) return;
+  const item = items.get(selectionKey(kind, id));
+  if (item) submitEdit(kind, item, "rewrite", next, "");
+}
+
+detailClaimInputEl.addEventListener("input", autoGrow);
+detailClaimInputEl.addEventListener("blur", () => {
+  // "Click away to save" means clicking somewhere else on this page. Cmd-Tab to
+  // check a wording in another app also fires blur, and committing there would
+  // save a half-typed sentence as the owner's own words. Focus leaving the
+  // window is not an intent signal, so the editor simply stays open.
+  if (!document.hasFocus()) return;
+  commitEditing();
+});
+detailClaimInputEl.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.stopPropagation();
+    endEditing();
+    detailTitleEl.focus();
+  } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    commitEditing();
+    // Symmetric with the Escape path: a keyboard commit must not strand focus
+    // on the document body.
+    if (!detailEl.hidden && !detailTitleEl.hidden) detailTitleEl.focus();
+  }
+});
+
+detailTitleEl.addEventListener("click", () => {
+  if (selectedItem) beginEditing(selected?.kind, selectedItem);
+});
+detailTitleEl.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  if (selectedItem) beginEditing(selected?.kind, selectedItem);
+});
+
+detailRejectEl.addEventListener("click", () => {
+  if (!selected || !selectedItem) return;
+  if (detailRejectEl.dataset.armed !== "true") {
+    // One deliberate confirmation: withdrawing a claim is not undoable here.
+    detailRejectEl.dataset.armed = "true";
+    detailRejectEl.textContent = "Yes, remove it from my model";
+    setEditStatus("This leaves your history, but not your model.", null);
+    return;
+  }
+  submitEdit(selected.kind, selectedItem, "retire", "", "");
+});
+
+function uneditableNote(kind) {
+  if (kind === "context") {
+    return "An entity your model refers to — a person, project, tool, or file."
+      + " It is the far end of a relation, not a claim about you, so there is"
+      + " nothing here to correct.";
+  }
+  if (kind === "line") {
+    return "A relation between two things your model knows."
+      + " Lines are derived from what they connect, so correct those instead.";
+  }
+  return "";
+}
+
+function renderEditor(kind, item) {
+  endEditing();
+  setEditStatus("", null);
+  delete detailRejectEl.dataset.armed;
+  detailRejectEl.textContent = "This is wrong about me";
+  detailRejectEl.disabled = editInFlight;
+
+  const editable = isEditable(kind, item);
+  detailTitleEl.dataset.editable = String(editable);
+  detailActionsEl.hidden = !editable;
+  // Say what a node IS when it cannot be corrected. "Nothing to edit here" only
+  // tells the owner what they cannot do; an entity or a Line is not a claim
+  // about them at all, and that is the useful thing to know.
+  detailHintEl.innerHTML = editable
+    ? "Click the text to rewrite it in your own words."
+    : uneditableNote(kind);
+  detailHintEl.hidden = !detailHintEl.innerHTML;
+  // Focusable, so a keyboard user can reach the claim and press Enter to edit
+  // it — but never `role="button"`. That would override the heading role and
+  // leave the drawer with no heading at all, which is the one landmark a screen
+  // reader user navigates it by. `aria-describedby` carries the affordance.
+  if (editable) {
+    detailTitleEl.setAttribute("title", "Click to correct this in your own words");
+    detailTitleEl.tabIndex = 0;
+  } else {
+    detailTitleEl.removeAttribute("title");
+    detailTitleEl.removeAttribute("tabindex");
+  }
+}
+
 function showDetails(kind, item) {
   const lineDetail = kind === "line" ? linePresentation(item, model) : null;
   selected = { kind, id: item.id };
@@ -1237,12 +1507,19 @@ function showDetails(kind, item) {
   pauseAutoRotate();
   syncSelectionState();
   detailEl.dataset.kind = kind;
-  detailKindEl.textContent = kind;
+  detailKindEl.textContent = kind === "context" ? "entity" : kind;
   detailTitleEl.textContent = (
     lineDetail?.title
     || item.content || item.signature || item.label || item.predicate || item.kind || item.id
   );
   evidenceTrail = [{ label: detailTitleEl.textContent, data: null }];
+  // "Evidence-backed" is a claim about where the text came from, so it must not
+  // sit above text the owner wrote themselves.
+  const authored = isAuthored(kind, item);
+  detailProvenanceEl.textContent = kind === "context"
+    ? "Referenced by your model"
+    : (authored ? "Your words" : "Evidence-backed");
+  detailProvenanceEl.classList.toggle("detail-authored", authored);
   detailMetaEl.replaceChildren();
   appendMeta("Layer", item.layer || item.level);
   appendMeta("Status", item.status);
@@ -1259,8 +1536,23 @@ function showDetails(kind, item) {
   if (lineDetail) appendLineTechnicalDetails(item);
   renderNodeEvidence(kind, item);
   renderNodeHistory(item);
-  setDetailTab("overview");
+  renderEditor(kind, item);
+  editAlertEl.hidden = true;
+  // Folds start closed on every selection: the claim is what the owner came to
+  // read, and provenance is one click away rather than one of four places the
+  // content might be hiding.
+  detailEvidenceFoldEl.open = false;
+  detailHistoryFoldEl.open = false;
+  detailEl.scrollTop = 0;
   detailEl.hidden = false;
+}
+
+// An owner-authored object must not read as a machine-derived claim. Faces,
+// Volumes and the Root carry `provenance="authored"`; Points carry the
+// `source:owner-edit` tag.
+function isAuthored(kind, item) {
+  if (kind === "point") return String(item.tags || "").split(/\s+/).includes("source:owner-edit");
+  return item.provenance === "authored";
 }
 
 function updateTimelineBounds() {
@@ -1348,7 +1640,7 @@ async function loadModelOnce(force) {
     }
     errorEl.hidden = true;
     const nextFingerprint = fingerprint(payload.model);
-    if (!force && nextFingerprint === modelFingerprint) return;
+    if (!force && nextFingerprint === modelFingerprint) return true;
     model = payload.model;
     modelGeneratedAt = payload.generated_at || "";
     modelFingerprint = nextFingerprint;
@@ -1359,21 +1651,35 @@ async function loadModelOnce(force) {
     setShareBusy(false);
     updateTimelineBounds();
     buildScene();
+    return true;
   } catch (error) {
     shareReady = false;
     setShareBusy(false);
     showModelLoadError(error);
+    // Reported rather than swallowed: a caller that just wrote to the model
+    // needs to know it is still looking at pre-write state.
+    return false;
   } finally {
     window.clearTimeout(timeout);
   }
 }
 
 function loadModel(force = false) {
-  if (modelLoadPromise) return modelLoadPromise;
-  modelLoadPromise = loadModelOnce(force).finally(() => {
-    modelLoadPromise = null;
+  // A forced load must actually observe the server again. Returning an
+  // in-flight promise silently dropped `force`, so a poll issued microseconds
+  // before a correction was saved would satisfy the reload that follows the
+  // save — and the drawer would re-render from the pre-edit snapshot while
+  // reporting success. A forced load now queues behind whatever is running.
+  if (modelLoadPromise && !force) return modelLoadPromise;
+  const run = () => loadModelOnce(force);
+  const started = modelLoadPromise ? modelLoadPromise.then(run, run) : run();
+  const chained = started.finally(() => {
+    // Only the newest load clears the slot; an older one finishing later must
+    // not blank out a load that is still running.
+    if (modelLoadPromise === chained) modelLoadPromise = null;
   });
-  return modelLoadPromise;
+  modelLoadPromise = chained;
+  return chained;
 }
 
 function frameLayout(force) {
@@ -1560,16 +1866,6 @@ lineSelectEl.addEventListener("change", () => {
   if (item) showDetails("line", item);
 });
 
-detailTabEls.forEach((button, index) => {
-  button.addEventListener("click", () => setDetailTab(button.dataset.detailTab));
-  button.addEventListener("keydown", (event) => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    event.preventDefault();
-    const direction = event.key === "ArrowRight" ? 1 : -1;
-    const next = (index + direction + detailTabEls.length) % detailTabEls.length;
-    setDetailTab(detailTabEls[next].dataset.detailTab, true);
-  });
-});
 
 document.getElementById("rotate").addEventListener("click", (event) => {
   controls.autoRotate = !controls.autoRotate;
@@ -1714,20 +2010,26 @@ renderer.domElement.addEventListener("pointerup", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && selected) {
-    clearSelection();
-    return;
-  }
   const target = event.target;
-  if (
+  const typing = (
     target instanceof HTMLInputElement
     || target instanceof HTMLTextAreaElement
     || target instanceof HTMLSelectElement
-    || target?.isContentEditable
-    || event.metaKey
-    || event.ctrlKey
-    || event.altKey
-  ) return;
+    || Boolean(target?.isContentEditable)
+  );
+  if (event.key === "Escape" && selected) {
+    // The claim editor handles its own Escape (discard, keep the drawer open)
+    // and stops propagation, so anything reaching here is either not editing or
+    // is in some other field. Either way Escape closes the drawer, which is
+    // what a single Escape should do.
+    if (typing) {
+      target.blur();
+      return;
+    }
+    clearSelection();
+    return;
+  }
+  if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
   if (event.key === "+" || event.key === "=") {
     event.preventDefault();
     stepZoom(1);

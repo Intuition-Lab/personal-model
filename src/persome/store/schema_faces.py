@@ -44,6 +44,11 @@ logger = get("persome.store.schema_faces")
 PROVENANCE_MINED = "mined"
 PROVENANCE_EMERGENT = "emergent"
 PROVENANCE_BOTH = "both"
+# The memory owner replaced this object's proposition by hand. Derivation keeps
+# running underneath it — observations and confidence still accrue — but the
+# extractors stop rewriting the signature, so the owner's wording is what every
+# reader (viewer, MCP snapshot, HUMAN.md card, export) sees from then on.
+PROVENANCE_AUTHORED = "authored"
 
 # footprint-Jaccard floor for "same face" folding (merge conservatively —
 # below it, a new face is born instead of polluting an existing one)
@@ -160,6 +165,34 @@ def _find_match(
     return None
 
 
+def _owner_rejected_match(
+    conn: sqlite3.Connection, *, signature: str, members: set[str], level: int
+) -> sqlite3.Row | None:
+    """Find a withdrawn object this contribution would otherwise re-create.
+
+    The level-1/2 counterpart of :func:`owner_decided_root`. Retired rows are
+    closed, so ``_find_match`` correctly skips them — which on its own only
+    means the next re-mine inserts an identical row instead of reviving the old
+    one. Matching uses the same two criteria as ``_find_match`` so a rejection
+    is as hard to route around as an ordinary fold.
+    """
+    conn.row_factory = sqlite3.Row
+    sig = _norm_sig(signature)
+    for row in conn.execute(
+        "SELECT * FROM schema_faces WHERE level = ? AND status = ? AND provenance = ?",
+        (level, MemoryStatus.ARCHIVED.value, PROVENANCE_AUTHORED),
+    ).fetchall():
+        if sig and _norm_sig(row["signature"]) == sig:
+            return row
+        try:
+            stored = set(json.loads(row["members"]))
+        except (TypeError, ValueError):
+            continue
+        if _jaccard(members, stored) >= MATCH_JACCARD:
+            return row
+    return None
+
+
 def record_face(
     conn: sqlite3.Connection,
     *,
@@ -194,6 +227,15 @@ def record_face(
     now = _now()
     existing = _find_match(conn, signature=signature, members=member_set, level=level)
     if existing is None:
+        rejected = _owner_rejected_match(conn, signature=signature, members=member_set, level=level)
+        if rejected is not None:
+            # The owner rejected this proposition. Closing the old row's
+            # validity stops it being folded onto again, but nothing stopped
+            # derivation from re-deriving the same regularity into a *new* row
+            # and promoting that one — the rejection undone by a twin rather
+            # than by a resurrection. Returning the tombstone's id keeps the
+            # caller's bookkeeping intact while writing nothing.
+            return str(rejected["face_id"])
         face_id = f"face-{hashlib.sha1((_norm_sig(signature) + now).encode()).hexdigest()[:12]}"
         conn.execute(
             "INSERT INTO schema_faces (face_id, level, parent_face, signature, members,"
@@ -224,7 +266,16 @@ def record_face(
         footprints = footprints[-FOOTPRINT_HISTORY_KEEP:]
         members_json = json.dumps(sorted(member_set))
     provenance = existing["provenance"]
-    if provenance != PROVENANCE_BOTH and provenance != source:
+    authored = provenance == PROVENANCE_AUTHORED
+    if authored:
+        # The owner rewrote this proposition. Their wording outranks every
+        # extractor, so the signature write below is suppressed by binding an
+        # empty string to the CASE guard, and provenance does not escalate away
+        # from `authored`. Everything else still lands: members, footprints,
+        # observations, and the confidence ratchet keep accruing, so an
+        # owner-authored object goes on gathering evidence like any other.
+        signature = ""
+    elif provenance != PROVENANCE_BOTH and provenance != source:
         provenance = PROVENANCE_BOTH  # the other signal arrived — escalate
     try:
         merged_anchors = set(json.loads(existing["anchors"] or "[]")) | anchor_set
@@ -248,6 +299,92 @@ def record_face(
         ),
     )
     return existing["face_id"]
+
+
+def set_authored_signature(conn: sqlite3.Connection, *, face_id: str, signature: str) -> str | None:
+    """Replace one live object's proposition with the owner's own wording.
+
+    Returns the signature that was displaced (so the caller can record it as the
+    edit's audit trail), or ``None`` when no live row carries ``face_id``.
+
+    The row is updated in place rather than superseded on purpose: a new row
+    would mint a new ``face_id`` and dangle every child's ``parent_face`` and
+    every parent's ``members`` entry. Identity is what keeps the geometry
+    connected, so identity is what is preserved.
+
+    ``provenance`` flips to :data:`PROVENANCE_AUTHORED`, which is what stops
+    :func:`record_face` from rewriting the signature on the next re-mine and
+    what marks the object as owner-authored for every reader.
+    """
+    ensure_schema(conn)
+    text = (signature or "").strip()
+    if not text:
+        raise ValueError("authored signature must not be empty")
+    row = conn.execute(
+        "SELECT signature FROM schema_faces WHERE face_id = ? AND valid_to IS NULL",
+        (face_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    prior = str(row[0] or "")
+    conn.execute(
+        "UPDATE schema_faces SET signature = ?, provenance = ? WHERE face_id = ?",
+        (text, PROVENANCE_AUTHORED, face_id),
+    )
+    return prior
+
+
+def retire_face(conn: sqlite3.Connection, *, face_id: str) -> str | None:
+    """Retire one live object the owner rejected. Returns its signature, or
+    ``None`` when no live row carries ``face_id``.
+
+    Archival is deliberately a status change, not a delete: the row, its
+    members, its footprints, and its observation count stay queryable. The
+    snapshot projector already filters ``status = 'active'``
+    (``model/snapshot.py``), so the object leaves the viewer, the share card,
+    the HUMAN.md card, and the MCP snapshot together, with no projection change.
+    """
+    ensure_schema(conn)
+    row = conn.execute(
+        "SELECT signature FROM schema_faces WHERE face_id = ? AND valid_to IS NULL",
+        (face_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute(
+        # Closing validity is what makes the rejection stick. Archiving alone
+        # left the row live to `_find_match`, so the next re-mine folded onto
+        # it, bumped its observations, and `maybe_promote` handed it straight
+        # back to ACTIVE — the owner's rejection undone by the next tick.
+        # Closing `valid_to` also records *when* the owner withdrew it, which
+        # `maybe_promote` already treats as disqualifying.
+        "UPDATE schema_faces SET status = ?, provenance = ?, valid_to = ? WHERE face_id = ?",
+        (MemoryStatus.ARCHIVED.value, PROVENANCE_AUTHORED, _now(), face_id),
+    )
+    return str(row[0] or "")
+
+
+def owner_decided_root(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """Return the apex the owner settled by hand, live or withdrawn.
+
+    Root has no stable id — ``upsert_root`` mints a new one on every synthesis
+    — so an owner decision about the apex is keyed on the singleton rather than
+    on a row. The newest level-3 row is inspected whatever its status: a
+    rewritten apex is ACTIVE, a rejected one is ARCHIVED, and treating the
+    second as absence would let the next synthesis resurrect what the owner
+    just removed.
+
+    Returns ``None`` when the apex is still the model's own to write.
+    """
+    ensure_schema(conn)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM schema_faces WHERE level = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (ROOT_LEVEL,),
+    ).fetchone()
+    if row is None or row["provenance"] != PROVENANCE_AUTHORED:
+        return None
+    return row
 
 
 def maybe_promote(

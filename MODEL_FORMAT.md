@@ -122,6 +122,15 @@ A Face is one active level-1 `schema_faces` row. It contains a behavioral
 signature, members, observations, confidence, provenance, anchors, and source
 receipts. Promotion requires stable repeated support.
 
+`provenance` names which extractor reached the object: `mined`, `emergent`,
+`both`, or `synth` for a synthesized Root. The value `authored` means the
+memory owner replaced the signature by hand. Derivation continues under an
+authored object, so its observations and confidence keep moving, but no
+extractor rewrites its signature. A Point the owner wrote or corrected carries
+the `source:owner-edit` tag, which is the same distinction at the Point layer.
+Both are visible in every snapshot reader, so an owner's own claim is never
+mistaken for a derived one.
+
 ### Volume
 
 A Volume is one active level-2 cross-domain schema. It relates behavior across

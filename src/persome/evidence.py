@@ -18,6 +18,12 @@ _SUMMARY_LIMIT = 4_000
 _NEARBY_CAPTURE_LIMIT = 3
 _NEARBY_CAPTURE_SECONDS = 30 * 60
 
+# Semantic tag stamped on every fact the memory owner wrote or corrected by
+# hand. It is the Point-layer counterpart of ``schema_faces.PROVENANCE_AUTHORED``
+# and the reason an owner-authored fact is distinguishable from an observed one
+# forever after. Written by ``model/edit.py``; read here and by the viewer.
+OWNER_EDIT_TAG = "source:owner-edit"
+
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return (
@@ -234,6 +240,12 @@ def _resolve_entry(
     canonical = f"⟨{identifier}:{path}⟩" if path else receipt or identifier
     timestamp = str(row[2]) if row[2] else None
     context_timestamp = str(metadata.get("occurred_at") or timestamp or "") or None
+    if OWNER_EDIT_TAG in metadata["tags"]:
+        # The owner typed this fact. Whatever happened to be on screen when they
+        # typed it is not context for it — attaching those captures would dress
+        # an assertion up as an observation, which is precisely the confusion
+        # this module exists to prevent.
+        context_timestamp = None
     return _base(
         reference=original,
         canonical_reference=canonical,
@@ -310,6 +322,10 @@ def _resolve_evo_node(
     path = str(row[8] or "")
     canonical = f"⟨{identifier}:{path}⟩" if path else receipt or identifier
     timestamp = str(row[14] or row[6] or row[7]) if row[14] or row[6] or row[7] else None
+    tags = str(row[9] or "").split()
+    # Same rule as `_resolve_entry`: an owner-authored Point gets no
+    # time-adjacent captures dressed up as its context.
+    context_timestamp = None if OWNER_EDIT_TAG in tags else timestamp
     return _base(
         reference=original,
         canonical_reference=canonical,
@@ -323,7 +339,7 @@ def _resolve_evo_node(
         metadata={
             "layer": row[2],
             "is_latest": bool(row[4]),
-            "tags": str(row[9] or "").split(),
+            "tags": tags,
             "confidence": row[12],
             "conflicted": bool(row[13]),
             "occurred_at": row[14],
@@ -331,7 +347,7 @@ def _resolve_evo_node(
             "valid_until": row[16],
         },
         sources=sources,
-        context=_nearby_capture_links(conn, timestamp),
+        context=_nearby_capture_links(conn, context_timestamp),
         history=history,
     )
 

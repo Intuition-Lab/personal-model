@@ -405,10 +405,18 @@ class TestViewPage:
         assert 'id="zoom-reset"' in body
         assert 'id="zoom-in"' in body
         assert "Scroll or pinch to zoom" in body
-        assert 'role="tablist"' in body
-        assert 'data-detail-tab="overview"' in body
-        assert 'data-detail-tab="evidence"' in body
-        assert 'data-detail-tab="history"' in body
+        # The drawer is one page, not a tabbed form: the claim is editable in
+        # place and provenance folds away beneath it.
+        assert 'role="tablist"' not in body
+        assert "data-detail-tab" not in body
+        assert 'id="detail-claim-input"' in body
+        assert 'id="detail-evidence-fold"' in body
+        assert 'id="detail-history-fold"' in body
+        assert 'id="detail-reject"' in body
+        # Entities are the most numerous thing on screen; the legend must name
+        # them rather than leaving a sixth unexplained visual class.
+        assert 'class="swatch context"' in body
+        assert "the other end of a relation" in body
         assert 'id="evidence-breadcrumbs"' in body
 
     def test_bundled_viewer_assets_are_served(self, ac_root):

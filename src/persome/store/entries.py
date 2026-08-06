@@ -1399,6 +1399,16 @@ def _fts_content_without_provenance(content: str, *, supersedes: set[str]) -> st
     return content
 
 
+def strip_supersede_provenance(content: str, *, supersedes: set[str]) -> str:
+    """Public alias for readers that project entry bodies to a person.
+
+    The supersede marker is bookkeeping, not content. Anything that shows a
+    fact body to the owner — the FTS projection, the model snapshot — trims it
+    with this, so only one rule for "what is the fact" exists.
+    """
+    return _fts_content_without_provenance(content, supersedes=supersedes).rstrip()
+
+
 def _supersedes_by_id(
     source_state_by_id: dict[str, tuple[str, str | None, int, str | None, str | None]],
 ) -> dict[str, set[str]]:

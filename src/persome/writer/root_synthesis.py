@@ -186,11 +186,26 @@ def synthesize_root(
     budget: int | None = None,
     roster: Any | None = None,
 ) -> RootResult:
-    """Gather → LLM → 4 gates → upsert_root born-active. Injectable ``llm_call``/``roster``
+    """Gather → LLM → gates → upsert_root born-active. Injectable ``llm_call``/``roster``
     for tests. Returns a RootResult; NEVER raises (fail-open is the tick's contract, but we
-    also guard here)."""
+    also guard here).
+
+    An owner-authored apex short-circuits the whole pass (``skip_authored``): it
+    is a healthy no-op, not a failure, and it spends no LLM budget."""
     budget = int(budget if budget is not None else getattr(cfg.schema, "root_token_budget", 1500))
     try:
+        # gate 0: the owner already decided what this apex says, or that it
+        # should not exist. `upsert_root` does not update — it closes every live
+        # level-3 row and inserts a fresh one — so without this gate the next
+        # nightly pass would discard an owner-written apex, or resurrect one the
+        # owner rejected. The newest level-3 row is consulted regardless of
+        # status, because a rejected apex is archived and would otherwise look
+        # like a cold start. Checked before gathering, so an owner decision
+        # costs no LLM call at all.
+        decided = schema_faces.owner_decided_root(conn)
+        if decided is not None:
+            return RootResult(str(decided["face_id"]), "skip_authored")
+
         bodies = _active(conn, 2)
         faces = _active(conn, 1, _TOP_FACES)
         profile = _profile_facts(cfg)
@@ -224,6 +239,16 @@ def synthesize_root(
 
         anchors = sorted(root_entities)
         members = [b["face_id"] for b in bodies]
+        # Re-check gate 0 immediately before writing. The LLM call above can
+        # take many seconds, and the owner may have settled the apex by hand in
+        # the meantime — from the viewer or the CLI, both of which write on a
+        # different connection. `upsert_root` closes every live level-3 row, so
+        # without this the machine apex would overwrite a correction made
+        # moments earlier and the owner would never be told.
+        decided = schema_faces.owner_decided_root(conn)
+        if decided is not None:
+            return RootResult(str(decided["face_id"]), "skip_authored")
+
         face_id = schema_faces.upsert_root(
             conn, signature=apex, members=members, anchors=anchors, confidence=1.0
         )

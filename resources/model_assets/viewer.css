@@ -600,6 +600,15 @@ button {
 .swatch.line { color: var(--line); height: 1px; border-radius: 0; background: var(--line); }
 .swatch.face { color: var(--face); border-radius: 1px; background: var(--face); transform: rotate(45deg); }
 .swatch.volume { color: var(--volume); border: 1px solid var(--volume); background: transparent; }
+/* Entities render as small grey cubes, so the swatch is a square rather than a
+   dot and carries no glow — they are context, not a claim about the owner. */
+.swatch.context {
+  color: var(--muted);
+  border-radius: 1px;
+  background: var(--muted);
+  box-shadow: none;
+  opacity: 0.8;
+}
 .swatch.root { color: var(--root); background: var(--root); transform: rotate(45deg); border-radius: 2px; }
 
 .line-explorer {
@@ -708,52 +717,9 @@ button {
   color: var(--detail-accent, var(--root));
 }
 
-.detail h1 {
-  margin: 0 0 16px;
-  font-size: 20px;
-  font-weight: 630;
-  letter-spacing: -0.025em;
-  line-height: 1.3;
-}
-
-.detail-tabs {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 3px;
-  margin-bottom: 14px;
-  padding: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.025);
-}
-
-.detail-tabs button {
-  padding: 7px 6px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--dim);
-  cursor: pointer;
-  font: 8px/1.2 -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
-  font-weight: 750;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.detail-tabs button[aria-selected="true"] {
-  background: color-mix(in srgb, var(--detail-accent, var(--root)) 16%, rgba(255, 255, 255, 0.04));
-  color: var(--text);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--detail-accent, var(--root)) 35%, transparent);
-}
-
-.detail-tabs button:focus-visible {
-  outline: 2px solid var(--detail-accent, var(--root));
-  outline-offset: 1px;
-}
-
-.detail-panel[hidden] {
-  display: none;
-}
+/* The claim's box lives on `.detail-claim` alone, so the heading and the
+   textarea that replaces it are pixel-identical. A `.detail h1` rule here would
+   out-specify that single class and make the drawer jump on every edit. */
 
 .detail-summary {
   margin-bottom: 12px;
@@ -770,35 +736,6 @@ button {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.5;
-}
-
-.detail-meta {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1px;
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 11px;
-  background: rgba(255, 255, 255, 0.07);
-  color: var(--muted);
-  font-size: 10px;
-}
-
-.detail-meta > div {
-  min-width: 0;
-  padding: 8px 9px;
-  overflow-wrap: anywhere;
-  background: rgba(8, 7, 15, 0.92);
-}
-
-.detail-meta strong {
-  display: block;
-  margin-bottom: 2px;
-  color: var(--dim);
-  font-size: 7px;
-  font-weight: 750;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
 }
 
 .detail-receipts {
@@ -1493,4 +1430,234 @@ button {
 
 #index-health-banner[hidden] {
   display: none;
+}
+
+/* ── Detail drawer ─────────────────────────────────────────────────────────
+   One thought, read as a page. The claim is the content, not a field inside a
+   form; metadata is a quiet line under it; provenance folds away until asked
+   for. Editing is the same surface, not a different mode. */
+
+/* `display` here would otherwise beat the UA's `[hidden]` rule and leave an
+   empty edit box sitting under every claim. */
+.detail-claim[hidden] {
+  display: none;
+}
+
+.detail-claim {
+  display: block;
+  width: 100%;
+  margin: 0 0 10px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 20px;
+  font-weight: 630;
+  letter-spacing: -0.025em;
+  line-height: 1.32;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+/* Editable claims invite the click; derived ones stay inert. */
+.detail-claim[data-editable="true"] {
+  cursor: text;
+}
+
+.detail-claim[data-editable="true"]:hover {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.detail-claim[data-editable="true"]:focus-visible {
+  border-color: var(--detail-accent, var(--border-bright));
+  background: rgba(255, 255, 255, 0.045);
+  outline: 2px solid var(--detail-accent, var(--border-bright));
+  outline-offset: 2px;
+}
+
+.detail-claim-input {
+  overflow: hidden;
+  border-color: var(--detail-accent, var(--border-bright));
+  background: rgba(255, 255, 255, 0.06);
+  resize: none;
+}
+
+.detail-claim-input:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--detail-accent, #fff) 14%, transparent);
+}
+
+.detail-hint {
+  margin: -4px 0 12px;
+  padding-left: 9px;
+  color: var(--dim);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.detail-hint kbd {
+  margin-right: 2px;
+  padding: 1px 4px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+  font-family: inherit;
+  font-size: 9px;
+}
+
+.detail-status {
+  margin: 0 0 12px;
+  padding-left: 9px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.detail-status:empty {
+  display: none;
+}
+
+.detail-status[data-tone="error"] { color: #ff9e94; }
+.detail-status[data-tone="warn"] { color: #ffd58a; }
+.detail-status[data-tone="ok"] { color: #96e2b2; }
+
+/* Properties, not a table. One quiet line that wraps. */
+.detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-bottom: 14px;
+  padding-left: 9px;
+  color: var(--dim);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.detail-meta > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.detail-meta strong {
+  margin-right: 4px;
+  color: #57525f;
+  font-weight: 600;
+}
+
+/* Provenance is the product's promise, so it stays reachable — one click,
+   not one tab. */
+.detail-fold {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.detail-fold[hidden] {
+  display: none;
+}
+
+.detail-fold > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 9px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.09em;
+  list-style: none;
+  text-transform: uppercase;
+  transition: color 140ms ease;
+}
+
+.detail-fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.detail-fold > summary:hover {
+  color: var(--text);
+}
+
+.detail-fold-count {
+  margin-right: auto;
+  margin-left: 8px;
+  color: var(--dim);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.detail-fold-count:empty {
+  display: none;
+}
+
+.detail-fold > summary span {
+  margin-right: auto;
+}
+
+.detail-fold > summary:has(.detail-fold-count:not(:empty)) span {
+  margin-right: 0;
+}
+
+.detail-fold > summary i {
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  opacity: 0.65;
+  transform: rotate(45deg) translate(-2px, -2px);
+  transition: transform 180ms ease;
+}
+
+.detail-fold[open] > summary i {
+  transform: rotate(225deg) translate(-2px, -2px);
+}
+
+.detail-fold > *:not(summary) {
+  padding-left: 9px;
+}
+
+.detail-actions {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.detail-actions[hidden] {
+  display: none;
+}
+
+/* Withdrawing a claim is a real decision, so it reads as a considered choice
+   rather than a primary action. */
+.detail-reject {
+  padding: 7px 11px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #8d8798;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+
+.detail-reject:hover:not(:disabled) {
+  border-color: rgba(255, 138, 128, 0.3);
+  background: rgba(255, 106, 92, 0.1);
+  color: #ffb0a8;
+}
+
+.detail-reject:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.detail-authored {
+  color: #96e2b2;
+}
+
+/* Sits above the model-load banner so a save failure is never stacked
+   underneath an unrelated one. */
+.edit-alert {
+  z-index: 20;
 }

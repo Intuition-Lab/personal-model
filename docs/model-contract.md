@@ -29,8 +29,9 @@ placeholder after later model builds. Automatic refresh replaces only files
 with Persome's projection marker. If an unrecognized, self-authored
 `HUMAN.md` already occupies the path, Persome preserves it and reports the
 conflict instead of overwriting it. Direct edits to a managed projection are
-not a correction interface and may be replaced; use `persome correct` for model
-changes.
+not a correction interface and may be replaced. Correct the model through
+`persome correct` (natural language, LLM-mediated), the viewer (click a claim to
+rewrite it), or `persome model edit` (both deterministic and object-addressed).
 
 `model build` uses an exclusive `<PERSOME_ROOT>/model-build.lock`. It waits up to 30 seconds by
 default; `--wait-seconds` changes the bound and `--no-wait` returns `busy` immediately. The kernel
@@ -102,8 +103,9 @@ sweeper resamples. This preserves the two-observation bar without inventing a se
 
 ## Viewer layout
 
-The loopback viewer projects the snapshot as a deterministic hierarchy; it does not mutate or
-re-cluster stored model objects. Root stays at the center, Volumes occupy the inner shell, Faces
+The loopback viewer projects the snapshot as a deterministic hierarchy. Rendering never mutates or
+re-clusters stored model objects; the only writes it can make are the owner's own explicit
+corrections, described below. Root stays at the center, Volumes occupy the inner shell, Faces
 form outward semantic clusters, and Points grow as stable local clouds around their primary Face.
 The viewer resolves Face membership through `member_receipts` and infers Volume-to-Face membership
 from inherited `source_receipts`, because stored `members` may be internal stable keys rather than
@@ -146,6 +148,59 @@ Zoom is relative to the fitted model: the visible minus, percentage, and plus co
 through 400%, the percentage resets to 100%, and the plus, minus, and zero keys provide the same
 actions. Wheel and trackpad pinch gestures zoom toward the pointer. `window.__persomeZoomState`
 exposes only aggregate distance and percentage values for local visual smoke tests.
+
+## Owner corrections
+
+The memory owner can rewrite a modeled object's wording or reject it outright, from the viewer,
+`POST /model/edit`, or `persome model edit`. In the viewer the claim itself is the editing surface:
+clicking the text opens it for rewriting in place, blur or Cmd+Enter commits, and Escape discards.
+There is no separate edit mode, and provenance folds beneath the claim rather than competing with it
+for the reader's attention. All three share one deterministic,
+LLM-free writer, so a correction applies offline and cannot fail to find its target: the caller
+addresses the object by the id the snapshot published. Points, Faces, Volumes, and the Root are
+editable. Lines are not — a relation or evolution Line is derived from the objects it connects, so
+the objects are what get corrected.
+
+The two layers use different mechanisms because different machinery would otherwise discard the
+edit.
+
+A **Point** correction goes through the ordinary supersede path. The owner's wording becomes a new
+entry carrying the `source:owner-edit` tag; the superseded fact keeps its own row, its receipts,
+and its place on the evolution Line. Rejecting a Point retires it without a successor, and a Point
+retired without a successor leaves the live model the way a closed Line or an archived Face does.
+Its row stays queryable, so the rejection remains auditable and reversible.
+
+A **Face**, **Volume**, or **Root** correction sets `provenance` to `authored`. Derivation keeps
+running underneath an authored object — observations accumulate and confidence still ratchets — but
+the schema miner stops rewriting its signature and root synthesis stops replacing the apex. That
+marker is what makes the correction durable, and it is what distinguishes an owner's claim from a
+derived one in every reader: the viewer, the MCP snapshot, `HUMAN.md`, and exports. Rejecting one
+archives it, which removes it from the live geometry while preserving its members, footprints, and
+observation count.
+
+Every correction records the text it displaced. An owner-authored object never accrues
+time-adjacent screen captures as context: an assertion the owner typed is not an observation, and
+presenting it as one would misrepresent its provenance.
+
+An authored Face is matched on re-mine by member overlap rather than by its signature. If its
+membership later drifts past the folding threshold, derivation starts a separate Face beside it
+rather than reclaiming the authored one.
+
+Two consequences of correcting a Face, Volume, or Root in place are worth stating plainly.
+
+The correction keeps the object's `face_id`, because a new row would mint a new id and dangle every
+child's `parent_face` and every parent's `members` entry. Identity is what holds the geometry
+together, so identity is what is preserved — and the cost is that `schema_faces` carries only the
+current wording. The full sequence of corrections is replayable from the `memory_deltas` audit rows,
+each of which records the text it displaced, but an as-of query against `schema_faces` itself
+returns the object as it reads now. Points do not share this limitation: their corrections supersede
+in the ordinary way and remain fully bitemporal.
+
+Retiring a Face does not cascade. A Volume that listed it keeps naming it in `members`, and the
+member resolves to no receipt until the model is rebuilt — which the retirement schedules by
+flagging the structure dirty. Rejecting one regularity is not a claim about the larger pattern
+built over it, so the rebuild re-derives that pattern from what is still live rather than deleting
+it outright.
 
 ## Evidence sources
 
