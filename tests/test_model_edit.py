@@ -7,6 +7,7 @@ used to overwrite anything a human wrote.
 from __future__ import annotations
 
 import json
+import pathlib
 import sqlite3
 from types import SimpleNamespace
 
@@ -1026,15 +1027,355 @@ def test_an_evo_native_point_is_correctable(ac_root) -> None:
     assert OWNER_EDIT_TAG in str(row[1]).split()
 
 
-def test_a_point_backed_by_nothing_is_refused(ac_root) -> None:
-    """No Markdown and no files row means the Point is a remnant."""
-    point_id = _seed_point()
+def test_a_point_the_engine_holds_is_correctable_even_unregistered(ac_root) -> None:
+    """`delta_apply` mints Points into evo_nodes with no Markdown and no files
+    row. The engine already owns those files; they are simply unregistered, and
+    the evomem writer registers them on write. Refusing them would leave every
+    newly observed entity fact permanently uncorrectable.
+    """
     from persome.store import files as files_mod
 
+    point_id = _seed_point()
     files_mod.memory_path("person-alex.md").unlink()
     with fts.cursor() as conn:
         conn.execute("DELETE FROM files WHERE path = 'person-alex.md'")
         result = apply_model_edit(
             conn, kind="point", target_id=point_id, op="rewrite", replacement="Mine."
         )
-    assert not result.ok and result.reason == "point_file_missing"
+        registered = conn.execute("SELECT 1 FROM files WHERE path = 'person-alex.md'").fetchone()
+    assert result.ok, f"expected a correction, got {result.reason}"
+    assert registered is not None, "the engine-owned file must be registered on write"
+
+
+def test_the_snapshot_says_which_points_can_be_corrected(ac_root) -> None:
+    """The viewer must not advertise an edit the writer refuses. On a real model
+    that was 46% of the Points on screen — each inviting a correction and then
+    declining it."""
+    original = "Alex reserves mornings for focused writing."
+    point_id = _seed_point(original)
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        snapshot = build_snapshot(conn, redact=False)
+
+    by_id = {p["id"]: p for p in snapshot["points"]}
+    # The superseded predecessor is still projected (it anchors the evolution
+    # Line) but must not be offered for correction.
+    assert by_id[point_id]["edit_refusal"] == "point_superseded"
+    assert by_id[result.new_id]["edit_refusal"] == ""
+
+
+def test_the_snapshot_marks_unpromoted_patterns_as_unrewritable(ac_root) -> None:
+    with fts.cursor() as conn:
+        shadow = sf.record_face(
+            conn, source=sf.PROVENANCE_MINED, signature="A tentative pattern.", members=["m1"]
+        )
+        active = _seed_face("A settled pattern.")
+        conn.execute("UPDATE schema_faces SET status='shadow' WHERE face_id=?", (shadow,))
+        snapshot = build_snapshot(conn, redact=False)
+
+    by_id = {f["id"]: f for f in snapshot["faces"]}
+    assert by_id[active]["edit_refusal"] == ""
+    assert shadow not in by_id, "a shadow Face is not projected at all"
+
+
+def test_every_refusal_reason_the_snapshot_emits_is_explained(ac_root) -> None:
+    """A reason the viewer cannot translate would reach the owner as a slug."""
+    import re
+
+    viewer = (
+        pathlib.Path(__file__).resolve().parents[1] / "resources/model_assets/viewer.js"
+    ).read_text(encoding="utf-8")
+    explained = set(re.findall(r"^\s{2}([a-z_]+):", viewer, re.MULTILINE))
+    emitted = {
+        "point_has_no_file",
+        "point_not_editable_in_this_file",
+        "point_archived",
+        "point_already_retired",
+        "point_superseded",
+        "point_file_missing",
+        "object_not_active",
+    }
+    assert emitted <= explained, f"unexplained: {sorted(emitted - explained)}"
+
+
+# ── deep-research regressions ─────────────────────────────────────────────
+
+
+def test_retiring_a_correction_withdraws_the_wording_it_replaced(ac_root) -> None:
+    """Rewrite then reject used to leave the ORIGINAL wording as the model's
+    only statement of that fact — the claim the owner had already replaced,
+    resurrected and permanently uneditable."""
+    original = "Alex works at Acme as a staff engineer."
+    point_id = _seed_point(original)
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=point_id,
+            op="rewrite",
+            replacement="I lead the platform team at Acme.",
+        )
+        assert first.ok
+        assert apply_model_edit(conn, kind="point", target_id=first.new_id, op="retire").ok
+        snapshot = build_snapshot(conn, redact=False)
+
+    contents = [p["content"] for p in snapshot["points"]]
+    assert original not in contents, "the replaced wording must not come back"
+    assert all(p["id"] not in (point_id, first.new_id) for p in snapshot["points"])
+
+
+def test_a_stranded_predecessor_is_correctable_again(ac_root) -> None:
+    """With every successor withdrawn there is no chain left to fork, so the
+    only version the owner can see becomes editable rather than a dead end."""
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        apply_model_edit(conn, kind="point", target_id=first.new_id, op="retire")
+        result = apply_model_edit(conn, kind="point", target_id=point_id, op="retire")
+    assert result.ok, f"expected the stranded version to be reachable, got {result.reason}"
+
+
+def test_the_audit_records_the_fact_the_owner_saw(ac_root) -> None:
+    """`prior_text` used to carry the `<!-- supersedes -->` marker, so a second
+    correction — and the withdrawal guard that reads this trail — compared
+    against bytes the owner never saw."""
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        second = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=first.new_id,
+            op="rewrite",
+            replacement="I write before anyone is awake.",
+        )
+    assert second.ok
+    assert second.prior_text == "I write at dawn.", second.prior_text
+    assert "supersedes" not in second.prior_text
+
+
+def test_a_second_correction_still_sticks(ac_root) -> None:
+    """The withdrawal guard reads the audit trail; a marker in `prior_text`
+    meant it stopped matching from the second edit onward."""
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        apply_model_edit(
+            conn,
+            kind="point",
+            target_id=first.new_id,
+            op="rewrite",
+            replacement="I write before anyone is awake.",
+        )
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {
+                "entities": [{"canonical": "Alex", "kind": "person"}],
+                "assertions": [{"subject": {"canonical": "Alex"}, "text": "I write at dawn."}],
+            },
+        )
+    assert result.assertions_minted == 0, "the replaced wording must not be re-minted"
+
+
+def test_a_correction_is_not_re_minted_as_a_duplicate(ac_root) -> None:
+    """The dedupe check compared stored bytes, so a corrected Point was
+    invisible to it and the owner's own wording came back as a second live
+    Point the next time it was observed."""
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    point_id = _seed_point()
+    mine = "I reserve mornings for writing."
+    with fts.cursor() as conn:
+        assert apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement=mine
+        ).ok
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {
+                "entities": [{"canonical": "Alex", "kind": "person"}],
+                "assertions": [{"subject": {"canonical": "Alex"}, "text": mine}],
+            },
+        )
+    assert result.assertions_minted == 0
+    assert result.assertions_seen == 1
+
+
+def test_two_concurrent_corrections_cannot_fork_the_chain(ac_root) -> None:
+    """The head check and the write have to be one decision.
+
+    Separated, two overlapping corrections both believe they hold the chain
+    head and both commit, producing exactly the forked chain — two live
+    successors of one fact — that the guard exists to prevent.
+    """
+    import threading
+
+    point_id = _seed_point()
+    results: list[object] = []
+    barrier = threading.Barrier(2)
+
+    def correct(text: str) -> None:
+        barrier.wait()
+        with fts.cursor() as conn:
+            results.append(
+                apply_model_edit(
+                    conn, kind="point", target_id=point_id, op="rewrite", replacement=text
+                )
+            )
+
+    threads = [
+        threading.Thread(target=correct, args=("First wording.",)),
+        threading.Thread(target=correct, args=("Second wording.",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert all(not t.is_alive() for t in threads), "an owner edit must never deadlock"
+
+    assert len(results) == 2
+    accepted = [r for r in results if r.ok]
+    assert len(accepted) == 1, "exactly one correction may win the head"
+    assert [r.reason for r in results if not r.ok] == ["point_superseded"]
+
+    with fts.cursor() as conn:
+        successors = conn.execute(
+            "SELECT superseded_by FROM evo_nodes WHERE node_id = ?", (point_id,)
+        ).fetchone()[0]
+        heads = conn.execute(
+            "SELECT count(*) FROM evo_nodes WHERE is_latest = 1 AND file_name = 'person-alex.md'"
+        ).fetchone()[0]
+    assert len(json.loads(successors)) == 1, f"chain forked: {successors}"
+    assert heads == 1
+
+
+# ── the whole matrix, through the real route ──────────────────────────────
+
+
+def test_no_target_state_can_produce_a_server_error(ac_root) -> None:
+    """Every reachable target and operation, through the HTTP surface.
+
+    The bar is not "most edits work": it is that no state of any target
+    produces a 500, and every refusal is a reason the viewer can explain in
+    words. A 500 on this surface is indistinguishable from the feature being
+    broken.
+    """
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.models import MemoryLayer
+    from persome.model.edit import KINDS, OPS
+
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        evo_native = EvoMemory().add_direct(
+            "An evo-native assertion.",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-sam",
+            tags="fact",
+        )
+        face = _seed_face("A settled pattern.")
+        volume = _seed_face("A cross-domain structure.", level=2)
+        root = _seed_face("An apex.", level=3)
+        shadow = sf.record_face(
+            conn, source=sf.PROVENANCE_MINED, signature="A tentative one.", members=["z1"]
+        )
+
+    client = TestClient(build_api_app(auth_enabled=False))
+    targets = [
+        ("point", point_id),
+        ("point", evo_native),
+        ("point", "no-such-point"),
+        ("face", face),
+        ("face", shadow),
+        ("face", "no-such-face"),
+        ("volume", volume),
+        ("volume", face),  # level mismatch
+        ("root", root),
+        ("root", volume),  # level mismatch
+    ]
+
+    seen_refusals: set[str] = set()
+    for kind in sorted(KINDS):
+        for target_kind, target_id in targets:
+            if target_kind != kind:
+                continue
+            for op in sorted(OPS):
+                body = {"schema_version": 1, "kind": kind, "id": target_id, "op": op}
+                if op == "rewrite":
+                    body["replacement"] = "Owner wording for this object."
+                response = client.post("/model/edit", json=body)
+                assert response.status_code != 500, (
+                    f"{kind}/{op} on {target_id} returned 500: {response.text[:200]}"
+                )
+                assert response.status_code in (200, 400), (
+                    f"{kind}/{op} returned {response.status_code}"
+                )
+                if response.status_code == 400:
+                    seen_refusals.add(response.json()["detail"])
+
+    # Whatever refusals this matrix reached must all be explainable.
+    viewer = (
+        pathlib.Path(__file__).resolve().parents[1] / "resources/model_assets/viewer.js"
+    ).read_text(encoding="utf-8")
+    for reason in seen_refusals:
+        assert f"  {reason}:" in viewer, f"refusal {reason!r} has no explanation in the viewer"
+
+
+def test_the_snapshot_and_the_writer_never_disagree(ac_root) -> None:
+    """What the viewer offers and what the writer accepts must be the same set.
+
+    Both directions are bugs: advertising an edit that fails wastes the owner's
+    typing, and refusing one that would have worked hides a correction they are
+    entitled to make.
+    """
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.models import MemoryLayer
+
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        EvoMemory().add_direct(
+            "An evo-native assertion.",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-sam",
+            tags="fact",
+        )
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="Corrected."
+        )
+        assert first.ok
+        snapshot = build_snapshot(conn, redact=False)
+
+    client = TestClient(build_api_app(auth_enabled=False))
+    checked = 0
+    for point in snapshot["points"]:
+        advertised = not point["edit_refusal"]
+        response = client.post(
+            "/model/edit",
+            json={
+                "schema_version": 1,
+                "kind": "point",
+                "id": point["id"],
+                "op": "rewrite",
+                "replacement": f"Owner wording {point['id'][:6]}.",
+            },
+        )
+        assert response.status_code != 500
+        accepted = response.status_code == 200
+        assert accepted == advertised, (
+            f"{point['id']}: snapshot said {'editable' if advertised else point['edit_refusal']},"
+            f" writer returned {response.status_code}"
+        )
+        checked += 1
+    assert checked >= 2

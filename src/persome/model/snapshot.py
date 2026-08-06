@@ -112,7 +112,7 @@ def _point_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     #
     # Only a Point that is end-dated, no longer current, and has no successor
     # was actually withdrawn.
-    return list(
+    rows = list(
         conn.execute(
             f"SELECT {', '.join(selected)} FROM evo_nodes "
             "WHERE status != 'archived' "
@@ -121,6 +121,32 @@ def _point_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             "ORDER BY node_id"
         ).fetchall()
     )
+    # A superseded Point earns its place by anchoring an evolution Line. When
+    # its successor is withdrawn there is no Line left to anchor, and keeping it
+    # would republish the very wording the owner replaced — alone, as the
+    # model's only surviving statement of that fact. Withdraw the whole chain
+    # together, the way retiring a single Point already does.
+    live = {str(row["node_id"]) for row in rows}
+    kept: list[sqlite3.Row] = []
+    for row in rows:
+        successors = {str(v) for v in _json_list(row["superseded_by"])}
+        if successors and not (successors & live):
+            continue
+        kept.append(row)
+    return kept
+
+
+def _owner_edit_count(conn: sqlite3.Connection) -> int:
+    """Number of owner corrections recorded in the audit trail. Fail-open."""
+    if not _table_exists(conn, "memory_deltas"):
+        return 0
+    try:
+        row = conn.execute(
+            "SELECT count(*) FROM memory_deltas WHERE session_id = 'owner-edit'"
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0] or 0) if row else 0
 
 
 def _visible_content(row: sqlite3.Row) -> str:
@@ -226,6 +252,9 @@ def _schema_item(
         "status": row["status"],
         "valid_from": row["valid_from"],
         "created_at": row["created_at"],
+        # A pattern that has not been promoted cannot have its wording pinned
+        # (no promotion gate accepts `authored`), but it can still be rejected.
+        "edit_refusal": "" if row["status"] == "active" else "object_not_active",
     }
 
 
@@ -327,6 +356,12 @@ def build_snapshot(
     point_rows = _point_rows(conn)
     from ..store.schema_faces import member_key
 
+    # The viewer must not offer a correction the writer will refuse, so
+    # editability is decided here, once, by the module that owns the rules.
+    from .edit import backing_map, point_refusal
+
+    backings = backing_map(conn, {str(row["file_name"] or "") for row in point_rows} - {""})
+
     raw_content: dict[str, str] = {str(row["node_id"]): _visible_content(row) for row in point_rows}
     # The body exactly as stored, supersede marker included — what the schema
     # miner reads when it computes the member keys a Face records.
@@ -370,6 +405,14 @@ def build_snapshot(
                 "valid_until": row["valid_until"],
                 "created_at": row["gmt_created"],
                 "receipt": receipt,
+                "edit_refusal": point_refusal(
+                    file_name=str(row["file_name"] or ""),
+                    status=str(row["status"] or ""),
+                    is_latest=bool(row["is_latest"]),
+                    valid_until=row["valid_until"],
+                    superseded_by_empty=not _json_list(row["superseded_by"]),
+                    backing=backings.get(str(row["file_name"] or "")),
+                ),
             }
         )
 
@@ -516,6 +559,11 @@ def build_snapshot(
             "volumes": len(volumes),
             "roots": len(roots),
             "receipts": len(receipts),
+            # How many corrections the owner has made. A monotonic count, so any
+            # reader holding a rendered copy of the model can tell that the owner
+            # has changed it since — which build metadata alone cannot express,
+            # because an edit does not start a build.
+            "owner_edits": _owner_edit_count(conn),
             "redactions": dict(sorted(redactor.counts.items())),
         },
     }

@@ -33,6 +33,7 @@ displaced, which is what lets a reader see *what* was changed rather than only
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -162,15 +163,206 @@ def _point_backing(conn: sqlite3.Connection, file_name: str) -> str | None:
     there is nothing to correct.
     """
     try:
-        if files_mod.memory_path(file_name).is_file():
-            return "markdown"
+        path = files_mod.memory_path(file_name)
     except Exception:  # noqa: BLE001 — an unresolvable name is not editable either
         return None
+    if path.is_file():
+        return "markdown"
     try:
         row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (file_name,)).fetchone()
+        if row is not None:
+            return "evomem"
+        # No Markdown and no registry row, but the engine is already storing
+        # nodes under this name — which is how `delta_apply` mints every entity
+        # and assertion Point. The file is the engine's; it simply has not been
+        # registered yet, and the evomem writer registers it on write.
+        held = conn.execute(
+            "SELECT 1 FROM evo_nodes WHERE file_name = ? LIMIT 1", (file_name,)
+        ).fetchone()
     except sqlite3.Error:
         return None
-    return "evomem" if row is not None else None
+    return "evomem" if held is not None else None
+
+
+def _ensure_registered(conn: sqlite3.Connection, file_name: str) -> None:
+    """Give an engine-owned file its registry row if it has none.
+
+    `evo_inversion.supersede_entry` refuses a file with neither Markdown nor a
+    `files` row, even though its own `_finish_file_write` creates that row on
+    the way out. Points minted straight into `evo_nodes` therefore arrive
+    uncorrectable. Registering the file the engine is already storing nodes for
+    invents no content — the row describes where the nodes live.
+    """
+    from ..store import fts as fts_store
+
+    try:
+        if (
+            conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (file_name,)).fetchone()
+            is not None
+        ):
+            return
+        prefix = files_mod.validate_prefix(file_name)
+        count = conn.execute(
+            "SELECT count(*) FROM evo_nodes WHERE file_name = ? AND is_latest = 1", (file_name,)
+        ).fetchone()
+        today = files_mod.today()
+        fts_store.upsert_file(
+            conn,
+            fts_store.FileRow(
+                path=file_name,
+                prefix=prefix,
+                description="",
+                tags="",
+                status="active",
+                entry_count=int(count[0] or 0) if count else 0,
+                created=today,
+                updated=today,
+                needs_compact=0,
+            ),
+        )
+    except Exception:  # noqa: BLE001 — the writer's own guard still applies
+        logger.exception("could not register %s before an owner edit", _loggable(file_name))
+
+
+def _owner_edit_lock():
+    """Serialize owner corrections against each other.
+
+    Deliberately NOT the memory file's own lock: the writers take that one
+    themselves and it is a plain `threading.Lock`, so holding it across the call
+    deadlocks. A separate sentinel path gives mutual exclusion between owner
+    edits without touching the writers' locking.
+
+    In-process only, like every lock in this store. The daemon serves every HTTP
+    correction, so that covers the case this guards — a second correction
+    arriving while the first is still deciding whether it holds the chain head.
+    """
+    from .. import paths
+
+    return files_mod.file_lock(paths.root() / ".owner-edit.lock")
+
+
+def _lost_the_head(conn: sqlite3.Connection, node_id: str) -> bool:
+    """Whether this Point stopped being the chain head since it was first read."""
+    try:
+        row = conn.execute(
+            "SELECT is_latest FROM evo_nodes WHERE node_id = ? LIMIT 1", (node_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None and not int(row["is_latest"] or 0)
+
+
+def _has_live_successor(conn: sqlite3.Connection, superseded_by: object) -> bool:
+    """Whether any successor of this Point is still in the live model."""
+    try:
+        ids = [str(v) for v in json.loads(str(superseded_by or "[]") or "[]")]
+    except (TypeError, ValueError):
+        return False
+    for node_id in ids:
+        try:
+            row = conn.execute(
+                "SELECT valid_until, superseded_by, status FROM evo_nodes WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return True  # unknown: keep the conservative refusal
+        if row is None:
+            continue
+        withdrawn = (bool(row["valid_until"]) and str(row["superseded_by"] or "[]") == "[]") or str(
+            row["status"] or ""
+        ) == "archived"
+        if not withdrawn:
+            return True
+    return False
+
+
+def _node_backing(conn: sqlite3.Connection, file_name: str, node_id: str) -> str | None:
+    """Backing for one Point, which is not the same as backing for its file.
+
+    A file can hold both: `delta_apply` mints assertion Points straight into
+    `evo_nodes` under an entity file the classifier may also have created as
+    Markdown, and correcting an evo-native Point writes a Markdown projection of
+    that file as a side effect — after which every other evo-native Point in it
+    would look Markdown-backed. Deciding per file sent those to
+    `entries.supersede_entry`, which raises `ValueError: entry <id> not found`
+    and surfaced as an opaque 500. The node is Markdown-backed only if the file
+    on disk actually contains it.
+    """
+    backing = _point_backing(conn, file_name)
+    if backing != "markdown":
+        return backing
+    try:
+        parsed = files_mod.read_file(files_mod.memory_path(file_name))
+    except Exception:  # noqa: BLE001 — an unreadable file is not the node's home
+        return "evomem"
+    return "markdown" if any(entry.id == node_id for entry in parsed.entries) else "evomem"
+
+
+def backing_map(conn: sqlite3.Connection, file_names: set[str]) -> dict[str, str | None]:
+    """Resolve the backing of many files at once.
+
+    The snapshot needs this for every projected Point, so it must not be one
+    query per Point. Markdown presence is a stat per distinct file; the `files`
+    table is read in a single pass.
+    """
+    known: set[str] = set()
+    held: set[str] = set()
+    try:
+        known = {str(r[0]) for r in conn.execute("SELECT path FROM files")}
+        # Files the engine stores nodes under, registered or not. Must mirror
+        # `_point_backing`, or the snapshot advertises a refusal the writer
+        # would not make — the same disagreement, pointing the other way.
+        held = {
+            str(r[0])
+            for r in conn.execute("SELECT DISTINCT file_name FROM evo_nodes WHERE file_name != ''")
+        }
+    except sqlite3.Error:
+        known = set()
+    out: dict[str, str | None] = {}
+    for name in file_names:
+        try:
+            on_disk = files_mod.memory_path(name).is_file()
+        except Exception:  # noqa: BLE001
+            out[name] = None
+            continue
+        if on_disk:
+            out[name] = "markdown"
+        elif name in known or name in held:
+            out[name] = "evomem"
+        else:
+            out[name] = None
+    return out
+
+
+def point_refusal(
+    *,
+    file_name: str,
+    status: str,
+    is_latest: bool,
+    valid_until: str | None,
+    superseded_by_empty: bool,
+    backing: str | None,
+) -> str:
+    """Why this Point cannot be corrected, or ``""`` when it can.
+
+    The same rules `_edit_point` enforces, in a form the snapshot can evaluate
+    for every Point it projects. The viewer must not offer an action the writer
+    will refuse: on a real model that was 46% of the Points on screen, each one
+    inviting a correction and then declining it.
+    """
+    if not file_name:
+        return "point_has_no_file"
+    if not _point_file_is_editable(file_name):
+        return "point_not_editable_in_this_file"
+    if status == "archived":
+        return "point_archived"
+    if valid_until and not is_latest and superseded_by_empty:
+        return "point_already_retired"
+    if not is_latest:
+        return "point_superseded"
+    if backing is None:
+        return "point_file_missing"
+    return ""
 
 
 def _semantic_tags(raw: str) -> list[str]:
@@ -244,7 +436,8 @@ def _edit_point(
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
-            "SELECT file_name, content, tags, status, valid_until, superseded_by, is_latest"
+            "SELECT file_name, content, tags, status, valid_until, superseded_by, is_latest,"
+            " supersedes"
             " FROM evo_nodes WHERE node_id = ? LIMIT 1",
             (target_id,),
         ).fetchone()
@@ -267,7 +460,7 @@ def _edit_point(
     # evo-native. Sending those down the Markdown path raises `FileNotFoundError`
     # from inside the store, which is what turned an ordinary correction into an
     # opaque 500. Correct each Point where it actually lives.
-    backing = _point_backing(conn, file_name)
+    backing = _node_backing(conn, file_name, target_id)
     if backing is None:
         return _reject("point", target_id, op, "point_file_missing")
     if str(row["status"] or "") == "archived":
@@ -283,16 +476,30 @@ def _edit_point(
     )
     if already_retired:
         return _reject("point", target_id, op, "point_already_retired")
-    if not int(row["is_latest"] or 0):
+    if not int(row["is_latest"] or 0) and _has_live_successor(conn, row["superseded_by"]):
         # Correcting an already-superseded version would fork the chain: two
         # live successors of one fact, each claiming to be the current wording.
         # The owner means the version they can see, which is the chain head.
+        #
+        # Once every successor has been withdrawn there is nothing left to fork,
+        # and this version is the only one the owner can see — so it becomes
+        # correctable again rather than a dead end.
         return _reject("point", target_id, op, "point_superseded")
 
-    prior_text = str(row["content"] or "")
+    # The visible fact, not the stored bytes. A Point that is itself a
+    # correction carries a `<!-- supersedes: ... -->` marker, and recording that
+    # in the audit trail breaks every reader that compares the audit against
+    # what the owner actually saw — including `delta_apply._owner_withdrew`,
+    # whose whole job is making a rejection durable.
+    prior_text = entries.strip_supersede_provenance(
+        str(row["content"] or ""),
+        supersedes={str(v) for v in json.loads(str(row["supersedes"] or "[]") or "[]")},
+    )
     tags = _semantic_tags(row["tags"])
 
     writer = entries if backing == "markdown" else evo_inversion
+    if backing == "evomem":
+        _ensure_registered(conn, file_name)
 
     if op == "rewrite":
         new_id = writer.supersede_entry(
@@ -428,9 +635,13 @@ def apply_model_edit(
 
     misses_before = evo_shadow.miss_count()
     if kind == "point":
-        result = _edit_point(
-            conn, target_id=target_id, op=op, replacement=replacement, reason=reason
-        )
+        # The head check and the write must not be separated by another
+        # correction, or two edits both believe they hold the chain head and
+        # the chain forks into two live successors of one fact.
+        with _owner_edit_lock():
+            result = _edit_point(
+                conn, target_id=target_id, op=op, replacement=replacement, reason=reason
+            )
     else:
         result = _edit_schema_object(
             conn, kind=kind, target_id=target_id, op=op, replacement=replacement

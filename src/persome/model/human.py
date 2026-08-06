@@ -180,6 +180,7 @@ def _frontmatter(
         f"generated_at: {_yaml_scalar(snapshot.get('generated_at'))}",
         f"build_id: {_yaml_scalar(build.get('build_id'))}",
         f"build_status: {_yaml_scalar(build.get('status'))}",
+        f"owner_edits: {int((snapshot.get('stats') or {}).get('owner_edits') or 0)}",
         f"root_id: {_yaml_scalar(root.get('id') if root else None)}",
         'visibility: "owner-only"',
         f"redacted: {str(redacted).lower()}",
@@ -833,6 +834,37 @@ def _placeholder_snapshot(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _owner_edit_count() -> int | None:
+    """Owner corrections recorded so far, for the staleness gate.
+
+    An owner edit starts no build, so build metadata cannot express it and the
+    reconcile short-circuited on a file that still asserted a claim the owner
+    had rejected.
+
+    ``None`` means "cannot tell" — an index that is absent or being repaired.
+    That must not be read as "the owner edited something", or an unreadable
+    store would force a rebuild on every reconcile.
+    """
+    from ..store import fts
+
+    try:
+        with fts.canonical_read_cursor() as conn:
+            row = conn.execute(
+                "SELECT count(*) FROM memory_deltas WHERE session_id = 'owner-edit'"
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _owner_edits_match(current: _ManagedHuman) -> bool:
+    """Whether the rendered file reflects the owner's corrections so far."""
+    seq = _owner_edit_count()
+    if seq is None:
+        return True
+    return int(current.get("owner_edits") or 0) == seq
+
+
 def sync_live_human_markdown() -> Path:
     """Backfill or refresh HUMAN.md from an existing Runtime model.
 
@@ -855,6 +887,7 @@ def sync_live_human_markdown() -> Path:
             and current.get("renderer_version") == HUMAN_RENDERER_VERSION
             and current.get("build_id") == build_id
             and current.get("build_status") == manifest.get("status")
+            and _owner_edits_match(current)
         ):
             return target
 

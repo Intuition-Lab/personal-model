@@ -159,6 +159,7 @@ def test_fresh_root_snapshot_has_complete_geometry_and_receipts(ac_root, monkeyp
         "volumes": 1,
         "roots": 1,
         "receipts": 5,
+        "owner_edits": 0,
         "redactions": {},
     }
     assert snapshot["root"]["id"] == seeded["root_id"]
@@ -272,22 +273,26 @@ def test_point_correction_and_delete_keep_auditable_history(ac_root, monkeypatch
     # A Point retired without a successor has been withdrawn, so it leaves the
     # live model the way a closed Line or an archived Face does.
     assert "point-focus-v3" not in deleted_points
-    # Withdrawal is not amnesia. The predecessor still carries the chain,
-    # because it names its successor in `superseded_by` and is therefore
-    # history rather than a live claim.
-    assert deleted_points["point-focus-v2"]["content"] == (
+    # And so does the version it replaced. A superseded Point earns its place by
+    # anchoring an evolution Line; once its successor is withdrawn there is no
+    # Line left to anchor, and keeping it would republish the exact wording the
+    # owner corrected away — alone, as the model's only statement of that fact.
+    assert "point-focus-v2" not in deleted_points
+    # Withdrawal is not amnesia: every version stays queryable in the store,
+    # which is what keeps the retirement auditable and reversible.
+    with fts.cursor() as conn:
+        rows = {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                "SELECT node_id, content, valid_until FROM evo_nodes WHERE node_id IN (?, ?)",
+                ("point-focus-v2", "point-focus-v3"),
+            )
+        }
+    assert rows["point-focus-v3"][0] == "The user now reserves mornings for release review."
+    assert rows["point-focus-v3"][1] == "2026-07-11T08:00:00+00:00"
+    assert rows["point-focus-v2"][0] == (
         "The user reserves mornings for focused writing and review."
     )
-    # And the withdrawn row itself stays queryable in the store, which is what
-    # keeps the retirement reversible and auditable.
-    with fts.cursor() as conn:
-        retired = conn.execute(
-            "SELECT content, valid_until FROM evo_nodes WHERE node_id = ?",
-            ("point-focus-v3",),
-        ).fetchone()
-    assert retired is not None
-    assert retired[0] == "The user now reserves mornings for release review."
-    assert retired[1] == "2026-07-11T08:00:00+00:00"
 
 
 def test_fresh_root_rebuild_is_structurally_identical(ac_root, monkeypatch, tmp_path) -> None:
