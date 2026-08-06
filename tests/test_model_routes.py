@@ -474,6 +474,20 @@ class TestViewPage:
         assert b"--build-color: var(--root)" in css.body
         assert b"--build-color: var(--point)" in css.body
         assert b"controls.zoomToCursor = true" in viewer.body
+        # The wheel is the viewer's, not OrbitControls'. Its wheel path lands
+        # the whole delta in one step while orbit and pan glide under damping,
+        # and normalises by devicePixelRatio, which halves the gain on a Retina
+        # display and divides by zero below 1. The viewer takes the wheel in the
+        # capture phase and drives its own damped, cursor-anchored goal — and
+        # taking only the wheel leaves OrbitControls' touch pinch and
+        # middle-button dolly working.
+        assert b"{ passive: false, capture: true }" in viewer.body
+        assert b"zoomAnchor" in viewer.body
+        assert b"zoomMath.wheelFactor" in viewer.body
+        assert b"controls.enableZoom = false" not in viewer.body
+        # Safari reports a trackpad pinch only as a gesture event, so a viewer
+        # that listens for ctrlKey wheel alone has no pinch there at all.
+        assert b'addEventListener("gesturechange"' in viewer.body
         assert b"downloadShareImage" in viewer.body
         assert b"shareReady = Boolean" in viewer.body
         assert b"window.open" in viewer.body

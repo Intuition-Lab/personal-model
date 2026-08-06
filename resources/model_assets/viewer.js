@@ -70,10 +70,15 @@ const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x070610, 0.026);
 
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+// No `preserveDrawingBuffer`: it makes the browser copy the whole framebuffer
+// every frame (tens of megabytes at 2x device pixel ratio) to serve readers
+// that may never come. Both readers here — samplePixels() and
+// createConstellationBlob() — read inside the same synchronous task as the
+// render that produced the pixels, which is exactly when the buffer is still
+// valid without it.
 const renderer = new THREE.WebGLRenderer({
   antialias: true,
   alpha: true,
-  preserveDrawingBuffer: true,
 });
 renderer.setClearColor(0x000000, 0);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -94,10 +99,15 @@ canvasHost.appendChild(labelRenderer.domElement);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.07;
-controls.zoomSpeed = 0.62;
+// OrbitControls keeps its dolly, which is what a touchscreen pinch and a
+// middle-button drag ride on, but it never sees the wheel: the viewer takes
+// that in the capture phase below. Its wheel path applies the whole delta in
+// one update and resets the accumulator, so wheel zoom landed in hard steps
+// while orbit and pan glided under damping, and it normalises by
+// `devicePixelRatio | 0`, which halves the gain on a Retina display — a full
+// trackpad pinch moved the camera 5% — and divides by zero once the ratio
+// drops below 1, where one notch teleports to the zoom limit.
 controls.zoomToCursor = true;
-controls.minDistance = 5;
-controls.maxDistance = 32;
 controls.target.set(0, 2.2, 0);
 
 scene.add(new THREE.HemisphereLight(0xdad6ff, 0x080710, 2.25));
@@ -121,6 +131,15 @@ let minTime = new Date();
 let maxTime = new Date();
 let playTimer = null;
 let pointerDown = null;
+// Which pointers are down, tracked apart from the click candidate. A gesture
+// stays live whatever it turns out to be — a second finger retires the click
+// candidate because a pinch must never select a node, and a right-drag is a
+// pan that carries no click candidate at all — and hover picking and the graph
+// poll must stay out of the way of all of them. Identities rather than a count:
+// a release can land on a label instead of the canvas, and a counter that
+// missed one would wedge closed for the rest of the session.
+const livePointers = new Set();
+let labelGesture = null;
 let hoverPointer = null;
 let hoverDirty = false;
 let selected = null;
@@ -143,6 +162,8 @@ let framedRadius = 0;
 let pulseGlows = [];
 let fitDistance = 12;
 let zoomGoalDistance = null;
+let zoomAnchor = null;
+let canvasBounds = null;
 let lastZoomPercent = null;
 let lastFrameTime = performance.now();
 let shareReady = false;
@@ -159,6 +180,15 @@ const kindLayers = {
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 const zoomDirection = new THREE.Vector3();
+const zoomRaycaster = new THREE.Raycaster();
+const zoomPlane = new THREE.Plane();
+const zoomViewDirection = new THREE.Vector3();
+const zoomAnchorBefore = new THREE.Vector3();
+const zoomAnchorAfter = new THREE.Vector3();
+const zoomShift = new THREE.Vector3();
+const zoomAnchorNdc = new THREE.Vector2();
+const pickWorldPosition = new THREE.Vector3();
+const pickProjected = new THREE.Vector3();
 const MIN_NODE_HIT_RADIUS_PX = 12;
 const MIN_LINE_HIT_RADIUS_PX = 8;
 const ZOOM_MIN_PERCENT = 50;
@@ -321,9 +351,43 @@ function addLabel(text, position, layer, priority, kind, item, context = false) 
   label.position.copy(position);
   label.userData.priority = priority;
   registerSelectionTarget(kind, item.id, label);
-  element.addEventListener("pointerdown", (event) => event.stopPropagation());
+  element.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    // A label used to swallow the gesture outright, so the twenty of them on
+    // screen were twenty places where a drag did nothing at all. Hand the
+    // pointer to the canvas — OrbitControls captures it there and orbits — and
+    // record what was under it so a gesture that turns out to be a click still
+    // opens this label's node.
+    event.preventDefault();
+    // preventDefault also suppresses the focus the button would have taken, so
+    // give it back: a mouse user who selects a node should still be able to
+    // Tab onward from it.
+    element.focus({ preventScroll: true });
+    labelGesture = { kind, item };
+    renderer.domElement.dispatchEvent(new PointerEvent("pointerdown", {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      isPrimary: event.isPrimary,
+      button: event.button,
+      buttons: event.buttons,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      // Modifiers pick the gesture: shift or ctrl turns OrbitControls' left
+      // drag from an orbit into a pan, and a drag begun on a label has to mean
+      // the same thing as one begun on bare canvas.
+      ctrlKey: event.ctrlKey,
+      shiftKey: event.shiftKey,
+      altKey: event.altKey,
+      metaKey: event.metaKey,
+      bubbles: false,
+      cancelable: true,
+    }));
+  });
   element.addEventListener("click", (event) => {
     event.stopPropagation();
+    // Pointer-driven activation is resolved on the canvas above. Only keyboard
+    // activation, which reports no pointer detail, still arrives here.
+    if (event.detail !== 0) return;
     showDetails(kind, item);
   });
   register(label, layer);
@@ -686,6 +750,14 @@ function buildScene() {
   renderStatus();
   emptyEl.hidden = visiblePoints.length > 0;
   frameLayout(false);
+  // Fresh label elements and a possibly-resized status strip: both cached
+  // measurements have to be taken again.
+  invalidatePanelBoxes();
+  // A viewer that started against an empty store rendered nothing for its
+  // first frames and would otherwise have spent its whole probe budget on a
+  // blank scene, leaving the local smoke signal reading "nothing rendered"
+  // forever. A new scene deserves a fresh look.
+  renderProbeSweeps = 0;
   const renderedLines = renderedLineItems.length;
   window.__persomeViewerState = {
     schemaVersion: model.schema_version,
@@ -951,6 +1023,7 @@ function clearSelection() {
   evidenceTrail = [];
   detailEl.hidden = true;
   delete detailEl.dataset.kind;
+  invalidatePanelBoxes();
   syncSelectionState();
 }
 
@@ -1558,6 +1631,9 @@ function showDetails(kind, item) {
   selected = { kind, id: item.id };
   selectedItem = item;
   pauseAutoRotate();
+  // The drawer is one of the boxes labels are culled against, and it has just
+  // changed shape.
+  invalidatePanelBoxes();
   syncSelectionState();
   detailEl.dataset.kind = kind;
   detailKindEl.textContent = kind === "context" ? "entity" : kind;
@@ -1748,6 +1824,11 @@ function frameLayout(force) {
   controls.target.set(0, 0, 0);
   controls.minDistance = distance * 100 / ZOOM_MAX_PERCENT;
   controls.maxDistance = distance * 100 / ZOOM_MIN_PERCENT;
+  // Zooming at the cursor walks the orbit centre towards whatever is under it.
+  // Bound how far it may wander so a long pinch cannot strand the constellation
+  // off-screen with nothing left to orbit around.
+  controls.maxTargetRadius = radius * 1.5;
+  zoomAnchor = null;
   framedRadius = radius;
   controls.update();
   syncZoomUI();
@@ -1771,27 +1852,44 @@ function currentZoomPercent() {
   );
 }
 
+// Rebuilt in place rather than reallocated: syncZoomUI runs once per frame and
+// a fresh object literal per frame is pure garbage for the collector to chase
+// during exactly the gesture we are trying to keep smooth.
+window.__persomeZoomState = {
+  percent: 100,
+  distance: 0,
+  fitDistance: 0,
+  minPercent: ZOOM_MIN_PERCENT,
+  maxPercent: ZOOM_MAX_PERCENT,
+  animating: false,
+};
+
 function syncZoomUI() {
   const distance = camera.position.distanceTo(controls.target);
-  const percent = currentZoomPercent();
+  const percent = zoomMath.percentForDistance(
+    fitDistance,
+    distance,
+    ZOOM_MIN_PERCENT,
+    ZOOM_MAX_PERCENT,
+  );
+  // The DOM writes are the expensive half. They only mean anything when the
+  // rounded percent actually changes, which during a glide is a few frames out
+  // of every hundred.
   if (percent !== lastZoomPercent) {
     zoomResetButton.textContent = `${percent}%`;
     zoomResetButton.setAttribute(
       "aria-label",
       `Reset zoom to 100 percent (currently ${percent} percent)`,
     );
+    zoomOutButton.disabled = percent <= ZOOM_MIN_PERCENT;
+    zoomInButton.disabled = percent >= ZOOM_MAX_PERCENT;
     lastZoomPercent = percent;
   }
-  zoomOutButton.disabled = percent <= ZOOM_MIN_PERCENT;
-  zoomInButton.disabled = percent >= ZOOM_MAX_PERCENT;
-  window.__persomeZoomState = {
-    percent,
-    distance: Number(distance.toFixed(3)),
-    fitDistance: Number(fitDistance.toFixed(3)),
-    minPercent: ZOOM_MIN_PERCENT,
-    maxPercent: ZOOM_MAX_PERCENT,
-    animating: zoomGoalDistance !== null,
-  };
+  const state = window.__persomeZoomState;
+  state.percent = percent;
+  state.distance = Number(distance.toFixed(3));
+  state.fitDistance = Number(fitDistance.toFixed(3));
+  state.animating = zoomGoalDistance !== null;
 }
 
 function requestZoom(percent) {
@@ -1801,6 +1899,22 @@ function requestZoom(percent) {
     controls.minDistance,
     controls.maxDistance,
   );
+  zoomAnchor = null;
+}
+
+// Wheel and pinch drive the goal multiplicatively from wherever the glide is
+// already headed, so a stream of small events composes into one continuous
+// gesture instead of repeatedly restarting from the camera's current position.
+function requestZoomBy(factor, anchor) {
+  const base = zoomGoalDistance === null
+    ? camera.position.distanceTo(controls.target)
+    : zoomGoalDistance;
+  zoomGoalDistance = THREE.MathUtils.clamp(
+    base / factor,
+    controls.minDistance,
+    controls.maxDistance,
+  );
+  zoomAnchor = anchor || null;
 }
 
 function stepZoom(direction) {
@@ -1821,30 +1935,78 @@ function stepZoom(direction) {
   ));
 }
 
+// Where the ray through `ndc` meets the plane that carries the orbit target and
+// faces the camera. Zooming keeps this point pinned under the pointer.
+function anchorWorldPoint(ndc, out) {
+  camera.updateMatrixWorld();
+  zoomRaycaster.setFromCamera(ndc, camera);
+  camera.getWorldDirection(zoomViewDirection);
+  zoomPlane.setFromNormalAndCoplanarPoint(zoomViewDirection, controls.target);
+  return zoomRaycaster.ray.intersectPlane(zoomPlane, out);
+}
+
 function applyZoomAnimation(deltaSeconds) {
   if (zoomGoalDistance === null) return;
   const currentDistance = camera.position.distanceTo(controls.target);
   const nextDistance = REDUCED_MOTION
     ? zoomGoalDistance
     : THREE.MathUtils.damp(currentDistance, zoomGoalDistance, 12, deltaSeconds);
+  const settled = Math.abs(nextDistance - zoomGoalDistance) < 0.01;
+  const landedDistance = settled ? zoomGoalDistance : nextDistance;
+  const anchored = zoomAnchor !== null
+    && anchorWorldPoint(zoomAnchor, zoomAnchorBefore) !== null;
+
   zoomDirection.copy(camera.position).sub(controls.target);
   if (zoomDirection.lengthSq() < 1e-8) zoomDirection.set(0, 0, 1);
-  zoomDirection.setLength(nextDistance);
+  zoomDirection.setLength(landedDistance);
   camera.position.copy(controls.target).add(zoomDirection);
-  if (Math.abs(nextDistance - zoomGoalDistance) < 0.01) {
-    zoomDirection.setLength(zoomGoalDistance);
-    camera.position.copy(controls.target).add(zoomDirection);
+
+  if (anchored && anchorWorldPoint(zoomAnchor, zoomAnchorAfter) !== null) {
+    // Translating the camera and the orbit target by the same vector leaves the
+    // spherical radius, theta and phi untouched, so OrbitControls' damping
+    // carries on undisturbed while the anchored point stays under the pointer.
+    zoomShift.copy(zoomAnchorBefore).sub(zoomAnchorAfter);
+    camera.position.add(zoomShift);
+    controls.target.add(zoomShift);
+  }
+
+  if (settled) {
     zoomGoalDistance = null;
+    zoomAnchor = null;
   }
 }
 
-function cullLabels() {
-  const occupied = [...document.querySelectorAll(".story, .legend, .status, .timeline, .detail:not([hidden])")]
+// Reading an element's box forces the browser to flush pending layout. The
+// render loop writes a fresh inline transform onto every label each frame, so
+// layout is always dirty by the time culling runs — measuring here meant one
+// full-document reflow per frame, across hundreds of labels. Nothing being
+// measured actually changes that often: a label pill is sized by its own text
+// and a fixed max-width, and the overlay panels move only on resize or when the
+// drawer opens. Measure each once and cache.
+let occupiedPanels = null;
+
+function invalidatePanelBoxes() {
+  occupiedPanels = null;
+  canvasBounds = null;
+}
+
+function panelBoxes() {
+  if (occupiedPanels) return occupiedPanels;
+  occupiedPanels = [...document.querySelectorAll(".story, .legend, .status, .timeline, .detail:not([hidden])")]
     .map((element) => element.getBoundingClientRect())
     .filter((box) => box.width > 0 && box.height > 0)
     .map((box) => ({ x0: box.left - 6, x1: box.right + 6, y0: box.top - 6, y1: box.bottom + 6 }));
+  return occupiedPanels;
+}
+
+const cullProjected = new THREE.Vector3();
+const cullCandidates = [];
+
+function cullLabels() {
+  const occupied = panelBoxes().slice();
   const mobile = window.innerWidth < 760;
   const maxLabels = mobile ? 8 : 20;
+  const maxWidth = mobile ? 130 : 220;
   const safeArea = {
     left: mobile ? 8 : 6,
     right: window.innerWidth - (mobile ? 8 : 6),
@@ -1852,18 +2014,39 @@ function cullLabels() {
     bottom: window.innerHeight - (mobile ? 70 : 64),
   };
   let shown = 0;
-  const projected = new THREE.Vector3();
-  const candidates = labels.filter((label) => label.visible).map((label) => {
+  const projected = cullProjected;
+  cullCandidates.length = 0;
+  labels.forEach((label) => {
+    if (!label.visible) return;
     label.getWorldPosition(projected);
     projected.project(camera);
     const x = (projected.x * 0.5 + 0.5) * window.innerWidth;
     const y = (-projected.y * 0.5 + 0.5) * window.innerHeight;
-    const maxWidth = mobile ? 130 : 220;
-    const fallbackWidth = (label.element.textContent.length * 6.2) + 16;
-    const width = Math.min(maxWidth, Math.max(32, label.element.offsetWidth || fallbackWidth));
-    const height = Math.max(21, label.element.offsetHeight || 21);
-    return { label, x, y, width, height, priority: label.userData.priority || 0, depth: projected.z };
-  }).sort((a, b) => b.priority - a.priority);
+    // Measure only labels that are on screen and not yet known. Culling runs
+    // before labelRenderer.render(), so a freshly built label is not in the
+    // document on its first pass and measures zero — cache that and the size is
+    // wrong for as long as the label lives. A culled label is display:none and
+    // measures zero too, so asking it costs a reflow and answers nothing.
+    // Everything else settles after one read and is never measured again.
+    if (!label.userData.measuredWidth && !label.element.classList.contains("hidden")) {
+      const measured = label.element.offsetWidth;
+      if (measured) {
+        label.userData.measuredWidth = Math.max(32, measured);
+        label.userData.measuredHeight = Math.max(21, label.element.offsetHeight || 21);
+      }
+    }
+    const estimatedWidth = (label.element.textContent.length * 6.2) + 16;
+    cullCandidates.push({
+      label,
+      x,
+      y,
+      width: Math.min(maxWidth, label.userData.measuredWidth || Math.max(32, estimatedWidth)),
+      height: label.userData.measuredHeight || 21,
+      priority: label.userData.priority || 0,
+      depth: projected.z,
+    });
+  });
+  const candidates = cullCandidates.sort((a, b) => b.priority - a.priority);
 
   candidates.forEach((candidate) => {
     const { label, x, y, width, height, depth } = candidate;
@@ -1885,8 +2068,22 @@ function cullLabels() {
   window.__persomeLabelHealth = { total: labels.length, shown, max: maxLabels };
 }
 
+// Each gl.readPixels blocks until the GPU catches up, so this 77-point sweep is
+// 77 pipeline stalls. It only latched once it saw something lit, and a viewer
+// whose model is empty, still loading, or has every layer toggled off never
+// does — so the render loop paid the whole sweep on every frame, forever, in
+// exactly the states where the owner is most likely to be poking at the
+// controls. The sweep is unchanged; it is now bounded, and it reuses one
+// buffer instead of allocating 77 per frame. It must stay inside the render
+// task: without `preserveDrawingBuffer` the pixels are only valid there.
+const RENDER_PROBE_MAX_SWEEPS = 30;
+const renderProbePixel = new Uint8Array(4);
+let renderProbeSweeps = 0;
+
 function samplePixels() {
   if (window.__persomeModelRender?.lit > 0) return;
+  if (renderProbeSweeps >= RENDER_PROBE_MAX_SWEEPS) return;
+  renderProbeSweeps += 1;
   const gl = renderer.getContext();
   const width = gl.drawingBufferWidth;
   const height = gl.drawingBufferHeight;
@@ -1894,13 +2091,12 @@ function samplePixels() {
   let checked = 0;
   for (let y = 1; y < 8; y += 1) {
     for (let x = 1; x < 12; x += 1) {
-      const pixel = new Uint8Array(4);
-      gl.readPixels(Math.floor(width * x / 12), Math.floor(height * y / 8), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+      gl.readPixels(Math.floor(width * x / 12), Math.floor(height * y / 8), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, renderProbePixel);
       checked += 1;
-      if (pixel[0] + pixel[1] + pixel[2] > 96) lit += 1;
+      if (renderProbePixel[0] + renderProbePixel[1] + renderProbePixel[2] > 96) lit += 1;
     }
   }
-  window.__persomeModelRender = { width, height, checked, lit };
+  window.__persomeModelRender = { width, height, checked, lit, sweeps: renderProbeSweeps };
   canvasHost.dataset.litPixels = String(lit);
 }
 
@@ -1930,6 +2126,93 @@ zoomResetButton.addEventListener("click", () => requestZoom(100));
 zoomInButton.addEventListener("click", () => stepZoom(1));
 controls.addEventListener("start", () => {
   zoomGoalDistance = null;
+  zoomAnchor = null;
+});
+
+// Zoom input lives on the whole viewer, not just the canvas: the topbar, the
+// legend and the status strip cover a good part of the screen, and a wheel that
+// lands on one of them used to fall through to the browser instead of the
+// model. The drawer is a real scroll container, so it keeps its own wheel.
+function anchorFromClient(clientX, clientY) {
+  // Cached: a trackpad delivers wheel events faster than the display refreshes,
+  // and this rect only moves when the window does.
+  if (!canvasBounds) canvasBounds = renderer.domElement.getBoundingClientRect();
+  const bounds = canvasBounds;
+  if (!bounds.width || !bounds.height) return null;
+  zoomAnchorNdc.set(
+    ((clientX - bounds.left) / bounds.width) * 2 - 1,
+    -((clientY - bounds.top) / bounds.height) * 2 + 1,
+  );
+  return zoomAnchorNdc;
+}
+
+// Safari reports a trackpad pinch as its own gesture events and never as a
+// ctrlKey wheel, so a viewer that only listens for the wheel has no pinch at
+// all there. These listeners are registered unconditionally: engines that do
+// not implement the events simply never fire them, which is cheaper and more
+// honest than sniffing for a vendor hook whose name has moved around.
+let gestureScale = 0;
+let gestureSeenAt = 0;
+const gestureAnchor = new THREE.Vector2();
+const GESTURE_IDLE_MS = 400;
+
+// A gesture whose `gestureend` never arrives must not wedge the wheel off for
+// the rest of the session, so an idle gesture is treated as finished.
+function gestureInFlight() {
+  if (!gestureScale) return false;
+  if (performance.now() - gestureSeenAt < GESTURE_IDLE_MS) return true;
+  gestureScale = 0;
+  return false;
+}
+
+// Capture phase on the whole viewer, so this runs before OrbitControls' own
+// wheel listener on the canvas and stops the event reaching it. That leaves
+// OrbitControls' touch and middle-button dolly intact while the wheel — the
+// path with the bad normalisation and no damping — belongs to the viewer. It
+// also means a wheel over the topbar, legend or status strip zooms the model
+// instead of falling through to the browser.
+viewerEl.addEventListener("wheel", (event) => {
+  // The drawer and the line picker are real scroll containers; leave them be.
+  if (event.target.closest?.(".detail, .line-explorer")) return;
+  event.stopPropagation();
+  // If a gesture is in flight this wheel is the same fingers counted twice.
+  if (gestureInFlight()) return;
+  // Chrome and Firefox report a trackpad pinch as a wheel with ctrlKey set,
+  // which is also the browser's own page-zoom chord: without preventDefault the
+  // page would zoom instead of the model.
+  event.preventDefault();
+  pauseAutoRotate();
+  requestZoomBy(
+    zoomMath.wheelFactor(event, window.innerHeight),
+    anchorFromClient(event.clientX, event.clientY),
+  );
+}, { passive: false, capture: true });
+
+viewerEl.addEventListener("gesturestart", (event) => {
+  if (event.target.closest?.(".detail, .line-explorer")) return;
+  event.preventDefault();
+  gestureScale = 1;
+  gestureSeenAt = performance.now();
+  if (anchorFromClient(event.clientX, event.clientY)) gestureAnchor.copy(zoomAnchorNdc);
+  else gestureAnchor.set(0, 0);
+  pauseAutoRotate();
+});
+viewerEl.addEventListener("gesturechange", (event) => {
+  if (!gestureScale) return;
+  event.preventDefault();
+  gestureSeenAt = performance.now();
+  const scale = Number(event.scale);
+  if (!Number.isFinite(scale) || scale <= 0) return;
+  // `scale` is cumulative since gesturestart, so the step is the ratio since
+  // the last event — which composes into the same goal a wheel stream would.
+  zoomAnchorNdc.copy(gestureAnchor);
+  requestZoomBy(scale / gestureScale, zoomAnchorNdc);
+  gestureScale = scale;
+});
+viewerEl.addEventListener("gestureend", (event) => {
+  if (!gestureScale) return;
+  event.preventDefault();
+  gestureScale = 0;
 });
 document.getElementById("reset").addEventListener("click", resetCamera);
 document.getElementById("close-detail").addEventListener("click", clearSelection);
@@ -1969,8 +2252,11 @@ function pickAt(event) {
     x: event.clientX - bounds.left,
     y: event.clientY - bounds.top,
   };
+  // Projecting into a shared scratch vector rather than cloning per candidate:
+  // hover picking runs on the frame after every pointer move, over every
+  // visible node, so a clone per node is a steady drip of garbage.
   const projectWorldPoint = (worldPosition) => {
-    const projected = worldPosition.clone().project(camera);
+    const projected = pickProjected.copy(worldPosition).project(camera);
     if (projected.z < -1 || projected.z > 1) return null;
     return {
       x: (projected.x + 1) * 0.5 * bounds.width,
@@ -1978,10 +2264,10 @@ function pickAt(event) {
       depth: projected.z,
     };
   };
-  const worldPosition = new THREE.Vector3();
-  const nodeCandidates = pickables.filter((object) => object.visible).map((object) => {
-    object.getWorldPosition(worldPosition);
-    const projected = projectWorldPoint(worldPosition);
+  const visiblePickables = pickables.filter((object) => object.visible);
+  const nodeCandidates = visiblePickables.map((object) => {
+    object.getWorldPosition(pickWorldPosition);
+    const projected = projectWorldPoint(pickWorldPosition);
     return projected ? { ...projected, target: object } : null;
   }).filter(Boolean);
   const screenNode = pickScreenTarget(
@@ -1995,10 +2281,7 @@ function pickAt(event) {
   pointer.x = (localPointer.x / bounds.width) * 2 - 1;
   pointer.y = -(localPointer.y / bounds.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
-  const meshHit = raycaster.intersectObjects(
-    pickables.filter((object) => object.visible),
-    false,
-  )[0];
+  const meshHit = raycaster.intersectObjects(visiblePickables, false)[0];
   if (meshHit) return meshHit;
 
   const lineCandidates = screenLinePickables.filter((object) => object.visible).map((object) => {
@@ -2022,33 +2305,76 @@ function pickAt(event) {
   return screenLine ? { object: screenLine } : null;
 }
 
+// How far a pointer may travel and still count as a click rather than a drag.
+// Measured as a real distance, not the sum of the axes, so a diagonal nudge is
+// not penalised twice; a finger wobbles far more than a mouse does.
+function clickSlopFor(pointerType) {
+  if (pointerType === "touch") return 12;
+  if (pointerType === "pen") return 8;
+  return 5;
+}
+
 renderer.domElement.addEventListener("pointerdown", (event) => {
-  pointerDown = { x: event.clientX, y: event.clientY };
+  // Every button counts as a live gesture: the right button pans and the middle
+  // button dollies, and neither wants hover picking running underneath it. Only
+  // the primary button can become a click.
+  livePointers.add(event.pointerId);
+  const primary = event.pointerType !== "mouse" || event.button === 0;
+  // A second finger means a pinch. Whatever the first finger was doing, it was
+  // not choosing a node, so retire the click candidate rather than letting the
+  // gesture end in an accidental selection.
+  pointerDown = primary && livePointers.size === 1
+    ? { x: event.clientX, y: event.clientY, type: event.pointerType }
+    : null;
+  if (livePointers.size > 1 || !primary) labelGesture = null;
   hoverDirty = false;
+  hoverPointer = null;
   renderer.domElement.style.cursor = "grabbing";
 });
 renderer.domElement.addEventListener("pointermove", (event) => {
-  if (pointerDown) return;
+  if (livePointers.size) return;
   hoverPointer = { clientX: event.clientX, clientY: event.clientY };
   hoverDirty = true;
 });
 renderer.domElement.addEventListener("pointerleave", () => {
   hoverPointer = null;
   hoverDirty = false;
-  if (!pointerDown) renderer.domElement.style.cursor = "grab";
+  if (!livePointers.size) renderer.domElement.style.cursor = "grab";
 });
+
+// Releases are pruned on the window, not the canvas. A gesture that began on a
+// label is captured by the canvas, but a second, uncaptured pointer releases
+// wherever it happens to be — on the label, on an overlay — and a pointer left
+// behind in the set would stop hover picking and the graph poll for good.
+window.addEventListener("pointerup", (event) => livePointers.delete(event.pointerId), true);
+window.addEventListener("pointercancel", (event) => livePointers.delete(event.pointerId), true);
+
 renderer.domElement.addEventListener("pointercancel", () => {
   pointerDown = null;
+  labelGesture = null;
   hoverPointer = null;
   hoverDirty = false;
   renderer.domElement.style.cursor = "grab";
 });
 renderer.domElement.addEventListener("pointerup", (event) => {
-  if (!pointerDown) return;
-  const movement = Math.abs(event.clientX - pointerDown.x) + Math.abs(event.clientY - pointerDown.y);
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+  const started = pointerDown;
+  const label = labelGesture;
   pointerDown = null;
-  if (movement > 5) {
+  labelGesture = null;
+  if (!started) return;
+  const dx = event.clientX - started.x;
+  const dy = event.clientY - started.y;
+  const slop = clickSlopFor(started.type);
+  if (dx * dx + dy * dy > slop * slop) {
     renderer.domElement.style.cursor = "grab";
+    return;
+  }
+  // A gesture that began on a label and stayed put is that label's click; the
+  // canvas captured the pointer, so the label never sees a click of its own.
+  if (label) {
+    renderer.domElement.style.cursor = "pointer";
+    showDetails(label.kind, label.item);
     return;
   }
   const hit = pickAt(event);
@@ -2100,6 +2426,7 @@ window.addEventListener("resize", () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   labelRenderer.setSize(window.innerWidth, window.innerHeight);
+  invalidatePanelBoxes();
   const portrait = window.innerWidth / window.innerHeight < 0.72;
   if (portrait !== portraitMode) resetCamera();
 });
@@ -2113,11 +2440,39 @@ window.addEventListener("unhandledrejection", (event) => {
   errorEl.hidden = false;
 });
 
+// A rolling window of how long each frame's own work took, so a smoothness
+// regression is a number somebody can read rather than a feeling. Written into
+// a pre-allocated ring: a probe that allocates every frame would measure itself.
+const FRAME_SAMPLE_COUNT = 240;
+const frameSamples = new Float32Array(FRAME_SAMPLE_COUNT);
+const frameSamplesSorted = new Float32Array(FRAME_SAMPLE_COUNT);
+let frameSampleIndex = 0;
+let frameSampleFilled = 0;
+window.__persomeFrameStats = { p50: 0, p95: 0, worst: 0, samples: 0 };
+
+function recordFrameCost(milliseconds) {
+  frameSamples[frameSampleIndex] = milliseconds;
+  frameSampleIndex = (frameSampleIndex + 1) % FRAME_SAMPLE_COUNT;
+  frameSampleFilled = Math.min(FRAME_SAMPLE_COUNT, frameSampleFilled + 1);
+  if (frameSampleIndex % 30 !== 0) return;
+  frameSamplesSorted.set(frameSamples);
+  const recent = frameSamplesSorted.subarray(0, frameSampleFilled);
+  recent.sort();
+  const stats = window.__persomeFrameStats;
+  stats.p50 = Number(recent[Math.floor(frameSampleFilled * 0.5)].toFixed(2));
+  stats.p95 = Number(recent[Math.floor(frameSampleFilled * 0.95)].toFixed(2));
+  stats.worst = Number(recent[frameSampleFilled - 1].toFixed(2));
+  stats.samples = frameSampleFilled;
+}
+
 function animate(frameTime = performance.now()) {
+  const frameStart = performance.now();
   const deltaSeconds = Math.min(Math.max((frameTime - lastFrameTime) / 1000, 0), 0.5);
   lastFrameTime = frameTime;
   applyZoomAnimation(deltaSeconds);
-  controls.update();
+  // Auto-rotate advances by wall time rather than by frame, so the model turns
+  // at one speed whether the display runs at 60Hz or 120Hz.
+  controls.update(deltaSeconds);
   syncZoomUI();
   const time = performance.now() * 0.001;
   if (!REDUCED_MOTION) {
@@ -2126,7 +2481,7 @@ function animate(frameTime = performance.now()) {
       glow.scale.setScalar(glow.userData.glowBase * pulse);
     });
   }
-  if (hoverDirty && hoverPointer && !pointerDown) {
+  if (hoverDirty && hoverPointer && !livePointers.size) {
     renderer.domElement.style.cursor = pickAt(hoverPointer) ? "pointer" : "grab";
     hoverDirty = false;
   }
@@ -2134,10 +2489,16 @@ function animate(frameTime = performance.now()) {
   renderer.render(scene, camera);
   labelRenderer.render(scene, camera);
   samplePixels();
+  recordFrameCost(performance.now() - frameStart);
   window.requestAnimationFrame(animate);
 }
 
 resetCamera();
 animate();
 await loadModel(true);
-window.setInterval(() => loadModel(false), 5000);
+window.setInterval(() => {
+  // Parsing a multi-megabyte snapshot and fingerprinting every Point takes long
+  // enough to drop frames. Never do it under the owner's finger.
+  if (livePointers.size) return;
+  loadModel(false);
+}, 5000);

@@ -146,8 +146,20 @@ local smoke tests.
 
 Zoom is relative to the fitted model: the visible minus, percentage, and plus controls cover 50%
 through 400%, the percentage resets to 100%, and the plus, minus, and zero keys provide the same
-actions. Wheel and trackpad pinch gestures zoom toward the pointer. `window.__persomeZoomState`
-exposes only aggregate distance and percentage values for local visual smoke tests.
+actions in 25% steps. Wheel and trackpad pinch gestures zoom continuously toward the pointer,
+gliding to their goal under the same damping that carries orbit and pan, so releasing a gesture
+coasts to a stop rather than stopping dead. Wheel deltas are normalized to pixels first, so a
+gesture means the same amount of zoom whether the browser reports pixels, lines, or pages, and one
+comfortable trackpad pinch is worth roughly a doubling on every display. A pinch is read from
+`ctrlKey` wheel events and, on browsers that report one instead, from gesture events; a touchscreen
+pinch and a middle-button drag keep the orbit controller's own dolly, which already tracks the
+fingers directly. `window.__persomeZoomState` exposes only aggregate distance and percentage values
+for local visual smoke tests.
+
+Dragging works anywhere over the model, including on a label and over the read-only legend and
+status panels, and a second finger cancels the click so a pinch never selects a node.
+`window.__persomeFrameStats` exposes rolling p50, p95, and worst frame costs in milliseconds over
+the last 240 frames, so a smoothness regression is measurable locally rather than only visible.
 
 ## Owner corrections
 
