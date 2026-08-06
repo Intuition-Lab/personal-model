@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from ..evomem.engine import EvoMemory
 from ..evomem.models import MemoryLayer
 from ..evomem.person_graph import _slug as _entity_slug
 from ..logger import get
+from ..model.edit import AUDIT_SESSION_ID as _OWNER_EDIT_SESSION
 from ..store import entries as entries_store
 from ..store import relation_edges as edges_store
 from ..store.relation_edges import EntityKind, Predicate
@@ -149,30 +151,40 @@ def _assertion_exists(conn: sqlite3.Connection, stored: str, text: str) -> bool:
 
 
 def _owner_withdrew(conn: sqlite3.Connection, stored: str, text: str) -> bool:
-    """Whether the owner already rejected this exact assertion.
+    """Whether the owner explicitly rejected this exact assertion.
 
     A withdrawn Point is not ``is_latest``, so the dedupe check above does not
     see it and the next observation of the same behaviour mints the claim again.
     "This is wrong about me" then lasts until the next time the owner does the
     thing — which is no rejection at all.
 
-    Re-observation is not new information here: the owner did not dispute that
-    the behaviour occurred, they disputed that it belongs in their model. A
-    differently-worded observation is unaffected, and the owner can always
-    re-add the fact deliberately.
+    Intent is read from the owner-edit audit trail rather than inferred from the
+    row's shape. A retired Point is ``shadow`` with a ``valid_until`` and no
+    successor — but so is one the orphan reaper collected after its TTL, and so
+    is anything else that retires a node without replacing it. Those are
+    housekeeping, not decisions: a fact that aged out must be free to come back
+    when the owner starts doing it again. Only an explicit rejection suppresses
+    re-minting, and only of the wording the owner actually rejected.
     """
     try:
-        row = conn.execute(
-            "SELECT 1 FROM evo_nodes"
-            " WHERE file_name = ? AND content = ? AND is_latest = 0"
-            "   AND valid_until IS NOT NULL"
-            "   AND (superseded_by IS NULL OR superseded_by = '[]')"
-            " LIMIT 1",
-            (stored, text),
-        ).fetchone()
-        return row is not None
+        rows = conn.execute(
+            "SELECT payload FROM memory_deltas WHERE session_id = ?",
+            (_OWNER_EDIT_SESSION,),
+        ).fetchall()
     except Exception:  # noqa: BLE001 — a dedupe miss must never break ingestion
         return False
+    for (payload,) in rows:
+        try:
+            edit = json.loads(payload or "{}").get("owner_edit") or {}
+        except (TypeError, ValueError):
+            continue
+        if (
+            edit.get("kind") == "point"
+            and edit.get("op") == "retire"
+            and str(edit.get("prior_text") or "").strip() == text.strip()
+        ):
+            return True
+    return False
 
 
 def _apply_assertions(

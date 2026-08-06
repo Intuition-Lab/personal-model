@@ -831,3 +831,41 @@ def test_compaction_refuses_to_strip_owner_authorship(ac_root) -> None:
     # Ordinary compression that keeps both markers is unaffected.
     compressed = before.replace("My own wording.", "My wording.")
     assert _owner_authorship_lost(before, compressed) == ""
+
+
+def test_an_orphan_reaped_fact_is_still_free_to_come_back(ac_root) -> None:
+    """Housekeeping is not a decision.
+
+    The orphan reaper retires an unreferenced Point after its TTL, producing the
+    same row shape as an owner rejection: shadow, end-dated, no successor.
+    Inferring intent from that shape would mean a fact that merely aged out
+    could never return, even once the owner starts doing it again.
+    """
+    from persome import config as config_mod
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.store import NodeStore
+    from persome.writer import delta_apply
+
+    text = "Alex works at Acme as a staff engineer."
+    point_id = _seed_point(text)
+
+    # Exactly what writer/orphan_reaper.py does to a TTL'd orphan.
+    EvoMemory().commit_retire(point_id, valid_until="2026-08-01T00:00:00+00:00")
+    assert NodeStore() is not None
+
+    with fts.cursor() as conn:
+        row = conn.execute(
+            "SELECT is_latest, valid_until, superseded_by FROM evo_nodes WHERE node_id = ?",
+            (point_id,),
+        ).fetchone()
+        assert row[0] == 0 and row[1] and row[2] in ("[]", None), "precondition: looks retired"
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {
+                "entities": [{"canonical": "Alex", "kind": "person"}],
+                "assertions": [{"subject": {"canonical": "Alex"}, "text": text}],
+            },
+        )
+
+    assert result.assertions_minted == 1, "an aged-out fact must be free to return"

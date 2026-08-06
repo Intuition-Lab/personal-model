@@ -49,7 +49,9 @@ OPS: frozenset[str] = frozenset({"rewrite", "retire"})
 # appear here — they live in `evo_nodes` and take the supersede path.
 _LEVEL_BY_KIND: dict[str, int] = {"face": 1, "volume": 2, "root": 3}
 
-_AUDIT_SESSION_ID = "owner-edit"
+# The audit trail is the record of owner intent, so its session id is part of
+# the contract between the editor and anything that must respect a decision.
+AUDIT_SESSION_ID = "owner-edit"
 MAX_REPLACEMENT_CHARS = 4_000
 MAX_REASON_CHARS = 500
 
@@ -170,7 +172,7 @@ def _audit(
     try:
         memory_deltas.insert(
             conn,
-            session_id=_AUDIT_SESSION_ID,
+            session_id=AUDIT_SESSION_ID,
             payload={
                 "owner_edit": {
                     "kind": kind,
