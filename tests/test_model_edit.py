@@ -7,6 +7,7 @@ used to overwrite anything a human wrote.
 from __future__ import annotations
 
 import json
+import pathlib
 import sqlite3
 from types import SimpleNamespace
 
@@ -1038,3 +1039,56 @@ def test_a_point_backed_by_nothing_is_refused(ac_root) -> None:
             conn, kind="point", target_id=point_id, op="rewrite", replacement="Mine."
         )
     assert not result.ok and result.reason == "point_file_missing"
+
+
+def test_the_snapshot_says_which_points_can_be_corrected(ac_root) -> None:
+    """The viewer must not advertise an edit the writer refuses. On a real model
+    that was 46% of the Points on screen — each inviting a correction and then
+    declining it."""
+    original = "Alex reserves mornings for focused writing."
+    point_id = _seed_point(original)
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        snapshot = build_snapshot(conn, redact=False)
+
+    by_id = {p["id"]: p for p in snapshot["points"]}
+    # The superseded predecessor is still projected (it anchors the evolution
+    # Line) but must not be offered for correction.
+    assert by_id[point_id]["edit_refusal"] == "point_superseded"
+    assert by_id[result.new_id]["edit_refusal"] == ""
+
+
+def test_the_snapshot_marks_unpromoted_patterns_as_unrewritable(ac_root) -> None:
+    with fts.cursor() as conn:
+        shadow = sf.record_face(
+            conn, source=sf.PROVENANCE_MINED, signature="A tentative pattern.", members=["m1"]
+        )
+        active = _seed_face("A settled pattern.")
+        conn.execute("UPDATE schema_faces SET status='shadow' WHERE face_id=?", (shadow,))
+        snapshot = build_snapshot(conn, redact=False)
+
+    by_id = {f["id"]: f for f in snapshot["faces"]}
+    assert by_id[active]["edit_refusal"] == ""
+    assert shadow not in by_id, "a shadow Face is not projected at all"
+
+
+def test_every_refusal_reason_the_snapshot_emits_is_explained(ac_root) -> None:
+    """A reason the viewer cannot translate would reach the owner as a slug."""
+    import re
+
+    viewer = (
+        pathlib.Path(__file__).resolve().parents[1] / "resources/model_assets/viewer.js"
+    ).read_text(encoding="utf-8")
+    explained = set(re.findall(r"^\s{2}([a-z_]+):", viewer, re.MULTILINE))
+    emitted = {
+        "point_has_no_file",
+        "point_not_editable_in_this_file",
+        "point_archived",
+        "point_already_retired",
+        "point_superseded",
+        "point_file_missing",
+        "object_not_active",
+    }
+    assert emitted <= explained, f"unexplained: {sorted(emitted - explained)}"

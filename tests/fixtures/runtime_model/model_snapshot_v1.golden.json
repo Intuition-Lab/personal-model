@@ -28,10 +28,11 @@
     "trigger"
   ],
   "point": [
-    "conflicted",
     "confidence",
+    "conflicted",
     "content",
     "created_at",
+    "edit_refusal",
     "file_name",
     "id",
     "is_latest",
@@ -75,6 +76,7 @@
     "anchors",
     "confidence",
     "created_at",
+    "edit_refusal",
     "id",
     "level",
     "member_receipts",

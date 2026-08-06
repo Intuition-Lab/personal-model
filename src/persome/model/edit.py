@@ -173,6 +173,60 @@ def _point_backing(conn: sqlite3.Connection, file_name: str) -> str | None:
     return "evomem" if row is not None else None
 
 
+def backing_map(conn: sqlite3.Connection, file_names: set[str]) -> dict[str, str | None]:
+    """Resolve the backing of many files at once.
+
+    The snapshot needs this for every projected Point, so it must not be one
+    query per Point. Markdown presence is a stat per distinct file; the `files`
+    table is read in a single pass.
+    """
+    known: set[str] = set()
+    try:
+        known = {str(r[0]) for r in conn.execute("SELECT path FROM files")}
+    except sqlite3.Error:
+        known = set()
+    out: dict[str, str | None] = {}
+    for name in file_names:
+        try:
+            on_disk = files_mod.memory_path(name).is_file()
+        except Exception:  # noqa: BLE001
+            out[name] = None
+            continue
+        out[name] = "markdown" if on_disk else ("evomem" if name in known else None)
+    return out
+
+
+def point_refusal(
+    *,
+    file_name: str,
+    status: str,
+    is_latest: bool,
+    valid_until: str | None,
+    superseded_by_empty: bool,
+    backing: str | None,
+) -> str:
+    """Why this Point cannot be corrected, or ``""`` when it can.
+
+    The same rules `_edit_point` enforces, in a form the snapshot can evaluate
+    for every Point it projects. The viewer must not offer an action the writer
+    will refuse: on a real model that was 46% of the Points on screen, each one
+    inviting a correction and then declining it.
+    """
+    if not file_name:
+        return "point_has_no_file"
+    if not _point_file_is_editable(file_name):
+        return "point_not_editable_in_this_file"
+    if status == "archived":
+        return "point_archived"
+    if valid_until and not is_latest and superseded_by_empty:
+        return "point_already_retired"
+    if not is_latest:
+        return "point_superseded"
+    if backing is None:
+        return "point_file_missing"
+    return ""
+
+
 def _semantic_tags(raw: str) -> list[str]:
     """Split an ``evo_nodes.tags`` cell into its semantic tags, minus our marker.
 

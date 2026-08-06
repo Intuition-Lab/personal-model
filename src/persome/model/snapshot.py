@@ -226,6 +226,9 @@ def _schema_item(
         "status": row["status"],
         "valid_from": row["valid_from"],
         "created_at": row["created_at"],
+        # A pattern that has not been promoted cannot have its wording pinned
+        # (no promotion gate accepts `authored`), but it can still be rejected.
+        "edit_refusal": "" if row["status"] == "active" else "object_not_active",
     }
 
 
@@ -327,6 +330,12 @@ def build_snapshot(
     point_rows = _point_rows(conn)
     from ..store.schema_faces import member_key
 
+    # The viewer must not offer a correction the writer will refuse, so
+    # editability is decided here, once, by the module that owns the rules.
+    from .edit import backing_map, point_refusal
+
+    backings = backing_map(conn, {str(row["file_name"] or "") for row in point_rows} - {""})
+
     raw_content: dict[str, str] = {str(row["node_id"]): _visible_content(row) for row in point_rows}
     # The body exactly as stored, supersede marker included — what the schema
     # miner reads when it computes the member keys a Face records.
@@ -370,6 +379,14 @@ def build_snapshot(
                 "valid_until": row["valid_until"],
                 "created_at": row["gmt_created"],
                 "receipt": receipt,
+                "edit_refusal": point_refusal(
+                    file_name=str(row["file_name"] or ""),
+                    status=str(row["status"] or ""),
+                    is_latest=bool(row["is_latest"]),
+                    valid_until=row["valid_until"],
+                    superseded_by_empty=not _json_list(row["superseded_by"]),
+                    backing=backings.get(str(row["file_name"] or "")),
+                ),
             }
         )
 

@@ -1252,7 +1252,11 @@ function appendLineTechnicalDetails(item) {
 const EDITABLE_KINDS = new Set(["point", "face", "volume", "root"]);
 
 function isEditable(kind, item) {
-  return Boolean(item) && EDITABLE_KINDS.has(kind) && Boolean(item.id);
+  // The server decides. It knows which layer backs a Point, whether a newer
+  // version exists, and whether a pattern has been promoted; the client would
+  // be guessing. Offering an edit the writer refuses is worse than not
+  // offering one — on a real model that was 46% of the Points on screen.
+  return Boolean(item) && EDITABLE_KINDS.has(kind) && Boolean(item.id) && !item.edit_refusal;
 }
 
 function editableText(kind, item) {
@@ -1263,6 +1267,9 @@ function editableText(kind, item) {
 // nothing: they did not choose the reason, and most of these are about the
 // state of their store rather than about what they typed.
 const EDIT_REFUSALS = {
+  point_has_no_file:
+    "This fact is not filed under any memory, so there is nothing to correct"
+    + " it in.",
   point_file_missing:
     "The memory file behind this fact is missing from disk, so it cannot be"
     + " corrected. Run `persome doctor` — the index and your Markdown have"
@@ -1494,7 +1501,11 @@ detailRejectEl.addEventListener("click", () => {
   submitEdit(selected.kind, selectedItem, "retire", "", "");
 });
 
-function uneditableNote(kind) {
+function uneditableNote(kind, item) {
+  // A refusal the server already computed explains itself better than a
+  // generic "not editable here".
+  const refusal = item?.edit_refusal;
+  if (refusal && EDIT_REFUSALS[refusal]) return EDIT_REFUSALS[refusal];
   if (kind === "context") {
     return "An entity your model refers to — a person, project, tool, or file."
       + " It is the far end of a relation, not a claim about you, so there is"
@@ -1515,14 +1526,19 @@ function renderEditor(kind, item) {
   detailRejectEl.disabled = editInFlight;
 
   const editable = isEditable(kind, item);
+  // Rejecting is a separate capability: a pattern that cannot be reworded can
+  // still be withdrawn.
+  const rejectable = Boolean(item?.id)
+    && EDITABLE_KINDS.has(kind)
+    && (editable || item.edit_refusal === "object_not_active");
   detailTitleEl.dataset.editable = String(editable);
-  detailActionsEl.hidden = !editable;
+  detailActionsEl.hidden = !rejectable;
   // Say what a node IS when it cannot be corrected. "Nothing to edit here" only
   // tells the owner what they cannot do; an entity or a Line is not a claim
   // about them at all, and that is the useful thing to know.
   detailHintEl.innerHTML = editable
     ? "Click the text to rewrite it in your own words."
-    : uneditableNote(kind);
+    : uneditableNote(kind, item);
   detailHintEl.hidden = !detailHintEl.innerHTML;
   // Focusable, so a keyboard user can reach the claim and press Enter to edit
   // it — but never `role="button"`. That would override the heading role and

@@ -122,6 +122,12 @@ A Face is one active level-1 `schema_faces` row. It contains a behavioral
 signature, members, observations, confidence, provenance, anchors, and source
 receipts. Promotion requires stable repeated support.
 
+Every projected Point and schema object carries `edit_refusal`: an empty string when the owner can
+correct it, otherwise a stable reason code naming why not — a newer version exists, the object was
+withdrawn, the pattern is not promoted, or nothing backs the Point. Readers should treat a non-empty
+value as "do not offer a correction here" rather than deriving that themselves; the Runtime knows
+which layer backs each object and whether a newer version exists, and a client does not.
+
 `provenance` names which extractor reached the object: `mined`, `emergent`,
 `both`, or `synth` for a synthesized Root. The value `authored` means the
 memory owner replaced the signature by hand. Derivation continues under an
