@@ -148,17 +148,60 @@ def _row_face(conn: sqlite3.Connection, face_id: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM schema_faces WHERE face_id = ?", (face_id,)).fetchone()
 
 
+def displaced_signatures(conn: sqlite3.Connection) -> dict[str, str]:
+    """Normalized wordings the owner has corrected a live object away from,
+    mapped to the object that displaced them.
+
+    An authored object's signature no longer matches what the miner produces, so
+    signature equality — the anchor that normally absorbs ordinary membership
+    drift — stops working for it. Its own history is the replacement anchor.
+    Read from the owner-edit audit trail; fail-open, since losing this only
+    weakens matching back to the footprint test.
+    """
+    out: dict[str, str] = {}
+    try:
+        rows = conn.execute(
+            "SELECT payload FROM memory_deltas WHERE session_id = 'owner-edit' ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error:
+        return out
+    for (payload,) in rows:
+        try:
+            edit = json.loads(payload or "{}").get("owner_edit") or {}
+        except (TypeError, ValueError):
+            continue
+        if edit.get("op") != "rewrite" or edit.get("kind") not in ("face", "volume", "root"):
+            continue
+        prior = _norm_sig(str(edit.get("prior_text") or ""))
+        target = str(edit.get("target_id") or "")
+        if prior and target:
+            out[prior] = target
+    return out
+
+
 def _find_match(
     conn: sqlite3.Connection, *, signature: str, members: set[str], level: int
 ) -> sqlite3.Row | None:
     """Same-face detection: normalized-signature equality OR footprint Jaccard
-    ≥ MATCH_JACCARD against any live face at the same level."""
+    ≥ MATCH_JACCARD against any live face at the same level.
+
+    An authored object also matches the wording it displaced. Without that, a
+    re-mine still producing the original proposition finds nothing to fold onto
+    once membership has drifted past the Jaccard floor, and derivation
+    republishes the very claim the owner corrected away as a brand-new face
+    beside their own.
+    """
     conn.row_factory = sqlite3.Row
     sig = _norm_sig(signature)
-    for row in conn.execute(
+    displaced = displaced_signatures(conn) if sig else {}
+    rows = conn.execute(
         "SELECT * FROM schema_faces WHERE valid_to IS NULL AND level = ?", (level,)
-    ).fetchall():
+    ).fetchall()
+    displaced_target = displaced.get(sig)
+    for row in rows:
         if sig and _norm_sig(row["signature"]) == sig:
+            return row
+        if displaced_target and row["face_id"] == displaced_target:
             return row
         if _jaccard(members, set(json.loads(row["members"]))) >= MATCH_JACCARD:
             return row

@@ -136,6 +136,19 @@ def _point_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return kept
 
 
+def _owner_edit_count(conn: sqlite3.Connection) -> int:
+    """Number of owner corrections recorded in the audit trail. Fail-open."""
+    if not _table_exists(conn, "memory_deltas"):
+        return 0
+    try:
+        row = conn.execute(
+            "SELECT count(*) FROM memory_deltas WHERE session_id = 'owner-edit'"
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
 def _visible_content(row: sqlite3.Row) -> str:
     """A Point's fact body, without the structural supersede marker.
 
@@ -546,6 +559,11 @@ def build_snapshot(
             "volumes": len(volumes),
             "roots": len(roots),
             "receipts": len(receipts),
+            # How many corrections the owner has made. A monotonic count, so any
+            # reader holding a rendered copy of the model can tell that the owner
+            # has changed it since — which build metadata alone cannot express,
+            # because an edit does not start a build.
+            "owner_edits": _owner_edit_count(conn),
             "redactions": dict(sorted(redactor.counts.items())),
         },
     }

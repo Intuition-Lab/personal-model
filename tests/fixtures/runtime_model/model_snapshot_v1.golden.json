@@ -101,6 +101,7 @@
     "active_points",
     "evolution_lines",
     "faces",
+    "owner_edits",
     "points",
     "receipts",
     "redactions",

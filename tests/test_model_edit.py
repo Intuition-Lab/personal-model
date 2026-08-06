@@ -1027,18 +1027,24 @@ def test_an_evo_native_point_is_correctable(ac_root) -> None:
     assert OWNER_EDIT_TAG in str(row[1]).split()
 
 
-def test_a_point_backed_by_nothing_is_refused(ac_root) -> None:
-    """No Markdown and no files row means the Point is a remnant."""
-    point_id = _seed_point()
+def test_a_point_the_engine_holds_is_correctable_even_unregistered(ac_root) -> None:
+    """`delta_apply` mints Points into evo_nodes with no Markdown and no files
+    row. The engine already owns those files; they are simply unregistered, and
+    the evomem writer registers them on write. Refusing them would leave every
+    newly observed entity fact permanently uncorrectable.
+    """
     from persome.store import files as files_mod
 
+    point_id = _seed_point()
     files_mod.memory_path("person-alex.md").unlink()
     with fts.cursor() as conn:
         conn.execute("DELETE FROM files WHERE path = 'person-alex.md'")
         result = apply_model_edit(
             conn, kind="point", target_id=point_id, op="rewrite", replacement="Mine."
         )
-    assert not result.ok and result.reason == "point_file_missing"
+        registered = conn.execute("SELECT 1 FROM files WHERE path = 'person-alex.md'").fetchone()
+    assert result.ok, f"expected a correction, got {result.reason}"
+    assert registered is not None, "the engine-owned file must be registered on write"
 
 
 def test_the_snapshot_says_which_points_can_be_corrected(ac_root) -> None:
@@ -1206,3 +1212,170 @@ def test_a_correction_is_not_re_minted_as_a_duplicate(ac_root) -> None:
         )
     assert result.assertions_minted == 0
     assert result.assertions_seen == 1
+
+
+def test_two_concurrent_corrections_cannot_fork_the_chain(ac_root) -> None:
+    """The head check and the write have to be one decision.
+
+    Separated, two overlapping corrections both believe they hold the chain
+    head and both commit, producing exactly the forked chain — two live
+    successors of one fact — that the guard exists to prevent.
+    """
+    import threading
+
+    point_id = _seed_point()
+    results: list[object] = []
+    barrier = threading.Barrier(2)
+
+    def correct(text: str) -> None:
+        barrier.wait()
+        with fts.cursor() as conn:
+            results.append(
+                apply_model_edit(
+                    conn, kind="point", target_id=point_id, op="rewrite", replacement=text
+                )
+            )
+
+    threads = [
+        threading.Thread(target=correct, args=("First wording.",)),
+        threading.Thread(target=correct, args=("Second wording.",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert all(not t.is_alive() for t in threads), "an owner edit must never deadlock"
+
+    assert len(results) == 2
+    accepted = [r for r in results if r.ok]
+    assert len(accepted) == 1, "exactly one correction may win the head"
+    assert [r.reason for r in results if not r.ok] == ["point_superseded"]
+
+    with fts.cursor() as conn:
+        successors = conn.execute(
+            "SELECT superseded_by FROM evo_nodes WHERE node_id = ?", (point_id,)
+        ).fetchone()[0]
+        heads = conn.execute(
+            "SELECT count(*) FROM evo_nodes WHERE is_latest = 1 AND file_name = 'person-alex.md'"
+        ).fetchone()[0]
+    assert len(json.loads(successors)) == 1, f"chain forked: {successors}"
+    assert heads == 1
+
+
+# ── the whole matrix, through the real route ──────────────────────────────
+
+
+def test_no_target_state_can_produce_a_server_error(ac_root) -> None:
+    """Every reachable target and operation, through the HTTP surface.
+
+    The bar is not "most edits work": it is that no state of any target
+    produces a 500, and every refusal is a reason the viewer can explain in
+    words. A 500 on this surface is indistinguishable from the feature being
+    broken.
+    """
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.models import MemoryLayer
+    from persome.model.edit import KINDS, OPS
+
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        evo_native = EvoMemory().add_direct(
+            "An evo-native assertion.",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-sam",
+            tags="fact",
+        )
+        face = _seed_face("A settled pattern.")
+        volume = _seed_face("A cross-domain structure.", level=2)
+        root = _seed_face("An apex.", level=3)
+        shadow = sf.record_face(
+            conn, source=sf.PROVENANCE_MINED, signature="A tentative one.", members=["z1"]
+        )
+
+    client = TestClient(build_api_app(auth_enabled=False))
+    targets = [
+        ("point", point_id),
+        ("point", evo_native),
+        ("point", "no-such-point"),
+        ("face", face),
+        ("face", shadow),
+        ("face", "no-such-face"),
+        ("volume", volume),
+        ("volume", face),  # level mismatch
+        ("root", root),
+        ("root", volume),  # level mismatch
+    ]
+
+    seen_refusals: set[str] = set()
+    for kind in sorted(KINDS):
+        for target_kind, target_id in targets:
+            if target_kind != kind:
+                continue
+            for op in sorted(OPS):
+                body = {"schema_version": 1, "kind": kind, "id": target_id, "op": op}
+                if op == "rewrite":
+                    body["replacement"] = "Owner wording for this object."
+                response = client.post("/model/edit", json=body)
+                assert response.status_code != 500, (
+                    f"{kind}/{op} on {target_id} returned 500: {response.text[:200]}"
+                )
+                assert response.status_code in (200, 400), (
+                    f"{kind}/{op} returned {response.status_code}"
+                )
+                if response.status_code == 400:
+                    seen_refusals.add(response.json()["detail"])
+
+    # Whatever refusals this matrix reached must all be explainable.
+    viewer = (
+        pathlib.Path(__file__).resolve().parents[1] / "resources/model_assets/viewer.js"
+    ).read_text(encoding="utf-8")
+    for reason in seen_refusals:
+        assert f"  {reason}:" in viewer, f"refusal {reason!r} has no explanation in the viewer"
+
+
+def test_the_snapshot_and_the_writer_never_disagree(ac_root) -> None:
+    """What the viewer offers and what the writer accepts must be the same set.
+
+    Both directions are bugs: advertising an edit that fails wastes the owner's
+    typing, and refusing one that would have worked hides a correction they are
+    entitled to make.
+    """
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.models import MemoryLayer
+
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        EvoMemory().add_direct(
+            "An evo-native assertion.",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-sam",
+            tags="fact",
+        )
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="Corrected."
+        )
+        assert first.ok
+        snapshot = build_snapshot(conn, redact=False)
+
+    client = TestClient(build_api_app(auth_enabled=False))
+    checked = 0
+    for point in snapshot["points"]:
+        advertised = not point["edit_refusal"]
+        response = client.post(
+            "/model/edit",
+            json={
+                "schema_version": 1,
+                "kind": "point",
+                "id": point["id"],
+                "op": "rewrite",
+                "replacement": f"Owner wording {point['id'][:6]}.",
+            },
+        )
+        assert response.status_code != 500
+        accepted = response.status_code == 200
+        assert accepted == advertised, (
+            f"{point['id']}: snapshot said {'editable' if advertised else point['edit_refusal']},"
+            f" writer returned {response.status_code}"
+        )
+        checked += 1
+    assert checked >= 2

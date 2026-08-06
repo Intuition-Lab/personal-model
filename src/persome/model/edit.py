@@ -170,9 +170,86 @@ def _point_backing(conn: sqlite3.Connection, file_name: str) -> str | None:
         return "markdown"
     try:
         row = conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (file_name,)).fetchone()
+        if row is not None:
+            return "evomem"
+        # No Markdown and no registry row, but the engine is already storing
+        # nodes under this name — which is how `delta_apply` mints every entity
+        # and assertion Point. The file is the engine's; it simply has not been
+        # registered yet, and the evomem writer registers it on write.
+        held = conn.execute(
+            "SELECT 1 FROM evo_nodes WHERE file_name = ? LIMIT 1", (file_name,)
+        ).fetchone()
     except sqlite3.Error:
         return None
-    return "evomem" if row is not None else None
+    return "evomem" if held is not None else None
+
+
+def _ensure_registered(conn: sqlite3.Connection, file_name: str) -> None:
+    """Give an engine-owned file its registry row if it has none.
+
+    `evo_inversion.supersede_entry` refuses a file with neither Markdown nor a
+    `files` row, even though its own `_finish_file_write` creates that row on
+    the way out. Points minted straight into `evo_nodes` therefore arrive
+    uncorrectable. Registering the file the engine is already storing nodes for
+    invents no content — the row describes where the nodes live.
+    """
+    from ..store import fts as fts_store
+
+    try:
+        if (
+            conn.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (file_name,)).fetchone()
+            is not None
+        ):
+            return
+        prefix = files_mod.validate_prefix(file_name)
+        count = conn.execute(
+            "SELECT count(*) FROM evo_nodes WHERE file_name = ? AND is_latest = 1", (file_name,)
+        ).fetchone()
+        today = files_mod.today()
+        fts_store.upsert_file(
+            conn,
+            fts_store.FileRow(
+                path=file_name,
+                prefix=prefix,
+                description="",
+                tags="",
+                status="active",
+                entry_count=int(count[0] or 0) if count else 0,
+                created=today,
+                updated=today,
+                needs_compact=0,
+            ),
+        )
+    except Exception:  # noqa: BLE001 — the writer's own guard still applies
+        logger.exception("could not register %s before an owner edit", _loggable(file_name))
+
+
+def _owner_edit_lock():
+    """Serialize owner corrections against each other.
+
+    Deliberately NOT the memory file's own lock: the writers take that one
+    themselves and it is a plain `threading.Lock`, so holding it across the call
+    deadlocks. A separate sentinel path gives mutual exclusion between owner
+    edits without touching the writers' locking.
+
+    In-process only, like every lock in this store. The daemon serves every HTTP
+    correction, so that covers the case this guards — a second correction
+    arriving while the first is still deciding whether it holds the chain head.
+    """
+    from .. import paths
+
+    return files_mod.file_lock(paths.root() / ".owner-edit.lock")
+
+
+def _lost_the_head(conn: sqlite3.Connection, node_id: str) -> bool:
+    """Whether this Point stopped being the chain head since it was first read."""
+    try:
+        row = conn.execute(
+            "SELECT is_latest FROM evo_nodes WHERE node_id = ? LIMIT 1", (node_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None and not int(row["is_latest"] or 0)
 
 
 def _has_live_successor(conn: sqlite3.Connection, superseded_by: object) -> bool:
@@ -229,8 +306,16 @@ def backing_map(conn: sqlite3.Connection, file_names: set[str]) -> dict[str, str
     table is read in a single pass.
     """
     known: set[str] = set()
+    held: set[str] = set()
     try:
         known = {str(r[0]) for r in conn.execute("SELECT path FROM files")}
+        # Files the engine stores nodes under, registered or not. Must mirror
+        # `_point_backing`, or the snapshot advertises a refusal the writer
+        # would not make — the same disagreement, pointing the other way.
+        held = {
+            str(r[0])
+            for r in conn.execute("SELECT DISTINCT file_name FROM evo_nodes WHERE file_name != ''")
+        }
     except sqlite3.Error:
         known = set()
     out: dict[str, str | None] = {}
@@ -240,7 +325,12 @@ def backing_map(conn: sqlite3.Connection, file_names: set[str]) -> dict[str, str
         except Exception:  # noqa: BLE001
             out[name] = None
             continue
-        out[name] = "markdown" if on_disk else ("evomem" if name in known else None)
+        if on_disk:
+            out[name] = "markdown"
+        elif name in known or name in held:
+            out[name] = "evomem"
+        else:
+            out[name] = None
     return out
 
 
@@ -408,6 +498,8 @@ def _edit_point(
     tags = _semantic_tags(row["tags"])
 
     writer = entries if backing == "markdown" else evo_inversion
+    if backing == "evomem":
+        _ensure_registered(conn, file_name)
 
     if op == "rewrite":
         new_id = writer.supersede_entry(
@@ -543,9 +635,13 @@ def apply_model_edit(
 
     misses_before = evo_shadow.miss_count()
     if kind == "point":
-        result = _edit_point(
-            conn, target_id=target_id, op=op, replacement=replacement, reason=reason
-        )
+        # The head check and the write must not be separated by another
+        # correction, or two edits both believe they hold the chain head and
+        # the chain forks into two live successors of one fact.
+        with _owner_edit_lock():
+            result = _edit_point(
+                conn, target_id=target_id, op=op, replacement=replacement, reason=reason
+            )
     else:
         result = _edit_schema_object(
             conn, kind=kind, target_id=target_id, op=op, replacement=replacement

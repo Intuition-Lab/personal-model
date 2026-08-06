@@ -159,6 +159,7 @@ def test_fresh_root_snapshot_has_complete_geometry_and_receipts(ac_root, monkeyp
         "volumes": 1,
         "roots": 1,
         "receipts": 5,
+        "owner_edits": 0,
         "redactions": {},
     }
     assert snapshot["root"]["id"] == seeded["root_id"]
