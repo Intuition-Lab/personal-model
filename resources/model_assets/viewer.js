@@ -1439,12 +1439,14 @@ function renderEditor(kind, item) {
     ? "Click the text to rewrite it in your own words."
     : uneditableNote(kind);
   detailHintEl.hidden = !detailHintEl.innerHTML;
+  // Focusable, so a keyboard user can reach the claim and press Enter to edit
+  // it — but never `role="button"`. That would override the heading role and
+  // leave the drawer with no heading at all, which is the one landmark a screen
+  // reader user navigates it by. `aria-describedby` carries the affordance.
   if (editable) {
-    detailTitleEl.setAttribute("role", "button");
     detailTitleEl.setAttribute("title", "Click to correct this in your own words");
     detailTitleEl.tabIndex = 0;
   } else {
-    detailTitleEl.removeAttribute("role");
     detailTitleEl.removeAttribute("title");
     detailTitleEl.removeAttribute("tabindex");
   }

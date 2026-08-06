@@ -91,7 +91,7 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       <button id="close-detail" class="icon-button close" type="button" aria-label="Close" title="Close (Esc)">×</button>
       <p class="detail-eyebrow"><span id="detail-kind" class="detail-kind"></span><span id="detail-provenance">Evidence-backed</span></p>
 
-      <h1 id="detail-title" class="detail-claim" tabindex="0" role="button" aria-describedby="detail-hint"></h1>
+      <h1 id="detail-title" class="detail-claim" aria-describedby="detail-hint"></h1>
       <textarea id="detail-claim-input" class="detail-claim detail-claim-input" rows="1" maxlength="4000" aria-label="Edit this claim in your own words" hidden></textarea>
       <p id="detail-hint" class="detail-hint" hidden></p>
       <p id="detail-status" class="detail-status" role="status"></p>
