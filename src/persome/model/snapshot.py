@@ -229,6 +229,41 @@ def _schema_item(
     }
 
 
+def _displaced_signatures(
+    conn: sqlite3.Connection, schema_items: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Every wording an owner has corrected a live level-1 Face away from.
+
+    Read from the ``memory_deltas`` audit trail, which is where an in-place
+    correction records the text it displaced. Fail-open: these aliases only
+    restore receipts, so losing them degrades the view rather than breaking it.
+    """
+    authored = {
+        str(item["id"]): item
+        for item in schema_items
+        if item["level"] == 1 and item.get("provenance") == "authored"
+    }
+    if not authored or not _table_exists(conn, "memory_deltas"):
+        return {}
+    displaced: dict[str, dict[str, Any]] = {}
+    try:
+        rows = conn.execute(
+            "SELECT payload FROM memory_deltas WHERE session_id = 'owner-edit' ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    for row in rows:
+        try:
+            edit = json.loads(row[0] or "{}").get("owner_edit") or {}
+        except (TypeError, ValueError):
+            continue
+        item = authored.get(str(edit.get("target_id") or ""))
+        prior = str(edit.get("prior_text") or "").strip().casefold()
+        if item is not None and prior:
+            displaced[prior] = item
+    return displaced
+
+
 def _schema_member_aliases(
     conn: sqlite3.Connection, schema_items: list[dict[str, Any]]
 ) -> dict[str, dict[str, Any]]:
@@ -238,6 +273,13 @@ def _schema_member_aliases(
         for item in schema_items
         if item["level"] == 1 and str(item["signature"] or "").strip()
     }
+    # The join is signature equality against the `central:` line of the Face's
+    # own schema markdown. An owner correction replaces the signature while that
+    # markdown keeps the derived proposition, so an authored Face would drop out
+    # of the map and the Volume above it would silently lose that evidence.
+    # Re-admit it under every wording it has been corrected away from.
+    for displaced, item in _displaced_signatures(conn, schema_items).items():
+        by_signature.setdefault(displaced, item)
     if not by_signature or not _table_exists(conn, "entries"):
         return {}
     aliases: dict[str, dict[str, Any]] = {}
@@ -286,6 +328,11 @@ def build_snapshot(
     from ..store.schema_faces import member_key
 
     raw_content: dict[str, str] = {str(row["node_id"]): _visible_content(row) for row in point_rows}
+    # The body exactly as stored, supersede marker included — what the schema
+    # miner reads when it computes the member keys a Face records.
+    stored_content: dict[str, str] = {
+        str(row["node_id"]): str(row["content"] or "") for row in point_rows
+    }
 
     for row in point_rows:
         node_id = str(row["node_id"])
@@ -349,11 +396,28 @@ def build_snapshot(
             node = successor_of[node]
         return receipt_by_id.get(node)
 
-    for old_id in successor_of:
-        previous = raw_content.get(old_id)
+    # A live Point's own key always outranks an alias. `member_key` normalises
+    # and casefolds, so two unrelated Points can share one — and re-pointing a
+    # live Point's key at some other chain's successor would make a Face cite a
+    # fact that is not the one the key stands for.
+    own_keys = {
+        member_key(raw_content[point["id"]]) for point in points if point["id"] in raw_content
+    }
+    superseded_ids = {point["id"] for point in points} & set(successor_of)
+    live_own_keys = own_keys - {
+        member_key(raw_content[node_id]) for node_id in superseded_ids if node_id in raw_content
+    }
+
+    for old_id, previous_raw in ((k, raw_content.get(k)) for k in successor_of):
         current = _current_receipt(old_id, set())
-        if previous and current:
-            point_receipts[member_key(previous)] = current
+        if not previous_raw or not current:
+            continue
+        # Both readings of the predecessor's body, because a Face's stored member
+        # key may have been mined from the body with its supersede marker intact
+        # (the miner reads verbatim) or without it (the FTS projection strips it).
+        for key in (member_key(previous_raw), member_key(stored_content.get(old_id, previous_raw))):
+            if key not in live_own_keys:
+                point_receipts[key] = current
 
     lines: list[dict[str, Any]] = []
     for point in points:

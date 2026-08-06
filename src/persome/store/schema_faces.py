@@ -165,6 +165,34 @@ def _find_match(
     return None
 
 
+def _owner_rejected_match(
+    conn: sqlite3.Connection, *, signature: str, members: set[str], level: int
+) -> sqlite3.Row | None:
+    """Find a withdrawn object this contribution would otherwise re-create.
+
+    The level-1/2 counterpart of :func:`owner_decided_root`. Retired rows are
+    closed, so ``_find_match`` correctly skips them — which on its own only
+    means the next re-mine inserts an identical row instead of reviving the old
+    one. Matching uses the same two criteria as ``_find_match`` so a rejection
+    is as hard to route around as an ordinary fold.
+    """
+    conn.row_factory = sqlite3.Row
+    sig = _norm_sig(signature)
+    for row in conn.execute(
+        "SELECT * FROM schema_faces WHERE level = ? AND status = ? AND provenance = ?",
+        (level, MemoryStatus.ARCHIVED.value, PROVENANCE_AUTHORED),
+    ).fetchall():
+        if sig and _norm_sig(row["signature"]) == sig:
+            return row
+        try:
+            stored = set(json.loads(row["members"]))
+        except (TypeError, ValueError):
+            continue
+        if _jaccard(members, stored) >= MATCH_JACCARD:
+            return row
+    return None
+
+
 def record_face(
     conn: sqlite3.Connection,
     *,
@@ -199,6 +227,15 @@ def record_face(
     now = _now()
     existing = _find_match(conn, signature=signature, members=member_set, level=level)
     if existing is None:
+        rejected = _owner_rejected_match(conn, signature=signature, members=member_set, level=level)
+        if rejected is not None:
+            # The owner rejected this proposition. Closing the old row's
+            # validity stops it being folded onto again, but nothing stopped
+            # derivation from re-deriving the same regularity into a *new* row
+            # and promoting that one — the rejection undone by a twin rather
+            # than by a resurrection. Returning the tombstone's id keeps the
+            # caller's bookkeeping intact while writing nothing.
+            return str(rejected["face_id"])
         face_id = f"face-{hashlib.sha1((_norm_sig(signature) + now).encode()).hexdigest()[:12]}"
         conn.execute(
             "INSERT INTO schema_faces (face_id, level, parent_face, signature, members,"

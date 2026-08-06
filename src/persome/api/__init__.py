@@ -38,13 +38,22 @@ _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 
 def _hostname_of(host: str | None) -> str | None:
-    """Lower-cased hostname with any ``:port`` stripped; ``[::1]`` kept whole."""
+    """Lower-cased hostname with any ``:port`` stripped; ``[::1]`` kept whole.
+
+    A bare IPv6 literal is not bracketed once it has been through
+    ``urlsplit().hostname``, and every colon in it belongs to the address. Port
+    stripping therefore only applies when at most one colon is present —
+    otherwise ``::1`` was truncated to ``::`` and loopback over IPv6 was refused
+    even though ``_LOCAL_HOSTS`` lists it.
+    """
     if not host:
         return None
     if host.startswith("["):
         hostname = host.split("]", 1)[0] + "]" if "]" in host else host
+    elif host.count(":") == 1:
+        hostname = host.rsplit(":", 1)[0]
     else:
-        hostname = host.rsplit(":", 1)[0] if ":" in host else host
+        hostname = host
     return hostname.strip().lower() or None
 
 

@@ -624,3 +624,111 @@ def test_retiring_a_face_does_not_cascade_to_its_volume(ac_root) -> None:
     assert all(face["id"] != child for face in snapshot["faces"])
     assert any(item["id"] == volume for item in snapshot["volumes"])
     assert dirty is not None and int(dirty[0]) >= 1, "the rebuild must be scheduled"
+
+
+# ── regressions found by the second adversarial pass ──────────────────────
+
+
+def test_a_correction_cannot_forge_a_memory_entry(ac_root) -> None:
+    """Memory files are re-parsed by splitting on entry headings, and a
+    correction body is written into one verbatim. A heading-shaped line would
+    truncate the correction, overwrite the predecessor's canonical content, and
+    break rebuild_index permanently on the duplicate id."""
+    point_id = _seed_point()
+    forged = (
+        "I write in the mornings by choice.\n"
+        f"## [2020-01-01T00:00] {{id: {point_id}}} #fact\n"
+        "and here is the rest of what I wanted to say."
+    )
+    with fts.cursor() as conn:
+        result = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement=forged
+        )
+    assert not result.ok
+    assert result.reason == "replacement_forges_an_entry"
+
+    # And the store is untouched: the index still rebuilds.
+    with fts.cursor() as conn:
+        entries_mod.rebuild_index(conn)
+
+
+def test_a_correction_may_still_contain_ordinary_markdown(ac_root) -> None:
+    """The guard targets one exact shape, not markdown in general."""
+    from persome.model.edit import replacement_forges_an_entry
+
+    assert not replacement_forges_an_entry("## A heading I typed")
+    assert not replacement_forges_an_entry("I use {braces} and [brackets].")
+    assert replacement_forges_an_entry("## [2020-01-01T00:00] {id: abc-123} #fact")
+
+
+def test_a_rejected_face_is_not_re_created_as_a_twin(ac_root) -> None:
+    """Closing the retired row stops it being revived — on its own that only
+    means derivation mints an identical row beside it and promotes that.
+
+    Asserting on ids alone (as an earlier test did) misses this entirely,
+    because the twin has a different id.
+    """
+    face_id = _seed_face("Alex works late.")
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="face", target_id=face_id, op="retire").ok
+        for _ in range(3):
+            returned = sf.record_face(
+                conn,
+                source=sf.PROVENANCE_MINED,
+                signature="Alex works late.",
+                members=["m1", "m2", "m3"],
+            )
+            sf.maybe_promote(conn, returned)
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert returned == face_id, "the rejection must absorb the re-derivation"
+    signatures = [face["signature"] for face in snapshot["faces"]]
+    assert "Alex works late." not in signatures
+
+
+def test_an_ended_but_current_fact_can_still_be_corrected(ac_root) -> None:
+    """The snapshot keeps these Points, so the editor must accept them too."""
+    point_id = _seed_point("Alex worked at Acme.")
+    with fts.cursor() as conn:
+        conn.execute(
+            "UPDATE evo_nodes SET valid_until = ? WHERE node_id = ?",
+            ("2026-08-01T00:00:00+00:00", point_id),
+        )
+        snapshot = build_snapshot(conn, redact=False)
+        assert any(point["id"] == point_id for point in snapshot["points"])
+        result = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=point_id,
+            op="rewrite",
+            replacement="I worked at Acme until this spring.",
+        )
+    assert result.ok, f"a rendered Point must be correctable, got {result.reason}"
+
+
+def test_rewriting_an_unpromoted_object_is_refused(ac_root) -> None:
+    """Marking a SHADOW object authored would make it permanently unpromotable
+    — invisible forever, while the save claimed success."""
+    with fts.cursor() as conn:
+        face_id = sf.record_face(
+            conn, source=sf.PROVENANCE_MINED, signature="A tentative pattern.", members=["m1"]
+        )
+        result = apply_model_edit(
+            conn, kind="face", target_id=face_id, op="rewrite", replacement="My words."
+        )
+        # Rejecting one is still coherent: withdrawing what never surfaced.
+        retired = apply_model_edit(conn, kind="face", target_id=face_id, op="retire")
+    assert not result.ok
+    assert result.reason == "object_not_active"
+    assert retired.ok
+
+
+def test_ipv6_loopback_is_accepted_by_the_origin_guard(ac_root) -> None:
+    """`urlsplit().hostname` strips the brackets, and port-stripping then ate
+    the address, so the viewer's own POST was refused over IPv6."""
+    from persome.api import _hostname_of, _is_local_host
+
+    assert _hostname_of("::1") == "::1"
+    assert _is_local_host("::1")
+    assert _is_local_host("[::1]:8742")
+    assert not _is_local_host("evil.com")

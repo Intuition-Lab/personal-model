@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 
 from ..evidence import OWNER_EDIT_TAG
 from ..logger import get
+from ..store import files as files_mod
 
 logger = get("persome.model.edit")
 
@@ -103,6 +104,24 @@ def _reject(kind: str, target_id: str, op: str, reason: str) -> EditResult:
     return EditResult(ok=False, kind=kind, target_id=target_id, op=op, reason=reason)
 
 
+def replacement_forges_an_entry(text: str) -> bool:
+    """Whether this text would be re-read as a memory entry heading.
+
+    Memory files are the store's source of truth and are re-parsed by splitting
+    on ``## [timestamp] {id: ...}``. A correction body is written into that file
+    verbatim, so a line of that exact shape does not stay text — it becomes a
+    second entry. The consequences are not cosmetic: the correction is truncated
+    at that line, the forged id collides with a real one and overwrites that
+    Point's canonical content, and ``rebuild_index`` then fails permanently on
+    the duplicate id, disabling restore and index recovery.
+
+    No malice is required. The viewer shows the id of the object being
+    corrected, and the id in a pasted entry is exactly the kind of thing an
+    owner might paste back in.
+    """
+    return files_mod.ENTRY_HEADING_RE.search(str(text or "")) is not None
+
+
 def _point_file_is_editable(file_name: str) -> bool:
     """Whether a correction to a Point in this file can actually reach the model.
 
@@ -117,8 +136,6 @@ def _point_file_is_editable(file_name: str) -> bool:
     Point exactly where it was, so the owner would be told a correction landed
     that their model never reflects.
     """
-    from ..store import files as files_mod
-
     if "/" in file_name:
         return False
     try:
@@ -213,7 +230,15 @@ def _edit_point(
         return _reject("point", target_id, op, "point_not_editable_in_this_file")
     if str(row["status"] or "") == "archived":
         return _reject("point", target_id, op, "point_archived")
-    already_retired = bool(row["valid_until"]) and str(row["superseded_by"] or "[]") == "[]"
+    # Same three conditions the snapshot uses. `valid_until` alone also marks a
+    # relationship that ended while the fact is still current, and those Points
+    # are rendered in the model — refusing to correct one would show the owner a
+    # claim about themselves that they are not allowed to touch.
+    already_retired = (
+        bool(row["valid_until"])
+        and not int(row["is_latest"] or 0)
+        and str(row["superseded_by"] or "[]") == "[]"
+    )
     if already_retired:
         return _reject("point", target_id, op, "point_already_retired")
     if not int(row["is_latest"] or 0):
@@ -278,6 +303,13 @@ def _edit_schema_object(
         return _reject(kind, target_id, op, "kind_level_mismatch")
     if str(row["status"] or "") == "archived":
         return _reject(kind, target_id, op, "object_archived")
+    if op == "rewrite" and str(row["status"] or "") != "active":
+        # A SHADOW object has not been promoted yet, and `maybe_promote` only
+        # accepts `both` (or `emergent` at level 2). Marking one `authored`
+        # would make it permanently unpromotable — invisible to the model
+        # forever, while the save reported success. Rejecting one is still
+        # allowed: withdrawing something that never surfaced is coherent.
+        return _reject(kind, target_id, op, "object_not_active")
 
     if op == "rewrite":
         prior = schema_faces.set_authored_signature(conn, face_id=target_id, signature=replacement)
@@ -345,6 +377,8 @@ def apply_model_edit(
             return _reject(kind, target_id, op, "empty_replacement")
         if len(replacement) > MAX_REPLACEMENT_CHARS:
             return _reject(kind, target_id, op, "replacement_too_long")
+        if replacement_forges_an_entry(replacement):
+            return _reject(kind, target_id, op, "replacement_forges_an_entry")
 
     misses_before = evo_shadow.miss_count()
     if kind == "point":
