@@ -577,3 +577,50 @@ def test_a_point_in_an_append_only_log_is_refused(ac_root) -> None:
     assert _point_file_is_editable("person-alex.md")
     assert not _point_file_is_editable("event-2026-08-05.md")
     assert not _point_file_is_editable("skills/writing.md")
+
+
+def test_a_faces_correction_history_is_replayable(ac_root) -> None:
+    """In-place correction keeps `face_id`, so `schema_faces` holds only the
+    current wording. The sequence must still be reconstructable end to end."""
+    face_id = _seed_face("Alex works late.")
+    with fts.cursor() as conn:
+        for text in ("I work late by choice.", "I choose my hours."):
+            assert apply_model_edit(
+                conn, kind="face", target_id=face_id, op="rewrite", replacement=text
+            ).ok
+        rows = conn.execute(
+            "SELECT payload FROM memory_deltas WHERE session_id = 'owner-edit' ORDER BY id"
+        ).fetchall()
+
+    chain = [json.loads(row[0])["owner_edit"] for row in rows]
+    assert [(edit["prior_text"], edit["new_text"]) for edit in chain] == [
+        ("Alex works late.", "I work late by choice."),
+        ("I work late by choice.", "I choose my hours."),
+    ]
+    assert _live(face_id)["signature"] == "I choose my hours."
+
+
+def test_retiring_a_face_does_not_cascade_to_its_volume(ac_root) -> None:
+    """Rejecting one regularity is not a claim about the pattern built over it.
+
+    The Volume survives and the rebuild the retirement schedules re-derives it
+    from what is still live.
+    """
+    child = _seed_face("Alex guards mornings.")
+    volume = _seed_face("Alex structures time deliberately.", level=2)
+    with fts.cursor() as conn:
+        conn.execute(
+            "UPDATE schema_faces SET members = ?, parent_face = NULL WHERE face_id = ?",
+            (json.dumps([child]), volume),
+        )
+        conn.execute("UPDATE schema_faces SET parent_face = ? WHERE face_id = ?", (volume, child))
+        assert apply_model_edit(conn, kind="face", target_id=child, op="retire").ok
+        snapshot = build_snapshot(conn, redact=False)
+        dirty = conn.execute(
+            "SELECT value FROM system_state WHERE key = 'model_structure_dirty'"
+        ).fetchone()
+
+    validate_snapshot(snapshot)
+    assert all(face["id"] != child for face in snapshot["faces"])
+    assert any(item["id"] == volume for item in snapshot["volumes"])
+    assert dirty is not None and int(dirty[0]) >= 1, "the rebuild must be scheduled"

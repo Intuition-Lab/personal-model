@@ -183,6 +183,22 @@ An authored Face is matched on re-mine by member overlap rather than by its sign
 membership later drifts past the folding threshold, derivation starts a separate Face beside it
 rather than reclaiming the authored one.
 
+Two consequences of correcting a Face, Volume, or Root in place are worth stating plainly.
+
+The correction keeps the object's `face_id`, because a new row would mint a new id and dangle every
+child's `parent_face` and every parent's `members` entry. Identity is what holds the geometry
+together, so identity is what is preserved — and the cost is that `schema_faces` carries only the
+current wording. The full sequence of corrections is replayable from the `memory_deltas` audit rows,
+each of which records the text it displaced, but an as-of query against `schema_faces` itself
+returns the object as it reads now. Points do not share this limitation: their corrections supersede
+in the ordinary way and remain fully bitemporal.
+
+Retiring a Face does not cascade. A Volume that listed it keeps naming it in `members`, and the
+member resolves to no receipt until the model is rebuilt — which the retirement schedules by
+flagging the structure dirty. Rejecting one regularity is not a claim about the larger pattern
+built over it, so the rebuild re-derives that pattern from what is still live rather than deleting
+it outright.
+
 ## Evidence sources
 
 Relation edges may carry the nullable triplet `source_kind`, `source_id`, and `source_receipt`.
