@@ -151,8 +151,11 @@ exposes only aggregate distance and percentage values for local visual smoke tes
 
 ## Owner corrections
 
-The memory owner can rewrite a modeled object's wording or reject it outright, from the viewer's
-Correct panel, `POST /model/edit`, or `persome model edit`. All three share one deterministic,
+The memory owner can rewrite a modeled object's wording or reject it outright, from the viewer,
+`POST /model/edit`, or `persome model edit`. In the viewer the claim itself is the editing surface:
+clicking the text opens it for rewriting in place, blur or Cmd+Enter commits, and Escape discards.
+There is no separate edit mode, and provenance folds beneath the claim rather than competing with it
+for the reader's attention. All three share one deterministic,
 LLM-free writer, so a correction applies offline and cannot fail to find its target: the caller
 addresses the object by the id the snapshot published. Points, Faces, Volumes, and the Root are
 editable. Lines are not — a relation or evolution Line is derived from the objects it connects, so

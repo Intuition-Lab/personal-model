@@ -86,30 +86,31 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       <div><span class="swatch root"></span><b>Root</b><span>current personal model</span></div>
     </aside>
 
-    <aside id="detail" class="detail" aria-labelledby="detail-title" aria-live="polite" hidden>
-      <button id="close-detail" class="icon-button close" type="button" aria-label="Close details" title="Close details">×</button>
+    <aside id="detail" class="detail" aria-labelledby="detail-title" hidden>
+      <button id="close-detail" class="icon-button close" type="button" aria-label="Close" title="Close (Esc)">×</button>
       <p class="detail-eyebrow"><span id="detail-kind" class="detail-kind"></span><span id="detail-provenance">Evidence-backed</span></p>
-      <h1 id="detail-title"></h1>
-      <nav id="detail-tabs" class="detail-tabs" role="tablist" aria-label="Detail views">
-        <button id="detail-tab-overview" type="button" role="tab" data-detail-tab="overview" aria-controls="detail-overview" aria-selected="true">Overview</button>
-        <button id="detail-tab-evidence" type="button" role="tab" data-detail-tab="evidence" aria-controls="detail-evidence" aria-selected="false" tabindex="-1">Evidence</button>
-        <button id="detail-tab-history" type="button" role="tab" data-detail-tab="history" aria-controls="detail-history" aria-selected="false" tabindex="-1">History</button>
-        <button id="detail-tab-edit" type="button" role="tab" data-detail-tab="edit" aria-controls="detail-edit" aria-selected="false" tabindex="-1">Correct</button>
-      </nav>
-      <section id="detail-overview" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-overview">
-        <div id="detail-summary" class="detail-summary"></div>
-        <div id="detail-meta" class="detail-meta"></div>
-      </section>
-      <section id="detail-evidence" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-evidence" hidden>
+
+      <h1 id="detail-title" class="detail-claim" tabindex="0" role="button" aria-describedby="detail-hint"></h1>
+      <textarea id="detail-claim-input" class="detail-claim detail-claim-input" rows="1" maxlength="4000" aria-label="Edit this claim in your own words" hidden></textarea>
+      <p id="detail-hint" class="detail-hint" hidden></p>
+      <p id="detail-status" class="detail-status" role="status"></p>
+
+      <div id="detail-meta" class="detail-meta"></div>
+      <div id="detail-summary" class="detail-summary"></div>
+
+      <details id="detail-evidence-fold" class="detail-fold">
+        <summary><span>Evidence</span><b id="detail-evidence-count" class="detail-fold-count"></b><i aria-hidden="true"></i></summary>
         <nav id="evidence-breadcrumbs" class="evidence-breadcrumbs" aria-label="Evidence drill-down"></nav>
         <div id="detail-receipts" class="detail-receipts"></div>
-      </section>
-      <section id="detail-history" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-history" hidden>
+      </details>
+      <details id="detail-history-fold" class="detail-fold">
+        <summary><span>History</span><b id="detail-history-count" class="detail-fold-count"></b><i aria-hidden="true"></i></summary>
         <div id="detail-history-list" class="detail-receipts"></div>
-      </section>
-      <section id="detail-edit" class="detail-panel" role="tabpanel" aria-labelledby="detail-tab-edit" aria-live="off" hidden>
-        <div id="detail-edit-form"></div>
-      </section>
+      </details>
+
+      <div id="detail-actions" class="detail-actions" hidden>
+        <button id="detail-reject" class="detail-reject" type="button">This is wrong about me</button>
+      </div>
     </aside>
 
     <div id="empty" class="empty" hidden>

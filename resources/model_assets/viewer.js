@@ -44,10 +44,13 @@ const detailMetaEl = document.getElementById("detail-meta");
 const detailReceiptsEl = document.getElementById("detail-receipts");
 const detailHistoryEl = document.getElementById("detail-history-list");
 const evidenceBreadcrumbsEl = document.getElementById("evidence-breadcrumbs");
-const detailTabEls = [...document.querySelectorAll("[data-detail-tab]")];
-const detailPanelEls = [...document.querySelectorAll(".detail-panel")];
-const detailEditFormEl = document.getElementById("detail-edit-form");
-const detailTabEditEl = document.getElementById("detail-tab-edit");
+const detailClaimInputEl = document.getElementById("detail-claim-input");
+const detailHintEl = document.getElementById("detail-hint");
+const detailStatusEl = document.getElementById("detail-status");
+const detailActionsEl = document.getElementById("detail-actions");
+const detailRejectEl = document.getElementById("detail-reject");
+const detailEvidenceFoldEl = document.getElementById("detail-evidence-fold");
+const detailHistoryFoldEl = document.getElementById("detail-history-fold");
 const emptyEl = document.getElementById("empty");
 const errorEl = document.getElementById("error");
 const modelIdentityEl = document.getElementById("model-identity");
@@ -970,8 +973,16 @@ function applyLayerVisibility() {
   syncSelectionState();
 }
 
+function humaneMeta(label, value) {
+  if (!/^(Valid from|From|To)$/.test(label)) return value;
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
 function appendMeta(label, value) {
   if (value === null || value === undefined || value === "") return;
+  value = humaneMeta(label, value);
   const row = document.createElement("div");
   const name = document.createElement("strong");
   name.textContent = `${label}: `;
@@ -979,23 +990,6 @@ function appendMeta(label, value) {
   detailMetaEl.appendChild(row);
 }
 
-function setDetailTab(tab, focus = false) {
-  // A hidden tab must never hold the tablist's single tab stop, or keyboard
-  // users lose their way back into the drawer entirely.
-  const shown = detailTabEls.filter((button) => !button.hidden);
-  const target = shown.some((button) => button.dataset.detailTab === tab)
-    ? tab
-    : (shown[0]?.dataset.detailTab ?? tab);
-  detailTabEls.forEach((button) => {
-    const active = button.dataset.detailTab === target;
-    button.setAttribute("aria-selected", String(active));
-    button.tabIndex = active && !button.hidden ? 0 : -1;
-    if (active && focus && !button.hidden) button.focus();
-  });
-  detailPanelEls.forEach((panel) => {
-    panel.hidden = panel.id !== `detail-${target}`;
-  });
-}
 
 function technicalDetails(link) {
   const details = document.createElement("details");
@@ -1030,7 +1024,7 @@ function evidenceCard(link, { drill = true } = {}) {
   }
   if (drill && (link.reference || link.id)) {
     button.addEventListener("click", () => {
-      setDetailTab("evidence");
+      detailEvidenceFoldEl.open = true;
       loadEvidence(link.reference || link.id);
     });
   } else {
@@ -1202,19 +1196,21 @@ function renderNodeEvidence(kind, item) {
 function renderOverview(kind, item) {
   detailSummaryEl.replaceChildren();
   const overview = evidenceOverview(kind, item, model);
-  const heading = document.createElement("strong");
-  heading.textContent = overview.title;
   const copy = document.createElement("p");
   copy.textContent = overview.copy;
-  detailSummaryEl.append(heading, copy);
-  overview.highlights.forEach((card) => {
-    detailSummaryEl.appendChild(evidenceCard(card));
-  });
+  detailSummaryEl.append(copy);
+  // `overview.highlights` is the first three of exactly the cards the Evidence
+  // fold renders, so showing them here too buried the rest of the drawer under
+  // a duplicate. The count moves to the fold's own summary instead.
+  const count = document.getElementById("detail-evidence-count");
+  if (count) count.textContent = overview.highlights.length ? String(nodeEvidenceCards(item, model).length) : "";
 }
 
 function renderNodeHistory(item) {
   detailHistoryEl.replaceChildren();
   const history = nodeHistoryCards(item, model);
+  const count = document.getElementById("detail-history-count");
+  if (count) count.textContent = history.length ? String(history.length) : "";
   if (!history.length) {
     const empty = document.createElement("p");
     empty.className = "evidence-note";
@@ -1254,17 +1250,25 @@ function editableText(kind, item) {
 }
 
 function setEditStatus(message, tone) {
-  const status = detailEditFormEl.querySelector(".edit-status");
-  if (!status) return;
-  status.textContent = message || "";
-  if (tone) status.dataset.tone = tone;
-  else delete status.dataset.tone;
+  detailStatusEl.textContent = message || "";
+  if (tone) detailStatusEl.dataset.tone = tone;
+  else delete detailStatusEl.dataset.tone;
 }
 
+// ── Editing in place ──────────────────────────────────────────────────────
+// The claim is the content, so correcting it happens on the claim itself:
+// click the text, it becomes editable, blur or Cmd+Enter commits, Escape
+// reverts. No mode to enter, no form to find, no second copy of the text to
+// keep in sync with the first.
+
+let editingItem = null;
+let editInFlight = false;
+
 async function submitEdit(kind, item, op, replacement, reason) {
-  const buttons = [...detailEditFormEl.querySelectorAll("button")];
-  buttons.forEach((button) => { button.disabled = true; });
-  setEditStatus(op === "retire" ? "Rejecting…" : "Saving…", null);
+  if (editInFlight) return;
+  editInFlight = true;
+  detailRejectEl.disabled = true;
+  setEditStatus(op === "retire" ? "Removing…" : "Saving…", null);
   try {
     const response = await fetch("./edit", {
       method: "POST",
@@ -1281,32 +1285,23 @@ async function submitEdit(kind, item, op, replacement, reason) {
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const detail = payload?.detail || `HTTP ${response.status}`;
-      setEditStatus(`Could not save: ${detail}`, "error");
-      buttons.forEach((button) => { button.disabled = false; });
+      setEditStatus(`Could not save: ${payload?.detail || `HTTP ${response.status}`}`, "error");
       return;
     }
     const data = payload?.data || {};
-    // A Point rewrite supersedes the old fact, so the object the owner was
-    // looking at now has a new id. Re-target the drawer or it closes on reload.
     const nextId = data.new_id || item.id;
     // A correction is a statement about the present, and the successor Point is
     // stamped now. If the owner is time-travelling, that Point sits past the
-    // cutoff and would never appear — the save would look like it failed, and a
-    // second attempt would follow. Return to Now so they see what they wrote.
+    // cutoff and would never appear — the save would look like it failed.
     if (Number(slider.value) < 100) {
       slider.value = "100";
       updateCutoff();
     }
     const refreshed = await loadModel(true);
     // The awaits above can span seconds. If the owner selected something else
-    // meanwhile, that selection is theirs — stealing the drawer back would
-    // discard a correction they had started typing on another node. The same
-    // guard the evidence loader applies before touching the DOM.
+    // meanwhile, that selection is theirs.
     if (!selected || selected.kind !== kind || selected.id !== item.id) return;
     if (refreshed === false) {
-      // The write landed; the reload did not. Re-rendering the drawer now would
-      // put "Saved." beside the text the owner just replaced.
       setEditStatus("Saved, but the view could not refresh. Reload to see it.", "warn");
       return;
     }
@@ -1316,16 +1311,10 @@ async function submitEdit(kind, item, op, replacement, reason) {
     }
     const nextItem = items.get(selectionKey(kind, nextId));
     if (!nextItem) {
-      // The write committed; only the re-selection failed. Leave the drawer
-      // where it is rather than closing it on a success.
       setEditStatus("Saved. Reopen the node to see the update.", "ok");
       return;
     }
     showDetails(kind, nextItem);
-    // `showDetails` rebuilds the panel, so the button the owner activated is
-    // gone and focus has fallen to the document body. Put it back on the tab
-    // rather than making them walk the whole viewer to return.
-    setDetailTab("edit", true);
     if (data.shadow_misses) {
       // The markdown layer changed but the Point may not have moved. Saying
       // "saved" here would be a lie the owner cannot see through.
@@ -1339,89 +1328,110 @@ async function submitEdit(kind, item, op, replacement, reason) {
     }
   } catch (error) {
     setEditStatus(`Could not save: ${error?.message || error}`, "error");
-    buttons.forEach((button) => { button.disabled = false; });
+  } finally {
+    editInFlight = false;
+    detailRejectEl.disabled = false;
   }
 }
 
-function renderEditor(kind, item) {
-  detailEditFormEl.replaceChildren();
-  const editable = isEditable(kind, item);
-  detailTabEditEl.hidden = !editable;
-  if (!editable) {
-    const note = document.createElement("p");
-    note.className = "edit-note";
-    note.textContent = kind === "line"
-      ? "Lines are derived from the objects they connect. Correct those instead."
-      : "This node is drawn from context and has nothing stored to correct.";
-    detailEditFormEl.appendChild(note);
+
+function autoGrow() {
+  detailClaimInputEl.style.height = "auto";
+  detailClaimInputEl.style.height = `${detailClaimInputEl.scrollHeight}px`;
+}
+
+function beginEditing(kind, item) {
+  if (!isEditable(kind, item) || editingItem) return;
+  editingItem = { kind, id: item.id, original: editableText(kind, item) };
+  detailClaimInputEl.value = editingItem.original;
+  detailClaimInputEl.hidden = false;
+  detailTitleEl.hidden = true;
+  detailHintEl.innerHTML = "<kbd>\u2318</kbd><kbd>\u21a9</kbd> or click away to save · <kbd>Esc</kbd> to discard";
+  detailHintEl.hidden = false;
+  autoGrow();
+  detailClaimInputEl.focus();
+  detailClaimInputEl.setSelectionRange(
+    detailClaimInputEl.value.length,
+    detailClaimInputEl.value.length,
+  );
+}
+
+function endEditing() {
+  editingItem = null;
+  detailClaimInputEl.hidden = true;
+  detailTitleEl.hidden = false;
+  const editable = detailTitleEl.dataset.editable === "true";
+  detailHintEl.innerHTML = editable ? "Click the text to rewrite it in your own words." : "";
+  detailHintEl.hidden = !editable;
+}
+
+function commitEditing() {
+  if (!editingItem) return;
+  const next = detailClaimInputEl.value.trim();
+  const { kind, id, original } = editingItem;
+  endEditing();
+  if (!next || next === original.trim()) return;
+  const item = items.get(selectionKey(kind, id));
+  if (item) submitEdit(kind, item, "rewrite", next, "");
+}
+
+detailClaimInputEl.addEventListener("input", autoGrow);
+detailClaimInputEl.addEventListener("blur", commitEditing);
+detailClaimInputEl.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.stopPropagation();
+    endEditing();
+    detailTitleEl.focus();
+  } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    commitEditing();
+  }
+});
+
+detailTitleEl.addEventListener("click", () => {
+  if (selectedItem) beginEditing(selected?.kind, selectedItem);
+});
+detailTitleEl.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  if (selectedItem) beginEditing(selected?.kind, selectedItem);
+});
+
+detailRejectEl.addEventListener("click", () => {
+  if (!selected || !selectedItem) return;
+  if (detailRejectEl.dataset.armed !== "true") {
+    // One deliberate confirmation: withdrawing a claim is not undoable here.
+    detailRejectEl.dataset.armed = "true";
+    detailRejectEl.textContent = "Yes, remove it from my model";
+    setEditStatus("This leaves your history, but not your model.", null);
     return;
   }
+  submitEdit(selected.kind, selectedItem, "retire", "", "");
+});
 
-  const form = document.createElement("div");
-  form.className = "edit-form";
+function renderEditor(kind, item) {
+  endEditing();
+  setEditStatus("", null);
+  delete detailRejectEl.dataset.armed;
+  detailRejectEl.textContent = "This is wrong about me";
+  detailRejectEl.disabled = false;
 
-  const textLabel = document.createElement("label");
-  textLabel.setAttribute("for", "edit-replacement");
-  textLabel.textContent = kind === "point" ? "In your words" : "What this should say";
-  const textarea = document.createElement("textarea");
-  textarea.id = "edit-replacement";
-  textarea.rows = 4;
-  textarea.maxLength = 4000;
-  textarea.value = editableText(kind, item);
-
-  const reasonLabel = document.createElement("label");
-  reasonLabel.setAttribute("for", "edit-reason");
-  reasonLabel.textContent = "Why (optional)";
-  const reason = document.createElement("input");
-  reason.id = "edit-reason";
-  reason.type = "text";
-  reason.maxLength = 500;
-
-  const actions = document.createElement("div");
-  actions.className = "edit-actions";
-  const save = document.createElement("button");
-  save.type = "button";
-  save.dataset.op = "rewrite";
-  save.textContent = "Save correction";
-  const retire = document.createElement("button");
-  retire.type = "button";
-  retire.dataset.op = "retire";
-  retire.textContent = "This is wrong about me";
-  actions.append(save, retire);
-
-  const note = document.createElement("p");
-  note.className = "edit-note";
-  note.textContent = kind === "point"
-    ? "Your wording supersedes the observed fact. The original stays in your history."
-    : "Your wording replaces this claim and stops the model from rewriting it."
-      + " Evidence keeps accruing underneath.";
-
-  const status = document.createElement("p");
-  status.className = "edit-status";
-  // `#detail-edit` sets `aria-live="off"` so a half-typed correction is not
-  // read out keystroke by keystroke. That silenced the save result too, on the
-  // one panel that actually writes to the owner's memory. `role="status"` makes
-  // this paragraph its own polite region, independent of the ancestor.
-  status.setAttribute("role", "status");
-
-  save.addEventListener("click", () => {
-    const replacement = textarea.value.trim();
-    if (!replacement) {
-      setEditStatus("Write the correction first.", "error");
-      return;
-    }
-    if (replacement === editableText(kind, item).trim()) {
-      setEditStatus("That is what it already says.", null);
-      return;
-    }
-    submitEdit(kind, item, "rewrite", replacement, reason.value.trim());
-  });
-  retire.addEventListener("click", () => {
-    submitEdit(kind, item, "retire", "", reason.value.trim());
-  });
-
-  form.append(textLabel, textarea, reasonLabel, reason, actions, note, status);
-  detailEditFormEl.appendChild(form);
+  const editable = isEditable(kind, item);
+  detailTitleEl.dataset.editable = String(editable);
+  detailActionsEl.hidden = !editable;
+  detailHintEl.innerHTML = editable
+    ? 'Click the text to rewrite it in your own words.'
+    : "";
+  detailHintEl.hidden = !editable;
+  if (editable) {
+    detailTitleEl.setAttribute("role", "button");
+    detailTitleEl.setAttribute("title", "Click to correct this in your own words");
+    detailTitleEl.tabIndex = 0;
+  } else {
+    detailTitleEl.removeAttribute("role");
+    detailTitleEl.removeAttribute("title");
+    detailTitleEl.removeAttribute("tabindex");
+  }
 }
 
 function showDetails(kind, item) {
@@ -1438,8 +1448,7 @@ function showDetails(kind, item) {
   );
   evidenceTrail = [{ label: detailTitleEl.textContent, data: null }];
   // "Evidence-backed" is a claim about where the text came from, so it must not
-  // sit above text the owner wrote themselves. The eyebrow is on every tab, so
-  // the distinction follows the object rather than living in one panel.
+  // sit above text the owner wrote themselves.
   const authored = isAuthored(kind, item);
   detailProvenanceEl.textContent = authored ? "Your words" : "Evidence-backed";
   detailProvenanceEl.classList.toggle("detail-authored", authored);
@@ -1460,7 +1469,12 @@ function showDetails(kind, item) {
   renderNodeEvidence(kind, item);
   renderNodeHistory(item);
   renderEditor(kind, item);
-  setDetailTab("overview");
+  // Folds start closed on every selection: the claim is what the owner came to
+  // read, and provenance is one click away rather than one of four places the
+  // content might be hiding.
+  detailEvidenceFoldEl.open = false;
+  detailHistoryFoldEl.open = false;
+  detailEl.scrollTop = 0;
   detailEl.hidden = false;
 }
 
@@ -1783,23 +1797,6 @@ lineSelectEl.addEventListener("change", () => {
   if (item) showDetails("line", item);
 });
 
-detailTabEls.forEach((button) => {
-  button.addEventListener("click", () => setDetailTab(button.dataset.detailTab));
-  button.addEventListener("keydown", (event) => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    event.preventDefault();
-    // Walk only the tabs that are actually on screen. The Correct tab is hidden
-    // for objects that have nothing stored to correct, and stepping onto it
-    // would hide every real panel, focus a `display:none` button, and leave the
-    // whole tablist out of the tab order — unreachable without a mouse.
-    const shown = detailTabEls.filter((tab) => !tab.hidden);
-    const here = shown.indexOf(button);
-    if (here < 0 || shown.length < 2) return;
-    const direction = event.key === "ArrowRight" ? 1 : -1;
-    const next = (here + direction + shown.length) % shown.length;
-    setDetailTab(shown[next].dataset.detailTab, true);
-  });
-});
 
 document.getElementById("rotate").addEventListener("click", (event) => {
   controls.autoRotate = !controls.autoRotate;
@@ -1952,9 +1949,10 @@ window.addEventListener("keydown", (event) => {
     || Boolean(target?.isContentEditable)
   );
   if (event.key === "Escape" && selected) {
-    // Escape used to close the drawer unconditionally. With a correction box in
-    // it, that would throw away whatever the owner had typed. Inside a field,
-    // Escape now only leaves the field; a second press closes the drawer.
+    // The claim editor handles its own Escape (discard, keep the drawer open)
+    // and stops propagation, so anything reaching here is either not editing or
+    // is in some other field. Either way Escape closes the drawer, which is
+    // what a single Escape should do.
     if (typing) {
       target.blur();
       return;
