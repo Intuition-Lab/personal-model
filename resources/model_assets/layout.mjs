@@ -527,8 +527,47 @@ function nextZoomPercent(
   );
 }
 
+// A wheel event's `deltaY` means three different things depending on
+// `deltaMode`, and browsers disagree on which they send: Chrome reports pixels
+// (a notch is ~100), Firefox reports lines (a notch is ~3), and page mode shows
+// up on some remote-desktop stacks. Reduce all three to CSS pixels so one
+// gesture means the same amount of zoom everywhere.
+const WHEEL_LINE_HEIGHT_PX = 16;
+const WHEEL_PIXEL_LIMIT_PX = 400;
+
+function wheelZoomPixels(event, viewportHeight = 800) {
+  const raw = Number(event?.deltaY);
+  if (!Number.isFinite(raw)) return 0;
+  const height = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 800;
+  const pixels = event.deltaMode === 1
+    ? raw * WHEEL_LINE_HEIGHT_PX
+    : event.deltaMode === 2
+      ? raw * height
+      : raw;
+  // Kinetic scrolling and page mode can deliver one enormous event. Cap a
+  // single event so no gesture can teleport the camera across the whole range.
+  return Math.max(-WHEEL_PIXEL_LIMIT_PX, Math.min(WHEEL_PIXEL_LIMIT_PX, pixels));
+}
+
+// Zoom is exponential in accumulated wheel pixels, so a gesture composed of
+// many small events lands in the same place as one large event of equal total.
+// A macOS trackpad pinch (ctrlKey wheel) accumulates roughly 300px over one
+// comfortable spread, which should be worth about a doubling; a mouse notch is
+// 100px and should be a much smaller, discrete-feeling step.
+const PINCH_GAIN_PER_PX = Math.LN2 / 300;
+const WHEEL_GAIN_PER_PX = Math.log(1.16) / 100;
+
+function wheelZoomFactor(event, viewportHeight = 800) {
+  const pixels = wheelZoomPixels(event, viewportHeight);
+  const gain = event?.ctrlKey ? PINCH_GAIN_PER_PX : WHEEL_GAIN_PER_PX;
+  // Wheel-up and pinch-out both report a negative delta and both mean "closer".
+  return Math.exp(-pixels * gain);
+}
+
 export const zoomMath = {
   clampPercent: clampZoomPercent,
   nextPercent: nextZoomPercent,
   percentForDistance: zoomPercentForDistance,
+  wheelFactor: wheelZoomFactor,
+  wheelPixels: wheelZoomPixels,
 };

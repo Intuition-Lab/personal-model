@@ -27,6 +27,14 @@ body {
   height: 100%;
   margin: 0;
   overflow: hidden;
+  /* The model is dragged, not scrolled: stop a two-finger swipe from rubber
+     banding the page or triggering the browser's back gesture mid-orbit. */
+  overscroll-behavior: none;
+  /* A drag across the canvas would otherwise paint a text selection across
+     whatever overlay copy it passes over. Selection comes back below on the
+     panels whose text is worth copying — a drawer's claim, and an error the
+     owner may want to paste into a bug report. */
+  user-select: none;
   background: var(--bg);
   color: var(--text);
   font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
@@ -73,6 +81,21 @@ button {
   position: fixed;
   z-index: 1;
   inset: 0;
+}
+
+/* On the host, not only on the canvas: the label layer sits on top of the
+   canvas, and a touch that lands on a label must not start a browser pan. */
+#canvas {
+  touch-action: none;
+}
+
+/* Selection comes back where the words matter: the drawer's claim and
+   provenance, and any failure the owner might want to quote back to us. */
+.detail,
+.error,
+.edit-alert,
+.share-notice {
+  user-select: text;
 }
 
 #canvas canvas {
@@ -461,6 +484,9 @@ button {
   min-height: 54px;
   overflow: hidden;
   border-radius: 15px;
+  /* A read-only tally of the model's composition. Nothing to click, so it does
+     not get to absorb a drag. */
+  pointer-events: none;
 }
 
 .status-loading {
@@ -553,6 +579,8 @@ button {
   --build-glow: rgba(78, 240, 195, 0.72);
 }
 
+/* Inert, like .story: a legend that reads "how to read your model" has nothing
+   to click, so it must not be a place where dragging the model does nothing. */
 .legend {
   position: absolute;
   z-index: 8;
@@ -562,6 +590,7 @@ button {
   padding: 12px 14px 13px;
   border-radius: 15px;
   background: var(--surface-soft);
+  pointer-events: none;
 }
 
 .legend > p {
@@ -671,6 +700,9 @@ button {
   width: min(400px, calc(100vw - 48px));
   max-height: min(520px, calc(100vh - 190px));
   overflow: auto;
+  /* Keep a flick inside the drawer from chaining out to the page once it hits
+     the end of its content. */
+  overscroll-behavior: contain;
   padding: 22px 50px 20px 20px;
   border-radius: var(--radius);
   background:
@@ -1095,9 +1127,17 @@ button {
   pointer-events: auto;
   text-align: left;
   text-overflow: ellipsis;
-  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+  /* `transform` must never be transitioned here. CSS2DRenderer rewrites this
+     element's inline transform on every animation frame, so a transition on it
+     restarts every frame and the label becomes a 140ms-lagging follower of the
+     node it names — the single most visible way this view stops feeling
+     smooth while the camera moves. */
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
   white-space: nowrap;
-  backdrop-filter: blur(8px);
+  /* No backdrop-filter: up to twenty of these move over a canvas that repaints
+     every frame, so each one is a per-frame backdrop readback and blur, and at
+     78% background opacity almost none of it is visible anyway. */
+  will-change: transform;
 }
 
 .model-label::before {
@@ -1118,11 +1158,12 @@ button {
 .model-label[data-kind="root"] { --label-accent: var(--root); }
 .model-label[data-kind="context"] { --label-accent: var(--muted); }
 
+/* No `transform` lift here: the renderer owns this element's transform and
+   overwrites any rule with an inline one, so the lift never rendered. */
 .model-label:hover,
 .model-label:focus-visible {
   border-color: var(--label-accent);
   background: rgba(20, 17, 34, 0.96);
-  transform: translateY(-1px);
 }
 
 .model-label[aria-expanded="true"] {
@@ -1140,9 +1181,11 @@ button {
   color: var(--muted);
 }
 
+/* `display: none` rather than `visibility: hidden`: a culled label is one of
+   hundreds, and hidden is not the same as gone — laid-out labels still cost a
+   style and layout pass on every frame the camera moves. */
 .model-label.hidden {
-  visibility: hidden;
-  pointer-events: none;
+  display: none;
 }
 
 @media (min-width: 1181px) and (max-width: 1360px) {
