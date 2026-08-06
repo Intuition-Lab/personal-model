@@ -931,3 +931,42 @@ def test_compaction_refuses_to_unstrike_a_rejected_entry(ac_root) -> None:
     unstruck = before.replace("~~", "")
     assert "strike markers" in _owner_authorship_lost(before, unstruck)
     assert _owner_authorship_lost(before, before) == ""
+
+
+def test_a_point_whose_markdown_is_gone_is_refused_not_a_500(ac_root) -> None:
+    """`evo_nodes` can outlive the Markdown it projects — a partly restored
+    backup leaves rows whose source of truth is missing. Under Markdown
+    authority the supersede raises FileNotFoundError from deep in the store,
+    which reached the owner as "HTTP 500" on the one surface whose job is
+    telling them what happened to their model.
+    """
+    from persome.store import files as files_mod
+
+    point_id = _seed_point()
+    files_mod.memory_path("person-alex.md").unlink()
+
+    with fts.cursor() as conn:
+        rewrite = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="Mine."
+        )
+        retire = apply_model_edit(conn, kind="point", target_id=point_id, op="retire")
+
+    assert not rewrite.ok and rewrite.reason == "point_file_missing"
+    assert not retire.ok and retire.reason == "point_file_missing"
+
+
+def test_the_route_reports_a_storage_failure_instead_of_a_bare_500(ac_root, monkeypatch) -> None:
+    from persome.api import routes as routes_mod
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(routes_mod, "apply_model_edit", boom, raising=False)
+    monkeypatch.setattr("persome.model.edit.apply_model_edit", boom)
+    client = TestClient(build_api_app(auth_enabled=False))
+    response = client.post(
+        "/model/edit",
+        json={"schema_version": 1, "kind": "face", "id": "f", "op": "retire"},
+    )
+    assert response.status_code == 500
+    assert response.json()["detail"] == "edit_failed: OSError"

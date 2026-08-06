@@ -1259,6 +1259,43 @@ function editableText(kind, item) {
   return kind === "point" ? item.content || "" : item.signature || "";
 }
 
+// The server answers with a stable slug. Echoing it at the owner explains
+// nothing: they did not choose the reason, and most of these are about the
+// state of their store rather than about what they typed.
+const EDIT_REFUSALS = {
+  point_file_missing:
+    "The memory file behind this fact is missing from disk, so it cannot be"
+    + " corrected. Run `persome doctor` — the index and your Markdown have"
+    + " drifted apart.",
+  point_not_editable_in_this_file:
+    "This fact lives in an append-only log, which corrections cannot rewrite.",
+  point_superseded:
+    "A newer version of this fact exists. Correct that one instead.",
+  point_already_retired: "This fact has already been withdrawn.",
+  point_archived: "This fact has already been withdrawn.",
+  unknown_point: "This fact is no longer in your model. Reload the view.",
+  unknown_object: "This object is no longer in your model. Reload the view.",
+  object_archived: "This has already been removed from your model.",
+  object_not_active:
+    "This pattern has not been promoted yet, so its wording cannot be pinned."
+    + " You can still reject it.",
+  kind_level_mismatch: "That object is a different layer of the model.",
+  replacement_forges_an_entry:
+    "That text contains a memory entry heading, which would corrupt the file it"
+    + " is written into. Remove the line starting with \u0060## [\u0060.",
+  replacement_too_long: "That correction is too long.",
+  empty_replacement: "Write the correction first.",
+};
+
+function editRefusalMessage(detail, status) {
+  const known = EDIT_REFUSALS[detail];
+  if (known) return known;
+  if (typeof detail === "string" && detail.startsWith("edit_failed")) {
+    return "The Runtime could not apply this correction. Check `persome status`.";
+  }
+  return `Could not save: ${detail || `HTTP ${status}`}`;
+}
+
 function setEditStatus(message, tone) {
   // The drawer may already be closed: committing by clicking away — the gesture
   // the editor itself advertises — both saves and closes. Writing a failure
@@ -1316,7 +1353,7 @@ async function submitEdit(kind, item, op, replacement, reason) {
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      setEditStatus(`Could not save: ${payload?.detail || `HTTP ${response.status}`}`, "error");
+      setEditStatus(editRefusalMessage(payload?.detail, response.status), "error");
       return;
     }
     const data = payload?.data || {};

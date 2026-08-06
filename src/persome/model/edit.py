@@ -150,6 +150,14 @@ def _point_file_is_editable(file_name: str) -> bool:
         return False
 
 
+def _point_file_exists(file_name: str) -> bool:
+    """Whether the Markdown this Point projects is actually on disk."""
+    try:
+        return files_mod.memory_path(file_name).is_file()
+    except Exception:  # noqa: BLE001 — an unresolvable name is not editable either
+        return False
+
+
 def _semantic_tags(raw: str) -> list[str]:
     """Split an ``evo_nodes.tags`` cell into its semantic tags, minus our marker.
 
@@ -236,6 +244,14 @@ def _edit_point(
         return _reject("point", target_id, op, "point_has_no_file")
     if not _point_file_is_editable(file_name):
         return _reject("point", target_id, op, "point_not_editable_in_this_file")
+    if not _point_file_exists(file_name):
+        # `evo_nodes` can outlive the Markdown it projects — a partially restored
+        # backup, a recovered index, or a file removed by hand all leave rows
+        # whose source of truth is gone. Under Markdown authority the supersede
+        # would raise `FileNotFoundError` from deep in the store and surface as
+        # an opaque 500. A named refusal says which file is missing, which is
+        # the thing the owner can actually act on.
+        return _reject("point", target_id, op, "point_file_missing")
     if str(row["status"] or "") == "archived":
         return _reject("point", target_id, op, "point_archived")
     # Same three conditions the snapshot uses. `valid_until` alone also marks a
