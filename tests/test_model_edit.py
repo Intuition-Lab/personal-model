@@ -1092,3 +1092,117 @@ def test_every_refusal_reason_the_snapshot_emits_is_explained(ac_root) -> None:
         "object_not_active",
     }
     assert emitted <= explained, f"unexplained: {sorted(emitted - explained)}"
+
+
+# ── deep-research regressions ─────────────────────────────────────────────
+
+
+def test_retiring_a_correction_withdraws_the_wording_it_replaced(ac_root) -> None:
+    """Rewrite then reject used to leave the ORIGINAL wording as the model's
+    only statement of that fact — the claim the owner had already replaced,
+    resurrected and permanently uneditable."""
+    original = "Alex works at Acme as a staff engineer."
+    point_id = _seed_point(original)
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=point_id,
+            op="rewrite",
+            replacement="I lead the platform team at Acme.",
+        )
+        assert first.ok
+        assert apply_model_edit(conn, kind="point", target_id=first.new_id, op="retire").ok
+        snapshot = build_snapshot(conn, redact=False)
+
+    contents = [p["content"] for p in snapshot["points"]]
+    assert original not in contents, "the replaced wording must not come back"
+    assert all(p["id"] not in (point_id, first.new_id) for p in snapshot["points"])
+
+
+def test_a_stranded_predecessor_is_correctable_again(ac_root) -> None:
+    """With every successor withdrawn there is no chain left to fork, so the
+    only version the owner can see becomes editable rather than a dead end."""
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        apply_model_edit(conn, kind="point", target_id=first.new_id, op="retire")
+        result = apply_model_edit(conn, kind="point", target_id=point_id, op="retire")
+    assert result.ok, f"expected the stranded version to be reachable, got {result.reason}"
+
+
+def test_the_audit_records_the_fact_the_owner_saw(ac_root) -> None:
+    """`prior_text` used to carry the `<!-- supersedes -->` marker, so a second
+    correction — and the withdrawal guard that reads this trail — compared
+    against bytes the owner never saw."""
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        second = apply_model_edit(
+            conn,
+            kind="point",
+            target_id=first.new_id,
+            op="rewrite",
+            replacement="I write before anyone is awake.",
+        )
+    assert second.ok
+    assert second.prior_text == "I write at dawn.", second.prior_text
+    assert "supersedes" not in second.prior_text
+
+
+def test_a_second_correction_still_sticks(ac_root) -> None:
+    """The withdrawal guard reads the audit trail; a marker in `prior_text`
+    meant it stopped matching from the second edit onward."""
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    point_id = _seed_point()
+    with fts.cursor() as conn:
+        first = apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement="I write at dawn."
+        )
+        apply_model_edit(
+            conn,
+            kind="point",
+            target_id=first.new_id,
+            op="rewrite",
+            replacement="I write before anyone is awake.",
+        )
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {
+                "entities": [{"canonical": "Alex", "kind": "person"}],
+                "assertions": [{"subject": {"canonical": "Alex"}, "text": "I write at dawn."}],
+            },
+        )
+    assert result.assertions_minted == 0, "the replaced wording must not be re-minted"
+
+
+def test_a_correction_is_not_re_minted_as_a_duplicate(ac_root) -> None:
+    """The dedupe check compared stored bytes, so a corrected Point was
+    invisible to it and the owner's own wording came back as a second live
+    Point the next time it was observed."""
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    point_id = _seed_point()
+    mine = "I reserve mornings for writing."
+    with fts.cursor() as conn:
+        assert apply_model_edit(
+            conn, kind="point", target_id=point_id, op="rewrite", replacement=mine
+        ).ok
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {
+                "entities": [{"canonical": "Alex", "kind": "person"}],
+                "assertions": [{"subject": {"canonical": "Alex"}, "text": mine}],
+            },
+        )
+    assert result.assertions_minted == 0
+    assert result.assertions_seen == 1

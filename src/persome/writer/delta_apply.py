@@ -140,14 +140,31 @@ def _route_assertion_stem(
 
 
 def _assertion_exists(conn: sqlite3.Connection, stored: str, text: str) -> bool:
+    """Whether this exact assertion is already the live wording in that file.
+
+    Compares the *visible* body. A Point written by a correction stores its text
+    plus a `<!-- supersedes: ... -->` marker, so an exact match against
+    `content` never sees it — and the owner's own new wording gets minted a
+    second time as a duplicate live Point the next time it is observed.
+    """
+    from ..store.entries import strip_supersede_provenance
+
     try:
-        row = conn.execute(
-            "SELECT 1 FROM evo_nodes WHERE file_name = ? AND content = ? AND is_latest = 1 LIMIT 1",
-            (stored, text),
-        ).fetchone()
-        return row is not None
+        rows = conn.execute(
+            "SELECT content, supersedes FROM evo_nodes WHERE file_name = ? AND is_latest = 1",
+            (stored,),
+        ).fetchall()
     except Exception:  # noqa: BLE001
         return False
+    wanted = text.strip()
+    for content, supersedes in rows:
+        try:
+            chain = {str(v) for v in json.loads(str(supersedes or "[]") or "[]")}
+        except (TypeError, ValueError):
+            chain = set()
+        if strip_supersede_provenance(str(content or ""), supersedes=chain).strip() == wanted:
+            return True
+    return False
 
 
 def _owner_withdrew(conn: sqlite3.Connection, stored: str, text: str) -> bool:

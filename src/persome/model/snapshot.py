@@ -112,7 +112,7 @@ def _point_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     #
     # Only a Point that is end-dated, no longer current, and has no successor
     # was actually withdrawn.
-    return list(
+    rows = list(
         conn.execute(
             f"SELECT {', '.join(selected)} FROM evo_nodes "
             "WHERE status != 'archived' "
@@ -121,6 +121,19 @@ def _point_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             "ORDER BY node_id"
         ).fetchall()
     )
+    # A superseded Point earns its place by anchoring an evolution Line. When
+    # its successor is withdrawn there is no Line left to anchor, and keeping it
+    # would republish the very wording the owner replaced — alone, as the
+    # model's only surviving statement of that fact. Withdraw the whole chain
+    # together, the way retiring a single Point already does.
+    live = {str(row["node_id"]) for row in rows}
+    kept: list[sqlite3.Row] = []
+    for row in rows:
+        successors = {str(v) for v in _json_list(row["superseded_by"])}
+        if successors and not (successors & live):
+            continue
+        kept.append(row)
+    return kept
 
 
 def _visible_content(row: sqlite3.Row) -> str:
