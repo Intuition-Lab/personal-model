@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
 import { computeClusterLayout, pickScreenTarget, zoomMath } from "./layout.mjs";
+import { focusKeysForSelection, rankSearchEntries } from "./explore.mjs";
 import {
   evidenceBreadcrumb,
   evidenceOverview,
@@ -65,6 +66,18 @@ const shareButton = document.getElementById("share-x");
 const shareNoticeEl = document.getElementById("share-notice");
 const lineExplorerEl = document.getElementById("line-explorer");
 const lineSelectEl = document.getElementById("line-select");
+const searchPanelEl = document.getElementById("model-search-panel");
+const searchInputEl = document.getElementById("model-search");
+const searchResultsEl = document.getElementById("search-results");
+const searchSummaryEl = document.getElementById("search-summary");
+const searchEmptyEl = document.getElementById("search-empty");
+const openSearchButton = document.getElementById("open-search");
+const closeSearchButton = document.getElementById("close-search");
+const clearFocusButton = document.getElementById("clear-focus");
+const layerCountEls = Object.fromEntries(
+  ["points", "lines", "faces", "volumes", "root"]
+    .map((kind) => [kind, document.getElementById(`layer-count-${kind}`)]),
+);
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x070610, 0.026);
@@ -124,6 +137,7 @@ scene.add(violetLight);
 let graph = new THREE.Group();
 scene.add(graph);
 let model = { points: [], lines: [], faces: [], volumes: [], root: null, stats: {} };
+let sceneModel = { points: [], lines: [], faces: [], volumes: [], root: null };
 let modelFingerprint = "";
 let modelGeneratedAt = "";
 let cutoff = new Date();
@@ -144,6 +158,7 @@ let hoverPointer = null;
 let hoverDirty = false;
 let selected = null;
 let selectedItem = null;
+let selectionReturnFocus = null;
 let detailMode = "node";
 let evidenceTrail = [];
 let evidenceRequest = 0;
@@ -160,6 +175,8 @@ let currentLayout = null;
 let layoutRadius = 6;
 let framedRadius = 0;
 let pulseGlows = [];
+let focusLabels = [];
+let focusLabelsKey = "";
 let fitDistance = 12;
 let zoomGoalDistance = null;
 let zoomAnchor = null;
@@ -168,6 +185,11 @@ let lastZoomPercent = null;
 let lastFrameTime = performance.now();
 let shareReady = false;
 let modelLoadPromise = null;
+let searchEntries = [];
+let searchMatches = [];
+let searchActiveIndex = 0;
+let cameraFlight = null;
+let focusVisualsSuspended = false;
 const layerVisible = { points: true, lines: true, faces: true, volumes: true, root: true };
 const kindLayers = {
   point: "points",
@@ -191,6 +213,8 @@ const pickWorldPosition = new THREE.Vector3();
 const pickProjected = new THREE.Vector3();
 const MIN_NODE_HIT_RADIUS_PX = 12;
 const MIN_LINE_HIT_RADIUS_PX = 8;
+const TOUCH_NODE_HIT_RADIUS_PX = 22;
+const TOUCH_LINE_HIT_RADIUS_PX = 14;
 const ZOOM_MIN_PERCENT = 50;
 const ZOOM_MAX_PERCENT = 400;
 const ZOOM_STEP_PERCENT = 25;
@@ -200,7 +224,7 @@ const SHARE_CARD_TIMEOUT_MS = 15_000;
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 function freshLayerObjects() {
-  return { points: [], lines: [], faces: [], volumes: [], root: [] };
+  return { points: [], lines: [], hierarchy: [], faces: [], volumes: [], root: [] };
 }
 
 function hash(text) {
@@ -262,7 +286,7 @@ function glowTexture(color) {
   return texture;
 }
 
-function addGlow(position, color, size, opacity, layer, pulse = 0.06) {
+function addGlow(position, color, size, opacity, layer, pulse = 0.06, focusRefs = []) {
   const sprite = new THREE.Sprite(
     new THREE.SpriteMaterial({
       map: glowTexture(color),
@@ -279,7 +303,7 @@ function addGlow(position, color, size, opacity, layer, pulse = 0.06) {
   sprite.userData.glowBase = size;
   sprite.userData.glowPhase = hash(`${position.x}:${position.y}:${position.z}`) * Math.PI * 2;
   sprite.userData.glowPulse = pulse;
-  register(sprite, layer);
+  register(sprite, layer, focusRefs);
   pulseGlows.push(sprite);
   return sprite;
 }
@@ -310,8 +334,9 @@ function visibleAt(item) {
   return !time || time <= cutoff;
 }
 
-function register(object, layer) {
+function register(object, layer, focusRefs = []) {
   object.userData.layer = layer;
+  object.userData.focusRefs = focusRefs;
   layerObjects[layer].push(object);
   graph.add(object);
   return object;
@@ -395,14 +420,98 @@ function addLabel(text, position, layer, priority, kind, item, context = false) 
   return label;
 }
 
-function addLine(start, end, color, opacity, dashed, layer = "lines") {
+function clearFocusLabels() {
+  focusLabels.forEach((label) => {
+    graph.remove(label);
+    label.element.remove();
+    labels = labels.filter((candidate) => candidate !== label);
+    const layer = label.userData.layer;
+    if (layerObjects[layer]) {
+      layerObjects[layer] = layerObjects[layer].filter((candidate) => candidate !== label);
+    }
+    const ref = label.userData.ref;
+    if (ref) {
+      const key = selectionKey(ref.kind, ref.id);
+      const remaining = (selectionTargets.get(key) || [])
+        .filter((candidate) => candidate !== label);
+      if (remaining.length) selectionTargets.set(key, remaining);
+      else selectionTargets.delete(key);
+    }
+  });
+  focusLabels = [];
+}
+
+function updateFocusLabels(focusKeys, activeKey) {
+  const nextKey = activeKey
+    ? `${activeKey}|${[...focusKeys].sort().join("|")}`
+    : "";
+  if (nextKey === focusLabelsKey) return;
+  clearFocusLabels();
+  focusLabelsKey = nextKey;
+  if (!activeKey) return;
+
+  const kindPriority = { root: 0, volume: 1, face: 2, point: 3, context: 4 };
+  const candidates = [...focusKeys]
+    .map((key) => {
+      const separator = key.indexOf(":");
+      return {
+        key,
+        kind: separator > 0 ? key.slice(0, separator) : "context",
+        id: separator > 0 ? key.slice(separator + 1) : key,
+      };
+    })
+    .filter(({ kind }) => kind !== "line")
+    .sort((left, right) => (
+      Number(right.key === activeKey) - Number(left.key === activeKey)
+      || (kindPriority[left.kind] ?? 9) - (kindPriority[right.kind] ?? 9)
+      || left.key.localeCompare(right.key)
+    ));
+
+  let labeled = candidates.filter(({ key }) => (
+    (selectionTargets.get(key) || []).some((target) => target.element)
+  )).length;
+  for (const candidate of candidates) {
+    const alreadyLabeled = (selectionTargets.get(candidate.key) || [])
+      .some((target) => target.element);
+    if (alreadyLabeled) continue;
+    // The active object is the one label that must never lose a budget race.
+    // A high-degree node can already have nine labelled neighbors before this
+    // loop begins; allow one generated active label in that case, then stop.
+    if (labeled >= 9 && candidate.key !== activeKey) break;
+    const item = items.get(candidate.key);
+    const position = selectionPosition(candidate.kind, candidate.id);
+    const layer = kindLayers[candidate.kind];
+    if (!item || !position || !layer) continue;
+    const verticalOffset = {
+      root: 0.66,
+      volume: 0.55,
+      face: 0.4,
+      point: 0.25,
+      context: 0.24,
+    }[candidate.kind] || 0.25;
+    const label = addLabel(
+      searchTitle(candidate.kind, item),
+      position.add(new THREE.Vector3(0, verticalOffset, 0)),
+      layer,
+      850 - labeled,
+      candidate.kind,
+      item,
+      candidate.kind === "context",
+    );
+    label.userData.focusGenerated = true;
+    focusLabels.push(label);
+    labeled += 1;
+  }
+}
+
+function addLine(start, end, color, opacity, dashed, layer = "lines", focusRefs = []) {
   const geometry = new THREE.BufferGeometry().setFromPoints([start, end]);
   const material = dashed
     ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize: 0.12, gapSize: 0.09 })
     : new THREE.LineBasicMaterial({ color, transparent: true, opacity });
   const line = new THREE.Line(geometry, material);
   if (dashed) line.computeLineDistances();
-  register(line, layer);
+  register(line, layer, focusRefs);
   return line;
 }
 
@@ -461,6 +570,8 @@ function disposeGraph() {
   items = new Map();
   layerObjects = freshLayerObjects();
   pulseGlows = [];
+  focusLabels = [];
+  focusLabelsKey = "";
 }
 
 function addPoint(point, position, baseRadius, showLabel, promoted) {
@@ -479,7 +590,15 @@ function addPoint(point, position, baseRadius, showLabel, promoted) {
   const mesh = registerPickable(new THREE.Mesh(geometry, material), "points", "point", point);
   mesh.position.copy(position);
   if (active && promoted && hash(`${point.id}:glow`) < 0.08) {
-    addGlow(position, COLORS.points, radius * 5.4, 0.2, "points", 0.08);
+    addGlow(
+      position,
+      COLORS.points,
+      radius * 5.4,
+      0.2,
+      "points",
+      0.08,
+      [selectionKey("point", point.id)],
+    );
   }
   if (showLabel) {
     addLabel(
@@ -520,7 +639,7 @@ function addContextNode(id) {
   }
 }
 
-function addClusterHalo(memberPositions, center) {
+function addClusterHalo(memberPositions, center, focusRefs = []) {
   if (memberPositions.length < 2) return;
   const radius = Math.min(1.9, Math.max(0.55, ...memberPositions.map((member) => member.distanceTo(center))) + 0.18);
   const mesh = register(
@@ -534,7 +653,8 @@ function addClusterHalo(memberPositions, center) {
         depthWrite: false,
       })
     ),
-    "faces"
+    "faces",
+    focusRefs,
   );
   mesh.position.copy(center);
   mesh.scale.setScalar(radius);
@@ -544,10 +664,11 @@ function addClusterHalo(memberPositions, center) {
 function addFace(face, showLabel) {
   const position = positions.get(face.id);
   if (!position) return;
+  const faceKey = selectionKey("face", face.id);
   const memberIds = currentLayout?.facePointIds.get(face.id) || [];
   const memberPositions = memberIds.map((id) => positions.get(id)).filter(Boolean);
-  addClusterHalo(memberPositions, position);
-  addGlow(position, COLORS.faces, 1.55, 0.22, "faces", 0.07);
+  addClusterHalo(memberPositions, position, [faceKey]);
+  addGlow(position, COLORS.faces, 1.55, 0.22, "faces", 0.07, [faceKey]);
   const node = registerPickable(
     new THREE.Mesh(
       new THREE.OctahedronGeometry(0.28, 0),
@@ -573,13 +694,27 @@ function addFace(face, showLabel) {
       face
     );
   }
-  memberPositions.forEach((member) => addLine(member, position, COLORS.hierarchy, 0.1, true));
+  memberIds.forEach((id) => {
+    const member = positions.get(id);
+    if (member) {
+      addLine(
+        member,
+        position,
+        COLORS.hierarchy,
+        0.1,
+        true,
+        "hierarchy",
+        [faceKey, selectionKey("point", id)],
+      );
+    }
+  });
 }
 
 function addVolume(volume, showLabel) {
   const position = positions.get(volume.id);
   if (!position) return;
-  addGlow(position, COLORS.volumes, 2.35, 0.25, "volumes", 0.06);
+  const volumeKey = selectionKey("volume", volume.id);
+  addGlow(position, COLORS.volumes, 2.35, 0.25, "volumes", 0.06, [volumeKey]);
   const mesh = registerPickable(
     new THREE.Mesh(
       new THREE.IcosahedronGeometry(0.48, 1),
@@ -602,7 +737,8 @@ function addVolume(volume, showLabel) {
       new THREE.IcosahedronGeometry(0.17, 1),
       new THREE.MeshBasicMaterial({ color: COLORS.volumes, transparent: true, opacity: 0.68 })
     ),
-    "volumes"
+    "volumes",
+    [volumeKey],
   );
   core.position.copy(position);
   if (showLabel) {
@@ -616,14 +752,27 @@ function addVolume(volume, showLabel) {
     );
   }
   const memberIds = currentLayout?.volumeFaceIds.get(volume.id) || [];
-  memberIds.map((id) => positions.get(id)).filter(Boolean)
-    .forEach((member) => addLine(member, position, COLORS.volumes, 0.22, false));
+  memberIds.forEach((id) => {
+    const member = positions.get(id);
+    if (member) {
+      addLine(
+        member,
+        position,
+        COLORS.volumes,
+        0.22,
+        false,
+        "hierarchy",
+        [volumeKey, selectionKey("face", id)],
+      );
+    }
+  });
 }
 
 function addRoot(root) {
   const position = positions.get(root.id);
   if (!position) return;
-  addGlow(position, COLORS.root, 4.2, 0.42, "root", 0.075);
+  const rootKey = selectionKey("root", root.id);
+  addGlow(position, COLORS.root, 4.2, 0.42, "root", 0.075, [rootKey]);
   const mesh = registerPickable(
     new THREE.Mesh(
       new THREE.DodecahedronGeometry(0.62, 0),
@@ -651,8 +800,20 @@ function addRoot(root) {
     root
   );
   const parentIds = currentLayout?.rootVolumeIds || [];
-  parentIds.map((id) => positions.get(id)).filter(Boolean)
-    .forEach((member) => addLine(member, position, COLORS.root, 0.32, false));
+  parentIds.forEach((id) => {
+    const member = positions.get(id);
+    if (member) {
+      addLine(
+        member,
+        position,
+        COLORS.root,
+        0.32,
+        false,
+        "hierarchy",
+        [rootKey, selectionKey("volume", id)],
+      );
+    }
+  });
 }
 
 function addModelLine(line) {
@@ -711,6 +872,13 @@ function buildScene() {
   const visibleVolumes = model.volumes.filter(visibleAt);
   const visibleRoot = model.root && visibleAt(model.root) ? model.root : null;
   const visibleLines = model.lines.filter(visibleAt);
+  sceneModel = {
+    points: visiblePoints,
+    lines: visibleLines,
+    faces: visibleFaces,
+    volumes: visibleVolumes,
+    root: visibleRoot,
+  };
   currentLayout = computeClusterLayout({
     points: visiblePoints,
     lines: visibleLines,
@@ -746,8 +914,18 @@ function buildScene() {
   visibleVolumes.forEach((volume) => addVolume(volume, labeledVolumes.has(volume.id)));
   if (visibleRoot) addRoot(visibleRoot);
 
+  const renderedLines = renderedLineItems.length;
+  const currentCounts = {
+    points: visiblePoints.length,
+    lines: renderedLines,
+    faces: visibleFaces.length,
+    volumes: visibleVolumes.length,
+    root: visibleRoot ? 1 : 0,
+  };
+  updateLayerCounts(currentCounts);
+  rebuildSearchEntries();
   applyLayerVisibility();
-  renderStatus();
+  renderStatus(currentCounts);
   emptyEl.hidden = visiblePoints.length > 0;
   frameLayout(false);
   // Fresh label elements and a possibly-resized status strip: both cached
@@ -758,7 +936,6 @@ function buildScene() {
   // blank scene, leaving the local smoke signal reading "nothing rendered"
   // forever. A new scene deserves a fresh look.
   renderProbeSweeps = 0;
-  const renderedLines = renderedLineItems.length;
   window.__persomeViewerState = {
     schemaVersion: model.schema_version,
     generatedAt: modelGeneratedAt || null,
@@ -786,15 +963,14 @@ function buildScene() {
   viewerEl.dataset.layoutVersion = currentLayout.diagnostics.version;
 }
 
-function renderStatus() {
-  const stats = model.stats || {};
+function renderStatus(counts) {
   statusEl.replaceChildren();
   const parts = [
-    ["points", "Points", stats.points || 0],
-    ["lines", "Lines", (stats.evolution_lines || 0) + (stats.relation_lines || 0)],
-    ["faces", "Faces", stats.faces || 0],
-    ["volumes", "Volumes", stats.volumes || 0],
-    ["root", "Root", stats.roots || 0],
+    ["points", "Points", counts.points],
+    ["lines", "Lines", counts.lines],
+    ["faces", "Faces", counts.faces],
+    ["volumes", "Volumes", counts.volumes],
+    ["root", "Root", counts.root],
   ];
   parts.forEach(([kind, label, value]) => {
     const stat = document.createElement("span");
@@ -830,6 +1006,166 @@ function renderStatus() {
   }
   modelIdentityEl.textContent = model.root?.signature
     || "A living map of what you notice, repeat, and become.";
+}
+
+function updateLayerCounts(counts) {
+  Object.entries(layerCountEls).forEach(([kind, countEl]) => {
+    if (!countEl) return;
+    const count = Number(counts[kind] || 0);
+    countEl.textContent = String(count);
+    const button = countEl.closest("button");
+    if (button) {
+      const label = kind === "root" ? "Root" : `${kind[0].toUpperCase()}${kind.slice(1)}`;
+      button.setAttribute("aria-label", `${label}: ${count}. Toggle visibility`);
+    }
+  });
+}
+
+function searchTitle(kind, item) {
+  if (kind === "line") return linePresentation(item, sceneModel).title;
+  return item.content || item.signature || item.label || item.predicate || item.kind || item.id;
+}
+
+function searchSubtitle(kind, item) {
+  if (kind === "point") {
+    return item.status === "active" ? "Modeled observation · active" : "Modeled observation";
+  }
+  if (kind === "line") {
+    const presentation = linePresentation(item, sceneModel);
+    return `${presentation.source} → ${presentation.target}`;
+  }
+  if (kind === "face") return "Stable pattern";
+  if (kind === "volume") return "Cross-pattern structure";
+  if (kind === "root") return "Current personal model";
+  return "Context referenced by a relation";
+}
+
+function searchWeight(kind, item) {
+  const observations = Math.min(8, Number(item.observations || 0));
+  if (kind === "root") return 24;
+  if (kind === "volume") return 18 + observations;
+  if (kind === "face") return 12 + observations;
+  if (kind === "point") return 6 + Math.min(4, Number(item.confidence || 0) * 4);
+  if (kind === "line") return 3;
+  return 1;
+}
+
+function rebuildSearchEntries() {
+  searchEntries = [...items.entries()].map(([key, item]) => {
+    const separator = key.indexOf(":");
+    const kind = separator > 0 ? key.slice(0, separator) : "context";
+    const lineDetail = kind === "line" ? linePresentation(item, sceneModel) : null;
+    return {
+      key,
+      kind,
+      id: item.id,
+      title: String(searchTitle(kind, item) || "Untitled").replace(/\s+/g, " ").trim(),
+      subtitle: searchSubtitle(kind, item),
+      aliases: lineDetail
+        ? [lineDetail.predicate, lineDetail.label, lineDetail.source, lineDetail.target, item.kind]
+        : [item.kind, item.status],
+      weight: searchWeight(kind, item),
+    };
+  });
+  if (!searchPanelEl.hidden) renderSearchResults();
+}
+
+function setSearchActiveIndex(nextIndex) {
+  if (!searchMatches.length) {
+    searchActiveIndex = 0;
+    searchInputEl.removeAttribute("aria-activedescendant");
+    return;
+  }
+  searchActiveIndex = (nextIndex + searchMatches.length) % searchMatches.length;
+  const buttons = [...searchResultsEl.querySelectorAll(".search-result")];
+  buttons.forEach((button, index) => {
+    button.setAttribute("aria-selected", String(index === searchActiveIndex));
+  });
+  const active = buttons[searchActiveIndex];
+  if (active) {
+    searchInputEl.setAttribute("aria-activedescendant", active.id);
+    active.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function renderSearchResults() {
+  const query = searchInputEl.value.trim();
+  searchMatches = rankSearchEntries(searchEntries, query, 9);
+  searchActiveIndex = Math.min(searchActiveIndex, Math.max(0, searchMatches.length - 1));
+  searchResultsEl.replaceChildren();
+  searchMatches.forEach((entry, index) => {
+    const button = document.createElement("button");
+    button.id = `model-search-result-${index}`;
+    button.type = "button";
+    button.tabIndex = -1;
+    button.className = "search-result";
+    button.dataset.kind = entry.kind;
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(index === searchActiveIndex));
+
+    const marker = document.createElement("i");
+    marker.setAttribute("aria-hidden", "true");
+    const copy = document.createElement("span");
+    const title = document.createElement("b");
+    title.textContent = entry.title;
+    const subtitle = document.createElement("small");
+    subtitle.textContent = entry.subtitle;
+    copy.append(title, subtitle);
+    const kind = document.createElement("em");
+    kind.textContent = entry.kind === "context" ? "entity" : entry.kind;
+    button.append(marker, copy, kind);
+    button.addEventListener("pointerenter", () => setSearchActiveIndex(index));
+    button.addEventListener("click", () => selectSearchMatch(entry));
+    searchResultsEl.appendChild(button);
+  });
+  searchEmptyEl.hidden = searchMatches.length > 0;
+  searchSummaryEl.textContent = query
+    ? (searchMatches.length
+      ? `Top ${searchMatches.length} matches in this model view.`
+      : "No matching object in this model view.")
+    : `Showing ${searchMatches.length} anchors from this model view.`;
+  setSearchActiveIndex(searchActiveIndex);
+}
+
+function openSearch() {
+  pauseAutoRotate();
+  searchPanelEl.hidden = false;
+  searchInputEl.setAttribute("aria-expanded", "true");
+  searchActiveIndex = 0;
+  renderSearchResults();
+  invalidatePanelBoxes();
+  window.requestAnimationFrame(() => {
+    searchInputEl.focus({ preventScroll: true });
+    searchInputEl.select();
+  });
+}
+
+function closeSearch(restoreFocus = true) {
+  if (searchPanelEl.hidden) return;
+  searchPanelEl.hidden = true;
+  searchInputEl.setAttribute("aria-expanded", "false");
+  searchInputEl.removeAttribute("aria-activedescendant");
+  invalidatePanelBoxes();
+  if (restoreFocus) openSearchButton.focus({ preventScroll: true });
+}
+
+function selectSearchMatch(entry) {
+  const item = items.get(entry.key);
+  if (!item) {
+    rebuildSearchEntries();
+    renderSearchResults();
+    return;
+  }
+  const layer = kindLayers[entry.kind];
+  if (layer && !layerVisible[layer]) {
+    layerVisible[layer] = true;
+    applyLayerVisibility();
+    if (window.__persomeViewerState) window.__persomeViewerState.layers = { ...layerVisible };
+  }
+  closeSearch(false);
+  showDetails(entry.kind, item, openSearchButton);
+  flyToSelection(entry.kind, entry.id);
+  document.getElementById("close-detail").focus({ preventScroll: true });
 }
 
 function pauseAutoRotate() {
@@ -901,13 +1237,23 @@ function createHumanCardBlob(shareModel) {
 }
 
 function createConstellationBlob(shareModel) {
-  renderer.render(scene, camera);
   const canvas = document.createElement("canvas");
   canvas.width = CONSTELLATION_CARD_WIDTH;
   canvas.height = CONSTELLATION_CARD_HEIGHT;
   const context = canvas.getContext("2d");
   if (!context) return Promise.reject(new Error("Canvas export is unavailable"));
-  drawConstellationCard(context, renderer.domElement, shareModel);
+  // Focus is a reading aid, not part of the model. Export the complete current
+  // time slice even when the owner has a neighborhood selected.
+  focusVisualsSuspended = true;
+  syncSelectionState();
+  try {
+    renderer.render(scene, camera);
+    drawConstellationCard(context, renderer.domElement, shareModel);
+  } finally {
+    focusVisualsSuspended = false;
+    syncSelectionState();
+    renderer.render(scene, camera);
+  }
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) resolve(blob);
@@ -987,8 +1333,59 @@ async function shareConstellationToX() {
   }
 }
 
+function objectFocusKeys(object) {
+  const keys = new Set(object.userData.focusRefs || []);
+  const ref = object.userData.ref;
+  if (ref?.kind && ref?.id) keys.add(selectionKey(ref.kind, ref.id));
+  return keys;
+}
+
+function applyMaterialFocus(object, focusing, relevant) {
+  const materials = Array.isArray(object.material) ? object.material : [object.material];
+  materials.filter(Boolean).forEach((material) => {
+    material.userData.persomeFocusBase ||= {
+      opacity: Number(material.opacity),
+      transparent: Boolean(material.transparent),
+      depthWrite: Boolean(material.depthWrite),
+      emissiveIntensity: Number.isFinite(material.emissiveIntensity)
+        ? Number(material.emissiveIntensity)
+        : null,
+    };
+    const base = material.userData.persomeFocusBase;
+    const muted = focusing && !relevant;
+    const nextTransparent = muted ? true : base.transparent;
+    if (material.transparent !== nextTransparent) material.needsUpdate = true;
+    material.transparent = nextTransparent;
+    const mutedFactor = object.isSprite ? 0.025 : (object.isLine ? 0.025 : 0.045);
+    material.opacity = muted ? base.opacity * mutedFactor : base.opacity;
+    material.depthWrite = muted ? false : base.depthWrite;
+    if (base.emissiveIntensity !== null) {
+      material.emissiveIntensity = muted ? base.emissiveIntensity * 0.045 : base.emissiveIntensity;
+    }
+  });
+}
+
 function syncSelectionState() {
-  const activeKey = selected ? selectionKey(selected.kind, selected.id) : null;
+  const selectionVisible = selected && !focusVisualsSuspended;
+  const activeKey = selectionVisible ? selectionKey(selected.kind, selected.id) : null;
+  const focusKeys = selectionVisible
+    ? focusKeysForSelection(sceneModel, currentLayout, selected)
+    : new Set();
+  const focusing = focusKeys.size > 0;
+  if (!focusVisualsSuspended) updateFocusLabels(focusKeys, activeKey);
+
+  Object.values(layerObjects).flat().forEach((object) => {
+    const keys = objectFocusKeys(object);
+    const relevant = [...keys].some((key) => focusKeys.has(key));
+    if (object.element) {
+      const active = keys.has(activeKey);
+      object.element.classList.toggle("focus-muted", focusing && !relevant);
+      object.element.classList.toggle("focus-neighbor", focusing && relevant && !active);
+    } else if (object.material) {
+      applyMaterialFocus(object, focusing, relevant);
+    }
+  });
+
   selectionTargets.forEach((targets, key) => {
     const active = key === activeKey;
     targets.forEach((target) => {
@@ -996,10 +1393,11 @@ function syncSelectionState() {
         target.element.setAttribute("aria-expanded", String(active));
       } else if (target.isLine && target.material) {
         const baseOpacity = Number(target.userData.baseOpacity || 0);
-        target.material.opacity = active ? Math.min(1, baseOpacity * 2 + 0.24) : baseOpacity;
+        if (active) target.material.opacity = Math.min(1, baseOpacity * 2 + 0.24);
         target.renderOrder = active ? 5 : 0;
       } else if (target.isMesh) {
-        target.scale.setScalar(active ? 1.45 : 1);
+        target.userData.selectionBaseScale ||= target.scale.clone();
+        target.scale.copy(target.userData.selectionBaseScale).multiplyScalar(active ? 1.45 : 1);
       }
     });
   });
@@ -1009,29 +1407,51 @@ function syncSelectionState() {
     screenLinePickables: screenLinePickables.length,
     minimumNodeHitRadiusPx: MIN_NODE_HIT_RADIUS_PX,
     minimumLineHitRadiusPx: MIN_LINE_HIT_RADIUS_PX,
+    touchNodeHitRadiusPx: TOUCH_NODE_HIT_RADIUS_PX,
+    touchLineHitRadiusPx: TOUCH_LINE_HIT_RADIUS_PX,
     nodePickables: pickables.length,
     interactiveLabels: labels.filter((label) => Boolean(label.userData.ref)).length,
     selected: selected ? { ...selected } : null,
+    focused: Boolean(selectionVisible),
+    neighborhoodObjects: focusKeys.size,
   };
 }
 
-function clearSelection() {
+function clearSelection(restoreFocus = false) {
+  const returnFocus = restoreFocus ? selectionReturnFocus : null;
   evidenceRequest += 1;
   selected = null;
   selectedItem = null;
+  selectionReturnFocus = null;
   detailMode = "node";
   evidenceTrail = [];
   detailEl.hidden = true;
   delete detailEl.dataset.kind;
   invalidatePanelBoxes();
   syncSelectionState();
+  if (returnFocus?.isConnected) {
+    window.requestAnimationFrame(() => returnFocus.focus({ preventScroll: true }));
+  }
+}
+
+function showAllModel() {
+  clearSelection(true);
+  resetCamera();
 }
 
 function applyLayerVisibility() {
   Object.entries(layerObjects).forEach(([layer, objects]) => {
     objects.forEach((object) => {
-      object.visible = layerVisible[layer];
-      if (object.element) object.element.hidden = !layerVisible[layer];
+      const visible = layer === "hierarchy"
+        ? [...objectFocusKeys(object)].every((key) => {
+          const separator = key.indexOf(":");
+          const kind = separator > 0 ? key.slice(0, separator) : "context";
+          const endpointLayer = kindLayers[kind];
+          return !endpointLayer || layerVisible[endpointLayer];
+        })
+        : layerVisible[layer];
+      object.visible = visible;
+      if (object.element) object.element.hidden = !visible;
     });
   });
   document.querySelectorAll("[data-layer]").forEach((button) => {
@@ -1626,7 +2046,15 @@ function renderEditor(kind, item) {
   }
 }
 
-function showDetails(kind, item) {
+function showDetails(kind, item, returnFocus = null) {
+  if (detailEl.hidden) {
+    const candidate = returnFocus || document.activeElement;
+    selectionReturnFocus = candidate instanceof HTMLElement
+      && candidate !== document.body
+      && !detailEl.contains(candidate)
+      ? candidate
+      : openSearchButton;
+  }
   const lineDetail = kind === "line" ? linePresentation(item, model) : null;
   selected = { kind, id: item.id };
   selectedItem = item;
@@ -1819,6 +2247,7 @@ function frameLayout(force) {
   const direction = new THREE.Vector3(portrait ? 0.58 : 0.72, portrait ? 1.25 : 1.05, 1).normalize();
   const distance = Math.max(portrait ? 15 : 12, radius * (portrait ? 3.0 : 2.55));
   fitDistance = distance;
+  cameraFlight = null;
   zoomGoalDistance = null;
   camera.position.copy(direction.multiplyScalar(distance));
   controls.target.set(0, 0, 0);
@@ -1836,6 +2265,73 @@ function frameLayout(force) {
 
 function resetCamera() {
   frameLayout(true);
+}
+
+function selectionPosition(kind, id) {
+  if (kind === "line") {
+    const line = sceneModel.lines.find((item) => item.id === id);
+    const start = line ? positions.get(line.source) : null;
+    const end = line ? positions.get(line.target) : null;
+    if (start && end) return start.clone().lerp(end, 0.5);
+  }
+  return positions.get(id)?.clone() || null;
+}
+
+function cameraFocusDistance(kind) {
+  const factor = {
+    root: 0.7,
+    volume: 0.56,
+    face: 0.42,
+    line: 0.36,
+    point: 0.3,
+    context: 0.3,
+  }[kind] || 0.42;
+  const cap = kind === "root" ? 18 : (kind === "volume" ? 14 : 10);
+  return THREE.MathUtils.clamp(
+    Math.min(cap, fitDistance * factor),
+    controls.minDistance,
+    controls.maxDistance,
+  );
+}
+
+function flyToSelection(kind, id) {
+  const target = selectionPosition(kind, id);
+  if (!target) return;
+  pauseAutoRotate();
+  zoomGoalDistance = null;
+  zoomAnchor = null;
+
+  const direction = camera.position.clone().sub(controls.target);
+  if (direction.lengthSq() < 1e-8) direction.set(0.72, 0.9, 1);
+  direction.normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), 0.16);
+  direction.y += 0.06;
+  direction.normalize().multiplyScalar(cameraFocusDistance(kind));
+  const destination = target.clone().add(direction);
+  const travel = controls.target.distanceTo(target) + camera.position.distanceTo(destination) * 0.24;
+  const duration = REDUCED_MOTION ? 0 : THREE.MathUtils.clamp(0.56 + travel * 0.025, 0.56, 1.15);
+  cameraFlight = {
+    elapsed: 0,
+    duration,
+    fromPosition: camera.position.clone(),
+    toPosition: destination,
+    fromTarget: controls.target.clone(),
+    toTarget: target,
+  };
+  if (!duration) applyCameraFlight(0);
+}
+
+function applyCameraFlight(deltaSeconds) {
+  if (!cameraFlight) return;
+  const flight = cameraFlight;
+  flight.elapsed += deltaSeconds;
+  const progress = flight.duration ? Math.min(1, flight.elapsed / flight.duration) : 1;
+  const eased = progress < 0.5
+    ? 4 * progress * progress * progress
+    : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+  camera.position.lerpVectors(flight.fromPosition, flight.toPosition, eased);
+  controls.target.lerpVectors(flight.fromTarget, flight.toTarget, eased);
+  controls.update();
+  if (progress >= 1) cameraFlight = null;
 }
 
 function clampZoomPercent(value) {
@@ -1889,10 +2385,11 @@ function syncZoomUI() {
   state.percent = percent;
   state.distance = Number(distance.toFixed(3));
   state.fitDistance = Number(fitDistance.toFixed(3));
-  state.animating = zoomGoalDistance !== null;
+  state.animating = zoomGoalDistance !== null || cameraFlight !== null;
 }
 
 function requestZoom(percent) {
+  cameraFlight = null;
   const clamped = clampZoomPercent(percent);
   zoomGoalDistance = THREE.MathUtils.clamp(
     fitDistance * 100 / clamped,
@@ -1906,6 +2403,7 @@ function requestZoom(percent) {
 // already headed, so a stream of small events composes into one continuous
 // gesture instead of repeatedly restarting from the camera's current position.
 function requestZoomBy(factor, anchor) {
+  cameraFlight = null;
   const base = zoomGoalDistance === null
     ? camera.position.distanceTo(controls.target)
     : zoomGoalDistance;
@@ -1990,9 +2488,23 @@ function invalidatePanelBoxes() {
   canvasBounds = null;
 }
 
+const panelResizeObserver = "ResizeObserver" in window
+  ? new ResizeObserver(invalidatePanelBoxes)
+  : null;
+if (panelResizeObserver) {
+  document.querySelectorAll(
+    ".story, .legend, .status, .timeline, .detail, .search-dialog",
+  ).forEach((element) => panelResizeObserver.observe(element));
+}
+document.querySelector(".legend")?.addEventListener("toggle", invalidatePanelBoxes);
+detailEvidenceFoldEl.addEventListener("toggle", invalidatePanelBoxes);
+detailHistoryFoldEl.addEventListener("toggle", invalidatePanelBoxes);
+
 function panelBoxes() {
   if (occupiedPanels) return occupiedPanels;
-  occupiedPanels = [...document.querySelectorAll(".story, .legend, .status, .timeline, .detail:not([hidden])")]
+  occupiedPanels = [...document.querySelectorAll(
+    ".story, .legend, .status, .timeline, .detail:not([hidden]), .search-dialog",
+  )]
     .map((element) => element.getBoundingClientRect())
     .filter((box) => box.width > 0 && box.height > 0)
     .map((box) => ({ x0: box.left - 6, x1: box.right + 6, y0: box.top - 6, y1: box.bottom + 6 }));
@@ -2005,7 +2517,7 @@ const cullCandidates = [];
 function cullLabels() {
   const occupied = panelBoxes().slice();
   const mobile = window.innerWidth < 760;
-  const maxLabels = mobile ? 8 : 20;
+  const maxLabels = mobile ? (selected ? 9 : 8) : 20;
   const maxWidth = mobile ? 130 : 220;
   const safeArea = {
     left: mobile ? 8 : 6,
@@ -2018,6 +2530,12 @@ function cullLabels() {
   cullCandidates.length = 0;
   labels.forEach((label) => {
     if (!label.visible) return;
+    if (label.element.classList.contains("focus-muted")) {
+      label.element.classList.add("hidden");
+      label.element.setAttribute("aria-hidden", "true");
+      label.element.tabIndex = -1;
+      return;
+    }
     label.getWorldPosition(projected);
     projected.project(camera);
     const x = (projected.x * 0.5 + 0.5) * window.innerWidth;
@@ -2042,7 +2560,9 @@ function cullLabels() {
       y,
       width: Math.min(maxWidth, label.userData.measuredWidth || Math.max(32, estimatedWidth)),
       height: label.userData.measuredHeight || 21,
-      priority: label.userData.priority || 0,
+      priority: (label.userData.priority || 0)
+        + (label.element.getAttribute("aria-expanded") === "true" ? 1000 : 0)
+        + (label.element.classList.contains("focus-neighbor") ? 500 : 0),
       depth: projected.z,
     });
   });
@@ -2109,6 +2629,54 @@ document.querySelectorAll("[data-layer]").forEach((button) => {
   });
 });
 
+openSearchButton.addEventListener("click", openSearch);
+closeSearchButton.addEventListener("click", () => closeSearch());
+searchInputEl.addEventListener("input", () => {
+  searchActiveIndex = 0;
+  renderSearchResults();
+});
+searchPanelEl.addEventListener("click", (event) => {
+  if (event.target === searchPanelEl) closeSearch();
+});
+searchPanelEl.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeSearch();
+    return;
+  }
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setSearchActiveIndex(searchActiveIndex + 1);
+    return;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setSearchActiveIndex(searchActiveIndex - 1);
+    return;
+  }
+  if (event.key === "Enter" && event.target === searchInputEl && searchMatches[searchActiveIndex]) {
+    event.preventDefault();
+    selectSearchMatch(searchMatches[searchActiveIndex]);
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = [...searchPanelEl.querySelectorAll("button, input")]
+    .filter((element) => (
+      !element.disabled && element.tabIndex >= 0 && element.getClientRects().length > 0
+    ));
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
+
 lineSelectEl.addEventListener("change", () => {
   const index = Number(lineSelectEl.value) - 1;
   const item = lineNavigatorItems[index];
@@ -2125,6 +2693,7 @@ zoomOutButton.addEventListener("click", () => stepZoom(-1));
 zoomResetButton.addEventListener("click", () => requestZoom(100));
 zoomInButton.addEventListener("click", () => stepZoom(1));
 controls.addEventListener("start", () => {
+  cameraFlight = null;
   zoomGoalDistance = null;
   zoomAnchor = null;
 });
@@ -2173,7 +2742,7 @@ function gestureInFlight() {
 // instead of falling through to the browser.
 viewerEl.addEventListener("wheel", (event) => {
   // The drawer and the line picker are real scroll containers; leave them be.
-  if (event.target.closest?.(".detail, .line-explorer")) return;
+  if (event.target.closest?.(".detail, .line-explorer, .search-panel, .legend")) return;
   event.stopPropagation();
   // If a gesture is in flight this wheel is the same fingers counted twice.
   if (gestureInFlight()) return;
@@ -2189,7 +2758,7 @@ viewerEl.addEventListener("wheel", (event) => {
 }, { passive: false, capture: true });
 
 viewerEl.addEventListener("gesturestart", (event) => {
-  if (event.target.closest?.(".detail, .line-explorer")) return;
+  if (event.target.closest?.(".detail, .line-explorer, .search-panel, .legend")) return;
   event.preventDefault();
   gestureScale = 1;
   gestureSeenAt = performance.now();
@@ -2215,7 +2784,8 @@ viewerEl.addEventListener("gestureend", (event) => {
   gestureScale = 0;
 });
 document.getElementById("reset").addEventListener("click", resetCamera);
-document.getElementById("close-detail").addEventListener("click", clearSelection);
+document.getElementById("close-detail").addEventListener("click", () => clearSelection(true));
+clearFocusButton.addEventListener("click", showAllModel);
 cardButton.addEventListener("click", exportHumanCard);
 shareButton.addEventListener("click", shareConstellationToX);
 
@@ -2252,6 +2822,9 @@ function pickAt(event) {
     x: event.clientX - bounds.left,
     y: event.clientY - bounds.top,
   };
+  const coarsePointer = event.pointerType === "touch" || window.innerWidth < 760;
+  const nodeHitRadius = coarsePointer ? TOUCH_NODE_HIT_RADIUS_PX : MIN_NODE_HIT_RADIUS_PX;
+  const lineHitRadius = coarsePointer ? TOUCH_LINE_HIT_RADIUS_PX : MIN_LINE_HIT_RADIUS_PX;
   // Projecting into a shared scratch vector rather than cloning per candidate:
   // hover picking runs on the frame after every pointer move, over every
   // visible node, so a clone per node is a steady drip of garbage.
@@ -2274,7 +2847,7 @@ function pickAt(event) {
     localPointer,
     nodeCandidates,
     [],
-    { nodeRadius: MIN_NODE_HIT_RADIUS_PX },
+    { nodeRadius: nodeHitRadius },
   );
   if (screenNode) return { object: screenNode };
 
@@ -2300,7 +2873,7 @@ function pickAt(event) {
     localPointer,
     [],
     lineCandidates,
-    { lineRadius: MIN_LINE_HIT_RADIUS_PX },
+    { lineRadius: lineHitRadius },
   );
   return screenLine ? { object: screenLine } : null;
 }
@@ -2396,6 +2969,16 @@ window.addEventListener("keydown", (event) => {
     || target instanceof HTMLSelectElement
     || Boolean(target?.isContentEditable)
   );
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    openSearch();
+    return;
+  }
+  if (event.key === "Escape" && !searchPanelEl.hidden) {
+    event.preventDefault();
+    closeSearch();
+    return;
+  }
   if (event.key === "Escape" && selected) {
     // The claim editor handles its own Escape (discard, keep the drawer open)
     // and stops propagation, so anything reaching here is either not editing or
@@ -2405,11 +2988,17 @@ window.addEventListener("keydown", (event) => {
       target.blur();
       return;
     }
-    clearSelection();
+    clearSelection(true);
     return;
   }
   if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
-  if (event.key === "+" || event.key === "=") {
+  if (event.key === "/") {
+    event.preventDefault();
+    openSearch();
+  } else if (event.key.toLowerCase() === "f" && selected) {
+    event.preventDefault();
+    flyToSelection(selected.kind, selected.id);
+  } else if (event.key === "+" || event.key === "=") {
     event.preventDefault();
     stepZoom(1);
   } else if (event.key === "-" || event.key === "_") {
@@ -2469,6 +3058,7 @@ function animate(frameTime = performance.now()) {
   const frameStart = performance.now();
   const deltaSeconds = Math.min(Math.max((frameTime - lastFrameTime) / 1000, 0), 0.5);
   lastFrameTime = frameTime;
+  applyCameraFlight(deltaSeconds);
   applyZoomAnimation(deltaSeconds);
   // Auto-rotate advances by wall time rather than by frame, so the model turns
   // at one speed whether the display runs at 60Hz or 120Hz.

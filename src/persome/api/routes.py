@@ -750,6 +750,7 @@ def model_view(request: Request) -> HTMLResponse:
 
 _MODEL_ASSETS = {
     "evidence.mjs",
+    "explore.mjs",
     "onboarding.css",
     "onboarding.js",
     "three.module.js",

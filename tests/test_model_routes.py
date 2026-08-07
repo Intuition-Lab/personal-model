@@ -404,7 +404,17 @@ class TestViewPage:
         assert 'id="zoom-out"' in body
         assert 'id="zoom-reset"' in body
         assert 'id="zoom-in"' in body
-        assert "Scroll or pinch to zoom" in body
+        assert "Select to focus" in body
+        assert "⌘K to find" in body
+        assert 'id="open-search"' in body
+        assert 'id="model-search-panel"' in body
+        assert 'id="model-search"' in body
+        assert 'class="legend"' in body
+        assert 'id="layer-count-points"' in body
+        assert "inferred placement · not evidence" in body
+        assert 'id="clear-focus"' in body
+        assert 'role="combobox"' in body
+        assert 'role="listbox"' in body
         # The drawer is one page, not a tabbed form: the claim is editable in
         # place and provenance folds away beneath it.
         assert 'role="tablist"' not in body
@@ -422,6 +432,7 @@ class TestViewPage:
     def test_bundled_viewer_assets_are_served(self, ac_root):
         three = routes.model_asset("three.module.js")
         layout = routes.model_asset("layout.mjs")
+        explore = routes.model_asset("explore.mjs")
         evidence = routes.model_asset("evidence.mjs")
         share = routes.model_asset("share.mjs")
         viewer = routes.model_asset("viewer.js")
@@ -430,12 +441,15 @@ class TestViewPage:
         assert len(three.body) > 1_000_000
         assert b"class WebGLRenderer" in three.body
         assert b"computeClusterLayout" in layout.body
+        assert b"rankSearchEntries" in explore.body
+        assert b"focusKeysForSelection" in explore.body
         assert b"nodeEvidenceCards" in evidence.body
         assert b"humanCard" in share.body
         assert b"buildXIntentUrl" in share.body
         assert b"drawHumanCard" in share.body
         assert b"drawConstellationCard" in share.body
         assert b'from "./layout.mjs"' in viewer.body
+        assert b'from "./explore.mjs"' in viewer.body
         assert b'from "./share.mjs"' in viewer.body
         assert b"model.points" in viewer.body
         assert b"model.lines" in viewer.body
@@ -502,6 +516,12 @@ class TestViewPage:
         assert b"private source content" in share.body
         assert b"Built locally with Persome \xc2\xb7 Build yours" in share.body
         assert b"window.__persomeZoomState" in viewer.body
+        assert b"window.__persomeInteractionState" in viewer.body
+        assert b"TOUCH_NODE_HIT_RADIUS_PX = 22" in viewer.body
+        assert b"focusVisualsSuspended = true" in viewer.body
+        assert b"new ResizeObserver(invalidatePanelBoxes)" in viewer.body
+        assert b"flyToSelection" in viewer.body
+        assert b"rebuildSearchEntries" in viewer.body
         assert b"if (!REDUCED_MOTION)" in viewer.body
         assert b'event.key === "+"' in viewer.body
         assert b'event.key === "-"' in viewer.body
@@ -513,10 +533,11 @@ class TestViewPage:
         assert b".evidence-breadcrumbs" in css.body
         assert b".error button" in css.body
         assert b"(min-width: 1181px) and (max-width: 1360px)" in css.body
-        assert b"top: 116px" in css.body
+        assert b"@media (max-width: 860px)" in css.body
         assert b"prefers-reduced-motion" in css.body
         assert viewer.media_type == "text/javascript"
         assert layout.media_type == "text/javascript"
+        assert explore.media_type == "text/javascript"
         assert share.media_type == "text/javascript"
         assert css.media_type == "text/css"
 
@@ -547,6 +568,33 @@ class TestViewPage:
         assert ".line-explorer:focus-within" in css
         assert '.model-label[aria-expanded="true"]' in css
         assert '.detail[data-kind="line"]' in css
+
+    def test_viewer_exploration_contract_is_local_and_non_mutating(self, ac_root):
+        page = render_memory_view()
+        viewer = routes.model_asset("viewer.js").body.decode()
+        css = routes.model_asset("viewer.css").body.decode()
+
+        assert "Local model explorer" in page
+        assert "Search queries stay on this Mac" in page
+        assert 'autocomplete="off"' in page
+        assert 'fetch("./search"' not in viewer
+        assert "rankSearchEntries(searchEntries, query, 9)" in viewer
+        assert "focusKeysForSelection(sceneModel, currentLayout, selected)" in viewer
+        assert "sceneModel = {" in viewer
+        assert "layerVisible[layer] = true" in viewer
+        assert "flyToSelection(entry.kind, entry.id)" in viewer
+        assert 'event.key.toLowerCase() === "f"' in viewer
+        assert "focusVisualsSuspended = false" in viewer
+        assert "selectionReturnFocus" in viewer
+        assert "renderStatus(currentCounts)" in viewer
+        assert '"hierarchy"' in viewer
+        assert "updateFocusLabels" in viewer
+        assert 'button.setAttribute("role", "option")' in viewer
+        assert ".model-label.focus-muted" in css
+        assert ".focus-note" in css
+        assert ".focus-note button" in css
+        assert "max-height: min(66dvh, 620px)" in css
+        assert "env(safe-area-inset-bottom)" in css
 
 
 class TestEvidenceResolverRoute:

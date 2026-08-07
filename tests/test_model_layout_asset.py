@@ -17,6 +17,7 @@ def test_model_viewer_node_suite() -> None:
             node,
             "--test",
             "tests/js/model_evidence.test.mjs",
+            "tests/js/model_explore.test.mjs",
             "tests/js/model_layout.test.mjs",
             "tests/js/model_share.test.mjs",
             "tests/js/model_zoom.test.mjs",

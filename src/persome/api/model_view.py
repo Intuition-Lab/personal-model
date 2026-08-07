@@ -34,19 +34,24 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
     <div id="canvas"></div>
 
     <header class="topbar">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-        <span class="brand-lockup">
-          <strong>Persome</strong>
-          <span>Personal Model</span>
-        </span>
+      <div class="brand-tools">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="brand-lockup">
+            <strong>Persome</strong>
+            <span>Personal Model</span>
+          </span>
+        </div>
+        <button id="open-search" class="search-trigger" type="button" aria-haspopup="dialog" aria-controls="model-search-panel" title="Find in your model (⌘K)">
+          <span aria-hidden="true">⌕</span><b>Find in your model</b><kbd>⌘K</kbd>
+        </button>
       </div>
       <div class="layers" role="group" aria-label="Visible model layers">
-        <button type="button" data-layer="points" aria-pressed="true" title="Toggle Points"><i></i>Points</button>
-        <button type="button" data-layer="lines" aria-pressed="true" title="Toggle Lines"><i></i>Lines</button>
-        <button type="button" data-layer="faces" aria-pressed="true" title="Toggle Faces"><i></i>Faces</button>
-        <button type="button" data-layer="volumes" aria-pressed="true" title="Toggle Volumes"><i></i>Volumes</button>
-        <button type="button" data-layer="root" aria-pressed="true" title="Toggle Root"><i></i>Root</button>
+        <button type="button" data-layer="points" aria-pressed="true" title="Toggle Points"><i></i><span>Points</span><small id="layer-count-points" aria-hidden="true">0</small></button>
+        <button type="button" data-layer="lines" aria-pressed="true" title="Toggle Lines"><i></i><span>Lines</span><small id="layer-count-lines" aria-hidden="true">0</small></button>
+        <button type="button" data-layer="faces" aria-pressed="true" title="Toggle Faces"><i></i><span>Faces</span><small id="layer-count-faces" aria-hidden="true">0</small></button>
+        <button type="button" data-layer="volumes" aria-pressed="true" title="Toggle Volumes"><i></i><span>Volumes</span><small id="layer-count-volumes" aria-hidden="true">0</small></button>
+        <button type="button" data-layer="root" aria-pressed="true" title="Toggle Root"><i></i><span>Root</span><small id="layer-count-root" aria-hidden="true">0</small></button>
       </div>
       <div class="view-actions">
         <span class="privacy-badge"><i aria-hidden="true"></i>Local only</span>
@@ -77,19 +82,49 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       <span class="status-loading">Loading your model…</span>
     </section>
 
-    <aside class="legend" aria-label="Model layer legend">
-      <p>How to read your model</p>
-      <div><span class="swatch point"></span><b>Point</b><span>observed fact</span></div>
-      <div><span class="swatch line"></span><b>Line</b><span>evolution or relation</span></div>
-      <div><span class="swatch context"></span><b>Entity</b><span>the other end of a relation</span></div>
-      <div><span class="swatch face"></span><b>Face</b><span>stable pattern</span></div>
-      <div><span class="swatch volume"></span><b>Volume</b><span>cross-pattern structure</span></div>
-      <div><span class="swatch root"></span><b>Root</b><span>current personal model</span></div>
-    </aside>
+    <details class="legend" aria-label="Model layer legend" open>
+      <summary><span>How to read your model</span><small>7 cues</small></summary>
+      <div class="legend-body">
+        <div><span class="swatch point"></span><b>Point</b><span>sourced observation</span></div>
+        <div><span class="swatch line"></span><b>Line</b><span>stored evolution or relation</span></div>
+        <div><span class="swatch guide"></span><b>Guide</b><span>inferred placement · not evidence</span></div>
+        <div><span class="swatch context"></span><b>Entity</b><span>the other end of a relation</span></div>
+        <div><span class="swatch face"></span><b>Face</b><span>stable pattern</span></div>
+        <div><span class="swatch volume"></span><b>Volume</b><span>cross-pattern structure</span></div>
+        <div><span class="swatch root"></span><b>Root</b><span>current personal model</span></div>
+      </div>
+    </details>
+
+    <section id="model-search-panel" class="search-panel" role="dialog" aria-modal="true" aria-labelledby="search-title" hidden>
+      <div class="search-dialog">
+        <header>
+          <div>
+            <p class="search-kicker">Local model explorer</p>
+            <h2 id="search-title">Find a thought, pattern, or relation</h2>
+          </div>
+          <button id="close-search" class="icon-button" type="button" aria-label="Close model search" title="Close (Esc)">×</button>
+        </header>
+        <label class="visually-hidden" for="model-search">Search your personal model</label>
+        <div class="search-field">
+          <span aria-hidden="true">⌕</span>
+          <input id="model-search" type="search" role="combobox" autocomplete="off" spellcheck="false" placeholder="Search the local snapshot…" aria-autocomplete="list" aria-expanded="false" aria-controls="search-results" aria-describedby="search-summary">
+          <kbd>ESC</kbd>
+        </div>
+        <p id="search-summary" class="search-summary" aria-live="polite">Showing the clearest parts of your model.</p>
+        <div id="search-results" class="search-results" role="listbox" aria-label="Model search results"></div>
+        <p id="search-empty" class="search-empty" hidden>No matching model object. Try a shorter phrase.</p>
+        <footer><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>↵</kbd> focus</span><span>Search queries stay on this Mac</span></footer>
+      </div>
+    </section>
 
     <aside id="detail" class="detail" aria-labelledby="detail-title" hidden>
       <button id="close-detail" class="icon-button close" type="button" aria-label="Close" title="Close (Esc)">×</button>
       <p class="detail-eyebrow"><span id="detail-kind" class="detail-kind"></span><span id="detail-provenance">Evidence-backed</span></p>
+
+      <div class="focus-note" role="note">
+        <span><b>Focused neighborhood</b><small>Navigation view · not evidence</small></span>
+        <button id="clear-focus" type="button">Show all</button>
+      </div>
 
       <h1 id="detail-title" class="detail-claim" aria-describedby="detail-hint"></h1>
       <textarea id="detail-claim-input" class="detail-claim detail-claim-input" rows="1" maxlength="4000" aria-label="Edit this claim in your own words" hidden></textarea>
@@ -138,7 +173,7 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       <output id="as-of-label" for="as-of">Now</output>
     </footer>
 
-    <p class="gesture-hint"><span aria-hidden="true">↗</span> Drag to orbit · Scroll or pinch to zoom · Select a thought</p>
+    <p class="gesture-hint"><span aria-hidden="true">↗</span> Drag to orbit · Pinch to zoom · Select to focus · ⌘K to find</p>
   </main>
   <script type="module" src="assets/viewer.js"></script>
 </body>
