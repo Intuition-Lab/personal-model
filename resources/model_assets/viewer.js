@@ -2768,15 +2768,19 @@ function gestureInFlight() {
 // also means a wheel over the topbar, legend or status strip zooms the model
 // instead of falling through to the browser.
 viewerEl.addEventListener("wheel", (event) => {
-  // The drawer, line picker, and search panel own real scrolling; leave them be.
-  if (!shouldHandleModelGesture(event.target)) return;
+  // The drawer, line picker, and search panel own ordinary scrolling. A
+  // ctrlKey wheel is a Chrome/Firefox trackpad pinch, though, and must remain
+  // model navigation even when the gesture starts over one of those panels.
+  if (!shouldHandleModelGesture(event)) return;
   event.stopPropagation();
+  // Prevent browser page zoom even when Safari also reports this pinch through
+  // GestureEvents and the duplicate wheel is discarded below.
+  event.preventDefault();
   // If a gesture is in flight this wheel is the same fingers counted twice.
   if (gestureInFlight()) return;
   // Chrome and Firefox report a trackpad pinch as a wheel with ctrlKey set,
   // which is also the browser's own page-zoom chord: without preventDefault the
   // page would zoom instead of the model.
-  event.preventDefault();
   pauseAutoRotate();
   requestZoomBy(
     zoomMath.wheelFactor(event, window.innerHeight),
@@ -2785,14 +2789,16 @@ viewerEl.addEventListener("wheel", (event) => {
 }, { passive: false, capture: true });
 
 viewerEl.addEventListener("gesturestart", (event) => {
-  if (!shouldHandleModelGesture(event.target)) return;
+  // Safari GestureEvents always describe a pinch, never ordinary scrolling,
+  // so panels do not opt out as they do for a plain wheel.
+  if (!shouldHandleModelGesture(event)) return;
   event.preventDefault();
   gestureScale = 1;
   gestureSeenAt = performance.now();
   if (anchorFromClient(event.clientX, event.clientY)) gestureAnchor.copy(zoomAnchorNdc);
   else gestureAnchor.set(0, 0);
   pauseAutoRotate();
-});
+}, { passive: false, capture: true });
 viewerEl.addEventListener("gesturechange", (event) => {
   if (!gestureScale) return;
   event.preventDefault();
@@ -2804,12 +2810,12 @@ viewerEl.addEventListener("gesturechange", (event) => {
   zoomAnchorNdc.copy(gestureAnchor);
   requestZoomBy(scale / gestureScale, zoomAnchorNdc);
   gestureScale = scale;
-});
+}, { passive: false, capture: true });
 viewerEl.addEventListener("gestureend", (event) => {
   if (!gestureScale) return;
   event.preventDefault();
   gestureScale = 0;
-});
+}, { passive: false, capture: true });
 document.getElementById("reset").addEventListener("click", resetCamera);
 document.getElementById("close-detail").addEventListener("click", () => clearSelection(true));
 clearFocusButton.addEventListener("click", showAllModel);

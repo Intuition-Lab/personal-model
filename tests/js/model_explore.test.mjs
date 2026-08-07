@@ -38,17 +38,27 @@ test("keeps an in-progress claim focused when the search chord is pressed", () =
   assert.equal(opened, true);
 });
 
-test("zooms through the legend while preserving real scrolling surfaces", () => {
+test("preserves ordinary panel scrolling but captures pinch everywhere", () => {
   const targetIn = (className) => ({
     closest(selector) {
       return selector.split(", ").includes(className) ? { className } : null;
     },
   });
+  const eventIn = (className, properties = {}) => ({
+    type: "wheel",
+    target: targetIn(className),
+    ...properties,
+  });
 
-  assert.equal(shouldHandleModelGesture(targetIn(".legend")), true);
-  assert.equal(shouldHandleModelGesture(targetIn(".detail")), false);
-  assert.equal(shouldHandleModelGesture(targetIn(".line-explorer")), false);
-  assert.equal(shouldHandleModelGesture(targetIn(".search-panel")), false);
+  assert.equal(shouldHandleModelGesture(eventIn(".legend")), true);
+  assert.equal(shouldHandleModelGesture(eventIn(".detail")), false);
+  assert.equal(shouldHandleModelGesture(eventIn(".line-explorer")), false);
+  assert.equal(shouldHandleModelGesture(eventIn(".search-panel")), false);
+
+  assert.equal(shouldHandleModelGesture(eventIn(".detail", { ctrlKey: true })), true);
+  assert.equal(shouldHandleModelGesture(eventIn(".line-explorer", { ctrlKey: true })), true);
+  assert.equal(shouldHandleModelGesture(eventIn(".search-panel", { ctrlKey: true })), true);
+  assert.equal(shouldHandleModelGesture(eventIn(".detail", { type: "gesturestart" })), true);
 });
 
 test("restores the grab cursor after non-primary mouse gestures", () => {

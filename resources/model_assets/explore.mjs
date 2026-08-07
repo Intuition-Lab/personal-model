@@ -21,10 +21,14 @@ export function handleSearchShortcut(event, editing, openSearch) {
   return true;
 }
 
-export function shouldHandleModelGesture(target) {
-  // These surfaces own real scrolling or native selection. The legend does not:
-  // wheel and pinch over it still belong to the model behind the explanation.
-  return !target?.closest?.(MODEL_GESTURE_PASSTHROUGH_SELECTOR);
+export function shouldHandleModelGesture(event) {
+  // A pinch is model navigation even when it starts over a scroll container;
+  // otherwise the browser zooms the entire page. Ordinary wheel input still
+  // belongs to panels with real scrolling. The legend is not one of them.
+  const pinch = Boolean(event?.ctrlKey)
+    || String(event?.type || "").startsWith("gesture");
+  if (pinch) return true;
+  return !event?.target?.closest?.(MODEL_GESTURE_PASSTHROUGH_SELECTOR);
 }
 
 export function pointerUpOutcome(event, overTarget = false) {
