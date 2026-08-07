@@ -116,33 +116,51 @@ export function evidenceBreadcrumb(data) {
   return compactText(data?.label || data?.summary, humanizePath(data?.path) || data?.kind || "Evidence", 72);
 }
 
-function modelNodeLabel(id, model) {
-  if (id === "self") return "You";
-  const candidates = [
+function modelNodeCandidates(model) {
+  return [
     ["point", model?.points || [], "Observed point"],
     ["face", model?.faces || [], "Model pattern"],
     ["volume", model?.volumes || [], "Model structure"],
     ["root", model?.root ? [model.root] : [], "Personal model"],
   ];
-  for (const [, nodes, fallback] of candidates) {
+}
+
+function modelNodeDisplayLabel(node, fallback) {
+  return compactText(
+    node?.content || node?.signature || node?.label || node?.title,
+    fallback,
+    88,
+  );
+}
+
+export function modelNodeLabelIndex(model) {
+  const labels = new Map([["self", "You"]]);
+  modelNodeCandidates(model).forEach(([, nodes, fallback]) => {
+    nodes.forEach((node) => {
+      if (node?.id && !labels.has(node.id)) {
+        labels.set(node.id, modelNodeDisplayLabel(node, fallback));
+      }
+    });
+  });
+  return labels;
+}
+
+function modelNodeLabel(id, model, labels = null) {
+  if (id === "self") return "You";
+  if (labels) return labels.get(id) || "Context node";
+  for (const [, nodes, fallback] of modelNodeCandidates(model)) {
     const node = nodes.find((item) => item.id === id);
-    if (node) {
-      return compactText(
-        node.content || node.signature || node.label || node.title,
-        fallback,
-        88,
-      );
-    }
+    if (node) return modelNodeDisplayLabel(node, fallback);
   }
   return "Context node";
 }
 
-export function linePresentation(line, model) {
+export function linePresentation(line, model, nodeLabels = null) {
   const fallbackPredicate = line?.kind === "evolution" ? "supersedes" : "relation";
   const predicate = compactText(line?.predicate, fallbackPredicate, 72);
   const label = String(line?.label || "").replace(/\s+/g, " ").trim().slice(0, 88);
-  const source = modelNodeLabel(line?.source, model);
-  const target = modelNodeLabel(line?.target, model);
+  const source = modelNodeLabel(line?.source, model, nodeLabels);
+  const target = modelNodeLabel(line?.target, model, nodeLabels);
   const title = label || predicate;
   return {
     title,
@@ -152,6 +170,13 @@ export function linePresentation(line, model) {
     target,
     option: `${title}: ${source} → ${target}`,
   };
+}
+
+export function indexLinePresentations(lines, model, nodeLabels) {
+  return new Map(lines.map((line) => [
+    line.id,
+    linePresentation(line, model, nodeLabels),
+  ]));
 }
 
 export const evidenceText = { compactText, humanizePath, parseReceipt };

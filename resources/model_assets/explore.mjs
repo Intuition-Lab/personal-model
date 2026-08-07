@@ -6,6 +6,9 @@ const KIND_PRIORITY = {
   line: 4,
   context: 5,
 };
+const HISTORICAL_POINT_PENALTY = -72;
+const INACTIVE_POINT_PENALTY = -56;
+const EXACT_STATE_QUERY_BOOST = 120;
 
 const MODEL_GESTURE_PASSTHROUGH_SELECTOR = ".detail, .line-explorer, .search-panel";
 
@@ -98,21 +101,114 @@ function subsequenceScore(text, query) {
   return Math.max(4, 18 - Math.min(gap, 14));
 }
 
-function scoreEntry(entry, query) {
-  const title = normalize(entry.title);
-  const searchable = normalize([
-    entry.title,
-    entry.subtitle,
-    ...(entry.aliases || []),
-  ].filter(Boolean).join(" "));
-  const terms = normalize(query).split(" ").filter(Boolean);
-  if (!terms.length) return Number(entry.weight || 0);
+function searchWeight(entry) {
+  const weight = Number(entry.weight || 0);
+  return Number.isFinite(weight) ? weight : 0;
+}
 
-  let score = 0;
+export function prepareSearchEntries(entries) {
+  // This work belongs to scene rebuilds, not the per-keystroke ranking path.
+  return entries.map((entry) => {
+    const title = String(entry.title || "Untitled").replace(/\s+/g, " ").trim();
+    const subtitle = String(entry.subtitle || "").replace(/\s+/g, " ").trim();
+    const aliases = Array.isArray(entry.aliases) ? entry.aliases.filter(Boolean) : [];
+    const stateAliases = Array.isArray(entry.stateAliases)
+      ? entry.stateAliases.filter(Boolean)
+      : [];
+    const normalizedTitle = normalize(title);
+    return {
+      ...entry,
+      title,
+      subtitle,
+      aliases,
+      stateAliases,
+      normalizedTitle,
+      normalizedSearchable: normalize([title, subtitle, ...aliases].join(" ")),
+      normalizedStateAliases: stateAliases.map(normalize).filter(Boolean),
+      normalizedTitleWords: normalizedTitle.split(/[^\p{L}\p{N}]+/u).filter(Boolean),
+    };
+  });
+}
+
+function timestamp(value, fallback = Number.NaN) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const parsed = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+export function pointSearchMetadata(point, cutoff = new Date()) {
+  const status = String(point?.status || "").trim().toLocaleLowerCase();
+  const cutoffTime = timestamp(cutoff, Date.now());
+  const validFrom = timestamp(point?.valid_from);
+  const validUntil = timestamp(point?.valid_until);
+  const started = !Number.isFinite(validFrom) || validFrom <= cutoffTime;
+  const ended = Number.isFinite(validUntil) && validUntil <= cutoffTime;
+  const insideValidity = started && !ended;
+  // Superseding a Point rewrites its present-day lifecycle fields to
+  // is_latest=false/status=shadow. Before its valid_until, however, that
+  // predecessor is the head at the selected historical cutoff.
+  const historicalHead = !point?.is_latest && Number.isFinite(validUntil) && insideValidity;
+  const isCurrent = insideValidity && (
+    (Boolean(point?.is_latest) && status === "active") || historicalHead
+  );
+  if (isCurrent) {
+    return {
+      state: "current",
+      subtitle: "Modeled observation · current",
+      aliases: ["current", "active"],
+      weightAdjustment: 0,
+    };
+  }
+
+  if (!point?.is_latest || ended) {
+    const historyStates = [...new Set([
+      ended ? "ended" : "",
+      status && status !== "active" ? status : "",
+    ].filter(Boolean))];
+    const statusSuffix = historyStates.length ? ` · ${historyStates.join(" · ")}` : "";
+    return {
+      state: "history",
+      subtitle: `Modeled observation · historical${statusSuffix}`,
+      aliases: ["history", "historical", "not current", ...historyStates],
+      // Exact content remains findable, but a retired revision cannot outrank
+      // the current version of the same claim.
+      weightAdjustment: HISTORICAL_POINT_PENALTY,
+    };
+  }
+
+  const inactiveState = status || "inactive";
+  return {
+    state: inactiveState,
+    subtitle: `Modeled observation · ${inactiveState} · not active`,
+    aliases: [inactiveState, "inactive", "not active"],
+    weightAdjustment: INACTIVE_POINT_PENALTY,
+  };
+}
+
+function scoreEntry(entry, terms, normalizedQuery) {
+  const title = typeof entry.normalizedTitle === "string"
+    ? entry.normalizedTitle
+    : normalize(entry.title);
+  const searchable = typeof entry.normalizedSearchable === "string"
+    ? entry.normalizedSearchable
+    : normalize([
+      entry.title,
+      entry.subtitle,
+      ...(entry.aliases || []),
+    ].filter(Boolean).join(" "));
+  const titleWords = Array.isArray(entry.normalizedTitleWords)
+    ? entry.normalizedTitleWords
+    : title.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const stateAliases = Array.isArray(entry.normalizedStateAliases)
+    ? entry.normalizedStateAliases
+    : (entry.stateAliases || []).map(normalize).filter(Boolean);
+  if (!terms.length) return searchWeight(entry);
+
+  let score = stateAliases.includes(normalizedQuery) ? EXACT_STATE_QUERY_BOOST : 0;
   for (const term of terms) {
     if (title === term) score += 180;
     else if (title.startsWith(term)) score += 110;
-    else if (title.split(/[^\p{L}\p{N}]+/u).some((word) => word.startsWith(term))) score += 78;
+    else if (titleWords.some((word) => word.startsWith(term))) score += 78;
     else if (title.includes(term)) score += 58;
     else if (searchable.includes(term)) score += 34;
     else {
@@ -121,22 +217,45 @@ function scoreEntry(entry, query) {
       score += fuzzy;
     }
   }
-  return score + Number(entry.weight || 0);
+  return score + searchWeight(entry);
+}
+
+function compareRankedEntries(left, right) {
+  return (
+    right.score - left.score
+    || (KIND_PRIORITY[left.entry.kind] ?? 99) - (KIND_PRIORITY[right.entry.kind] ?? 99)
+    || String(left.entry.title || "").localeCompare(String(right.entry.title || ""))
+    || String(left.entry.key || "").localeCompare(String(right.entry.key || ""))
+  );
+}
+
+function insertBounded(ranked, candidate, limit) {
+  if (
+    ranked.length === limit
+    && compareRankedEntries(candidate, ranked[ranked.length - 1]) >= 0
+  ) return;
+
+  let low = 0;
+  let high = ranked.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (compareRankedEntries(candidate, ranked[middle]) < 0) high = middle;
+    else low = middle + 1;
+  }
+  ranked.splice(low, 0, candidate);
+  if (ranked.length > limit) ranked.pop();
 }
 
 export function rankSearchEntries(entries, query, limit = 9) {
   const boundedLimit = Math.max(1, Math.min(50, Number(limit) || 9));
-  return entries
-    .map((entry) => ({ entry, score: scoreEntry(entry, query) }))
-    .filter(({ score }) => score !== null)
-    .sort((left, right) => (
-      right.score - left.score
-      || (KIND_PRIORITY[left.entry.kind] ?? 99) - (KIND_PRIORITY[right.entry.kind] ?? 99)
-      || String(left.entry.title || "").localeCompare(String(right.entry.title || ""))
-      || String(left.entry.key || "").localeCompare(String(right.entry.key || ""))
-    ))
-    .slice(0, boundedLimit)
-    .map(({ entry }) => entry);
+  const normalizedQuery = normalize(query);
+  const terms = normalizedQuery.split(" ").filter(Boolean);
+  const ranked = [];
+  entries.forEach((entry) => {
+    const score = scoreEntry(entry, terms, normalizedQuery);
+    if (score !== null) insertBounded(ranked, { entry, score }, boundedLimit);
+  });
+  return ranked.map(({ entry }) => entry);
 }
 
 function selectionKey(kind, id) {

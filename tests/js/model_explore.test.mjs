@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   focusKeysForSelection,
   handleSearchShortcut,
+  pointSearchMetadata,
   pointerUpOutcome,
+  prepareSearchEntries,
   rankSearchEntries,
   reconcileSceneSelection,
   recoverInvalidSceneSelection,
@@ -155,6 +157,153 @@ test("uses explicit entry weights with deterministic kind tie-breaking for empty
     rankSearchEntries(entries, "").map((entry) => entry.key),
     ["point:1", "root:1", "face:1"],
   );
+});
+
+test("labels inactive Points explicitly and keeps history discoverable below current claims", () => {
+  const points = [
+    { id: "current", content: "Protect focused attention", is_latest: true, status: "active" },
+    { id: "shadow", content: "Protect focused attention", is_latest: true, status: "shadow" },
+    { id: "history", content: "Protect focused attention", is_latest: false, status: "superseded" },
+  ];
+  const entries = prepareSearchEntries(points.map((point) => {
+    const metadata = pointSearchMetadata(point);
+    return {
+      key: `point:${point.id}`,
+      kind: "point",
+      title: point.content,
+      subtitle: metadata.subtitle,
+      aliases: metadata.aliases,
+      stateAliases: metadata.aliases,
+      weight: 6 + metadata.weightAdjustment,
+      searchState: metadata.state,
+    };
+  }));
+
+  assert.deepEqual(
+    entries.map(({ searchState, subtitle }) => ({ searchState, subtitle })),
+    [
+      { searchState: "current", subtitle: "Modeled observation · current" },
+      { searchState: "shadow", subtitle: "Modeled observation · shadow · not active" },
+      { searchState: "history", subtitle: "Modeled observation · historical · superseded" },
+    ],
+  );
+  assert.deepEqual(
+    rankSearchEntries(entries, "protect focused").map((entry) => entry.key),
+    ["point:current", "point:shadow", "point:history"],
+  );
+  const noisyFaces = prepareSearchEntries(Array.from({ length: 12 }, (_, index) => ({
+    key: `face:${index}`,
+    kind: "face",
+    title: `Sensible habits allow deliberate outcomes weekly ${index}`,
+    subtitle: "Stable pattern",
+    weight: 20,
+  })));
+  assert.equal(rankSearchEntries([...entries, ...noisyFaces], "historical")[0].key, "point:history");
+  assert.equal(rankSearchEntries([...entries, ...noisyFaces], "shadow")[0].key, "point:shadow");
+
+  const endedPoint = {
+    id: "ended",
+    is_latest: true,
+    status: "active",
+    valid_until: "2026-03-01T00:00:00Z",
+  };
+  assert.equal(
+    pointSearchMetadata(endedPoint, new Date("2026-02-28T23:59:59Z")).state,
+    "current",
+  );
+  assert.deepEqual(
+    pointSearchMetadata(endedPoint, new Date("2026-03-01T00:00:00Z")),
+    {
+      state: "history",
+      subtitle: "Modeled observation · historical · ended",
+      aliases: ["history", "historical", "not current", "ended"],
+      weightAdjustment: -72,
+    },
+  );
+
+  const predecessor = {
+    id: "predecessor",
+    is_latest: false,
+    status: "shadow",
+    valid_from: "2026-01-01T00:00:00Z",
+    valid_until: "2026-03-01T00:00:00Z",
+  };
+  assert.deepEqual(
+    pointSearchMetadata(predecessor, new Date("2026-02-01T00:00:00Z")),
+    {
+      state: "current",
+      subtitle: "Modeled observation · current",
+      aliases: ["current", "active"],
+      weightAdjustment: 0,
+    },
+  );
+  assert.deepEqual(
+    pointSearchMetadata(predecessor, new Date("2026-03-01T00:00:00Z")),
+    {
+      state: "history",
+      subtitle: "Modeled observation · historical · ended · shadow",
+      aliases: ["history", "historical", "not current", "ended", "shadow"],
+      weightAdjustment: -72,
+    },
+  );
+});
+
+test("bounded top-k ranking matches a full-sort reference across ties and input order", () => {
+  const kindPriority = { root: 0, volume: 1, face: 2, point: 3, line: 4, context: 5 };
+  const entries = prepareSearchEntries(Array.from({ length: 240 }, (_, index) => ({
+    key: `${["line", "point", "face", "volume"][index % 4]}:${String(index).padStart(3, "0")}`,
+    kind: ["line", "point", "face", "volume"][index % 4],
+    title: `Shared anchor ${String(239 - index).padStart(3, "0")}`,
+    subtitle: "Common match",
+    weight: index % 11,
+  })).reverse());
+  const expected = [...entries].sort((left, right) => (
+    right.weight - left.weight
+    || kindPriority[left.kind] - kindPriority[right.kind]
+    || left.title.localeCompare(right.title)
+    || left.key.localeCompare(right.key)
+  )).slice(0, 9).map((entry) => entry.key);
+
+  assert.deepEqual(
+    rankSearchEntries(entries, "shared", 9).map((entry) => entry.key),
+    expected,
+  );
+});
+
+test("large prepared indexes normalize only the query and avoid a full-result sort", () => {
+  const entries = prepareSearchEntries(Array.from({ length: 20_000 }, (_, index) => ({
+    key: `point:${index}`,
+    kind: "point",
+    title: index % 997 === 0 ? `Needle anchor ${index}` : `Memory object ${index}`,
+    subtitle: "Modeled observation · current",
+    aliases: ["active"],
+    weight: index % 17,
+  })));
+  const originalNormalize = String.prototype.normalize;
+  const originalSort = Array.prototype.sort;
+  let normalizeCalls = 0;
+  let largestSortedArray = 0;
+  let matches;
+
+  try {
+    String.prototype.normalize = function countedNormalize(...args) {
+      normalizeCalls += 1;
+      return originalNormalize.apply(this, args);
+    };
+    Array.prototype.sort = function countedSort(...args) {
+      largestSortedArray = Math.max(largestSortedArray, this.length);
+      return originalSort.apply(this, args);
+    };
+    matches = rankSearchEntries(entries, "needle", 9);
+  } finally {
+    String.prototype.normalize = originalNormalize;
+    Array.prototype.sort = originalSort;
+  }
+
+  assert.equal(normalizeCalls, 1);
+  assert.equal(largestSortedArray, 0);
+  assert.equal(matches.length, 9);
+  assert.ok(matches.every((entry) => entry.normalizedTitle.includes("needle")));
 });
 
 function modelFixture() {

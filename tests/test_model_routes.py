@@ -586,7 +586,8 @@ class TestViewPage:
         assert 'id="line-select"' in page
         assert 'lineSelectEl.addEventListener("change"' in viewer
         assert "placeholder.disabled = lines.length > 0" in viewer
-        assert "linePresentation(item, model)" in viewer
+        assert "indexLinePresentations(renderedLineItems, sceneModel, sceneNodeLabels)" in viewer
+        assert "linePresentations.get(line.id)?.option" in viewer
         assert 'appendMeta("Predicate", lineDetail?.predicate)' in viewer
         assert 'appendMeta("From", lineDetail?.source)' in viewer
         assert "item.source ? `Source ID: ${item.source}`" in viewer

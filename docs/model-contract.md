@@ -119,7 +119,11 @@ exposes aggregate layout health for local visual smoke tests without exposing no
 Search is a local view over the objects visible at the current model-history cutoff. It ranks
 human-readable text from the already-loaded snapshot; it does not call another service, persist
 queries, or expand the canonical model. Choosing a result opens the same detail surface as selecting
-its rendered object. The search surface states this scope narrowly: search queries stay on the Mac;
+its rendered object. Point heads that are active at the selected cutoff rank ahead of shadow and
+historical Points. Those
+non-active Points remain discoverable by specific content or state searches and are labeled as
+shadow or historical results, preserving the snapshot's audit and time-travel boundary. The search
+surface states this scope narrowly: search queries stay on the Mac;
 the separate, explicit share actions retain their own review-before-posting boundary.
 
 Selection also creates a first-order "model neighborhood" from explicit Lines and the deterministic

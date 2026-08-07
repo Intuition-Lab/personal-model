@@ -10,7 +10,9 @@ import {
 import {
   focusKeysForSelection,
   handleSearchShortcut,
+  pointSearchMetadata,
   pointerUpOutcome,
+  prepareSearchEntries,
   rankSearchEntries,
   reconcileSceneSelection,
   recoverInvalidSceneSelection,
@@ -19,7 +21,8 @@ import {
 import {
   evidenceBreadcrumb,
   evidenceOverview,
-  linePresentation,
+  indexLinePresentations,
+  modelNodeLabelIndex,
   nodeEvidenceCards,
   nodeHistoryCards,
   relationLabel,
@@ -184,6 +187,8 @@ let lineNavigatorItems = [];
 let selectionTargets = new Map();
 let positions = new Map();
 let items = new Map();
+let sceneNodeLabels = new Map();
+let linePresentations = new Map();
 let layerObjects = freshLayerObjects();
 let currentLayout = null;
 let layoutRadius = 6;
@@ -550,7 +555,7 @@ function renderLineExplorer(lines) {
   lines.forEach((line, index) => {
     const option = document.createElement("option");
     option.value = String(index + 1);
-    option.textContent = linePresentation(line, model).option;
+    option.textContent = linePresentations.get(line.id)?.option || "Relationship";
     lineSelectEl.appendChild(option);
   });
   lineExplorerEl.hidden = lines.length === 0;
@@ -582,6 +587,8 @@ function disposeGraph() {
   selectionTargets = new Map();
   positions = new Map();
   items = new Map();
+  sceneNodeLabels = new Map();
+  linePresentations = new Map();
   layerObjects = freshLayerObjects();
   pulseGlows = [];
   focusLabels = [];
@@ -927,6 +934,8 @@ function buildScene({
   const renderedLineItems = visibleLines.filter(
     (line) => positions.has(line.source) && positions.has(line.target),
   );
+  sceneNodeLabels = modelNodeLabelIndex(sceneModel);
+  linePresentations = indexLinePresentations(renderedLineItems, sceneModel, sceneNodeLabels);
   renderLineExplorer(renderedLineItems);
   visibleFaces.forEach((face) => addFace(face, labeledFaces.has(face.id)));
   visibleVolumes.forEach((volume) => addVolume(volume, labeledVolumes.has(volume.id)));
@@ -1039,18 +1048,15 @@ function updateLayerCounts(counts) {
   });
 }
 
-function searchTitle(kind, item) {
-  if (kind === "line") return linePresentation(item, sceneModel).title;
+function searchTitle(kind, item, lineDetail = null) {
+  if (kind === "line") return lineDetail?.title || item.label || item.predicate || item.kind || item.id;
   return item.content || item.signature || item.label || item.predicate || item.kind || item.id;
 }
 
-function searchSubtitle(kind, item) {
-  if (kind === "point") {
-    return item.status === "active" ? "Modeled observation · active" : "Modeled observation";
-  }
+function searchSubtitle(kind, item, lineDetail = null, pointDetail = null) {
+  if (kind === "point") return pointDetail?.subtitle || "Modeled observation · not active";
   if (kind === "line") {
-    const presentation = linePresentation(item, sceneModel);
-    return `${presentation.source} → ${presentation.target}`;
+    return lineDetail ? `${lineDetail.source} → ${lineDetail.target}` : "Relationship";
   }
   if (kind === "face") return "Stable pattern";
   if (kind === "volume") return "Cross-pattern structure";
@@ -1058,33 +1064,41 @@ function searchSubtitle(kind, item) {
   return "Context referenced by a relation";
 }
 
-function searchWeight(kind, item) {
+function searchWeight(kind, item, pointDetail = null) {
   const observations = Math.min(8, Number(item.observations || 0));
   if (kind === "root") return 24;
   if (kind === "volume") return 18 + observations;
   if (kind === "face") return 12 + observations;
-  if (kind === "point") return 6 + Math.min(4, Number(item.confidence || 0) * 4);
+  if (kind === "point") {
+    return 6
+      + Math.min(4, Number(item.confidence || 0) * 4)
+      + Number(pointDetail?.weightAdjustment || 0);
+  }
   if (kind === "line") return 3;
   return 1;
 }
 
 function rebuildSearchEntries() {
-  searchEntries = [...items.entries()].map(([key, item]) => {
+  const entries = [...items.entries()].map(([key, item]) => {
     const separator = key.indexOf(":");
     const kind = separator > 0 ? key.slice(0, separator) : "context";
-    const lineDetail = kind === "line" ? linePresentation(item, sceneModel) : null;
+    const lineDetail = kind === "line" ? linePresentations.get(item.id) : null;
+    const pointDetail = kind === "point" ? pointSearchMetadata(item, cutoff) : null;
     return {
       key,
       kind,
       id: item.id,
-      title: String(searchTitle(kind, item) || "Untitled").replace(/\s+/g, " ").trim(),
-      subtitle: searchSubtitle(kind, item),
+      title: searchTitle(kind, item, lineDetail),
+      subtitle: searchSubtitle(kind, item, lineDetail, pointDetail),
       aliases: lineDetail
         ? [lineDetail.predicate, lineDetail.label, lineDetail.source, lineDetail.target, item.kind]
-        : [item.kind, item.status],
-      weight: searchWeight(kind, item),
+        : [...new Set([item.kind, item.status, ...(pointDetail?.aliases || [])].filter(Boolean))],
+      stateAliases: pointDetail?.aliases || [],
+      weight: searchWeight(kind, item, pointDetail),
+      searchState: pointDetail?.state || "",
     };
   });
+  searchEntries = prepareSearchEntries(entries);
   if (!searchPanelEl.hidden) renderSearchResults();
 }
 
@@ -1118,6 +1132,7 @@ function renderSearchResults() {
     button.tabIndex = -1;
     button.className = "search-result";
     button.dataset.kind = entry.kind;
+    if (entry.searchState) button.dataset.searchState = entry.searchState;
     button.setAttribute("role", "option");
     button.setAttribute("aria-selected", String(index === searchActiveIndex));
 
@@ -2202,7 +2217,7 @@ function showDetails(kind, item, returnFocus = null) {
       ? candidate
       : openSearchButton;
   }
-  const lineDetail = kind === "line" ? linePresentation(item, model) : null;
+  const lineDetail = kind === "line" ? linePresentations.get(item.id) : null;
   selected = { kind, id: item.id };
   selectedItem = item;
   pauseAutoRotate();
@@ -2281,7 +2296,7 @@ function updateCutoff() {
 function fingerprint(nextModel) {
   return JSON.stringify({
     points: nextModel.points.map((item) => [
-      item.id, item.status, item.is_latest, item.content, item.valid_from,
+      item.id, item.status, item.is_latest, item.content, item.valid_from, item.valid_until,
     ]),
     lines: nextModel.lines.map((item) => [item.id, item.predicate, item.valid_from]),
     faces: nextModel.faces.map((item) => [
