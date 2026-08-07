@@ -1,11 +1,28 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
-import { computeClusterLayout, pickScreenTarget, zoomMath } from "./layout.mjs";
+import {
+  computeClusterLayout,
+  fittedOverviewPose,
+  pickScreenTarget,
+  zoomMath,
+} from "./layout.mjs";
+import {
+  focusKeysForSelection,
+  handleSearchShortcut,
+  pointSearchMetadata,
+  pointerUpOutcome,
+  prepareSearchEntries,
+  rankSearchEntries,
+  reconcileSceneSelection,
+  recoverInvalidSceneSelection,
+  shouldHandleModelGesture,
+} from "./explore.mjs";
 import {
   evidenceBreadcrumb,
   evidenceOverview,
-  linePresentation,
+  indexLinePresentations,
+  modelNodeLabelIndex,
   nodeEvidenceCards,
   nodeHistoryCards,
   relationLabel,
@@ -60,20 +77,39 @@ const sliderLabel = document.getElementById("as-of-label");
 const zoomOutButton = document.getElementById("zoom-out");
 const zoomResetButton = document.getElementById("zoom-reset");
 const zoomInButton = document.getElementById("zoom-in");
+const rotateButton = document.getElementById("rotate");
 const cardButton = document.getElementById("human-card");
 const shareButton = document.getElementById("share-x");
 const shareNoticeEl = document.getElementById("share-notice");
 const lineExplorerEl = document.getElementById("line-explorer");
 const lineSelectEl = document.getElementById("line-select");
+const searchPanelEl = document.getElementById("model-search-panel");
+const searchInputEl = document.getElementById("model-search");
+const searchResultsEl = document.getElementById("search-results");
+const searchSummaryEl = document.getElementById("search-summary");
+const searchEmptyEl = document.getElementById("search-empty");
+const openSearchButton = document.getElementById("open-search");
+const closeSearchButton = document.getElementById("close-search");
+const clearFocusButton = document.getElementById("clear-focus");
+const mobileGuideEl = document.getElementById("mobile-guide");
+const layerCountEls = Object.fromEntries(
+  ["points", "lines", "faces", "volumes", "root"]
+    .map((kind) => [kind, document.getElementById(`layer-count-${kind}`)]),
+);
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x070610, 0.026);
 
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+// No `preserveDrawingBuffer`: it makes the browser copy the whole framebuffer
+// every frame (tens of megabytes at 2x device pixel ratio) to serve readers
+// that may never come. Both readers here — samplePixels() and
+// createConstellationBlob() — read inside the same synchronous task as the
+// render that produced the pixels, which is exactly when the buffer is still
+// valid without it.
 const renderer = new THREE.WebGLRenderer({
   antialias: true,
   alpha: true,
-  preserveDrawingBuffer: true,
 });
 renderer.setClearColor(0x000000, 0);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -94,10 +130,15 @@ canvasHost.appendChild(labelRenderer.domElement);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.07;
-controls.zoomSpeed = 0.62;
+// OrbitControls keeps its dolly, which is what a touchscreen pinch and a
+// middle-button drag ride on, but it never sees the wheel: the viewer takes
+// that in the capture phase below. Its wheel path applies the whole delta in
+// one update and resets the accumulator, so wheel zoom landed in hard steps
+// while orbit and pan glided under damping, and it normalises by
+// `devicePixelRatio | 0`, which halves the gain on a Retina display — a full
+// trackpad pinch moved the camera 5% — and divides by zero once the ratio
+// drops below 1, where one notch teleports to the zoom limit.
 controls.zoomToCursor = true;
-controls.minDistance = 5;
-controls.maxDistance = 32;
 controls.target.set(0, 2.2, 0);
 
 scene.add(new THREE.HemisphereLight(0xdad6ff, 0x080710, 2.25));
@@ -114,6 +155,7 @@ scene.add(violetLight);
 let graph = new THREE.Group();
 scene.add(graph);
 let model = { points: [], lines: [], faces: [], volumes: [], root: null, stats: {} };
+let sceneModel = { points: [], lines: [], faces: [], volumes: [], root: null };
 let modelFingerprint = "";
 let modelGeneratedAt = "";
 let cutoff = new Date();
@@ -121,10 +163,20 @@ let minTime = new Date();
 let maxTime = new Date();
 let playTimer = null;
 let pointerDown = null;
+// Which pointers are down, tracked apart from the click candidate. A gesture
+// stays live whatever it turns out to be — a second finger retires the click
+// candidate because a pinch must never select a node, and a right-drag is a
+// pan that carries no click candidate at all — and hover picking and the graph
+// poll must stay out of the way of all of them. Identities rather than a count:
+// a release can land on a label instead of the canvas, and a counter that
+// missed one would wedge closed for the rest of the session.
+const livePointers = new Set();
+let labelGesture = null;
 let hoverPointer = null;
 let hoverDirty = false;
 let selected = null;
 let selectedItem = null;
+let selectionReturnFocus = null;
 let detailMode = "node";
 let evidenceTrail = [];
 let evidenceRequest = 0;
@@ -136,17 +188,28 @@ let lineNavigatorItems = [];
 let selectionTargets = new Map();
 let positions = new Map();
 let items = new Map();
+let sceneNodeLabels = new Map();
+let linePresentations = new Map();
 let layerObjects = freshLayerObjects();
 let currentLayout = null;
 let layoutRadius = 6;
 let framedRadius = 0;
 let pulseGlows = [];
+let focusLabels = [];
+let focusLabelsKey = "";
 let fitDistance = 12;
 let zoomGoalDistance = null;
+let zoomAnchor = null;
+let canvasBounds = null;
 let lastZoomPercent = null;
 let lastFrameTime = performance.now();
 let shareReady = false;
 let modelLoadPromise = null;
+let searchEntries = [];
+let searchMatches = [];
+let searchActiveIndex = 0;
+let cameraFlight = null;
+let focusVisualsSuspended = false;
 const layerVisible = { points: true, lines: true, faces: true, volumes: true, root: true };
 const kindLayers = {
   point: "points",
@@ -159,8 +222,19 @@ const kindLayers = {
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 const zoomDirection = new THREE.Vector3();
+const zoomRaycaster = new THREE.Raycaster();
+const zoomPlane = new THREE.Plane();
+const zoomViewDirection = new THREE.Vector3();
+const zoomAnchorBefore = new THREE.Vector3();
+const zoomAnchorAfter = new THREE.Vector3();
+const zoomShift = new THREE.Vector3();
+const zoomAnchorNdc = new THREE.Vector2();
+const pickWorldPosition = new THREE.Vector3();
+const pickProjected = new THREE.Vector3();
 const MIN_NODE_HIT_RADIUS_PX = 12;
 const MIN_LINE_HIT_RADIUS_PX = 8;
+const TOUCH_NODE_HIT_RADIUS_PX = 22;
+const TOUCH_LINE_HIT_RADIUS_PX = 14;
 const ZOOM_MIN_PERCENT = 50;
 const ZOOM_MAX_PERCENT = 400;
 const ZOOM_STEP_PERCENT = 25;
@@ -170,7 +244,7 @@ const SHARE_CARD_TIMEOUT_MS = 15_000;
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 function freshLayerObjects() {
-  return { points: [], lines: [], faces: [], volumes: [], root: [] };
+  return { points: [], lines: [], hierarchy: [], faces: [], volumes: [], root: [] };
 }
 
 function hash(text) {
@@ -232,7 +306,7 @@ function glowTexture(color) {
   return texture;
 }
 
-function addGlow(position, color, size, opacity, layer, pulse = 0.06) {
+function addGlow(position, color, size, opacity, layer, pulse = 0.06, focusRefs = []) {
   const sprite = new THREE.Sprite(
     new THREE.SpriteMaterial({
       map: glowTexture(color),
@@ -249,7 +323,7 @@ function addGlow(position, color, size, opacity, layer, pulse = 0.06) {
   sprite.userData.glowBase = size;
   sprite.userData.glowPhase = hash(`${position.x}:${position.y}:${position.z}`) * Math.PI * 2;
   sprite.userData.glowPulse = pulse;
-  register(sprite, layer);
+  register(sprite, layer, focusRefs);
   pulseGlows.push(sprite);
   return sprite;
 }
@@ -280,8 +354,9 @@ function visibleAt(item) {
   return !time || time <= cutoff;
 }
 
-function register(object, layer) {
+function register(object, layer, focusRefs = []) {
   object.userData.layer = layer;
+  object.userData.focusRefs = focusRefs;
   layerObjects[layer].push(object);
   graph.add(object);
   return object;
@@ -321,9 +396,43 @@ function addLabel(text, position, layer, priority, kind, item, context = false) 
   label.position.copy(position);
   label.userData.priority = priority;
   registerSelectionTarget(kind, item.id, label);
-  element.addEventListener("pointerdown", (event) => event.stopPropagation());
+  element.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    // A label used to swallow the gesture outright, so the twenty of them on
+    // screen were twenty places where a drag did nothing at all. Hand the
+    // pointer to the canvas — OrbitControls captures it there and orbits — and
+    // record what was under it so a gesture that turns out to be a click still
+    // opens this label's node.
+    event.preventDefault();
+    // preventDefault also suppresses the focus the button would have taken, so
+    // give it back: a mouse user who selects a node should still be able to
+    // Tab onward from it.
+    element.focus({ preventScroll: true });
+    labelGesture = { kind, item };
+    renderer.domElement.dispatchEvent(new PointerEvent("pointerdown", {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      isPrimary: event.isPrimary,
+      button: event.button,
+      buttons: event.buttons,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      // Modifiers pick the gesture: shift or ctrl turns OrbitControls' left
+      // drag from an orbit into a pan, and a drag begun on a label has to mean
+      // the same thing as one begun on bare canvas.
+      ctrlKey: event.ctrlKey,
+      shiftKey: event.shiftKey,
+      altKey: event.altKey,
+      metaKey: event.metaKey,
+      bubbles: false,
+      cancelable: true,
+    }));
+  });
   element.addEventListener("click", (event) => {
     event.stopPropagation();
+    // Pointer-driven activation is resolved on the canvas above. Only keyboard
+    // activation, which reports no pointer detail, still arrives here.
+    if (event.detail !== 0) return;
     showDetails(kind, item);
   });
   register(label, layer);
@@ -331,14 +440,98 @@ function addLabel(text, position, layer, priority, kind, item, context = false) 
   return label;
 }
 
-function addLine(start, end, color, opacity, dashed, layer = "lines") {
+function clearFocusLabels() {
+  focusLabels.forEach((label) => {
+    graph.remove(label);
+    label.element.remove();
+    labels = labels.filter((candidate) => candidate !== label);
+    const layer = label.userData.layer;
+    if (layerObjects[layer]) {
+      layerObjects[layer] = layerObjects[layer].filter((candidate) => candidate !== label);
+    }
+    const ref = label.userData.ref;
+    if (ref) {
+      const key = selectionKey(ref.kind, ref.id);
+      const remaining = (selectionTargets.get(key) || [])
+        .filter((candidate) => candidate !== label);
+      if (remaining.length) selectionTargets.set(key, remaining);
+      else selectionTargets.delete(key);
+    }
+  });
+  focusLabels = [];
+}
+
+function updateFocusLabels(focusKeys, activeKey) {
+  const nextKey = activeKey
+    ? `${activeKey}|${[...focusKeys].sort().join("|")}`
+    : "";
+  if (nextKey === focusLabelsKey) return;
+  clearFocusLabels();
+  focusLabelsKey = nextKey;
+  if (!activeKey) return;
+
+  const kindPriority = { root: 0, volume: 1, face: 2, point: 3, context: 4 };
+  const candidates = [...focusKeys]
+    .map((key) => {
+      const separator = key.indexOf(":");
+      return {
+        key,
+        kind: separator > 0 ? key.slice(0, separator) : "context",
+        id: separator > 0 ? key.slice(separator + 1) : key,
+      };
+    })
+    .filter(({ kind }) => kind !== "line")
+    .sort((left, right) => (
+      Number(right.key === activeKey) - Number(left.key === activeKey)
+      || (kindPriority[left.kind] ?? 9) - (kindPriority[right.kind] ?? 9)
+      || left.key.localeCompare(right.key)
+    ));
+
+  let labeled = candidates.filter(({ key }) => (
+    (selectionTargets.get(key) || []).some((target) => target.element)
+  )).length;
+  for (const candidate of candidates) {
+    const alreadyLabeled = (selectionTargets.get(candidate.key) || [])
+      .some((target) => target.element);
+    if (alreadyLabeled) continue;
+    // The active object is the one label that must never lose a budget race.
+    // A high-degree node can already have nine labelled neighbors before this
+    // loop begins; allow one generated active label in that case, then stop.
+    if (labeled >= 9 && candidate.key !== activeKey) break;
+    const item = items.get(candidate.key);
+    const position = selectionPosition(candidate.kind, candidate.id);
+    const layer = kindLayers[candidate.kind];
+    if (!item || !position || !layer) continue;
+    const verticalOffset = {
+      root: 0.66,
+      volume: 0.55,
+      face: 0.4,
+      point: 0.25,
+      context: 0.24,
+    }[candidate.kind] || 0.25;
+    const label = addLabel(
+      searchTitle(candidate.kind, item),
+      position.add(new THREE.Vector3(0, verticalOffset, 0)),
+      layer,
+      850 - labeled,
+      candidate.kind,
+      item,
+      candidate.kind === "context",
+    );
+    label.userData.focusGenerated = true;
+    focusLabels.push(label);
+    labeled += 1;
+  }
+}
+
+function addLine(start, end, color, opacity, dashed, layer = "lines", focusRefs = []) {
   const geometry = new THREE.BufferGeometry().setFromPoints([start, end]);
   const material = dashed
     ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize: 0.12, gapSize: 0.09 })
     : new THREE.LineBasicMaterial({ color, transparent: true, opacity });
   const line = new THREE.Line(geometry, material);
   if (dashed) line.computeLineDistances();
-  register(line, layer);
+  register(line, layer, focusRefs);
   return line;
 }
 
@@ -363,7 +556,7 @@ function renderLineExplorer(lines) {
   lines.forEach((line, index) => {
     const option = document.createElement("option");
     option.value = String(index + 1);
-    option.textContent = linePresentation(line, model).option;
+    option.textContent = linePresentations.get(line.id)?.option || "Relationship";
     lineSelectEl.appendChild(option);
   });
   lineExplorerEl.hidden = lines.length === 0;
@@ -395,8 +588,12 @@ function disposeGraph() {
   selectionTargets = new Map();
   positions = new Map();
   items = new Map();
+  sceneNodeLabels = new Map();
+  linePresentations = new Map();
   layerObjects = freshLayerObjects();
   pulseGlows = [];
+  focusLabels = [];
+  focusLabelsKey = "";
 }
 
 function addPoint(point, position, baseRadius, showLabel, promoted) {
@@ -415,7 +612,15 @@ function addPoint(point, position, baseRadius, showLabel, promoted) {
   const mesh = registerPickable(new THREE.Mesh(geometry, material), "points", "point", point);
   mesh.position.copy(position);
   if (active && promoted && hash(`${point.id}:glow`) < 0.08) {
-    addGlow(position, COLORS.points, radius * 5.4, 0.2, "points", 0.08);
+    addGlow(
+      position,
+      COLORS.points,
+      radius * 5.4,
+      0.2,
+      "points",
+      0.08,
+      [selectionKey("point", point.id)],
+    );
   }
   if (showLabel) {
     addLabel(
@@ -456,7 +661,7 @@ function addContextNode(id) {
   }
 }
 
-function addClusterHalo(memberPositions, center) {
+function addClusterHalo(memberPositions, center, focusRefs = []) {
   if (memberPositions.length < 2) return;
   const radius = Math.min(1.9, Math.max(0.55, ...memberPositions.map((member) => member.distanceTo(center))) + 0.18);
   const mesh = register(
@@ -470,7 +675,8 @@ function addClusterHalo(memberPositions, center) {
         depthWrite: false,
       })
     ),
-    "faces"
+    "faces",
+    focusRefs,
   );
   mesh.position.copy(center);
   mesh.scale.setScalar(radius);
@@ -480,10 +686,11 @@ function addClusterHalo(memberPositions, center) {
 function addFace(face, showLabel) {
   const position = positions.get(face.id);
   if (!position) return;
+  const faceKey = selectionKey("face", face.id);
   const memberIds = currentLayout?.facePointIds.get(face.id) || [];
   const memberPositions = memberIds.map((id) => positions.get(id)).filter(Boolean);
-  addClusterHalo(memberPositions, position);
-  addGlow(position, COLORS.faces, 1.55, 0.22, "faces", 0.07);
+  addClusterHalo(memberPositions, position, [faceKey]);
+  addGlow(position, COLORS.faces, 1.55, 0.22, "faces", 0.07, [faceKey]);
   const node = registerPickable(
     new THREE.Mesh(
       new THREE.OctahedronGeometry(0.28, 0),
@@ -509,13 +716,27 @@ function addFace(face, showLabel) {
       face
     );
   }
-  memberPositions.forEach((member) => addLine(member, position, COLORS.hierarchy, 0.1, true));
+  memberIds.forEach((id) => {
+    const member = positions.get(id);
+    if (member) {
+      addLine(
+        member,
+        position,
+        COLORS.hierarchy,
+        0.1,
+        true,
+        "hierarchy",
+        [faceKey, selectionKey("point", id)],
+      );
+    }
+  });
 }
 
 function addVolume(volume, showLabel) {
   const position = positions.get(volume.id);
   if (!position) return;
-  addGlow(position, COLORS.volumes, 2.35, 0.25, "volumes", 0.06);
+  const volumeKey = selectionKey("volume", volume.id);
+  addGlow(position, COLORS.volumes, 2.35, 0.25, "volumes", 0.06, [volumeKey]);
   const mesh = registerPickable(
     new THREE.Mesh(
       new THREE.IcosahedronGeometry(0.48, 1),
@@ -538,7 +759,8 @@ function addVolume(volume, showLabel) {
       new THREE.IcosahedronGeometry(0.17, 1),
       new THREE.MeshBasicMaterial({ color: COLORS.volumes, transparent: true, opacity: 0.68 })
     ),
-    "volumes"
+    "volumes",
+    [volumeKey],
   );
   core.position.copy(position);
   if (showLabel) {
@@ -552,14 +774,27 @@ function addVolume(volume, showLabel) {
     );
   }
   const memberIds = currentLayout?.volumeFaceIds.get(volume.id) || [];
-  memberIds.map((id) => positions.get(id)).filter(Boolean)
-    .forEach((member) => addLine(member, position, COLORS.volumes, 0.22, false));
+  memberIds.forEach((id) => {
+    const member = positions.get(id);
+    if (member) {
+      addLine(
+        member,
+        position,
+        COLORS.volumes,
+        0.22,
+        false,
+        "hierarchy",
+        [volumeKey, selectionKey("face", id)],
+      );
+    }
+  });
 }
 
 function addRoot(root) {
   const position = positions.get(root.id);
   if (!position) return;
-  addGlow(position, COLORS.root, 4.2, 0.42, "root", 0.075);
+  const rootKey = selectionKey("root", root.id);
+  addGlow(position, COLORS.root, 4.2, 0.42, "root", 0.075, [rootKey]);
   const mesh = registerPickable(
     new THREE.Mesh(
       new THREE.DodecahedronGeometry(0.62, 0),
@@ -587,8 +822,20 @@ function addRoot(root) {
     root
   );
   const parentIds = currentLayout?.rootVolumeIds || [];
-  parentIds.map((id) => positions.get(id)).filter(Boolean)
-    .forEach((member) => addLine(member, position, COLORS.root, 0.32, false));
+  parentIds.forEach((id) => {
+    const member = positions.get(id);
+    if (member) {
+      addLine(
+        member,
+        position,
+        COLORS.root,
+        0.32,
+        false,
+        "hierarchy",
+        [rootKey, selectionKey("volume", id)],
+      );
+    }
+  });
 }
 
 function addModelLine(line) {
@@ -640,13 +887,24 @@ function addGround() {
   addOrbitRing(radius * 0.72, COLORS.root, 0.055, [Math.PI / 2.8, 0.42, 0.18], ringLayer);
 }
 
-function buildScene() {
+function buildScene({
+  frame = true,
+  preserveSelection = false,
+  selectionReplacement = null,
+} = {}) {
   disposeGraph();
   const visiblePoints = model.points.filter(visibleAt).sort((a, b) => a.id.localeCompare(b.id));
   const visibleFaces = model.faces.filter(visibleAt);
   const visibleVolumes = model.volumes.filter(visibleAt);
   const visibleRoot = model.root && visibleAt(model.root) ? model.root : null;
   const visibleLines = model.lines.filter(visibleAt);
+  sceneModel = {
+    points: visiblePoints,
+    lines: visibleLines,
+    faces: visibleFaces,
+    volumes: visibleVolumes,
+    root: visibleRoot,
+  };
   currentLayout = computeClusterLayout({
     points: visiblePoints,
     lines: visibleLines,
@@ -677,16 +935,35 @@ function buildScene() {
   const renderedLineItems = visibleLines.filter(
     (line) => positions.has(line.source) && positions.has(line.target),
   );
+  sceneNodeLabels = modelNodeLabelIndex(sceneModel);
+  linePresentations = indexLinePresentations(renderedLineItems, sceneModel, sceneNodeLabels);
   renderLineExplorer(renderedLineItems);
   visibleFaces.forEach((face) => addFace(face, labeledFaces.has(face.id)));
   visibleVolumes.forEach((volume) => addVolume(volume, labeledVolumes.has(volume.id)));
   if (visibleRoot) addRoot(visibleRoot);
 
-  applyLayerVisibility();
-  renderStatus();
-  emptyEl.hidden = visiblePoints.length > 0;
-  frameLayout(false);
   const renderedLines = renderedLineItems.length;
+  const currentCounts = {
+    points: visiblePoints.length,
+    lines: renderedLines,
+    faces: visibleFaces.length,
+    volumes: visibleVolumes.length,
+    root: visibleRoot ? 1 : 0,
+  };
+  updateLayerCounts(currentCounts);
+  rebuildSearchEntries();
+  applyLayerVisibility({ preserveSelection, selectionReplacement });
+  renderStatus(currentCounts);
+  emptyEl.hidden = visiblePoints.length > 0;
+  if (frame) frameLayout(false);
+  // Fresh label elements and a possibly-resized status strip: both cached
+  // measurements have to be taken again.
+  invalidatePanelBoxes();
+  // A viewer that started against an empty store rendered nothing for its
+  // first frames and would otherwise have spent its whole probe budget on a
+  // blank scene, leaving the local smoke signal reading "nothing rendered"
+  // forever. A new scene deserves a fresh look.
+  renderProbeSweeps = 0;
   window.__persomeViewerState = {
     schemaVersion: model.schema_version,
     generatedAt: modelGeneratedAt || null,
@@ -714,15 +991,14 @@ function buildScene() {
   viewerEl.dataset.layoutVersion = currentLayout.diagnostics.version;
 }
 
-function renderStatus() {
-  const stats = model.stats || {};
+function renderStatus(counts) {
   statusEl.replaceChildren();
   const parts = [
-    ["points", "Points", stats.points || 0],
-    ["lines", "Lines", (stats.evolution_lines || 0) + (stats.relation_lines || 0)],
-    ["faces", "Faces", stats.faces || 0],
-    ["volumes", "Volumes", stats.volumes || 0],
-    ["root", "Root", stats.roots || 0],
+    ["points", "Points", counts.points],
+    ["lines", "Lines", counts.lines],
+    ["faces", "Faces", counts.faces],
+    ["volumes", "Volumes", counts.volumes],
+    ["root", "Root", counts.root],
   ];
   parts.forEach(([kind, label, value]) => {
     const stat = document.createElement("span");
@@ -760,10 +1036,176 @@ function renderStatus() {
     || "A living map of what you notice, repeat, and become.";
 }
 
+function updateLayerCounts(counts) {
+  Object.entries(layerCountEls).forEach(([kind, countEl]) => {
+    if (!countEl) return;
+    const count = Number(counts[kind] || 0);
+    countEl.textContent = String(count);
+    const button = countEl.closest("button");
+    if (button) {
+      const label = kind === "root" ? "Root" : `${kind[0].toUpperCase()}${kind.slice(1)}`;
+      button.setAttribute("aria-label", `${label}: ${count}. Toggle visibility`);
+    }
+  });
+}
+
+function searchTitle(kind, item, lineDetail = null) {
+  if (kind === "line") return lineDetail?.title || item.label || item.predicate || item.kind || item.id;
+  return item.content || item.signature || item.label || item.predicate || item.kind || item.id;
+}
+
+function searchSubtitle(kind, item, lineDetail = null, pointDetail = null) {
+  if (kind === "point") return pointDetail?.subtitle || "Modeled observation · not active";
+  if (kind === "line") {
+    return lineDetail ? `${lineDetail.source} → ${lineDetail.target}` : "Relationship";
+  }
+  if (kind === "face") return "Stable pattern";
+  if (kind === "volume") return "Cross-pattern structure";
+  if (kind === "root") return "Current personal model";
+  return "Context referenced by a relation";
+}
+
+function searchWeight(kind, item, pointDetail = null) {
+  const observations = Math.min(8, Number(item.observations || 0));
+  if (kind === "root") return 24;
+  if (kind === "volume") return 18 + observations;
+  if (kind === "face") return 12 + observations;
+  if (kind === "point") {
+    return 6
+      + Math.min(4, Number(item.confidence || 0) * 4)
+      + Number(pointDetail?.weightAdjustment || 0);
+  }
+  if (kind === "line") return 3;
+  return 1;
+}
+
+function rebuildSearchEntries() {
+  const entries = [...items.entries()].map(([key, item]) => {
+    const separator = key.indexOf(":");
+    const kind = separator > 0 ? key.slice(0, separator) : "context";
+    const lineDetail = kind === "line" ? linePresentations.get(item.id) : null;
+    const pointDetail = kind === "point" ? pointSearchMetadata(item, cutoff) : null;
+    return {
+      key,
+      kind,
+      id: item.id,
+      title: searchTitle(kind, item, lineDetail),
+      subtitle: searchSubtitle(kind, item, lineDetail, pointDetail),
+      aliases: lineDetail
+        ? [lineDetail.predicate, lineDetail.label, lineDetail.source, lineDetail.target, item.kind]
+        : [...new Set([item.kind, item.status, ...(pointDetail?.aliases || [])].filter(Boolean))],
+      stateAliases: pointDetail?.aliases || [],
+      weight: searchWeight(kind, item, pointDetail),
+      searchState: pointDetail?.state || "",
+    };
+  });
+  searchEntries = prepareSearchEntries(entries);
+  if (!searchPanelEl.hidden) renderSearchResults();
+}
+
+function setSearchActiveIndex(nextIndex) {
+  if (!searchMatches.length) {
+    searchActiveIndex = 0;
+    searchInputEl.removeAttribute("aria-activedescendant");
+    return;
+  }
+  searchActiveIndex = (nextIndex + searchMatches.length) % searchMatches.length;
+  const buttons = [...searchResultsEl.querySelectorAll(".search-result")];
+  buttons.forEach((button, index) => {
+    button.setAttribute("aria-selected", String(index === searchActiveIndex));
+  });
+  const active = buttons[searchActiveIndex];
+  if (active) {
+    searchInputEl.setAttribute("aria-activedescendant", active.id);
+    active.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function renderSearchResults() {
+  const query = searchInputEl.value.trim();
+  searchMatches = rankSearchEntries(searchEntries, query, 9);
+  searchActiveIndex = Math.min(searchActiveIndex, Math.max(0, searchMatches.length - 1));
+  searchResultsEl.replaceChildren();
+  searchMatches.forEach((entry, index) => {
+    const button = document.createElement("button");
+    button.id = `model-search-result-${index}`;
+    button.type = "button";
+    button.tabIndex = -1;
+    button.className = "search-result";
+    button.dataset.kind = entry.kind;
+    if (entry.searchState) button.dataset.searchState = entry.searchState;
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(index === searchActiveIndex));
+
+    const marker = document.createElement("i");
+    marker.setAttribute("aria-hidden", "true");
+    const copy = document.createElement("span");
+    const title = document.createElement("b");
+    title.textContent = entry.title;
+    const subtitle = document.createElement("small");
+    subtitle.textContent = entry.subtitle;
+    copy.append(title, subtitle);
+    const kind = document.createElement("em");
+    kind.textContent = entry.kind === "context" ? "entity" : entry.kind;
+    button.append(marker, copy, kind);
+    button.addEventListener("pointerenter", () => setSearchActiveIndex(index));
+    button.addEventListener("click", () => selectSearchMatch(entry));
+    searchResultsEl.appendChild(button);
+  });
+  searchEmptyEl.hidden = searchMatches.length > 0;
+  searchSummaryEl.textContent = query
+    ? (searchMatches.length
+      ? `Top ${searchMatches.length} matches in this model view.`
+      : "No matching object in this model view.")
+    : `Showing ${searchMatches.length} anchors from this model view.`;
+  setSearchActiveIndex(searchActiveIndex);
+}
+
+function openSearch() {
+  pauseAutoRotate();
+  searchPanelEl.hidden = false;
+  searchInputEl.setAttribute("aria-expanded", "true");
+  searchActiveIndex = 0;
+  renderSearchResults();
+  invalidatePanelBoxes();
+  window.requestAnimationFrame(() => {
+    searchInputEl.focus({ preventScroll: true });
+    searchInputEl.select();
+  });
+}
+
+function closeSearch(restoreFocus = true) {
+  if (searchPanelEl.hidden) return;
+  searchPanelEl.hidden = true;
+  searchInputEl.setAttribute("aria-expanded", "false");
+  searchInputEl.removeAttribute("aria-activedescendant");
+  invalidatePanelBoxes();
+  if (restoreFocus) openSearchButton.focus({ preventScroll: true });
+}
+
+function selectSearchMatch(entry) {
+  const item = items.get(entry.key);
+  if (!item) {
+    rebuildSearchEntries();
+    renderSearchResults();
+    return;
+  }
+  const layer = kindLayers[entry.kind];
+  if (layer && !layerVisible[layer]) {
+    layerVisible[layer] = true;
+    applyLayerVisibility();
+    if (window.__persomeViewerState) window.__persomeViewerState.layers = { ...layerVisible };
+  }
+  closeSearch(false);
+  showDetails(entry.kind, item, openSearchButton);
+  flyToSelection(entry.kind, entry.id);
+  document.getElementById("close-detail").focus({ preventScroll: true });
+}
+
 function pauseAutoRotate() {
   if (!controls.autoRotate) return;
   controls.autoRotate = false;
-  document.getElementById("rotate").setAttribute("aria-pressed", "false");
+  rotateButton.setAttribute("aria-pressed", "false");
 }
 
 function showShareNotice(title, message, failed = false) {
@@ -798,8 +1240,10 @@ async function loadShareProjection() {
     });
     if (!response.ok) throw new Error(`Share endpoint returned HTTP ${response.status}`);
     const payload = await response.json();
+    const generatedAt = String(payload.generated_at || "");
     if (
-      !payload.model
+      !generatedAt
+      || !payload.model
       || !Array.isArray(payload.model.faces)
       || !Array.isArray(payload.model.volumes)
       || !payload.model.stats
@@ -807,10 +1251,30 @@ async function loadShareProjection() {
     ) {
       throw new Error("Share endpoint returned an invalid projection");
     }
-    return payload.model;
+    return { generatedAt, model: payload.model };
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+async function loadConstellationBundle() {
+  // `/share-card` exposes only scrubbed summaries, while `/graph` supplies the
+  // private geometry already available to this owner-local viewer. Match their
+  // server generation before drawing so text/counts can never describe a newer
+  // model than the constellation. A cache expiry can land between the two GETs,
+  // so carry the newer graph into bounded retries rather than guessing.
+  let graphPayload = modelGeneratedAt ? { generated_at: modelGeneratedAt, model } : null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const share = await loadShareProjection();
+    if (graphPayload?.generated_at === share.generatedAt) {
+      return { shareModel: share.model, graphModel: graphPayload.model };
+    }
+    graphPayload = await fetchModelGraph();
+    if (graphPayload.generated_at === share.generatedAt) {
+      return { shareModel: share.model, graphModel: graphPayload.model };
+    }
+  }
+  throw new Error("The model changed while preparing the share image. Try again.");
 }
 
 function createHumanCardBlob(shareModel) {
@@ -828,14 +1292,151 @@ function createHumanCardBlob(shareModel) {
   });
 }
 
-function createConstellationBlob(shareModel) {
-  renderer.render(scene, camera);
+function createConstellationBlob(shareModel, shareGraphModel = model) {
   const canvas = document.createElement("canvas");
   canvas.width = CONSTELLATION_CARD_WIDTH;
   canvas.height = CONSTELLATION_CARD_HEIGHT;
   const context = canvas.getContext("2d");
   if (!context) return Promise.reject(new Error("Canvas export is unavailable"));
-  drawConstellationCard(context, renderer.domElement, shareModel);
+
+  // Sharing is a projection, not a screenshot of the owner's current camera.
+  // Preserve every interactive state that the temporary 16:9 overview touches
+  // so a focused/flying/zooming viewer resumes exactly where it was.
+  const rendererSize = renderer.getSize(new THREE.Vector2());
+  const returnFocusKey = [...selectionTargets.entries()].find(([, targets]) => (
+    targets.some((target) => target.element === selectionReturnFocus)
+  ))?.[0] || null;
+  const viewState = {
+    rendererSize,
+    pixelRatio: renderer.getPixelRatio(),
+    cameraAspect: camera.aspect,
+    cameraPosition: camera.position.clone(),
+    cameraQuaternion: camera.quaternion.clone(),
+    controlsTarget: controls.target.clone(),
+    cameraFlight,
+    zoomGoalDistance,
+    zoomAnchor,
+    selected: selected ? { ...selected } : null,
+    selectedItem,
+    selectionReturnFocus,
+    returnFocusKey,
+    focusVisualsSuspended,
+    layers: { ...layerVisible },
+    sliderValue: slider.value,
+    sliderLabel: sliderLabel.textContent,
+    cutoff: new Date(cutoff),
+    fitDistance,
+    framedRadius,
+    portraitMode,
+    minDistance: controls.minDistance,
+    maxDistance: controls.maxDistance,
+    maxTargetRadius: controls.maxTargetRadius,
+    autoRotate: controls.autoRotate,
+    model,
+    minTime: new Date(minTime),
+    maxTime: new Date(maxTime),
+  };
+
+  try {
+    pauseAutoRotate();
+    cameraFlight = null;
+    zoomGoalDistance = null;
+    zoomAnchor = null;
+    focusVisualsSuspended = true;
+
+    const exportingDifferentModel = shareGraphModel !== model;
+    if (exportingDifferentModel) {
+      model = shareGraphModel;
+      slider.value = "100";
+      updateTimelineBounds();
+      buildScene({ frame: false, preserveSelection: true });
+    }
+
+    // The share projection is current, so its picture must be current too.
+    // Rebuild at Now before fitting the export; otherwise time travel would pair
+    // a historical constellation with current narrative and aggregate counts.
+    if (!exportingDifferentModel && slider.value !== "100") {
+      slider.value = "100";
+      updateCutoff();
+      buildScene({ frame: false, preserveSelection: true });
+    }
+
+    // Layer toggles are inspection state. The public artifact always shows the
+    // complete current time slice so its picture agrees with its full counts.
+    Object.keys(layerVisible).forEach((layer) => { layerVisible[layer] = true; });
+    applyLayerVisibility({ preserveSelection: true });
+
+    const overview = fittedOverviewPose(
+      layoutRadius,
+      CONSTELLATION_CARD_WIDTH,
+      CONSTELLATION_CARD_HEIGHT,
+    );
+
+    // Render at the artifact's own aspect ratio. Drawing a portrait viewport
+    // into the landscape card with drawCover() crops most of the constellation,
+    // even if that viewport's camera was otherwise fitted.
+    renderer.setPixelRatio(1);
+    renderer.setSize(CONSTELLATION_CARD_WIDTH, CONSTELLATION_CARD_HEIGHT, false);
+    camera.aspect = overview.aspect;
+    camera.position.set(...overview.position);
+    controls.target.set(...overview.target);
+    camera.lookAt(controls.target);
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
+    renderer.render(scene, camera);
+    drawConstellationCard(context, renderer.domElement, shareModel);
+  } finally {
+    renderer.setPixelRatio(viewState.pixelRatio);
+    renderer.setSize(viewState.rendererSize.x, viewState.rendererSize.y, false);
+
+    const exportedDifferentModel = model !== viewState.model;
+    model = viewState.model;
+    minTime = viewState.minTime;
+    maxTime = viewState.maxTime;
+    slider.value = viewState.sliderValue;
+    sliderLabel.textContent = viewState.sliderLabel;
+    cutoff = viewState.cutoff;
+    Object.entries(viewState.layers).forEach(([layer, visible]) => {
+      layerVisible[layer] = visible;
+    });
+    // A historical export temporarily built the latest scene. Rebuild the
+    // owner's exact slice before restoring the camera and focus over it.
+    if (exportedDifferentModel || viewState.sliderValue !== "100") {
+      buildScene({ frame: false, preserveSelection: true });
+    }
+
+    camera.aspect = viewState.cameraAspect;
+    camera.position.copy(viewState.cameraPosition);
+    camera.quaternion.copy(viewState.cameraQuaternion);
+    controls.target.copy(viewState.controlsTarget);
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
+    fitDistance = viewState.fitDistance;
+    framedRadius = viewState.framedRadius;
+    portraitMode = viewState.portraitMode;
+    controls.minDistance = viewState.minDistance;
+    controls.maxDistance = viewState.maxDistance;
+    controls.maxTargetRadius = viewState.maxTargetRadius;
+    cameraFlight = viewState.cameraFlight;
+    zoomGoalDistance = viewState.zoomGoalDistance;
+    zoomAnchor = viewState.zoomAnchor;
+    controls.autoRotate = viewState.autoRotate;
+    rotateButton.setAttribute("aria-pressed", String(viewState.autoRotate));
+    selected = viewState.selected;
+    selectedItem = selected
+      ? items.get(selectionKey(selected.kind, selected.id)) || viewState.selectedItem
+      : null;
+    focusVisualsSuspended = viewState.focusVisualsSuspended;
+    applyLayerVisibility();
+    // Restoring focus can generate labels that did not exist while focus was
+    // suspended, so resolve the return element only after selection sync.
+    selectionReturnFocus = selected && viewState.returnFocusKey
+      ? (selectionTargets.get(viewState.returnFocusKey) || [])
+        .find((target) => target.element)?.element || viewState.selectionReturnFocus
+      : viewState.selectionReturnFocus;
+    syncZoomUI();
+    renderer.render(scene, camera);
+  }
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) resolve(blob);
@@ -870,10 +1471,9 @@ function paintConstellationHandoff(popup) {
 
 async function exportHumanCard() {
   setShareBusy(true);
-  pauseAutoRotate();
   try {
-    const shareModel = await loadShareProjection();
-    const blob = await createHumanCardBlob(shareModel);
+    const share = await loadShareProjection();
+    const blob = await createHumanCardBlob(share.model);
     downloadShareImage(blob, HUMAN_CARD_FILE_NAME);
     showShareNotice(
       "HUMAN.md Card downloaded",
@@ -890,10 +1490,9 @@ async function shareConstellationToX() {
   const popup = window.open("about:blank", "_blank");
   paintConstellationHandoff(popup);
   setShareBusy(true);
-  pauseAutoRotate();
   try {
-    const shareModel = await loadShareProjection();
-    const blob = await createConstellationBlob(shareModel);
+    const { shareModel, graphModel } = await loadConstellationBundle();
+    const blob = await createConstellationBlob(shareModel, graphModel);
     downloadShareImage(blob, CONSTELLATION_FILE_NAME);
     showShareNotice(
       "Constellation downloaded",
@@ -915,8 +1514,59 @@ async function shareConstellationToX() {
   }
 }
 
+function objectFocusKeys(object) {
+  const keys = new Set(object.userData.focusRefs || []);
+  const ref = object.userData.ref;
+  if (ref?.kind && ref?.id) keys.add(selectionKey(ref.kind, ref.id));
+  return keys;
+}
+
+function applyMaterialFocus(object, focusing, relevant) {
+  const materials = Array.isArray(object.material) ? object.material : [object.material];
+  materials.filter(Boolean).forEach((material) => {
+    material.userData.persomeFocusBase ||= {
+      opacity: Number(material.opacity),
+      transparent: Boolean(material.transparent),
+      depthWrite: Boolean(material.depthWrite),
+      emissiveIntensity: Number.isFinite(material.emissiveIntensity)
+        ? Number(material.emissiveIntensity)
+        : null,
+    };
+    const base = material.userData.persomeFocusBase;
+    const muted = focusing && !relevant;
+    const nextTransparent = muted ? true : base.transparent;
+    if (material.transparent !== nextTransparent) material.needsUpdate = true;
+    material.transparent = nextTransparent;
+    const mutedFactor = object.isSprite ? 0.025 : (object.isLine ? 0.025 : 0.045);
+    material.opacity = muted ? base.opacity * mutedFactor : base.opacity;
+    material.depthWrite = muted ? false : base.depthWrite;
+    if (base.emissiveIntensity !== null) {
+      material.emissiveIntensity = muted ? base.emissiveIntensity * 0.045 : base.emissiveIntensity;
+    }
+  });
+}
+
 function syncSelectionState() {
-  const activeKey = selected ? selectionKey(selected.kind, selected.id) : null;
+  const selectionVisible = selected && !focusVisualsSuspended;
+  const activeKey = selectionVisible ? selectionKey(selected.kind, selected.id) : null;
+  const focusKeys = selectionVisible
+    ? focusKeysForSelection(sceneModel, currentLayout, selected)
+    : new Set();
+  const focusing = focusKeys.size > 0;
+  if (!focusVisualsSuspended) updateFocusLabels(focusKeys, activeKey);
+
+  Object.values(layerObjects).flat().forEach((object) => {
+    const keys = objectFocusKeys(object);
+    const relevant = [...keys].some((key) => focusKeys.has(key));
+    if (object.element) {
+      const active = keys.has(activeKey);
+      object.element.classList.toggle("focus-muted", focusing && !relevant);
+      object.element.classList.toggle("focus-neighbor", focusing && relevant && !active);
+    } else if (object.material) {
+      applyMaterialFocus(object, focusing, relevant);
+    }
+  });
+
   selectionTargets.forEach((targets, key) => {
     const active = key === activeKey;
     targets.forEach((target) => {
@@ -924,10 +1574,11 @@ function syncSelectionState() {
         target.element.setAttribute("aria-expanded", String(active));
       } else if (target.isLine && target.material) {
         const baseOpacity = Number(target.userData.baseOpacity || 0);
-        target.material.opacity = active ? Math.min(1, baseOpacity * 2 + 0.24) : baseOpacity;
+        if (active) target.material.opacity = Math.min(1, baseOpacity * 2 + 0.24);
         target.renderOrder = active ? 5 : 0;
       } else if (target.isMesh) {
-        target.scale.setScalar(active ? 1.45 : 1);
+        target.userData.selectionBaseScale ||= target.scale.clone();
+        target.scale.copy(target.userData.selectionBaseScale).multiplyScalar(active ? 1.45 : 1);
       }
     });
   });
@@ -937,39 +1588,75 @@ function syncSelectionState() {
     screenLinePickables: screenLinePickables.length,
     minimumNodeHitRadiusPx: MIN_NODE_HIT_RADIUS_PX,
     minimumLineHitRadiusPx: MIN_LINE_HIT_RADIUS_PX,
+    touchNodeHitRadiusPx: TOUCH_NODE_HIT_RADIUS_PX,
+    touchLineHitRadiusPx: TOUCH_LINE_HIT_RADIUS_PX,
     nodePickables: pickables.length,
     interactiveLabels: labels.filter((label) => Boolean(label.userData.ref)).length,
     selected: selected ? { ...selected } : null,
+    focused: Boolean(selectionVisible),
+    neighborhoodObjects: focusKeys.size,
   };
 }
 
-function clearSelection() {
+function clearSelection(restoreFocus = false) {
+  const returnFocus = restoreFocus ? selectionReturnFocus : null;
   evidenceRequest += 1;
   selected = null;
   selectedItem = null;
+  selectionReturnFocus = null;
   detailMode = "node";
   evidenceTrail = [];
   detailEl.hidden = true;
   delete detailEl.dataset.kind;
+  invalidatePanelBoxes();
   syncSelectionState();
+  if (returnFocus?.isConnected) {
+    window.requestAnimationFrame(() => returnFocus.focus({ preventScroll: true }));
+  }
 }
 
-function applyLayerVisibility() {
+function showAllModel() {
+  clearSelection(true);
+  resetCamera();
+}
+
+function applyLayerVisibility({ preserveSelection = false, selectionReplacement = null } = {}) {
   Object.entries(layerObjects).forEach(([layer, objects]) => {
     objects.forEach((object) => {
-      object.visible = layerVisible[layer];
-      if (object.element) object.element.hidden = !layerVisible[layer];
+      const visible = layer === "hierarchy"
+        ? [...objectFocusKeys(object)].every((key) => {
+          const separator = key.indexOf(":");
+          const kind = separator > 0 ? key.slice(0, separator) : "context";
+          const endpointLayer = kindLayers[kind];
+          return !endpointLayer || layerVisible[endpointLayer];
+        })
+        : layerVisible[layer];
+      object.visible = visible;
+      if (object.element) object.element.hidden = !visible;
     });
   });
   document.querySelectorAll("[data-layer]").forEach((button) => {
     button.setAttribute("aria-pressed", String(layerVisible[button.dataset.layer]));
   });
-  if (selected) {
-    const key = selectionKey(selected.kind, selected.id);
-    const layer = kindLayers[selected.kind];
-    if (!items.has(key) || (layer && !layerVisible[layer])) {
-      clearSelection();
+  if (!preserveSelection) {
+    const reconciliation = reconcileSceneSelection(
+      selected,
+      items,
+      layerVisible,
+      kindLayers,
+      selectionReplacement,
+    );
+    if (reconciliation.invalidated) {
+      // The selected object may have been the camera's orbit target after search
+      // focus. Once a cutoff or layer removes it, the drawer's Show all action is
+      // gone too, so restore the fitted overview here rather than leaving an
+      // apparently empty viewport aimed at a node that no longer exists.
+      recoverInvalidSceneSelection(reconciliation, clearSelection, resetCamera);
       return;
+    }
+    if (reconciliation.replaced) {
+      selected = reconciliation.selection;
+      selectedItem = items.get(selectionKey(selected.kind, selected.id)) || null;
     }
   }
   syncSelectionState();
@@ -1372,14 +2059,22 @@ async function submitEdit(kind, item, op, replacement, reason) {
       slider.value = "100";
       updateCutoff();
     }
-    const refreshed = await loadModel(true);
-    // The awaits above can span seconds. If the owner selected something else
-    // meanwhile, that selection is theirs.
-    if (!selected || selected.kind !== kind || selected.id !== item.id) return;
+    const refreshed = await loadModel(true, {
+      kind,
+      fromId: item.id,
+      toId: nextId,
+    });
     if (refreshed === false) {
-      setEditStatus("Saved, but the view could not refresh. Reload to see it.", "warn");
+      // The awaits above can span seconds. Do not write a warning into a detail
+      // drawer the owner opened for something else while this request ran.
+      if (selected?.kind === kind && selected.id === item.id) {
+        setEditStatus("Saved, but the view could not refresh. Reload to see it.", "warn");
+      }
       return;
     }
+    // A Point rewrite moves selection to its successor during scene rebuild.
+    // If the owner selected something else meanwhile, that selection is theirs.
+    if (!selected || selected.kind !== kind || selected.id !== nextId) return;
     if (op === "retire") {
       clearSelection();
       return;
@@ -1553,11 +2248,22 @@ function renderEditor(kind, item) {
   }
 }
 
-function showDetails(kind, item) {
-  const lineDetail = kind === "line" ? linePresentation(item, model) : null;
+function showDetails(kind, item, returnFocus = null) {
+  if (detailEl.hidden) {
+    const candidate = returnFocus || document.activeElement;
+    selectionReturnFocus = candidate instanceof HTMLElement
+      && candidate !== document.body
+      && !detailEl.contains(candidate)
+      ? candidate
+      : openSearchButton;
+  }
+  const lineDetail = kind === "line" ? linePresentations.get(item.id) : null;
   selected = { kind, id: item.id };
   selectedItem = item;
   pauseAutoRotate();
+  // The drawer is one of the boxes labels are culled against, and it has just
+  // changed shape.
+  invalidatePanelBoxes();
   syncSelectionState();
   detailEl.dataset.kind = kind;
   detailKindEl.textContent = kind === "context" ? "entity" : kind;
@@ -1630,7 +2336,7 @@ function updateCutoff() {
 function fingerprint(nextModel) {
   return JSON.stringify({
     points: nextModel.points.map((item) => [
-      item.id, item.status, item.is_latest, item.content, item.valid_from,
+      item.id, item.status, item.is_latest, item.content, item.valid_from, item.valid_until,
     ]),
     lines: nextModel.lines.map((item) => [item.id, item.predicate, item.valid_from]),
     faces: nextModel.faces.map((item) => [
@@ -1678,7 +2384,7 @@ function updateHealthBanner(health) {
   banner.hidden = false;
 }
 
-async function loadModelOnce(force) {
+async function fetchModelGraph() {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), MODEL_GRAPH_TIMEOUT_MS);
   try {
@@ -1688,9 +2394,22 @@ async function loadModelOnce(force) {
     });
     if (!response.ok) throw new Error(`Model endpoint returned HTTP ${response.status}`);
     const payload = await response.json();
-    if (!payload.model || !Array.isArray(payload.model.points)) {
+    if (
+      !String(payload.generated_at || "")
+      || !payload.model
+      || !Array.isArray(payload.model.points)
+    ) {
       throw new Error("Model endpoint returned an invalid snapshot");
     }
+    return payload;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+async function loadModelOnce(force, selectionReplacement = null) {
+  try {
+    const payload = await fetchModelGraph();
     errorEl.hidden = true;
     const nextFingerprint = fingerprint(payload.model);
     if (!force && nextFingerprint === modelFingerprint) return true;
@@ -1703,7 +2422,7 @@ async function loadModelOnce(force) {
     );
     setShareBusy(false);
     updateTimelineBounds();
-    buildScene();
+    buildScene({ selectionReplacement });
     return true;
   } catch (error) {
     shareReady = false;
@@ -1712,19 +2431,17 @@ async function loadModelOnce(force) {
     // Reported rather than swallowed: a caller that just wrote to the model
     // needs to know it is still looking at pre-write state.
     return false;
-  } finally {
-    window.clearTimeout(timeout);
   }
 }
 
-function loadModel(force = false) {
+function loadModel(force = false, selectionReplacement = null) {
   // A forced load must actually observe the server again. Returning an
   // in-flight promise silently dropped `force`, so a poll issued microseconds
   // before a correction was saved would satisfy the reload that follows the
   // save — and the drawer would re-render from the pre-edit snapshot while
   // reporting success. A forced load now queues behind whatever is running.
   if (modelLoadPromise && !force) return modelLoadPromise;
-  const run = () => loadModelOnce(force);
+  const run = () => loadModelOnce(force, selectionReplacement);
   const started = modelLoadPromise ? modelLoadPromise.then(run, run) : run();
   const chained = started.finally(() => {
     // Only the newest load clears the slot; an older one finishing later must
@@ -1736,25 +2453,95 @@ function loadModel(force = false) {
 }
 
 function frameLayout(force) {
-  const portrait = window.innerWidth / window.innerHeight < 0.72;
-  portraitMode = portrait;
-  const radius = Math.max(4.8, layoutRadius);
-  if (!force && framedRadius > 0 && radius <= framedRadius * 1.16) return;
-  const direction = new THREE.Vector3(portrait ? 0.58 : 0.72, portrait ? 1.25 : 1.05, 1).normalize();
-  const distance = Math.max(portrait ? 15 : 12, radius * (portrait ? 3.0 : 2.55));
-  fitDistance = distance;
+  const overview = fittedOverviewPose(layoutRadius, window.innerWidth, window.innerHeight);
+  portraitMode = overview.portrait;
+  if (!force && framedRadius > 0 && overview.radius <= framedRadius * 1.16) return;
+  fitDistance = overview.distance;
+  cameraFlight = null;
   zoomGoalDistance = null;
-  camera.position.copy(direction.multiplyScalar(distance));
-  controls.target.set(0, 0, 0);
-  controls.minDistance = distance * 100 / ZOOM_MAX_PERCENT;
-  controls.maxDistance = distance * 100 / ZOOM_MIN_PERCENT;
-  framedRadius = radius;
+  camera.position.set(...overview.position);
+  controls.target.set(...overview.target);
+  controls.minDistance = overview.distance * 100 / ZOOM_MAX_PERCENT;
+  controls.maxDistance = overview.distance * 100 / ZOOM_MIN_PERCENT;
+  // Zooming at the cursor walks the orbit centre towards whatever is under it.
+  // Bound how far it may wander so a long pinch cannot strand the constellation
+  // off-screen with nothing left to orbit around.
+  controls.maxTargetRadius = overview.radius * 1.5;
+  zoomAnchor = null;
+  framedRadius = overview.radius;
   controls.update();
   syncZoomUI();
 }
 
 function resetCamera() {
   frameLayout(true);
+}
+
+function selectionPosition(kind, id) {
+  if (kind === "line") {
+    const line = sceneModel.lines.find((item) => item.id === id);
+    const start = line ? positions.get(line.source) : null;
+    const end = line ? positions.get(line.target) : null;
+    if (start && end) return start.clone().lerp(end, 0.5);
+  }
+  return positions.get(id)?.clone() || null;
+}
+
+function cameraFocusDistance(kind) {
+  const factor = {
+    root: 0.7,
+    volume: 0.56,
+    face: 0.42,
+    line: 0.36,
+    point: 0.3,
+    context: 0.3,
+  }[kind] || 0.42;
+  const cap = kind === "root" ? 18 : (kind === "volume" ? 14 : 10);
+  return THREE.MathUtils.clamp(
+    Math.min(cap, fitDistance * factor),
+    controls.minDistance,
+    controls.maxDistance,
+  );
+}
+
+function flyToSelection(kind, id) {
+  const target = selectionPosition(kind, id);
+  if (!target) return;
+  pauseAutoRotate();
+  zoomGoalDistance = null;
+  zoomAnchor = null;
+
+  const direction = camera.position.clone().sub(controls.target);
+  if (direction.lengthSq() < 1e-8) direction.set(0.72, 0.9, 1);
+  direction.normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), 0.16);
+  direction.y += 0.06;
+  direction.normalize().multiplyScalar(cameraFocusDistance(kind));
+  const destination = target.clone().add(direction);
+  const travel = controls.target.distanceTo(target) + camera.position.distanceTo(destination) * 0.24;
+  const duration = REDUCED_MOTION ? 0 : THREE.MathUtils.clamp(0.56 + travel * 0.025, 0.56, 1.15);
+  cameraFlight = {
+    elapsed: 0,
+    duration,
+    fromPosition: camera.position.clone(),
+    toPosition: destination,
+    fromTarget: controls.target.clone(),
+    toTarget: target,
+  };
+  if (!duration) applyCameraFlight(0);
+}
+
+function applyCameraFlight(deltaSeconds) {
+  if (!cameraFlight) return;
+  const flight = cameraFlight;
+  flight.elapsed += deltaSeconds;
+  const progress = flight.duration ? Math.min(1, flight.elapsed / flight.duration) : 1;
+  const eased = progress < 0.5
+    ? 4 * progress * progress * progress
+    : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+  camera.position.lerpVectors(flight.fromPosition, flight.toPosition, eased);
+  controls.target.lerpVectors(flight.fromTarget, flight.toTarget, eased);
+  controls.update();
+  if (progress >= 1) cameraFlight = null;
 }
 
 function clampZoomPercent(value) {
@@ -1771,36 +2558,71 @@ function currentZoomPercent() {
   );
 }
 
+// Rebuilt in place rather than reallocated: syncZoomUI runs once per frame and
+// a fresh object literal per frame is pure garbage for the collector to chase
+// during exactly the gesture we are trying to keep smooth.
+window.__persomeZoomState = {
+  percent: 100,
+  distance: 0,
+  fitDistance: 0,
+  minPercent: ZOOM_MIN_PERCENT,
+  maxPercent: ZOOM_MAX_PERCENT,
+  animating: false,
+};
+
 function syncZoomUI() {
   const distance = camera.position.distanceTo(controls.target);
-  const percent = currentZoomPercent();
+  const percent = zoomMath.percentForDistance(
+    fitDistance,
+    distance,
+    ZOOM_MIN_PERCENT,
+    ZOOM_MAX_PERCENT,
+  );
+  // The DOM writes are the expensive half. They only mean anything when the
+  // rounded percent actually changes, which during a glide is a few frames out
+  // of every hundred.
   if (percent !== lastZoomPercent) {
     zoomResetButton.textContent = `${percent}%`;
     zoomResetButton.setAttribute(
       "aria-label",
       `Reset zoom to 100 percent (currently ${percent} percent)`,
     );
+    zoomOutButton.disabled = percent <= ZOOM_MIN_PERCENT;
+    zoomInButton.disabled = percent >= ZOOM_MAX_PERCENT;
     lastZoomPercent = percent;
   }
-  zoomOutButton.disabled = percent <= ZOOM_MIN_PERCENT;
-  zoomInButton.disabled = percent >= ZOOM_MAX_PERCENT;
-  window.__persomeZoomState = {
-    percent,
-    distance: Number(distance.toFixed(3)),
-    fitDistance: Number(fitDistance.toFixed(3)),
-    minPercent: ZOOM_MIN_PERCENT,
-    maxPercent: ZOOM_MAX_PERCENT,
-    animating: zoomGoalDistance !== null,
-  };
+  const state = window.__persomeZoomState;
+  state.percent = percent;
+  state.distance = Number(distance.toFixed(3));
+  state.fitDistance = Number(fitDistance.toFixed(3));
+  state.animating = zoomGoalDistance !== null || cameraFlight !== null;
 }
 
 function requestZoom(percent) {
+  cameraFlight = null;
   const clamped = clampZoomPercent(percent);
   zoomGoalDistance = THREE.MathUtils.clamp(
     fitDistance * 100 / clamped,
     controls.minDistance,
     controls.maxDistance,
   );
+  zoomAnchor = null;
+}
+
+// Wheel and pinch drive the goal multiplicatively from wherever the glide is
+// already headed, so a stream of small events composes into one continuous
+// gesture instead of repeatedly restarting from the camera's current position.
+function requestZoomBy(factor, anchor) {
+  cameraFlight = null;
+  const base = zoomGoalDistance === null
+    ? camera.position.distanceTo(controls.target)
+    : zoomGoalDistance;
+  zoomGoalDistance = THREE.MathUtils.clamp(
+    base / factor,
+    controls.minDistance,
+    controls.maxDistance,
+  );
+  zoomAnchor = anchor || null;
 }
 
 function stepZoom(direction) {
@@ -1821,30 +2643,93 @@ function stepZoom(direction) {
   ));
 }
 
+// Where the ray through `ndc` meets the plane that carries the orbit target and
+// faces the camera. Zooming keeps this point pinned under the pointer.
+function anchorWorldPoint(ndc, out) {
+  camera.updateMatrixWorld();
+  zoomRaycaster.setFromCamera(ndc, camera);
+  camera.getWorldDirection(zoomViewDirection);
+  zoomPlane.setFromNormalAndCoplanarPoint(zoomViewDirection, controls.target);
+  return zoomRaycaster.ray.intersectPlane(zoomPlane, out);
+}
+
 function applyZoomAnimation(deltaSeconds) {
   if (zoomGoalDistance === null) return;
   const currentDistance = camera.position.distanceTo(controls.target);
   const nextDistance = REDUCED_MOTION
     ? zoomGoalDistance
     : THREE.MathUtils.damp(currentDistance, zoomGoalDistance, 12, deltaSeconds);
+  const settled = Math.abs(nextDistance - zoomGoalDistance) < 0.01;
+  const landedDistance = settled ? zoomGoalDistance : nextDistance;
+  const anchored = zoomAnchor !== null
+    && anchorWorldPoint(zoomAnchor, zoomAnchorBefore) !== null;
+
   zoomDirection.copy(camera.position).sub(controls.target);
   if (zoomDirection.lengthSq() < 1e-8) zoomDirection.set(0, 0, 1);
-  zoomDirection.setLength(nextDistance);
+  zoomDirection.setLength(landedDistance);
   camera.position.copy(controls.target).add(zoomDirection);
-  if (Math.abs(nextDistance - zoomGoalDistance) < 0.01) {
-    zoomDirection.setLength(zoomGoalDistance);
-    camera.position.copy(controls.target).add(zoomDirection);
+
+  if (anchored && anchorWorldPoint(zoomAnchor, zoomAnchorAfter) !== null) {
+    // Translating the camera and the orbit target by the same vector leaves the
+    // spherical radius, theta and phi untouched, so OrbitControls' damping
+    // carries on undisturbed while the anchored point stays under the pointer.
+    zoomShift.copy(zoomAnchorBefore).sub(zoomAnchorAfter);
+    camera.position.add(zoomShift);
+    controls.target.add(zoomShift);
+  }
+
+  if (settled) {
     zoomGoalDistance = null;
+    zoomAnchor = null;
   }
 }
 
-function cullLabels() {
-  const occupied = [...document.querySelectorAll(".story, .legend, .status, .timeline, .detail:not([hidden])")]
+// Reading an element's box forces the browser to flush pending layout. The
+// render loop writes a fresh inline transform onto every label each frame, so
+// layout is always dirty by the time culling runs — measuring here meant one
+// full-document reflow per frame, across hundreds of labels. Nothing being
+// measured actually changes that often: a label pill is sized by its own text
+// and a fixed max-width, and the overlay panels move only on resize or when the
+// drawer opens. Measure each once and cache.
+let occupiedPanels = null;
+
+function invalidatePanelBoxes() {
+  occupiedPanels = null;
+  canvasBounds = null;
+}
+
+const panelResizeObserver = "ResizeObserver" in window
+  ? new ResizeObserver(invalidatePanelBoxes)
+  : null;
+if (panelResizeObserver) {
+  document.querySelectorAll(
+    ".story, .legend, .mobile-guide, .status, .timeline, .detail, .search-dialog",
+  ).forEach((element) => panelResizeObserver.observe(element));
+}
+document.querySelector(".legend")?.addEventListener("toggle", invalidatePanelBoxes);
+mobileGuideEl?.addEventListener("toggle", invalidatePanelBoxes);
+detailEvidenceFoldEl.addEventListener("toggle", invalidatePanelBoxes);
+detailHistoryFoldEl.addEventListener("toggle", invalidatePanelBoxes);
+
+function panelBoxes() {
+  if (occupiedPanels) return occupiedPanels;
+  occupiedPanels = [...document.querySelectorAll(
+    ".story, .legend, .mobile-guide, .status, .timeline, .detail:not([hidden]), .search-dialog",
+  )]
     .map((element) => element.getBoundingClientRect())
     .filter((box) => box.width > 0 && box.height > 0)
     .map((box) => ({ x0: box.left - 6, x1: box.right + 6, y0: box.top - 6, y1: box.bottom + 6 }));
+  return occupiedPanels;
+}
+
+const cullProjected = new THREE.Vector3();
+const cullCandidates = [];
+
+function cullLabels() {
+  const occupied = panelBoxes().slice();
   const mobile = window.innerWidth < 760;
-  const maxLabels = mobile ? 8 : 20;
+  const maxLabels = mobile ? (selected ? 9 : 8) : 20;
+  const maxWidth = mobile ? 130 : 220;
   const safeArea = {
     left: mobile ? 8 : 6,
     right: window.innerWidth - (mobile ? 8 : 6),
@@ -1852,18 +2737,47 @@ function cullLabels() {
     bottom: window.innerHeight - (mobile ? 70 : 64),
   };
   let shown = 0;
-  const projected = new THREE.Vector3();
-  const candidates = labels.filter((label) => label.visible).map((label) => {
+  const projected = cullProjected;
+  cullCandidates.length = 0;
+  labels.forEach((label) => {
+    if (!label.visible) return;
+    if (label.element.classList.contains("focus-muted")) {
+      label.element.classList.add("hidden");
+      label.element.setAttribute("aria-hidden", "true");
+      label.element.tabIndex = -1;
+      return;
+    }
     label.getWorldPosition(projected);
     projected.project(camera);
     const x = (projected.x * 0.5 + 0.5) * window.innerWidth;
     const y = (-projected.y * 0.5 + 0.5) * window.innerHeight;
-    const maxWidth = mobile ? 130 : 220;
-    const fallbackWidth = (label.element.textContent.length * 6.2) + 16;
-    const width = Math.min(maxWidth, Math.max(32, label.element.offsetWidth || fallbackWidth));
-    const height = Math.max(21, label.element.offsetHeight || 21);
-    return { label, x, y, width, height, priority: label.userData.priority || 0, depth: projected.z };
-  }).sort((a, b) => b.priority - a.priority);
+    // Measure only labels that are on screen and not yet known. Culling runs
+    // before labelRenderer.render(), so a freshly built label is not in the
+    // document on its first pass and measures zero — cache that and the size is
+    // wrong for as long as the label lives. A culled label is display:none and
+    // measures zero too, so asking it costs a reflow and answers nothing.
+    // Everything else settles after one read and is never measured again.
+    if (!label.userData.measuredWidth && !label.element.classList.contains("hidden")) {
+      const measured = label.element.offsetWidth;
+      if (measured) {
+        label.userData.measuredWidth = Math.max(32, measured);
+        label.userData.measuredHeight = Math.max(21, label.element.offsetHeight || 21);
+      }
+    }
+    const estimatedWidth = (label.element.textContent.length * 6.2) + 16;
+    cullCandidates.push({
+      label,
+      x,
+      y,
+      width: Math.min(maxWidth, label.userData.measuredWidth || Math.max(32, estimatedWidth)),
+      height: label.userData.measuredHeight || 21,
+      priority: (label.userData.priority || 0)
+        + (label.element.getAttribute("aria-expanded") === "true" ? 1000 : 0)
+        + (label.element.classList.contains("focus-neighbor") ? 500 : 0),
+      depth: projected.z,
+    });
+  });
+  const candidates = cullCandidates.sort((a, b) => b.priority - a.priority);
 
   candidates.forEach((candidate) => {
     const { label, x, y, width, height, depth } = candidate;
@@ -1885,8 +2799,22 @@ function cullLabels() {
   window.__persomeLabelHealth = { total: labels.length, shown, max: maxLabels };
 }
 
+// Each gl.readPixels blocks until the GPU catches up, so this 77-point sweep is
+// 77 pipeline stalls. It only latched once it saw something lit, and a viewer
+// whose model is empty, still loading, or has every layer toggled off never
+// does — so the render loop paid the whole sweep on every frame, forever, in
+// exactly the states where the owner is most likely to be poking at the
+// controls. The sweep is unchanged; it is now bounded, and it reuses one
+// buffer instead of allocating 77 per frame. It must stay inside the render
+// task: without `preserveDrawingBuffer` the pixels are only valid there.
+const RENDER_PROBE_MAX_SWEEPS = 30;
+const renderProbePixel = new Uint8Array(4);
+let renderProbeSweeps = 0;
+
 function samplePixels() {
   if (window.__persomeModelRender?.lit > 0) return;
+  if (renderProbeSweeps >= RENDER_PROBE_MAX_SWEEPS) return;
+  renderProbeSweeps += 1;
   const gl = renderer.getContext();
   const width = gl.drawingBufferWidth;
   const height = gl.drawingBufferHeight;
@@ -1894,13 +2822,12 @@ function samplePixels() {
   let checked = 0;
   for (let y = 1; y < 8; y += 1) {
     for (let x = 1; x < 12; x += 1) {
-      const pixel = new Uint8Array(4);
-      gl.readPixels(Math.floor(width * x / 12), Math.floor(height * y / 8), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+      gl.readPixels(Math.floor(width * x / 12), Math.floor(height * y / 8), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, renderProbePixel);
       checked += 1;
-      if (pixel[0] + pixel[1] + pixel[2] > 96) lit += 1;
+      if (renderProbePixel[0] + renderProbePixel[1] + renderProbePixel[2] > 96) lit += 1;
     }
   }
-  window.__persomeModelRender = { width, height, checked, lit };
+  window.__persomeModelRender = { width, height, checked, lit, sweeps: renderProbeSweeps };
   canvasHost.dataset.litPixels = String(lit);
 }
 
@@ -1913,6 +2840,54 @@ document.querySelectorAll("[data-layer]").forEach((button) => {
   });
 });
 
+openSearchButton.addEventListener("click", openSearch);
+closeSearchButton.addEventListener("click", () => closeSearch());
+searchInputEl.addEventListener("input", () => {
+  searchActiveIndex = 0;
+  renderSearchResults();
+});
+searchPanelEl.addEventListener("click", (event) => {
+  if (event.target === searchPanelEl) closeSearch();
+});
+searchPanelEl.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeSearch();
+    return;
+  }
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setSearchActiveIndex(searchActiveIndex + 1);
+    return;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setSearchActiveIndex(searchActiveIndex - 1);
+    return;
+  }
+  if (event.key === "Enter" && event.target === searchInputEl && searchMatches[searchActiveIndex]) {
+    event.preventDefault();
+    selectSearchMatch(searchMatches[searchActiveIndex]);
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = [...searchPanelEl.querySelectorAll("button, input")]
+    .filter((element) => (
+      !element.disabled && element.tabIndex >= 0 && element.getClientRects().length > 0
+    ));
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
+
 lineSelectEl.addEventListener("change", () => {
   const index = Number(lineSelectEl.value) - 1;
   const item = lineNavigatorItems[index];
@@ -1920,7 +2895,7 @@ lineSelectEl.addEventListener("change", () => {
 });
 
 
-document.getElementById("rotate").addEventListener("click", (event) => {
+rotateButton.addEventListener("click", (event) => {
   controls.autoRotate = !controls.autoRotate;
   controls.autoRotateSpeed = 0.7;
   event.currentTarget.setAttribute("aria-pressed", String(controls.autoRotate));
@@ -1929,10 +2904,105 @@ zoomOutButton.addEventListener("click", () => stepZoom(-1));
 zoomResetButton.addEventListener("click", () => requestZoom(100));
 zoomInButton.addEventListener("click", () => stepZoom(1));
 controls.addEventListener("start", () => {
+  cameraFlight = null;
   zoomGoalDistance = null;
+  zoomAnchor = null;
 });
+
+// Zoom input lives on the whole viewer, not just the canvas: the topbar, the
+// legend and the status strip cover a good part of the screen, and a wheel that
+// lands on one of them used to fall through to the browser instead of the
+// model. The drawer is a real scroll container, so it keeps its own wheel.
+function anchorFromClient(clientX, clientY) {
+  // Cached: a trackpad delivers wheel events faster than the display refreshes,
+  // and this rect only moves when the window does.
+  if (!canvasBounds) canvasBounds = renderer.domElement.getBoundingClientRect();
+  const bounds = canvasBounds;
+  if (!bounds.width || !bounds.height) return null;
+  zoomAnchorNdc.set(
+    ((clientX - bounds.left) / bounds.width) * 2 - 1,
+    -((clientY - bounds.top) / bounds.height) * 2 + 1,
+  );
+  return zoomAnchorNdc;
+}
+
+// Safari reports a trackpad pinch as its own gesture events and never as a
+// ctrlKey wheel, so a viewer that only listens for the wheel has no pinch at
+// all there. These listeners are registered unconditionally: engines that do
+// not implement the events simply never fire them, which is cheaper and more
+// honest than sniffing for a vendor hook whose name has moved around.
+let gestureScale = 0;
+let gestureSeenAt = 0;
+const gestureAnchor = new THREE.Vector2();
+const GESTURE_IDLE_MS = 400;
+
+// A gesture whose `gestureend` never arrives must not wedge the wheel off for
+// the rest of the session, so an idle gesture is treated as finished.
+function gestureInFlight() {
+  if (!gestureScale) return false;
+  if (performance.now() - gestureSeenAt < GESTURE_IDLE_MS) return true;
+  gestureScale = 0;
+  return false;
+}
+
+// Capture phase on the whole viewer, so this runs before OrbitControls' own
+// wheel listener on the canvas and stops the event reaching it. That leaves
+// OrbitControls' touch and middle-button dolly intact while the wheel — the
+// path with the bad normalisation and no damping — belongs to the viewer. It
+// also means a wheel over the topbar, legend or status strip zooms the model
+// instead of falling through to the browser.
+viewerEl.addEventListener("wheel", (event) => {
+  // The drawer, line picker, and search panel own ordinary scrolling. A
+  // ctrlKey wheel is a Chrome/Firefox trackpad pinch, though, and must remain
+  // model navigation even when the gesture starts over one of those panels.
+  if (!shouldHandleModelGesture(event)) return;
+  event.stopPropagation();
+  // Prevent browser page zoom even when Safari also reports this pinch through
+  // GestureEvents and the duplicate wheel is discarded below.
+  event.preventDefault();
+  // If a gesture is in flight this wheel is the same fingers counted twice.
+  if (gestureInFlight()) return;
+  // Chrome and Firefox report a trackpad pinch as a wheel with ctrlKey set,
+  // which is also the browser's own page-zoom chord: without preventDefault the
+  // page would zoom instead of the model.
+  pauseAutoRotate();
+  requestZoomBy(
+    zoomMath.wheelFactor(event, window.innerHeight),
+    anchorFromClient(event.clientX, event.clientY),
+  );
+}, { passive: false, capture: true });
+
+viewerEl.addEventListener("gesturestart", (event) => {
+  // Safari GestureEvents always describe a pinch, never ordinary scrolling,
+  // so panels do not opt out as they do for a plain wheel.
+  if (!shouldHandleModelGesture(event)) return;
+  event.preventDefault();
+  gestureScale = 1;
+  gestureSeenAt = performance.now();
+  if (anchorFromClient(event.clientX, event.clientY)) gestureAnchor.copy(zoomAnchorNdc);
+  else gestureAnchor.set(0, 0);
+  pauseAutoRotate();
+}, { passive: false, capture: true });
+viewerEl.addEventListener("gesturechange", (event) => {
+  if (!gestureScale) return;
+  event.preventDefault();
+  gestureSeenAt = performance.now();
+  const scale = Number(event.scale);
+  if (!Number.isFinite(scale) || scale <= 0) return;
+  // `scale` is cumulative since gesturestart, so the step is the ratio since
+  // the last event — which composes into the same goal a wheel stream would.
+  zoomAnchorNdc.copy(gestureAnchor);
+  requestZoomBy(scale / gestureScale, zoomAnchorNdc);
+  gestureScale = scale;
+}, { passive: false, capture: true });
+viewerEl.addEventListener("gestureend", (event) => {
+  if (!gestureScale) return;
+  event.preventDefault();
+  gestureScale = 0;
+}, { passive: false, capture: true });
 document.getElementById("reset").addEventListener("click", resetCamera);
-document.getElementById("close-detail").addEventListener("click", clearSelection);
+document.getElementById("close-detail").addEventListener("click", () => clearSelection(true));
+clearFocusButton.addEventListener("click", showAllModel);
 cardButton.addEventListener("click", exportHumanCard);
 shareButton.addEventListener("click", shareConstellationToX);
 
@@ -1969,8 +3039,14 @@ function pickAt(event) {
     x: event.clientX - bounds.left,
     y: event.clientY - bounds.top,
   };
+  const coarsePointer = event.pointerType === "touch" || window.innerWidth < 760;
+  const nodeHitRadius = coarsePointer ? TOUCH_NODE_HIT_RADIUS_PX : MIN_NODE_HIT_RADIUS_PX;
+  const lineHitRadius = coarsePointer ? TOUCH_LINE_HIT_RADIUS_PX : MIN_LINE_HIT_RADIUS_PX;
+  // Projecting into a shared scratch vector rather than cloning per candidate:
+  // hover picking runs on the frame after every pointer move, over every
+  // visible node, so a clone per node is a steady drip of garbage.
   const projectWorldPoint = (worldPosition) => {
-    const projected = worldPosition.clone().project(camera);
+    const projected = pickProjected.copy(worldPosition).project(camera);
     if (projected.z < -1 || projected.z > 1) return null;
     return {
       x: (projected.x + 1) * 0.5 * bounds.width,
@@ -1978,27 +3054,24 @@ function pickAt(event) {
       depth: projected.z,
     };
   };
-  const worldPosition = new THREE.Vector3();
-  const nodeCandidates = pickables.filter((object) => object.visible).map((object) => {
-    object.getWorldPosition(worldPosition);
-    const projected = projectWorldPoint(worldPosition);
+  const visiblePickables = pickables.filter((object) => object.visible);
+  const nodeCandidates = visiblePickables.map((object) => {
+    object.getWorldPosition(pickWorldPosition);
+    const projected = projectWorldPoint(pickWorldPosition);
     return projected ? { ...projected, target: object } : null;
   }).filter(Boolean);
   const screenNode = pickScreenTarget(
     localPointer,
     nodeCandidates,
     [],
-    { nodeRadius: MIN_NODE_HIT_RADIUS_PX },
+    { nodeRadius: nodeHitRadius },
   );
   if (screenNode) return { object: screenNode };
 
   pointer.x = (localPointer.x / bounds.width) * 2 - 1;
   pointer.y = -(localPointer.y / bounds.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
-  const meshHit = raycaster.intersectObjects(
-    pickables.filter((object) => object.visible),
-    false,
-  )[0];
+  const meshHit = raycaster.intersectObjects(visiblePickables, false)[0];
   if (meshHit) return meshHit;
 
   const lineCandidates = screenLinePickables.filter((object) => object.visible).map((object) => {
@@ -2017,42 +3090,92 @@ function pickAt(event) {
     localPointer,
     [],
     lineCandidates,
-    { lineRadius: MIN_LINE_HIT_RADIUS_PX },
+    { lineRadius: lineHitRadius },
   );
   return screenLine ? { object: screenLine } : null;
 }
 
+// How far a pointer may travel and still count as a click rather than a drag.
+// Measured as a real distance, not the sum of the axes, so a diagonal nudge is
+// not penalised twice; a finger wobbles far more than a mouse does.
+function clickSlopFor(pointerType) {
+  if (pointerType === "touch") return 12;
+  if (pointerType === "pen") return 8;
+  return 5;
+}
+
 renderer.domElement.addEventListener("pointerdown", (event) => {
-  pointerDown = { x: event.clientX, y: event.clientY };
+  // Every button counts as a live gesture: the right button pans and the middle
+  // button dollies, and neither wants hover picking running underneath it. Only
+  // the primary button can become a click.
+  livePointers.add(event.pointerId);
+  const primary = event.pointerType !== "mouse" || event.button === 0;
+  // A second finger means a pinch. Whatever the first finger was doing, it was
+  // not choosing a node, so retire the click candidate rather than letting the
+  // gesture end in an accidental selection.
+  pointerDown = primary && livePointers.size === 1
+    ? { x: event.clientX, y: event.clientY, type: event.pointerType }
+    : null;
+  if (livePointers.size > 1 || !primary) labelGesture = null;
   hoverDirty = false;
+  hoverPointer = null;
   renderer.domElement.style.cursor = "grabbing";
 });
 renderer.domElement.addEventListener("pointermove", (event) => {
-  if (pointerDown) return;
+  if (livePointers.size) return;
   hoverPointer = { clientX: event.clientX, clientY: event.clientY };
   hoverDirty = true;
 });
 renderer.domElement.addEventListener("pointerleave", () => {
   hoverPointer = null;
   hoverDirty = false;
-  if (!pointerDown) renderer.domElement.style.cursor = "grab";
+  if (!livePointers.size) renderer.domElement.style.cursor = "grab";
 });
+
+// Releases are pruned on the window, not the canvas. A gesture that began on a
+// label is captured by the canvas, but a second, uncaptured pointer releases
+// wherever it happens to be — on the label, on an overlay — and a pointer left
+// behind in the set would stop hover picking and the graph poll for good.
+window.addEventListener("pointerup", (event) => livePointers.delete(event.pointerId), true);
+window.addEventListener("pointercancel", (event) => livePointers.delete(event.pointerId), true);
+
 renderer.domElement.addEventListener("pointercancel", () => {
   pointerDown = null;
+  labelGesture = null;
   hoverPointer = null;
   hoverDirty = false;
   renderer.domElement.style.cursor = "grab";
 });
 renderer.domElement.addEventListener("pointerup", (event) => {
-  if (!pointerDown) return;
-  const movement = Math.abs(event.clientX - pointerDown.x) + Math.abs(event.clientY - pointerDown.y);
+  const release = pointerUpOutcome(event);
+  if (!release.selectionEligible) {
+    renderer.domElement.style.cursor = release.cursor;
+    return;
+  }
+  const started = pointerDown;
+  const label = labelGesture;
   pointerDown = null;
-  if (movement > 5) {
+  labelGesture = null;
+  if (!started) {
+    renderer.domElement.style.cursor = release.cursor;
+    return;
+  }
+  const dx = event.clientX - started.x;
+  const dy = event.clientY - started.y;
+  const slop = clickSlopFor(started.type);
+  if (dx * dx + dy * dy > slop * slop) {
     renderer.domElement.style.cursor = "grab";
     return;
   }
+  // A gesture that began on a label and stayed put is that label's click; the
+  // canvas captured the pointer, so the label never sees a click of its own.
+  if (label) {
+    renderer.domElement.style.cursor = pointerUpOutcome(event, true).cursor;
+    showDetails(label.kind, label.item);
+    return;
+  }
   const hit = pickAt(event);
-  renderer.domElement.style.cursor = hit ? "pointer" : "grab";
+  renderer.domElement.style.cursor = pointerUpOutcome(event, Boolean(hit)).cursor;
   if (!hit?.object.userData.ref) {
     clearSelection();
     return;
@@ -2070,6 +3193,12 @@ window.addEventListener("keydown", (event) => {
     || target instanceof HTMLSelectElement
     || Boolean(target?.isContentEditable)
   );
+  if (handleSearchShortcut(event, Boolean(editingItem), openSearch)) return;
+  if (event.key === "Escape" && !searchPanelEl.hidden) {
+    event.preventDefault();
+    closeSearch();
+    return;
+  }
   if (event.key === "Escape" && selected) {
     // The claim editor handles its own Escape (discard, keep the drawer open)
     // and stops propagation, so anything reaching here is either not editing or
@@ -2079,11 +3208,17 @@ window.addEventListener("keydown", (event) => {
       target.blur();
       return;
     }
-    clearSelection();
+    clearSelection(true);
     return;
   }
   if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
-  if (event.key === "+" || event.key === "=") {
+  if (event.key === "/") {
+    event.preventDefault();
+    openSearch();
+  } else if (event.key.toLowerCase() === "f" && selected) {
+    event.preventDefault();
+    flyToSelection(selected.kind, selected.id);
+  } else if (event.key === "+" || event.key === "=") {
     event.preventDefault();
     stepZoom(1);
   } else if (event.key === "-" || event.key === "_") {
@@ -2100,6 +3235,7 @@ window.addEventListener("resize", () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   labelRenderer.setSize(window.innerWidth, window.innerHeight);
+  invalidatePanelBoxes();
   const portrait = window.innerWidth / window.innerHeight < 0.72;
   if (portrait !== portraitMode) resetCamera();
 });
@@ -2113,11 +3249,40 @@ window.addEventListener("unhandledrejection", (event) => {
   errorEl.hidden = false;
 });
 
+// A rolling window of how long each frame's own work took, so a smoothness
+// regression is a number somebody can read rather than a feeling. Written into
+// a pre-allocated ring: a probe that allocates every frame would measure itself.
+const FRAME_SAMPLE_COUNT = 240;
+const frameSamples = new Float32Array(FRAME_SAMPLE_COUNT);
+const frameSamplesSorted = new Float32Array(FRAME_SAMPLE_COUNT);
+let frameSampleIndex = 0;
+let frameSampleFilled = 0;
+window.__persomeFrameStats = { p50: 0, p95: 0, worst: 0, samples: 0 };
+
+function recordFrameCost(milliseconds) {
+  frameSamples[frameSampleIndex] = milliseconds;
+  frameSampleIndex = (frameSampleIndex + 1) % FRAME_SAMPLE_COUNT;
+  frameSampleFilled = Math.min(FRAME_SAMPLE_COUNT, frameSampleFilled + 1);
+  if (frameSampleIndex % 30 !== 0) return;
+  frameSamplesSorted.set(frameSamples);
+  const recent = frameSamplesSorted.subarray(0, frameSampleFilled);
+  recent.sort();
+  const stats = window.__persomeFrameStats;
+  stats.p50 = Number(recent[Math.floor(frameSampleFilled * 0.5)].toFixed(2));
+  stats.p95 = Number(recent[Math.floor(frameSampleFilled * 0.95)].toFixed(2));
+  stats.worst = Number(recent[frameSampleFilled - 1].toFixed(2));
+  stats.samples = frameSampleFilled;
+}
+
 function animate(frameTime = performance.now()) {
+  const frameStart = performance.now();
   const deltaSeconds = Math.min(Math.max((frameTime - lastFrameTime) / 1000, 0), 0.5);
   lastFrameTime = frameTime;
+  applyCameraFlight(deltaSeconds);
   applyZoomAnimation(deltaSeconds);
-  controls.update();
+  // Auto-rotate advances by wall time rather than by frame, so the model turns
+  // at one speed whether the display runs at 60Hz or 120Hz.
+  controls.update(deltaSeconds);
   syncZoomUI();
   const time = performance.now() * 0.001;
   if (!REDUCED_MOTION) {
@@ -2126,7 +3291,7 @@ function animate(frameTime = performance.now()) {
       glow.scale.setScalar(glow.userData.glowBase * pulse);
     });
   }
-  if (hoverDirty && hoverPointer && !pointerDown) {
+  if (hoverDirty && hoverPointer && !livePointers.size) {
     renderer.domElement.style.cursor = pickAt(hoverPointer) ? "pointer" : "grab";
     hoverDirty = false;
   }
@@ -2134,10 +3299,16 @@ function animate(frameTime = performance.now()) {
   renderer.render(scene, camera);
   labelRenderer.render(scene, camera);
   samplePixels();
+  recordFrameCost(performance.now() - frameStart);
   window.requestAnimationFrame(animate);
 }
 
 resetCamera();
 animate();
 await loadModel(true);
-window.setInterval(() => loadModel(false), 5000);
+window.setInterval(() => {
+  // Parsing a multi-megabyte snapshot and fingerprinting every Point takes long
+  // enough to drop frames. Never do it under the owner's finger.
+  if (livePointers.size) return;
+  loadModel(false);
+}, 5000);

@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   evidenceBreadcrumb,
   evidenceOverview,
+  indexLinePresentations,
   linePresentation,
+  modelNodeLabelIndex,
   nodeEvidenceCards,
   nodeHistoryCards,
   relationLabel,
@@ -77,4 +79,57 @@ test("presents line endpoints without exposing raw node IDs or replacing the pre
   assert.equal(relation.target, "Context node");
   assert.ok(!JSON.stringify(relation).includes("point-current"));
   assert.ok(!JSON.stringify(relation).includes("private-context-id"));
+});
+
+test("indexes node labels once and presents each Line once without rescanning model nodes", () => {
+  const points = Array.from({ length: 5_000 }, (_, index) => ({
+    id: `point-${index}`,
+    content: `Point ${index}`,
+  }));
+  const largeModel = { points };
+  const nodeLabels = modelNodeLabelIndex(largeModel);
+  points.find = () => {
+    throw new Error("pre-indexed Line presentation must not scan the Point array");
+  };
+
+  const reads = new Map();
+  const countedLine = (values) => new Proxy(values, {
+    get(target, property, receiver) {
+      if (["id", "kind", "label", "predicate", "source", "target"].includes(property)) {
+        reads.set(property, (reads.get(property) || 0) + 1);
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const lines = [
+    countedLine({
+      id: "line-a",
+      kind: "relation",
+      label: "supports",
+      predicate: "supports",
+      source: "point-1",
+      target: "point-4999",
+    }),
+    countedLine({
+      id: "line-b",
+      kind: "evolution",
+      label: "",
+      predicate: "supersedes",
+      source: "point-2",
+      target: "point-3",
+    }),
+  ];
+
+  const presentations = indexLinePresentations(lines, largeModel, nodeLabels);
+
+  assert.equal(presentations.get("line-a").option, "supports: Point 1 → Point 4999");
+  assert.equal(presentations.get("line-b").source, "Point 2");
+  assert.deepEqual(Object.fromEntries(reads), {
+    id: 2,
+    kind: 2,
+    predicate: 2,
+    label: 2,
+    source: 2,
+    target: 2,
+  });
 });

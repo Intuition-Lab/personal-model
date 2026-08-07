@@ -116,6 +116,26 @@ The layout is append-stable for normal chronological growth: existing nodes keep
 coordinates while later evidence expands the surrounding cloud. `window.__persomeLayoutState`
 exposes aggregate layout health for local visual smoke tests without exposing node content or IDs.
 
+Search is a local view over the objects visible at the current model-history cutoff. It ranks
+human-readable text from the already-loaded snapshot; it does not call another service, persist
+queries, or expand the canonical model. Choosing a result opens the same detail surface as selecting
+its rendered object. Point heads that are active at the selected cutoff rank ahead of shadow and
+historical Points. Those
+non-active Points remain discoverable by specific content or state searches and are labeled as
+shadow or historical results, preserving the snapshot's audit and time-travel boundary. The search
+surface states this scope narrowly: search queries stay on the Mac;
+the separate, explicit share actions retain their own review-before-posting boundary.
+
+Selection also creates a first-order "model neighborhood" from explicit Lines and the deterministic
+Root, Volume, Face, and Point hierarchy already used for layout. The selected object and its direct
+semantic and hierarchy neighbors remain prominent while unrelated geometry is visually muted.
+Hierarchy membership may be inferred from receipts for layout, so this focus is navigation, not
+evidence; only explicit Lines and the Evidence surface establish provenance. Focusing does not mutate
+snapshot objects, coordinates, or persisted model state. Search reveal may enable the selected
+object's layer when it was hidden; ordinary focus leaves layer visibility unchanged. The detail
+surface labels the state as a navigation view, offers `Show all`, and temporarily adds a bounded set
+of labels for otherwise-unlabeled first-order neighbors.
+
 The viewer presents that hierarchy as a personal constellation: a Root-centered luminous core,
 Volume and Face orbit structures, Point clouds, and restrained ambient depth cues. Its editorial
 frame uses the live Root signature as the model's plain-language identity statement so each view is
@@ -129,7 +149,17 @@ Point labels, receipts, source names, timestamps, and viewer credentials are exc
 artifact; the owner attaches the downloaded image and confirms the post in X.
 Both share actions take their written summaries and aggregate counts from the canonically scrubbed
 `/model/share-card` projection rather than the owner-only graph. The adjacent `Card` action remains
-a separate renderer that downloads the portrait `my-human-card.png` without opening X.
+a separate renderer that downloads the portrait `my-human-card.png` without opening X. Neighborhood
+dimming and layer toggles are suspended only while the WebGL constellation is rendered for sharing.
+The constellation share always renders the latest complete time slice from the same cached snapshot
+generation as the current narrative and aggregate counts returned by `/model/share-card`, even when
+the owner is inspecting history. The client rejects a version mismatch instead of combining two
+generations. The export uses a fitted 16:9 overview at the artifact's own 1200-by-675 dimensions
+rather than cropping the owner's focused, zoomed, or portrait viewport. Renderer resolution, camera
+position and target,
+timeline cutoff, hidden-layer choices, auto-rotation, any in-flight camera/zoom animation, selection,
+the inspected snapshot, and focus return target are restored immediately after the pixels are copied,
+so the owner's inspection state is unchanged.
 
 Visible node labels and their Point, Face, Volume, Root, or context meshes open the same provenance
 detail panel. Overview summarizes the evidence footprint, Evidence presents human-readable source
@@ -140,14 +170,42 @@ screen-space hit target so distant geometry stays selectable. Evolution and rela
 their own human-readable endpoint, exact predicate, and evidence detail through an 8-pixel
 screen-space hit target; node hits always win where geometry overlaps. Keyboard focus reveals a
 line picker with the same detail action. Raw line and endpoint IDs remain inside collapsed technical
-details. Derived hierarchy connectors remain visual-only.
+details. Explicit Lines and their count/toggle remain separate from derived hierarchy guides. The
+guides follow endpoint-layer visibility and are named in the legend as inferred placement, not
+evidence; they remain visual-only.
 `window.__persomeInteractionState` exposes aggregate interaction counts and hit-target bounds for
 local smoke tests.
 
+Layer controls expose current snapshot counts, and the explanatory legend is collapsible without
+changing layer visibility. On narrow screens the detail panel becomes a safe-area-aware bottom sheet
+while retaining the same Overview, Evidence, History, and correction controls. Coarse-pointer node
+and Line hit radii expand beyond the 12- and 8-pixel desktop minimums, and primary mobile controls
+provide at least a 44-pixel target. The full legend yields to a compact, collapsed Guide disclosure
+above the timeline; its summary keeps `inferred placement · not evidence` visible without covering
+the primary controls, uses normal-text contrast for that safety boundary, and expanding it explains
+where to find sourced support.
+
 Zoom is relative to the fitted model: the visible minus, percentage, and plus controls cover 50%
 through 400%, the percentage resets to 100%, and the plus, minus, and zero keys provide the same
-actions. Wheel and trackpad pinch gestures zoom toward the pointer. `window.__persomeZoomState`
-exposes only aggregate distance and percentage values for local visual smoke tests.
+actions in 25% steps. Wheel and trackpad pinch gestures zoom continuously toward the pointer,
+gliding to their goal under the same damping that carries orbit and pan, so releasing a gesture
+coasts to a stop rather than stopping dead. Wheel deltas are normalized to pixels first, so a
+gesture means the same amount of zoom whether the browser reports pixels, lines, or pages, and one
+comfortable trackpad pinch is worth roughly a doubling on every display. A pinch is read from
+`ctrlKey` wheel events and, on browsers that report one instead, from gesture events; a touchscreen
+pinch and a middle-button drag keep the orbit controller's own dolly, which already tracks the
+fingers directly. `window.__persomeZoomState` exposes only aggregate distance and percentage values
+for local visual smoke tests.
+
+Choosing a search result, or pressing `F` for the current selection, smoothly flies the camera to
+that object without changing the deterministic layout. With reduced motion requested, the same move
+is immediate. `Frame` restores the fitted overview independently of the selection and active layers.
+
+Dragging works across the model canvas, including on a label, while search, the collapsible legend,
+and the detail surfaces retain their own pointer and scroll behavior. A second finger cancels the
+click so a pinch never selects a node.
+`window.__persomeFrameStats` exposes rolling p50, p95, and worst frame costs in milliseconds over
+the last 240 frames, so a smoothness regression is measurable locally rather than only visible.
 
 ## Owner corrections
 

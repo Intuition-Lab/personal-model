@@ -29,6 +29,7 @@ from ..model import (
     build_live_snapshot,
     normalize_activity_identity,
 )
+from ..privacy.scrub import scan
 from ..security.auth import (
     BROWSER_BOOTSTRAP_PATH,
     BROWSER_BOOTSTRAP_TTL_SECONDS,
@@ -750,6 +751,7 @@ def model_view(request: Request) -> HTMLResponse:
 
 _MODEL_ASSETS = {
     "evidence.mjs",
+    "explore.mjs",
     "onboarding.css",
     "onboarding.js",
     "three.module.js",
@@ -824,17 +826,19 @@ def model_graph() -> dict[str, Any]:
 
 
 def _share_card_projection(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Keep only scrubbed summaries and counts needed by public share artifacts.
+    """Keep and scrub only summaries and counts needed by public share artifacts.
 
     The owner viewer intentionally receives an unredacted graph. Sharing must
     cross a separate server-side boundary so raw receipts, identifiers, paths,
-    and source content never reach the export code by accident.
+    and source content never reach the export code by accident. This function
+    therefore scrubs each retained signature even when its input is the cached
+    owner graph rather than an already-redacted export snapshot.
     """
 
     def summary(item: object) -> dict[str, Any] | None:
         if not isinstance(item, dict):
             return None
-        signature = str(item.get("signature") or "").strip()
+        signature = scan(str(item.get("signature") or "")).redacted.strip()
         if not signature:
             return None
         return {
@@ -871,12 +875,12 @@ def _share_card_projection(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/model/share-card", tags=["model"])
 def model_share_card() -> dict[str, Any]:
-    """Return the minimal, canonically scrubbed public share projection."""
-    from ..store import fts as fts_store
-
-    with fts_store.cursor() as conn:
-        snapshot = build_live_snapshot(conn, redact=True)
-    return {"model": _share_card_projection(snapshot)}
+    """Return a scrubbed projection version-matched to the owner graph cache."""
+    graph = model_graph()
+    return {
+        "generated_at": graph["generated_at"],
+        "model": _share_card_projection(graph["model"]),
+    }
 
 
 @router.post("/model/edit", response_model=ApiResponse, include_in_schema=False, tags=["model"])

@@ -279,9 +279,11 @@ class TestGraphJson:
                 )
             conn.commit()
 
-        projection = routes.model_share_card()["model"]
+        payload = routes.model_share_card()
+        projection = payload["model"]
         serialized = json.dumps(projection)
 
+        assert payload["generated_at"]
         assert set(projection) == {"root", "faces", "volumes", "stats"}
         assert set(projection["root"]) == {"signature", "observations", "confidence"}
         assert set(projection["faces"][0]) == {"signature", "observations", "confidence"}
@@ -311,6 +313,38 @@ class TestGraphJson:
             "receipt",
         ):
             assert private_value not in serialized
+
+    def test_share_card_matches_and_rescrubs_the_cached_graph_generation(
+        self, ac_root, monkeypatch
+    ):
+        calls = []
+        private_path = "/" + "Users" + "/synthetic-owner/private"
+        private_email = "synthetic-owner@example.com"
+        raw_signature = f"Coordinates {private_email} from {private_path}"
+        snapshot = {
+            "root": {"signature": raw_signature, "observations": 3, "confidence": 0.9},
+            "faces": [],
+            "volumes": [],
+            "stats": {"roots": 1},
+        }
+
+        def fake_live_snapshot(conn, *, redact=True):  # type: ignore[no-untyped-def]
+            calls.append(conn)
+            assert redact is False
+            return snapshot
+
+        monkeypatch.setattr(routes, "build_live_snapshot", fake_live_snapshot)
+
+        graph = routes.model_graph()
+        share = routes.model_share_card()
+
+        assert len(calls) == 1
+        assert share["generated_at"] == graph["generated_at"]
+        assert graph["model"]["root"]["signature"] == raw_signature
+        serialized_share = json.dumps(share["model"])
+        assert "[REDACTED]" in serialized_share
+        assert private_email not in serialized_share
+        assert private_path not in serialized_share
 
     def test_empty_store_returns_an_empty_snapshot(self, ac_root):
         graph = routes.model_graph()
@@ -404,7 +438,22 @@ class TestViewPage:
         assert 'id="zoom-out"' in body
         assert 'id="zoom-reset"' in body
         assert 'id="zoom-in"' in body
-        assert "Scroll or pinch to zoom" in body
+        assert "Select to focus" in body
+        assert "⌘K to find" in body
+        assert 'id="open-search"' in body
+        assert 'id="model-search-panel"' in body
+        assert 'id="model-search"' in body
+        assert 'class="legend"' in body
+        assert 'id="layer-count-points"' in body
+        assert "inferred placement · not evidence" in body
+        assert 'id="clear-focus"' in body
+        assert 'id="mobile-guide"' in body
+        assert 'class="mobile-guide"' in body
+        assert '<details id="mobile-guide" class="mobile-guide"' in body
+        assert "<b>Guide</b><span>inferred placement · not evidence</span></summary>" in body
+        assert "Open Evidence on a model object for sourced support." in body
+        assert 'role="combobox"' in body
+        assert 'role="listbox"' in body
         # The drawer is one page, not a tabbed form: the claim is editable in
         # place and provenance folds away beneath it.
         assert 'role="tablist"' not in body
@@ -422,6 +471,7 @@ class TestViewPage:
     def test_bundled_viewer_assets_are_served(self, ac_root):
         three = routes.model_asset("three.module.js")
         layout = routes.model_asset("layout.mjs")
+        explore = routes.model_asset("explore.mjs")
         evidence = routes.model_asset("evidence.mjs")
         share = routes.model_asset("share.mjs")
         viewer = routes.model_asset("viewer.js")
@@ -430,12 +480,15 @@ class TestViewPage:
         assert len(three.body) > 1_000_000
         assert b"class WebGLRenderer" in three.body
         assert b"computeClusterLayout" in layout.body
+        assert b"rankSearchEntries" in explore.body
+        assert b"focusKeysForSelection" in explore.body
         assert b"nodeEvidenceCards" in evidence.body
         assert b"humanCard" in share.body
         assert b"buildXIntentUrl" in share.body
         assert b"drawHumanCard" in share.body
         assert b"drawConstellationCard" in share.body
         assert b'from "./layout.mjs"' in viewer.body
+        assert b'from "./explore.mjs"' in viewer.body
         assert b'from "./share.mjs"' in viewer.body
         assert b"model.points" in viewer.body
         assert b"model.lines" in viewer.body
@@ -474,6 +527,20 @@ class TestViewPage:
         assert b"--build-color: var(--root)" in css.body
         assert b"--build-color: var(--point)" in css.body
         assert b"controls.zoomToCursor = true" in viewer.body
+        # The wheel is the viewer's, not OrbitControls'. Its wheel path lands
+        # the whole delta in one step while orbit and pan glide under damping,
+        # and normalises by devicePixelRatio, which halves the gain on a Retina
+        # display and divides by zero below 1. The viewer takes the wheel in the
+        # capture phase and drives its own damped, cursor-anchored goal — and
+        # taking only the wheel leaves OrbitControls' touch pinch and
+        # middle-button dolly working.
+        assert b"{ passive: false, capture: true }" in viewer.body
+        assert b"zoomAnchor" in viewer.body
+        assert b"zoomMath.wheelFactor" in viewer.body
+        assert b"controls.enableZoom = false" not in viewer.body
+        # Safari reports a trackpad pinch only as a gesture event, so a viewer
+        # that listens for ctrlKey wheel alone has no pinch there at all.
+        assert b'addEventListener("gesturechange"' in viewer.body
         assert b"downloadShareImage" in viewer.body
         assert b"shareReady = Boolean" in viewer.body
         assert b"window.open" in viewer.body
@@ -483,11 +550,44 @@ class TestViewPage:
         assert b'shareButton.addEventListener("click", shareConstellationToX)' in viewer.body
         assert b"exportHumanCard({ toX: true })" not in viewer.body
         assert viewer.body.count(b"await loadShareProjection()") == 2
+        assert b"loadConstellationBundle" in viewer.body
+        assert b"graphPayload.generated_at === share.generatedAt" in viewer.body
+        assert b"fetchModelGraph()" in viewer.body
         assert b"drawConstellationCard(context, renderer.domElement, shareModel)" in viewer.body
         assert b"drawConstellationCard(context, renderer.domElement, model)" not in viewer.body
         assert b"private source content" in share.body
         assert b"Built locally with Persome \xc2\xb7 Build yours" in share.body
         assert b"window.__persomeZoomState" in viewer.body
+        assert b"window.__persomeInteractionState" in viewer.body
+        assert b"TOUCH_NODE_HIT_RADIUS_PX = 22" in viewer.body
+        assert b"focusVisualsSuspended = true" in viewer.body
+        assert b"fittedOverviewPose" in viewer.body
+        assert b"CONSTELLATION_CARD_WIDTH" in viewer.body
+        assert b"renderer.setPixelRatio(1)" in viewer.body
+        assert b"renderer.getSize(new THREE.Vector2())" in viewer.body
+        assert b"renderer.setPixelRatio(viewState.pixelRatio)" in viewer.body
+        assert (
+            b"renderer.setSize(viewState.rendererSize.x, viewState.rendererSize.y, false)"
+            in viewer.body
+        )
+        assert b"cameraFlight = viewState.cameraFlight" in viewer.body
+        assert b"zoomGoalDistance = viewState.zoomGoalDistance" in viewer.body
+        assert b"camera.aspect = viewState.cameraAspect" in viewer.body
+        assert b"camera.quaternion.copy(viewState.cameraQuaternion)" in viewer.body
+        assert b"controls.target.copy(viewState.controlsTarget)" in viewer.body
+        assert b'if (!exportingDifferentModel && slider.value !== "100")' in viewer.body
+        assert b"buildScene({ frame: false, preserveSelection: true })" in viewer.body
+        assert b"cutoff = viewState.cutoff" in viewer.body
+        assert b"layers: { ...layerVisible }" in viewer.body
+        assert b"layerVisible[layer] = true" in viewer.body
+        assert b"layerVisible[layer] = visible" in viewer.body
+        assert b"selectionReturnFocus = selected && viewState.returnFocusKey" in viewer.body
+        assert b"autoRotate: controls.autoRotate" in viewer.body
+        assert b"controls.autoRotate = viewState.autoRotate" in viewer.body
+        assert b"model = viewState.model" in viewer.body
+        assert b"new ResizeObserver(invalidatePanelBoxes)" in viewer.body
+        assert b"flyToSelection" in viewer.body
+        assert b"rebuildSearchEntries" in viewer.body
         assert b"if (!REDUCED_MOTION)" in viewer.body
         assert b'event.key === "+"' in viewer.body
         assert b'event.key === "-"' in viewer.body
@@ -499,10 +599,11 @@ class TestViewPage:
         assert b".evidence-breadcrumbs" in css.body
         assert b".error button" in css.body
         assert b"(min-width: 1181px) and (max-width: 1360px)" in css.body
-        assert b"top: 116px" in css.body
+        assert b"@media (max-width: 860px)" in css.body
         assert b"prefers-reduced-motion" in css.body
         assert viewer.media_type == "text/javascript"
         assert layout.media_type == "text/javascript"
+        assert explore.media_type == "text/javascript"
         assert share.media_type == "text/javascript"
         assert css.media_type == "text/css"
 
@@ -525,7 +626,8 @@ class TestViewPage:
         assert 'id="line-select"' in page
         assert 'lineSelectEl.addEventListener("change"' in viewer
         assert "placeholder.disabled = lines.length > 0" in viewer
-        assert "linePresentation(item, model)" in viewer
+        assert "indexLinePresentations(renderedLineItems, sceneModel, sceneNodeLabels)" in viewer
+        assert "linePresentations.get(line.id)?.option" in viewer
         assert 'appendMeta("Predicate", lineDetail?.predicate)' in viewer
         assert 'appendMeta("From", lineDetail?.source)' in viewer
         assert "item.source ? `Source ID: ${item.source}`" in viewer
@@ -533,6 +635,37 @@ class TestViewPage:
         assert ".line-explorer:focus-within" in css
         assert '.model-label[aria-expanded="true"]' in css
         assert '.detail[data-kind="line"]' in css
+
+    def test_viewer_exploration_contract_is_local_and_non_mutating(self, ac_root):
+        page = render_memory_view()
+        viewer = routes.model_asset("viewer.js").body.decode()
+        css = routes.model_asset("viewer.css").body.decode()
+
+        assert "Local model explorer" in page
+        assert "Search queries stay on this Mac" in page
+        assert 'autocomplete="off"' in page
+        assert 'fetch("./search"' not in viewer
+        assert "rankSearchEntries(searchEntries, query, 9)" in viewer
+        assert "focusKeysForSelection(sceneModel, currentLayout, selected)" in viewer
+        assert "sceneModel = {" in viewer
+        assert "layerVisible[layer] = true" in viewer
+        assert "flyToSelection(entry.kind, entry.id)" in viewer
+        assert 'event.key.toLowerCase() === "f"' in viewer
+        assert "focusVisualsSuspended = false" in viewer
+        assert "selectionReturnFocus" in viewer
+        assert "renderStatus(currentCounts)" in viewer
+        assert '"hierarchy"' in viewer
+        assert "updateFocusLabels" in viewer
+        assert 'button.setAttribute("role", "option")' in viewer
+        assert ".model-label.focus-muted" in css
+        assert ".focus-note" in css
+        assert ".focus-note button" in css
+        assert ".mobile-guide" in css
+        assert "bottom: 76px" in css
+        assert "min-height: 44px" in css
+        assert "color: #aaa4b6" in css
+        assert "max-height: min(66dvh, 620px)" in css
+        assert "env(safe-area-inset-bottom)" in css
 
 
 class TestEvidenceResolverRoute:
