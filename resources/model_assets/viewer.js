@@ -2,7 +2,15 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
 import { computeClusterLayout, pickScreenTarget, zoomMath } from "./layout.mjs";
-import { focusKeysForSelection, rankSearchEntries } from "./explore.mjs";
+import {
+  focusKeysForSelection,
+  handleSearchShortcut,
+  pointerUpOutcome,
+  rankSearchEntries,
+  reconcileSceneSelection,
+  recoverInvalidSceneSelection,
+  shouldHandleModelGesture,
+} from "./explore.mjs";
 import {
   evidenceBreadcrumb,
   evidenceOverview,
@@ -865,7 +873,7 @@ function addGround() {
   addOrbitRing(radius * 0.72, COLORS.root, 0.055, [Math.PI / 2.8, 0.42, 0.18], ringLayer);
 }
 
-function buildScene() {
+function buildScene(selectionReplacement = null) {
   disposeGraph();
   const visiblePoints = model.points.filter(visibleAt).sort((a, b) => a.id.localeCompare(b.id));
   const visibleFaces = model.faces.filter(visibleAt);
@@ -924,7 +932,7 @@ function buildScene() {
   };
   updateLayerCounts(currentCounts);
   rebuildSearchEntries();
-  applyLayerVisibility();
+  applyLayerVisibility(selectionReplacement);
   renderStatus(currentCounts);
   emptyEl.hidden = visiblePoints.length > 0;
   frameLayout(false);
@@ -1439,7 +1447,7 @@ function showAllModel() {
   resetCamera();
 }
 
-function applyLayerVisibility() {
+function applyLayerVisibility(selectionReplacement = null) {
   Object.entries(layerObjects).forEach(([layer, objects]) => {
     objects.forEach((object) => {
       const visible = layer === "hierarchy"
@@ -1457,13 +1465,24 @@ function applyLayerVisibility() {
   document.querySelectorAll("[data-layer]").forEach((button) => {
     button.setAttribute("aria-pressed", String(layerVisible[button.dataset.layer]));
   });
-  if (selected) {
-    const key = selectionKey(selected.kind, selected.id);
-    const layer = kindLayers[selected.kind];
-    if (!items.has(key) || (layer && !layerVisible[layer])) {
-      clearSelection();
-      return;
-    }
+  const reconciliation = reconcileSceneSelection(
+    selected,
+    items,
+    layerVisible,
+    kindLayers,
+    selectionReplacement,
+  );
+  if (reconciliation.invalidated) {
+    // The selected object may have been the camera's orbit target after search
+    // focus. Once a cutoff or layer removes it, the drawer's Show all action is
+    // gone too, so restore the fitted overview here rather than leaving an
+    // apparently empty viewport aimed at a node that no longer exists.
+    recoverInvalidSceneSelection(reconciliation, clearSelection, resetCamera);
+    return;
+  }
+  if (reconciliation.replaced) {
+    selected = reconciliation.selection;
+    selectedItem = items.get(selectionKey(selected.kind, selected.id)) || null;
   }
   syncSelectionState();
 }
@@ -1865,14 +1884,22 @@ async function submitEdit(kind, item, op, replacement, reason) {
       slider.value = "100";
       updateCutoff();
     }
-    const refreshed = await loadModel(true);
-    // The awaits above can span seconds. If the owner selected something else
-    // meanwhile, that selection is theirs.
-    if (!selected || selected.kind !== kind || selected.id !== item.id) return;
+    const refreshed = await loadModel(true, {
+      kind,
+      fromId: item.id,
+      toId: nextId,
+    });
     if (refreshed === false) {
-      setEditStatus("Saved, but the view could not refresh. Reload to see it.", "warn");
+      // The awaits above can span seconds. Do not write a warning into a detail
+      // drawer the owner opened for something else while this request ran.
+      if (selected?.kind === kind && selected.id === item.id) {
+        setEditStatus("Saved, but the view could not refresh. Reload to see it.", "warn");
+      }
       return;
     }
+    // A Point rewrite moves selection to its successor during scene rebuild.
+    // If the owner selected something else meanwhile, that selection is theirs.
+    if (!selected || selected.kind !== kind || selected.id !== nextId) return;
     if (op === "retire") {
       clearSelection();
       return;
@@ -2182,7 +2209,7 @@ function updateHealthBanner(health) {
   banner.hidden = false;
 }
 
-async function loadModelOnce(force) {
+async function loadModelOnce(force, selectionReplacement = null) {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), MODEL_GRAPH_TIMEOUT_MS);
   try {
@@ -2207,7 +2234,7 @@ async function loadModelOnce(force) {
     );
     setShareBusy(false);
     updateTimelineBounds();
-    buildScene();
+    buildScene(selectionReplacement);
     return true;
   } catch (error) {
     shareReady = false;
@@ -2221,14 +2248,14 @@ async function loadModelOnce(force) {
   }
 }
 
-function loadModel(force = false) {
+function loadModel(force = false, selectionReplacement = null) {
   // A forced load must actually observe the server again. Returning an
   // in-flight promise silently dropped `force`, so a poll issued microseconds
   // before a correction was saved would satisfy the reload that follows the
   // save — and the drawer would re-render from the pre-edit snapshot while
   // reporting success. A forced load now queues behind whatever is running.
   if (modelLoadPromise && !force) return modelLoadPromise;
-  const run = () => loadModelOnce(force);
+  const run = () => loadModelOnce(force, selectionReplacement);
   const started = modelLoadPromise ? modelLoadPromise.then(run, run) : run();
   const chained = started.finally(() => {
     // Only the newest load clears the slot; an older one finishing later must
@@ -2741,8 +2768,8 @@ function gestureInFlight() {
 // also means a wheel over the topbar, legend or status strip zooms the model
 // instead of falling through to the browser.
 viewerEl.addEventListener("wheel", (event) => {
-  // The drawer and the line picker are real scroll containers; leave them be.
-  if (event.target.closest?.(".detail, .line-explorer, .search-panel, .legend")) return;
+  // The drawer, line picker, and search panel own real scrolling; leave them be.
+  if (!shouldHandleModelGesture(event.target)) return;
   event.stopPropagation();
   // If a gesture is in flight this wheel is the same fingers counted twice.
   if (gestureInFlight()) return;
@@ -2758,7 +2785,7 @@ viewerEl.addEventListener("wheel", (event) => {
 }, { passive: false, capture: true });
 
 viewerEl.addEventListener("gesturestart", (event) => {
-  if (event.target.closest?.(".detail, .line-explorer, .search-panel, .legend")) return;
+  if (!shouldHandleModelGesture(event.target)) return;
   event.preventDefault();
   gestureScale = 1;
   gestureSeenAt = performance.now();
@@ -2930,12 +2957,19 @@ renderer.domElement.addEventListener("pointercancel", () => {
   renderer.domElement.style.cursor = "grab";
 });
 renderer.domElement.addEventListener("pointerup", (event) => {
-  if (event.pointerType === "mouse" && event.button !== 0) return;
+  const release = pointerUpOutcome(event);
+  if (!release.selectionEligible) {
+    renderer.domElement.style.cursor = release.cursor;
+    return;
+  }
   const started = pointerDown;
   const label = labelGesture;
   pointerDown = null;
   labelGesture = null;
-  if (!started) return;
+  if (!started) {
+    renderer.domElement.style.cursor = release.cursor;
+    return;
+  }
   const dx = event.clientX - started.x;
   const dy = event.clientY - started.y;
   const slop = clickSlopFor(started.type);
@@ -2946,12 +2980,12 @@ renderer.domElement.addEventListener("pointerup", (event) => {
   // A gesture that began on a label and stayed put is that label's click; the
   // canvas captured the pointer, so the label never sees a click of its own.
   if (label) {
-    renderer.domElement.style.cursor = "pointer";
+    renderer.domElement.style.cursor = pointerUpOutcome(event, true).cursor;
     showDetails(label.kind, label.item);
     return;
   }
   const hit = pickAt(event);
-  renderer.domElement.style.cursor = hit ? "pointer" : "grab";
+  renderer.domElement.style.cursor = pointerUpOutcome(event, Boolean(hit)).cursor;
   if (!hit?.object.userData.ref) {
     clearSelection();
     return;
@@ -2969,11 +3003,7 @@ window.addEventListener("keydown", (event) => {
     || target instanceof HTMLSelectElement
     || Boolean(target?.isContentEditable)
   );
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-    event.preventDefault();
-    openSearch();
-    return;
-  }
+  if (handleSearchShortcut(event, Boolean(editingItem), openSearch)) return;
   if (event.key === "Escape" && !searchPanelEl.hidden) {
     event.preventDefault();
     closeSearch();

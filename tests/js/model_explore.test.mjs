@@ -3,8 +3,121 @@ import test from "node:test";
 
 import {
   focusKeysForSelection,
+  handleSearchShortcut,
+  pointerUpOutcome,
   rankSearchEntries,
+  reconcileSceneSelection,
+  recoverInvalidSceneSelection,
+  shouldHandleModelGesture,
 } from "../../resources/model_assets/explore.mjs";
+
+test("keeps an in-progress claim focused when the search chord is pressed", () => {
+  let prevented = false;
+  let opened = false;
+  const event = {
+    key: "k",
+    metaKey: true,
+    ctrlKey: false,
+    preventDefault() { prevented = true; },
+  };
+
+  assert.equal(handleSearchShortcut(event, true, () => { opened = true; }), true);
+  assert.equal(prevented, true);
+  assert.equal(opened, false);
+
+  prevented = false;
+  event.metaKey = false;
+  event.ctrlKey = true;
+  assert.equal(handleSearchShortcut(event, true, () => { opened = true; }), true);
+  assert.equal(prevented, true);
+  assert.equal(opened, false);
+
+  prevented = false;
+  assert.equal(handleSearchShortcut(event, false, () => { opened = true; }), true);
+  assert.equal(prevented, true);
+  assert.equal(opened, true);
+});
+
+test("zooms through the legend while preserving real scrolling surfaces", () => {
+  const targetIn = (className) => ({
+    closest(selector) {
+      return selector.split(", ").includes(className) ? { className } : null;
+    },
+  });
+
+  assert.equal(shouldHandleModelGesture(targetIn(".legend")), true);
+  assert.equal(shouldHandleModelGesture(targetIn(".detail")), false);
+  assert.equal(shouldHandleModelGesture(targetIn(".line-explorer")), false);
+  assert.equal(shouldHandleModelGesture(targetIn(".search-panel")), false);
+});
+
+test("restores the grab cursor after non-primary mouse gestures", () => {
+  assert.deepEqual(
+    pointerUpOutcome({ pointerType: "mouse", button: 1 }, true),
+    { selectionEligible: false, cursor: "grab" },
+  );
+  assert.deepEqual(
+    pointerUpOutcome({ pointerType: "mouse", button: 2 }, true),
+    { selectionEligible: false, cursor: "grab" },
+  );
+  assert.deepEqual(
+    pointerUpOutcome({ pointerType: "mouse", button: 0 }, true),
+    { selectionEligible: true, cursor: "pointer" },
+  );
+});
+
+test("invalidates hidden selections but carries a correction to its successor", () => {
+  const kindLayers = { point: "points", face: "faces" };
+  const visible = { points: true, faces: true };
+  const items = new Map([
+    ["point:point-new", { id: "point-new" }],
+    ["face:face-a", { id: "face-a" }],
+  ]);
+
+  assert.deepEqual(
+    reconcileSceneSelection(
+      { kind: "point", id: "point-old" },
+      items,
+      visible,
+      kindLayers,
+      { kind: "point", fromId: "point-old", toId: "point-new" },
+    ),
+    {
+      selection: { kind: "point", id: "point-new" },
+      invalidated: false,
+      replaced: true,
+    },
+  );
+  assert.deepEqual(
+    reconcileSceneSelection(
+      { kind: "point", id: "point-old" },
+      items,
+      visible,
+      kindLayers,
+    ),
+    { selection: null, invalidated: true, replaced: false },
+  );
+  assert.deepEqual(
+    reconcileSceneSelection(
+      { kind: "face", id: "face-a" },
+      items,
+      { ...visible, faces: false },
+      kindLayers,
+    ),
+    { selection: null, invalidated: true, replaced: false },
+  );
+
+  const recovery = [];
+  assert.equal(
+    recoverInvalidSceneSelection(
+      { invalidated: true },
+      () => recovery.push("clear"),
+      () => recovery.push("frame"),
+    ),
+    true,
+  );
+  assert.deepEqual(recovery, ["clear", "frame"]);
+});
 
 test("ranks exact and title-prefix matches ahead of metadata and fuzzy matches", () => {
   const entries = [

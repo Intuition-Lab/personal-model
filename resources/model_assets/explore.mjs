@@ -7,6 +7,72 @@ const KIND_PRIORITY = {
   context: 5,
 };
 
+const MODEL_GESTURE_PASSTHROUGH_SELECTOR = ".detail, .line-explorer, .search-panel";
+
+export function handleSearchShortcut(event, editing, openSearch) {
+  const shortcut = (event?.metaKey || event?.ctrlKey)
+    && String(event?.key || "").toLowerCase() === "k";
+  if (!shortcut) return false;
+  // Search moves focus into its dialog. While the owner is rewriting a claim,
+  // that blur is also the save gesture, so consume the chord without opening
+  // search rather than committing text that was still being drafted.
+  event.preventDefault?.();
+  if (!editing) openSearch?.();
+  return true;
+}
+
+export function shouldHandleModelGesture(target) {
+  // These surfaces own real scrolling or native selection. The legend does not:
+  // wheel and pinch over it still belong to the model behind the explanation.
+  return !target?.closest?.(MODEL_GESTURE_PASSTHROUGH_SELECTOR);
+}
+
+export function pointerUpOutcome(event, overTarget = false) {
+  const selectionEligible = event?.pointerType !== "mouse" || event?.button === 0;
+  return {
+    selectionEligible,
+    cursor: selectionEligible && overTarget ? "pointer" : "grab",
+  };
+}
+
+export function reconcileSceneSelection(
+  selection,
+  items,
+  layerVisible,
+  kindLayers,
+  replacement = null,
+) {
+  if (!selection?.kind || !selection?.id) {
+    return { selection: null, invalidated: false, replaced: false };
+  }
+
+  let next = selection;
+  let replaced = false;
+  if (
+    replacement?.kind === selection.kind
+    && replacement?.fromId === selection.id
+    && replacement?.toId
+    && items?.has?.(selectionKey(selection.kind, replacement.toId))
+  ) {
+    next = { kind: selection.kind, id: replacement.toId };
+    replaced = replacement.toId !== selection.id;
+  }
+
+  const key = selectionKey(next.kind, next.id);
+  const layer = kindLayers?.[next.kind];
+  if (!items?.has?.(key) || (layer && !layerVisible?.[layer])) {
+    return { selection: null, invalidated: true, replaced: false };
+  }
+  return { selection: next, invalidated: false, replaced };
+}
+
+export function recoverInvalidSceneSelection(reconciliation, clearSelection, resetCamera) {
+  if (!reconciliation?.invalidated) return false;
+  clearSelection?.();
+  resetCamera?.();
+  return true;
+}
+
 function normalize(value) {
   return String(value || "")
     .normalize("NFKD")
