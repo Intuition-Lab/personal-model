@@ -77,6 +77,7 @@ const sliderLabel = document.getElementById("as-of-label");
 const zoomOutButton = document.getElementById("zoom-out");
 const zoomResetButton = document.getElementById("zoom-reset");
 const zoomInButton = document.getElementById("zoom-in");
+const rotateButton = document.getElementById("rotate");
 const cardButton = document.getElementById("human-card");
 const shareButton = document.getElementById("share-x");
 const shareNoticeEl = document.getElementById("share-notice");
@@ -1204,7 +1205,7 @@ function selectSearchMatch(entry) {
 function pauseAutoRotate() {
   if (!controls.autoRotate) return;
   controls.autoRotate = false;
-  document.getElementById("rotate").setAttribute("aria-pressed", "false");
+  rotateButton.setAttribute("aria-pressed", "false");
 }
 
 function showShareNotice(title, message, failed = false) {
@@ -1239,8 +1240,10 @@ async function loadShareProjection() {
     });
     if (!response.ok) throw new Error(`Share endpoint returned HTTP ${response.status}`);
     const payload = await response.json();
+    const generatedAt = String(payload.generated_at || "");
     if (
-      !payload.model
+      !generatedAt
+      || !payload.model
       || !Array.isArray(payload.model.faces)
       || !Array.isArray(payload.model.volumes)
       || !payload.model.stats
@@ -1248,10 +1251,30 @@ async function loadShareProjection() {
     ) {
       throw new Error("Share endpoint returned an invalid projection");
     }
-    return payload.model;
+    return { generatedAt, model: payload.model };
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+async function loadConstellationBundle() {
+  // `/share-card` exposes only scrubbed summaries, while `/graph` supplies the
+  // private geometry already available to this owner-local viewer. Match their
+  // server generation before drawing so text/counts can never describe a newer
+  // model than the constellation. A cache expiry can land between the two GETs,
+  // so carry the newer graph into bounded retries rather than guessing.
+  let graphPayload = modelGeneratedAt ? { generated_at: modelGeneratedAt, model } : null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const share = await loadShareProjection();
+    if (graphPayload?.generated_at === share.generatedAt) {
+      return { shareModel: share.model, graphModel: graphPayload.model };
+    }
+    graphPayload = await fetchModelGraph();
+    if (graphPayload.generated_at === share.generatedAt) {
+      return { shareModel: share.model, graphModel: graphPayload.model };
+    }
+  }
+  throw new Error("The model changed while preparing the share image. Try again.");
 }
 
 function createHumanCardBlob(shareModel) {
@@ -1269,7 +1292,7 @@ function createHumanCardBlob(shareModel) {
   });
 }
 
-function createConstellationBlob(shareModel) {
+function createConstellationBlob(shareModel, shareGraphModel = model) {
   const canvas = document.createElement("canvas");
   canvas.width = CONSTELLATION_CARD_WIDTH;
   canvas.height = CONSTELLATION_CARD_HEIGHT;
@@ -1308,18 +1331,31 @@ function createConstellationBlob(shareModel) {
     minDistance: controls.minDistance,
     maxDistance: controls.maxDistance,
     maxTargetRadius: controls.maxTargetRadius,
+    autoRotate: controls.autoRotate,
+    model,
+    minTime: new Date(minTime),
+    maxTime: new Date(maxTime),
   };
 
   try {
+    pauseAutoRotate();
     cameraFlight = null;
     zoomGoalDistance = null;
     zoomAnchor = null;
     focusVisualsSuspended = true;
 
+    const exportingDifferentModel = shareGraphModel !== model;
+    if (exportingDifferentModel) {
+      model = shareGraphModel;
+      slider.value = "100";
+      updateTimelineBounds();
+      buildScene({ frame: false, preserveSelection: true });
+    }
+
     // The share projection is current, so its picture must be current too.
     // Rebuild at Now before fitting the export; otherwise time travel would pair
     // a historical constellation with current narrative and aggregate counts.
-    if (slider.value !== "100") {
+    if (!exportingDifferentModel && slider.value !== "100") {
       slider.value = "100";
       updateCutoff();
       buildScene({ frame: false, preserveSelection: true });
@@ -1353,6 +1389,10 @@ function createConstellationBlob(shareModel) {
     renderer.setPixelRatio(viewState.pixelRatio);
     renderer.setSize(viewState.rendererSize.x, viewState.rendererSize.y, false);
 
+    const exportedDifferentModel = model !== viewState.model;
+    model = viewState.model;
+    minTime = viewState.minTime;
+    maxTime = viewState.maxTime;
     slider.value = viewState.sliderValue;
     sliderLabel.textContent = viewState.sliderLabel;
     cutoff = viewState.cutoff;
@@ -1361,7 +1401,7 @@ function createConstellationBlob(shareModel) {
     });
     // A historical export temporarily built the latest scene. Rebuild the
     // owner's exact slice before restoring the camera and focus over it.
-    if (viewState.sliderValue !== "100") {
+    if (exportedDifferentModel || viewState.sliderValue !== "100") {
       buildScene({ frame: false, preserveSelection: true });
     }
 
@@ -1380,6 +1420,8 @@ function createConstellationBlob(shareModel) {
     cameraFlight = viewState.cameraFlight;
     zoomGoalDistance = viewState.zoomGoalDistance;
     zoomAnchor = viewState.zoomAnchor;
+    controls.autoRotate = viewState.autoRotate;
+    rotateButton.setAttribute("aria-pressed", String(viewState.autoRotate));
     selected = viewState.selected;
     selectedItem = selected
       ? items.get(selectionKey(selected.kind, selected.id)) || viewState.selectedItem
@@ -1429,10 +1471,9 @@ function paintConstellationHandoff(popup) {
 
 async function exportHumanCard() {
   setShareBusy(true);
-  pauseAutoRotate();
   try {
-    const shareModel = await loadShareProjection();
-    const blob = await createHumanCardBlob(shareModel);
+    const share = await loadShareProjection();
+    const blob = await createHumanCardBlob(share.model);
     downloadShareImage(blob, HUMAN_CARD_FILE_NAME);
     showShareNotice(
       "HUMAN.md Card downloaded",
@@ -1449,10 +1490,9 @@ async function shareConstellationToX() {
   const popup = window.open("about:blank", "_blank");
   paintConstellationHandoff(popup);
   setShareBusy(true);
-  pauseAutoRotate();
   try {
-    const shareModel = await loadShareProjection();
-    const blob = await createConstellationBlob(shareModel);
+    const { shareModel, graphModel } = await loadConstellationBundle();
+    const blob = await createConstellationBlob(shareModel, graphModel);
     downloadShareImage(blob, CONSTELLATION_FILE_NAME);
     showShareNotice(
       "Constellation downloaded",
@@ -2344,7 +2384,7 @@ function updateHealthBanner(health) {
   banner.hidden = false;
 }
 
-async function loadModelOnce(force, selectionReplacement = null) {
+async function fetchModelGraph() {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), MODEL_GRAPH_TIMEOUT_MS);
   try {
@@ -2354,9 +2394,22 @@ async function loadModelOnce(force, selectionReplacement = null) {
     });
     if (!response.ok) throw new Error(`Model endpoint returned HTTP ${response.status}`);
     const payload = await response.json();
-    if (!payload.model || !Array.isArray(payload.model.points)) {
+    if (
+      !String(payload.generated_at || "")
+      || !payload.model
+      || !Array.isArray(payload.model.points)
+    ) {
       throw new Error("Model endpoint returned an invalid snapshot");
     }
+    return payload;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+async function loadModelOnce(force, selectionReplacement = null) {
+  try {
+    const payload = await fetchModelGraph();
     errorEl.hidden = true;
     const nextFingerprint = fingerprint(payload.model);
     if (!force && nextFingerprint === modelFingerprint) return true;
@@ -2378,8 +2431,6 @@ async function loadModelOnce(force, selectionReplacement = null) {
     // Reported rather than swallowed: a caller that just wrote to the model
     // needs to know it is still looking at pre-write state.
     return false;
-  } finally {
-    window.clearTimeout(timeout);
   }
 }
 
@@ -2844,7 +2895,7 @@ lineSelectEl.addEventListener("change", () => {
 });
 
 
-document.getElementById("rotate").addEventListener("click", (event) => {
+rotateButton.addEventListener("click", (event) => {
   controls.autoRotate = !controls.autoRotate;
   controls.autoRotateSpeed = 0.7;
   event.currentTarget.setAttribute("aria-pressed", String(controls.autoRotate));

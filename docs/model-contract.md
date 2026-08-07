@@ -151,13 +151,15 @@ Both share actions take their written summaries and aggregate counts from the ca
 `/model/share-card` projection rather than the owner-only graph. The adjacent `Card` action remains
 a separate renderer that downloads the portrait `my-human-card.png` without opening X. Neighborhood
 dimming and layer toggles are suspended only while the WebGL constellation is rendered for sharing.
-The constellation share always renders the latest complete time slice, matching the current narrative
-and aggregate counts returned by `/model/share-card`, even when the owner is inspecting history. It
-uses a fitted 16:9 overview at the artifact's own 1200-by-675 dimensions rather than cropping the
-owner's focused, zoomed, or portrait viewport. Renderer resolution, camera position and target,
-timeline cutoff, hidden-layer choices, any in-flight camera/zoom animation, selection, and focus
-return target are restored immediately after the pixels are copied, so the owner's inspection state
-is unchanged.
+The constellation share always renders the latest complete time slice from the same cached snapshot
+generation as the current narrative and aggregate counts returned by `/model/share-card`, even when
+the owner is inspecting history. The client rejects a version mismatch instead of combining two
+generations. The export uses a fitted 16:9 overview at the artifact's own 1200-by-675 dimensions
+rather than cropping the owner's focused, zoomed, or portrait viewport. Renderer resolution, camera
+position and target,
+timeline cutoff, hidden-layer choices, auto-rotation, any in-flight camera/zoom animation, selection,
+the inspected snapshot, and focus return target are restored immediately after the pixels are copied,
+so the owner's inspection state is unchanged.
 
 Visible node labels and their Point, Face, Volume, Root, or context meshes open the same provenance
 detail panel. Overview summarizes the evidence footprint, Evidence presents human-readable source
@@ -180,7 +182,8 @@ while retaining the same Overview, Evidence, History, and correction controls. C
 and Line hit radii expand beyond the 12- and 8-pixel desktop minimums, and primary mobile controls
 provide at least a 44-pixel target. The full legend yields to a compact, collapsed Guide disclosure
 above the timeline; its summary keeps `inferred placement · not evidence` visible without covering
-the primary controls, and expanding it explains where to find sourced support.
+the primary controls, uses normal-text contrast for that safety boundary, and expanding it explains
+where to find sourced support.
 
 Zoom is relative to the fitted model: the visible minus, percentage, and plus controls cover 50%
 through 400%, the percentage resets to 100%, and the plus, minus, and zero keys provide the same

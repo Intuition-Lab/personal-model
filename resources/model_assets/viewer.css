@@ -765,7 +765,7 @@ button {
   grid-template-columns: 10px auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
-  min-height: 26px;
+  min-height: 44px;
   color: var(--dim);
   cursor: pointer;
   list-style: none;
@@ -793,7 +793,9 @@ button {
 
 .mobile-guide > summary span:last-of-type {
   overflow: hidden;
-  font-size: 9px;
+  color: #aaa4b6;
+  font-size: 10px;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

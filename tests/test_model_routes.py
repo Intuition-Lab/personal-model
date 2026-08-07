@@ -279,9 +279,11 @@ class TestGraphJson:
                 )
             conn.commit()
 
-        projection = routes.model_share_card()["model"]
+        payload = routes.model_share_card()
+        projection = payload["model"]
         serialized = json.dumps(projection)
 
+        assert payload["generated_at"]
         assert set(projection) == {"root", "faces", "volumes", "stats"}
         assert set(projection["root"]) == {"signature", "observations", "confidence"}
         assert set(projection["faces"][0]) == {"signature", "observations", "confidence"}
@@ -311,6 +313,38 @@ class TestGraphJson:
             "receipt",
         ):
             assert private_value not in serialized
+
+    def test_share_card_matches_and_rescrubs_the_cached_graph_generation(
+        self, ac_root, monkeypatch
+    ):
+        calls = []
+        private_path = "/" + "Users" + "/synthetic-owner/private"
+        private_email = "synthetic-owner@example.com"
+        raw_signature = f"Coordinates {private_email} from {private_path}"
+        snapshot = {
+            "root": {"signature": raw_signature, "observations": 3, "confidence": 0.9},
+            "faces": [],
+            "volumes": [],
+            "stats": {"roots": 1},
+        }
+
+        def fake_live_snapshot(conn, *, redact=True):  # type: ignore[no-untyped-def]
+            calls.append(conn)
+            assert redact is False
+            return snapshot
+
+        monkeypatch.setattr(routes, "build_live_snapshot", fake_live_snapshot)
+
+        graph = routes.model_graph()
+        share = routes.model_share_card()
+
+        assert len(calls) == 1
+        assert share["generated_at"] == graph["generated_at"]
+        assert graph["model"]["root"]["signature"] == raw_signature
+        serialized_share = json.dumps(share["model"])
+        assert "[REDACTED]" in serialized_share
+        assert private_email not in serialized_share
+        assert private_path not in serialized_share
 
     def test_empty_store_returns_an_empty_snapshot(self, ac_root):
         graph = routes.model_graph()
@@ -516,6 +550,9 @@ class TestViewPage:
         assert b'shareButton.addEventListener("click", shareConstellationToX)' in viewer.body
         assert b"exportHumanCard({ toX: true })" not in viewer.body
         assert viewer.body.count(b"await loadShareProjection()") == 2
+        assert b"loadConstellationBundle" in viewer.body
+        assert b"graphPayload.generated_at === share.generatedAt" in viewer.body
+        assert b"fetchModelGraph()" in viewer.body
         assert b"drawConstellationCard(context, renderer.domElement, shareModel)" in viewer.body
         assert b"drawConstellationCard(context, renderer.domElement, model)" not in viewer.body
         assert b"private source content" in share.body
@@ -538,13 +575,16 @@ class TestViewPage:
         assert b"camera.aspect = viewState.cameraAspect" in viewer.body
         assert b"camera.quaternion.copy(viewState.cameraQuaternion)" in viewer.body
         assert b"controls.target.copy(viewState.controlsTarget)" in viewer.body
-        assert b'if (slider.value !== "100")' in viewer.body
+        assert b'if (!exportingDifferentModel && slider.value !== "100")' in viewer.body
         assert b"buildScene({ frame: false, preserveSelection: true })" in viewer.body
         assert b"cutoff = viewState.cutoff" in viewer.body
         assert b"layers: { ...layerVisible }" in viewer.body
         assert b"layerVisible[layer] = true" in viewer.body
         assert b"layerVisible[layer] = visible" in viewer.body
         assert b"selectionReturnFocus = selected && viewState.returnFocusKey" in viewer.body
+        assert b"autoRotate: controls.autoRotate" in viewer.body
+        assert b"controls.autoRotate = viewState.autoRotate" in viewer.body
+        assert b"model = viewState.model" in viewer.body
         assert b"new ResizeObserver(invalidatePanelBoxes)" in viewer.body
         assert b"flyToSelection" in viewer.body
         assert b"rebuildSearchEntries" in viewer.body
@@ -622,7 +662,8 @@ class TestViewPage:
         assert ".focus-note button" in css
         assert ".mobile-guide" in css
         assert "bottom: 76px" in css
-        assert "min-height: 26px" in css
+        assert "min-height: 44px" in css
+        assert "color: #aaa4b6" in css
         assert "max-height: min(66dvh, 620px)" in css
         assert "env(safe-area-inset-bottom)" in css
 
