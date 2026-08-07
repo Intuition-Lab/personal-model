@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { zoomMath } from "../../resources/model_assets/layout.mjs";
+import {
+  fittedOverviewPose,
+  zoomMath,
+} from "../../resources/model_assets/layout.mjs";
 
 function wheel(deltaY, { deltaMode = 0, ctrlKey = false } = {}) {
   return { deltaY, deltaMode, ctrlKey };
@@ -103,4 +106,32 @@ test("the button and keyboard zoom steps are unchanged", () => {
   assert.equal(zoomMath.nextPercent(141, -1, 25, 50, 400), 125);
   assert.equal(zoomMath.nextPercent(400, 1, 25, 50, 400), 400);
   assert.equal(zoomMath.nextPercent(50, -1, 25, 50, 400), 50);
+});
+
+test("the share overview is fitted to the artifact rather than the current viewport", () => {
+  const currentPortraitView = fittedOverviewPose(8, 390, 844);
+  const shareView = fittedOverviewPose(8, 1200, 675);
+
+  assert.equal(currentPortraitView.portrait, true);
+  assert.equal(shareView.portrait, false);
+  assert.equal(shareView.aspect, 1200 / 675);
+  assert.deepEqual(shareView.target, [0, 0, 0]);
+  assert.ok(
+    Math.abs(Math.hypot(...shareView.position) - shareView.distance) < 1e-12,
+    "the fitted camera position must stay exactly one fitted distance from the model centre",
+  );
+  assert.notDeepEqual(
+    shareView.position,
+    currentPortraitView.position,
+    "a portrait/focused viewport must not determine the landscape share framing",
+  );
+});
+
+test("the fitted overview uses safe deterministic defaults for malformed viewport input", () => {
+  const view = fittedOverviewPose(Number.NaN, 0, Number.NaN);
+  assert.equal(view.aspect, 1);
+  assert.equal(view.portrait, false);
+  assert.equal(view.radius, 6);
+  assert.ok(Number.isFinite(view.distance));
+  assert.ok(view.position.every(Number.isFinite));
 });

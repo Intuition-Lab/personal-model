@@ -438,6 +438,28 @@ export function computeClusterLayout(model) {
 
 export const layoutMath = { distance, magnitude, stableHash };
 
+export function fittedOverviewPose(layoutRadius, viewportWidth, viewportHeight) {
+  const width = Number.isFinite(Number(viewportWidth)) && Number(viewportWidth) > 0
+    ? Number(viewportWidth)
+    : 1;
+  const height = Number.isFinite(Number(viewportHeight)) && Number(viewportHeight) > 0
+    ? Number(viewportHeight)
+    : 1;
+  const rawRadius = Number(layoutRadius);
+  const radius = Math.max(4.8, Number.isFinite(rawRadius) && rawRadius > 0 ? rawRadius : 6);
+  const portrait = width / height < 0.72;
+  const direction = normalize([portrait ? 0.58 : 0.72, portrait ? 1.25 : 1.05, 1]);
+  const distance = Math.max(portrait ? 15 : 12, radius * (portrait ? 3.0 : 2.55));
+  return {
+    aspect: width / height,
+    portrait,
+    radius,
+    distance,
+    position: scale(direction, distance),
+    target: [0, 0, 0],
+  };
+}
+
 function pointSegmentDistanceSquared(pointer, start, end) {
   const dx = end.x - start.x;
   const dy = end.y - start.y;

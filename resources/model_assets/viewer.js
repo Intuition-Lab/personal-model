@@ -1,7 +1,12 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
-import { computeClusterLayout, pickScreenTarget, zoomMath } from "./layout.mjs";
+import {
+  computeClusterLayout,
+  fittedOverviewPose,
+  pickScreenTarget,
+  zoomMath,
+} from "./layout.mjs";
 import {
   focusKeysForSelection,
   handleSearchShortcut,
@@ -82,6 +87,7 @@ const searchEmptyEl = document.getElementById("search-empty");
 const openSearchButton = document.getElementById("open-search");
 const closeSearchButton = document.getElementById("close-search");
 const clearFocusButton = document.getElementById("clear-focus");
+const mobileGuideEl = document.getElementById("mobile-guide");
 const layerCountEls = Object.fromEntries(
   ["points", "lines", "faces", "volumes", "root"]
     .map((kind) => [kind, document.getElementById(`layer-count-${kind}`)]),
@@ -873,7 +879,11 @@ function addGround() {
   addOrbitRing(radius * 0.72, COLORS.root, 0.055, [Math.PI / 2.8, 0.42, 0.18], ringLayer);
 }
 
-function buildScene(selectionReplacement = null) {
+function buildScene({
+  frame = true,
+  preserveSelection = false,
+  selectionReplacement = null,
+} = {}) {
   disposeGraph();
   const visiblePoints = model.points.filter(visibleAt).sort((a, b) => a.id.localeCompare(b.id));
   const visibleFaces = model.faces.filter(visibleAt);
@@ -932,10 +942,10 @@ function buildScene(selectionReplacement = null) {
   };
   updateLayerCounts(currentCounts);
   rebuildSearchEntries();
-  applyLayerVisibility(selectionReplacement);
+  applyLayerVisibility({ preserveSelection, selectionReplacement });
   renderStatus(currentCounts);
   emptyEl.hidden = visiblePoints.length > 0;
-  frameLayout(false);
+  if (frame) frameLayout(false);
   // Fresh label elements and a possibly-resized status strip: both cached
   // measurements have to be taken again.
   invalidatePanelBoxes();
@@ -1250,16 +1260,124 @@ function createConstellationBlob(shareModel) {
   canvas.height = CONSTELLATION_CARD_HEIGHT;
   const context = canvas.getContext("2d");
   if (!context) return Promise.reject(new Error("Canvas export is unavailable"));
-  // Focus is a reading aid, not part of the model. Export the complete current
-  // time slice even when the owner has a neighborhood selected.
-  focusVisualsSuspended = true;
-  syncSelectionState();
+
+  // Sharing is a projection, not a screenshot of the owner's current camera.
+  // Preserve every interactive state that the temporary 16:9 overview touches
+  // so a focused/flying/zooming viewer resumes exactly where it was.
+  const rendererSize = renderer.getSize(new THREE.Vector2());
+  const returnFocusKey = [...selectionTargets.entries()].find(([, targets]) => (
+    targets.some((target) => target.element === selectionReturnFocus)
+  ))?.[0] || null;
+  const viewState = {
+    rendererSize,
+    pixelRatio: renderer.getPixelRatio(),
+    cameraAspect: camera.aspect,
+    cameraPosition: camera.position.clone(),
+    cameraQuaternion: camera.quaternion.clone(),
+    controlsTarget: controls.target.clone(),
+    cameraFlight,
+    zoomGoalDistance,
+    zoomAnchor,
+    selected: selected ? { ...selected } : null,
+    selectedItem,
+    selectionReturnFocus,
+    returnFocusKey,
+    focusVisualsSuspended,
+    layers: { ...layerVisible },
+    sliderValue: slider.value,
+    sliderLabel: sliderLabel.textContent,
+    cutoff: new Date(cutoff),
+    fitDistance,
+    framedRadius,
+    portraitMode,
+    minDistance: controls.minDistance,
+    maxDistance: controls.maxDistance,
+    maxTargetRadius: controls.maxTargetRadius,
+  };
+
   try {
+    cameraFlight = null;
+    zoomGoalDistance = null;
+    zoomAnchor = null;
+    focusVisualsSuspended = true;
+
+    // The share projection is current, so its picture must be current too.
+    // Rebuild at Now before fitting the export; otherwise time travel would pair
+    // a historical constellation with current narrative and aggregate counts.
+    if (slider.value !== "100") {
+      slider.value = "100";
+      updateCutoff();
+      buildScene({ frame: false, preserveSelection: true });
+    }
+
+    // Layer toggles are inspection state. The public artifact always shows the
+    // complete current time slice so its picture agrees with its full counts.
+    Object.keys(layerVisible).forEach((layer) => { layerVisible[layer] = true; });
+    applyLayerVisibility({ preserveSelection: true });
+
+    const overview = fittedOverviewPose(
+      layoutRadius,
+      CONSTELLATION_CARD_WIDTH,
+      CONSTELLATION_CARD_HEIGHT,
+    );
+
+    // Render at the artifact's own aspect ratio. Drawing a portrait viewport
+    // into the landscape card with drawCover() crops most of the constellation,
+    // even if that viewport's camera was otherwise fitted.
+    renderer.setPixelRatio(1);
+    renderer.setSize(CONSTELLATION_CARD_WIDTH, CONSTELLATION_CARD_HEIGHT, false);
+    camera.aspect = overview.aspect;
+    camera.position.set(...overview.position);
+    controls.target.set(...overview.target);
+    camera.lookAt(controls.target);
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
     renderer.render(scene, camera);
     drawConstellationCard(context, renderer.domElement, shareModel);
   } finally {
-    focusVisualsSuspended = false;
-    syncSelectionState();
+    renderer.setPixelRatio(viewState.pixelRatio);
+    renderer.setSize(viewState.rendererSize.x, viewState.rendererSize.y, false);
+
+    slider.value = viewState.sliderValue;
+    sliderLabel.textContent = viewState.sliderLabel;
+    cutoff = viewState.cutoff;
+    Object.entries(viewState.layers).forEach(([layer, visible]) => {
+      layerVisible[layer] = visible;
+    });
+    // A historical export temporarily built the latest scene. Rebuild the
+    // owner's exact slice before restoring the camera and focus over it.
+    if (viewState.sliderValue !== "100") {
+      buildScene({ frame: false, preserveSelection: true });
+    }
+
+    camera.aspect = viewState.cameraAspect;
+    camera.position.copy(viewState.cameraPosition);
+    camera.quaternion.copy(viewState.cameraQuaternion);
+    controls.target.copy(viewState.controlsTarget);
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
+    fitDistance = viewState.fitDistance;
+    framedRadius = viewState.framedRadius;
+    portraitMode = viewState.portraitMode;
+    controls.minDistance = viewState.minDistance;
+    controls.maxDistance = viewState.maxDistance;
+    controls.maxTargetRadius = viewState.maxTargetRadius;
+    cameraFlight = viewState.cameraFlight;
+    zoomGoalDistance = viewState.zoomGoalDistance;
+    zoomAnchor = viewState.zoomAnchor;
+    selected = viewState.selected;
+    selectedItem = selected
+      ? items.get(selectionKey(selected.kind, selected.id)) || viewState.selectedItem
+      : null;
+    focusVisualsSuspended = viewState.focusVisualsSuspended;
+    applyLayerVisibility();
+    // Restoring focus can generate labels that did not exist while focus was
+    // suspended, so resolve the return element only after selection sync.
+    selectionReturnFocus = selected && viewState.returnFocusKey
+      ? (selectionTargets.get(viewState.returnFocusKey) || [])
+        .find((target) => target.element)?.element || viewState.selectionReturnFocus
+      : viewState.selectionReturnFocus;
+    syncZoomUI();
     renderer.render(scene, camera);
   }
   return new Promise((resolve, reject) => {
@@ -1447,7 +1565,7 @@ function showAllModel() {
   resetCamera();
 }
 
-function applyLayerVisibility(selectionReplacement = null) {
+function applyLayerVisibility({ preserveSelection = false, selectionReplacement = null } = {}) {
   Object.entries(layerObjects).forEach(([layer, objects]) => {
     objects.forEach((object) => {
       const visible = layer === "hierarchy"
@@ -1465,24 +1583,26 @@ function applyLayerVisibility(selectionReplacement = null) {
   document.querySelectorAll("[data-layer]").forEach((button) => {
     button.setAttribute("aria-pressed", String(layerVisible[button.dataset.layer]));
   });
-  const reconciliation = reconcileSceneSelection(
-    selected,
-    items,
-    layerVisible,
-    kindLayers,
-    selectionReplacement,
-  );
-  if (reconciliation.invalidated) {
-    // The selected object may have been the camera's orbit target after search
-    // focus. Once a cutoff or layer removes it, the drawer's Show all action is
-    // gone too, so restore the fitted overview here rather than leaving an
-    // apparently empty viewport aimed at a node that no longer exists.
-    recoverInvalidSceneSelection(reconciliation, clearSelection, resetCamera);
-    return;
-  }
-  if (reconciliation.replaced) {
-    selected = reconciliation.selection;
-    selectedItem = items.get(selectionKey(selected.kind, selected.id)) || null;
+  if (!preserveSelection) {
+    const reconciliation = reconcileSceneSelection(
+      selected,
+      items,
+      layerVisible,
+      kindLayers,
+      selectionReplacement,
+    );
+    if (reconciliation.invalidated) {
+      // The selected object may have been the camera's orbit target after search
+      // focus. Once a cutoff or layer removes it, the drawer's Show all action is
+      // gone too, so restore the fitted overview here rather than leaving an
+      // apparently empty viewport aimed at a node that no longer exists.
+      recoverInvalidSceneSelection(reconciliation, clearSelection, resetCamera);
+      return;
+    }
+    if (reconciliation.replaced) {
+      selected = reconciliation.selection;
+      selectedItem = items.get(selectionKey(selected.kind, selected.id)) || null;
+    }
   }
   syncSelectionState();
 }
@@ -2234,7 +2354,7 @@ async function loadModelOnce(force, selectionReplacement = null) {
     );
     setShareBusy(false);
     updateTimelineBounds();
-    buildScene(selectionReplacement);
+    buildScene({ selectionReplacement });
     return true;
   } catch (error) {
     shareReady = false;
@@ -2267,25 +2387,22 @@ function loadModel(force = false, selectionReplacement = null) {
 }
 
 function frameLayout(force) {
-  const portrait = window.innerWidth / window.innerHeight < 0.72;
-  portraitMode = portrait;
-  const radius = Math.max(4.8, layoutRadius);
-  if (!force && framedRadius > 0 && radius <= framedRadius * 1.16) return;
-  const direction = new THREE.Vector3(portrait ? 0.58 : 0.72, portrait ? 1.25 : 1.05, 1).normalize();
-  const distance = Math.max(portrait ? 15 : 12, radius * (portrait ? 3.0 : 2.55));
-  fitDistance = distance;
+  const overview = fittedOverviewPose(layoutRadius, window.innerWidth, window.innerHeight);
+  portraitMode = overview.portrait;
+  if (!force && framedRadius > 0 && overview.radius <= framedRadius * 1.16) return;
+  fitDistance = overview.distance;
   cameraFlight = null;
   zoomGoalDistance = null;
-  camera.position.copy(direction.multiplyScalar(distance));
-  controls.target.set(0, 0, 0);
-  controls.minDistance = distance * 100 / ZOOM_MAX_PERCENT;
-  controls.maxDistance = distance * 100 / ZOOM_MIN_PERCENT;
+  camera.position.set(...overview.position);
+  controls.target.set(...overview.target);
+  controls.minDistance = overview.distance * 100 / ZOOM_MAX_PERCENT;
+  controls.maxDistance = overview.distance * 100 / ZOOM_MIN_PERCENT;
   // Zooming at the cursor walks the orbit centre towards whatever is under it.
   // Bound how far it may wander so a long pinch cannot strand the constellation
   // off-screen with nothing left to orbit around.
-  controls.maxTargetRadius = radius * 1.5;
+  controls.maxTargetRadius = overview.radius * 1.5;
   zoomAnchor = null;
-  framedRadius = radius;
+  framedRadius = overview.radius;
   controls.update();
   syncZoomUI();
 }
@@ -2520,17 +2637,18 @@ const panelResizeObserver = "ResizeObserver" in window
   : null;
 if (panelResizeObserver) {
   document.querySelectorAll(
-    ".story, .legend, .status, .timeline, .detail, .search-dialog",
+    ".story, .legend, .mobile-guide, .status, .timeline, .detail, .search-dialog",
   ).forEach((element) => panelResizeObserver.observe(element));
 }
 document.querySelector(".legend")?.addEventListener("toggle", invalidatePanelBoxes);
+mobileGuideEl?.addEventListener("toggle", invalidatePanelBoxes);
 detailEvidenceFoldEl.addEventListener("toggle", invalidatePanelBoxes);
 detailHistoryFoldEl.addEventListener("toggle", invalidatePanelBoxes);
 
 function panelBoxes() {
   if (occupiedPanels) return occupiedPanels;
   occupiedPanels = [...document.querySelectorAll(
-    ".story, .legend, .status, .timeline, .detail:not([hidden]), .search-dialog",
+    ".story, .legend, .mobile-guide, .status, .timeline, .detail:not([hidden]), .search-dialog",
   )]
     .map((element) => element.getBoundingClientRect())
     .filter((box) => box.width > 0 && box.height > 0)

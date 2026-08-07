@@ -413,6 +413,11 @@ class TestViewPage:
         assert 'id="layer-count-points"' in body
         assert "inferred placement · not evidence" in body
         assert 'id="clear-focus"' in body
+        assert 'id="mobile-guide"' in body
+        assert 'class="mobile-guide"' in body
+        assert '<details id="mobile-guide" class="mobile-guide"' in body
+        assert "<b>Guide</b><span>inferred placement · not evidence</span></summary>" in body
+        assert "Open Evidence on a model object for sourced support." in body
         assert 'role="combobox"' in body
         assert 'role="listbox"' in body
         # The drawer is one page, not a tabbed form: the claim is editable in
@@ -519,6 +524,27 @@ class TestViewPage:
         assert b"window.__persomeInteractionState" in viewer.body
         assert b"TOUCH_NODE_HIT_RADIUS_PX = 22" in viewer.body
         assert b"focusVisualsSuspended = true" in viewer.body
+        assert b"fittedOverviewPose" in viewer.body
+        assert b"CONSTELLATION_CARD_WIDTH" in viewer.body
+        assert b"renderer.setPixelRatio(1)" in viewer.body
+        assert b"renderer.getSize(new THREE.Vector2())" in viewer.body
+        assert b"renderer.setPixelRatio(viewState.pixelRatio)" in viewer.body
+        assert (
+            b"renderer.setSize(viewState.rendererSize.x, viewState.rendererSize.y, false)"
+            in viewer.body
+        )
+        assert b"cameraFlight = viewState.cameraFlight" in viewer.body
+        assert b"zoomGoalDistance = viewState.zoomGoalDistance" in viewer.body
+        assert b"camera.aspect = viewState.cameraAspect" in viewer.body
+        assert b"camera.quaternion.copy(viewState.cameraQuaternion)" in viewer.body
+        assert b"controls.target.copy(viewState.controlsTarget)" in viewer.body
+        assert b'if (slider.value !== "100")' in viewer.body
+        assert b"buildScene({ frame: false, preserveSelection: true })" in viewer.body
+        assert b"cutoff = viewState.cutoff" in viewer.body
+        assert b"layers: { ...layerVisible }" in viewer.body
+        assert b"layerVisible[layer] = true" in viewer.body
+        assert b"layerVisible[layer] = visible" in viewer.body
+        assert b"selectionReturnFocus = selected && viewState.returnFocusKey" in viewer.body
         assert b"new ResizeObserver(invalidatePanelBoxes)" in viewer.body
         assert b"flyToSelection" in viewer.body
         assert b"rebuildSearchEntries" in viewer.body
@@ -593,6 +619,9 @@ class TestViewPage:
         assert ".model-label.focus-muted" in css
         assert ".focus-note" in css
         assert ".focus-note button" in css
+        assert ".mobile-guide" in css
+        assert "bottom: 76px" in css
+        assert "min-height: 26px" in css
         assert "max-height: min(66dvh, 620px)" in css
         assert "env(safe-area-inset-bottom)" in css
 

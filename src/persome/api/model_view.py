@@ -95,6 +95,11 @@ _MEMORY_VIEW_TEMPLATE = """<!doctype html>
       </div>
     </details>
 
+    <details id="mobile-guide" class="mobile-guide" aria-label="Hierarchy guide explanation">
+      <summary><span class="swatch guide" aria-hidden="true"></span><b>Guide</b><span>inferred placement · not evidence</span></summary>
+      <p>These connectors help arrange the hierarchy. Open Evidence on a model object for sourced support.</p>
+    </details>
+
     <section id="model-search-panel" class="search-panel" role="dialog" aria-modal="true" aria-labelledby="search-title" hidden>
       <div class="search-dialog">
         <header>
