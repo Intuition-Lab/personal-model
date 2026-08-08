@@ -47,8 +47,15 @@ function composite(foreground, background, alpha) {
   return `#${mixed.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
 }
 
+function chroma(value) {
+  const values = channels(value);
+  return Math.max(...values) - Math.min(...values);
+}
+
 test("keeps CSS, WebGL, and export palette roles aligned", () => {
   assert.equal(cssToken("bg"), MODEL_PALETTE.canvas);
+  assert.equal(cssToken("surface"), colorWithAlpha(MODEL_PALETTE.surface, 0.82));
+  assert.equal(cssToken("surface-soft"), colorWithAlpha(MODEL_PALETTE.surfaceRaised, 0.64));
   assert.equal(cssToken("text"), MODEL_PALETTE.text);
   assert.equal(cssToken("muted"), MODEL_PALETTE.muted);
   assert.equal(cssToken("dim"), MODEL_PALETTE.dim);
@@ -64,6 +71,9 @@ test("keeps CSS, WebGL, and export palette roles aligned", () => {
   assert.equal(cssToken("guide-ui"), MODEL_PALETTE.guideUi);
   assert.equal(cssToken("relation"), MODEL_PALETTE.relation);
   assert.equal(cssToken("historical"), MODEL_PALETTE.historical);
+  assert.equal(cssToken("success"), MODEL_PALETTE.success);
+  assert.equal(cssToken("warning"), MODEL_PALETTE.warning);
+  assert.equal(cssToken("danger"), MODEL_PALETTE.error);
 
   assert.equal(MODEL_COLORS.points, Number.parseInt(MODEL_PALETTE.point.slice(1), 16));
   assert.equal(MODEL_COLORS.lines, Number.parseInt(MODEL_PALETTE.line.slice(1), 16));
@@ -72,13 +82,19 @@ test("keeps CSS, WebGL, and export palette roles aligned", () => {
   assert.equal(MODEL_COLORS.root, Number.parseInt(MODEL_PALETTE.root.slice(1), 16));
 });
 
-test("keeps dense evidence neutral and reserves chroma for promoted structure", () => {
-  assert.equal(MODEL_PALETTE.point, "#b3b3b3");
-  assert.equal(MODEL_PALETTE.line, "#666666");
+test("keeps the original semantic hues restrained on a deep-space canvas", () => {
+  assert.equal(MODEL_PALETTE.canvas, "#090b16");
+  assert.equal(MODEL_PALETTE.point, "#72d8c0");
+  assert.equal(MODEL_PALETTE.line, "#9f7a52");
+  assert.equal(MODEL_PALETTE.face, "#e47bc9");
+  assert.equal(MODEL_PALETTE.volume, "#8298ee");
+  assert.equal(MODEL_PALETTE.root, "#ee809b");
+  assert.ok(chroma(MODEL_PALETTE.canvas) >= 10, "canvas should remain blue-black, not charcoal");
+  assert.ok(chroma(MODEL_PALETTE.point) >= 60, "dense points should retain their mint hue");
+  assert.ok(chroma(MODEL_PALETTE.line) >= 50, "dense lines should retain their warm amber hue");
   assert.notEqual(MODEL_PALETTE.face, MODEL_PALETTE.volume);
   assert.notEqual(MODEL_PALETTE.volume, MODEL_PALETTE.root);
   assert.notEqual(MODEL_PALETTE.root, MODEL_PALETTE.face);
-  assert.ok(contrast(MODEL_PALETTE.line, MODEL_PALETTE.canvas) < 3);
   assert.ok(contrast(MODEL_PALETTE.focus, MODEL_PALETTE.canvas) >= 3);
 
   assert.ok(
@@ -86,16 +102,28 @@ test("keeps dense evidence neutral and reserves chroma for promoted structure", 
     "same-cluster evolution lines must remain visible after alpha compositing",
   );
   assert.ok(
+    contrast(composite(MODEL_PALETTE.line, MODEL_PALETTE.canvas, 0.5), MODEL_PALETTE.canvas) < 3,
+    "same-cluster evolution lines should not overpower dense points",
+  );
+  assert.ok(
     contrast(composite(MODEL_PALETTE.line, MODEL_PALETTE.canvas, 0.2), MODEL_PALETTE.canvas) >= 1.15,
     "cross-cluster evolution lines must remain subtly visible after alpha compositing",
+  );
+  assert.ok(
+    contrast(composite(MODEL_PALETTE.line, MODEL_PALETTE.canvas, 0.2), MODEL_PALETTE.canvas) < 1.5,
+    "cross-cluster evolution lines should remain atmospheric",
   );
   assert.ok(
     contrast(composite(MODEL_PALETTE.relation, MODEL_PALETTE.canvas, 0.36), MODEL_PALETTE.canvas) >= 2.1,
     "semantic relation lines must remain readable after alpha compositing",
   );
+  assert.ok(
+    contrast(composite(MODEL_PALETTE.relation, MODEL_PALETTE.canvas, 0.36), MODEL_PALETTE.canvas) < 3.2,
+    "semantic relation lines should not dominate the graph",
+  );
 });
 
-test("keeps essential small text and controls legible on charcoal surfaces", () => {
+test("keeps essential small text and controls legible on blue-black surfaces", () => {
   for (const role of ["text", "muted", "dim"]) {
     assert.ok(
       contrast(MODEL_PALETTE[role], MODEL_PALETTE.surface) >= 4.5,
@@ -108,6 +136,7 @@ test("keeps essential small text and controls legible on charcoal surfaces", () 
       `${role} must remain visible on the graph canvas`,
     );
   }
+  assert.ok(contrast(MODEL_PALETTE.focus, MODEL_PALETTE.surface) >= 3);
   for (const role of ["entity", "guideUi"]) {
     assert.ok(
       contrast(MODEL_PALETTE[role], MODEL_PALETTE.surface) >= 3,
@@ -117,7 +146,7 @@ test("keeps essential small text and controls legible on charcoal surfaces", () 
 });
 
 test("builds bounded rgba strings for canvas exports", () => {
-  assert.equal(colorWithAlpha(MODEL_PALETTE.focus, 0.14), "rgba(166, 138, 249, 0.14)");
-  assert.equal(colorWithAlpha(MODEL_PALETTE.root, 9), "rgba(250, 153, 205, 1)");
-  assert.equal(colorWithAlpha(MODEL_PALETTE.face, -1), "rgba(83, 223, 221, 0)");
+  assert.equal(colorWithAlpha("#123456", 0.14), "rgba(18, 52, 86, 0.14)");
+  assert.equal(colorWithAlpha("#123456", 9), "rgba(18, 52, 86, 1)");
+  assert.equal(colorWithAlpha("#123456", -1), "rgba(18, 52, 86, 0)");
 });

@@ -1,31 +1,31 @@
 :root {
   color-scheme: dark;
-  --bg: #1c1c1c;
-  --surface: rgba(35, 35, 35, 0.82);
-  --surface-strong: rgba(28, 28, 28, 0.96);
-  --surface-soft: rgba(40, 40, 40, 0.64);
-  --surface-modal: rgba(28, 28, 28, 0.98);
-  --overlay: rgba(14, 14, 16, 0.72);
-  --border: rgba(218, 218, 218, 0.12);
-  --border-bright: rgba(218, 218, 218, 0.22);
-  --text: #dadada;
-  --muted: #a6a6ae;
-  --dim: #8a8a94;
-  --point: #b3b3b3;
-  --line: #92929b;
-  --line-stroke: #666666;
-  --face: #53dfdd;
-  --volume: #a882ff;
-  --root: #fa99cd;
-  --focus: #a68af9;
-  --entity: #76767f;
-  --guide: #3f3f3f;
-  --guide-ui: #8a8a94;
-  --relation: #44cf6e;
-  --historical: #666666;
-  --success: #44cf6e;
-  --warning: #e0de71;
-  --danger: #fb7378;
+  --bg: #090b16;
+  --surface: rgba(17, 20, 37, 0.82);
+  --surface-strong: rgba(9, 11, 22, 0.96);
+  --surface-soft: rgba(24, 28, 51, 0.64);
+  --surface-modal: rgba(9, 11, 22, 0.98);
+  --overlay: rgba(3, 5, 13, 0.74);
+  --border: rgba(236, 234, 242, 0.12);
+  --border-bright: rgba(236, 234, 242, 0.22);
+  --text: #eceaf2;
+  --muted: #aaa6b8;
+  --dim: #878299;
+  --point: #72d8c0;
+  --line: #c5a16f;
+  --line-stroke: #9f7a52;
+  --face: #e47bc9;
+  --volume: #8298ee;
+  --root: #ee809b;
+  --focus: #aa96ef;
+  --entity: #7f8196;
+  --guide: #34374d;
+  --guide-ui: #898da4;
+  --relation: #68c69c;
+  --historical: #625f73;
+  --success: #59c995;
+  --warning: #d5b76a;
+  --danger: #eb767f;
   --radius: 18px;
 }
 
@@ -64,17 +64,17 @@ body::after {
 
 body::before {
   background:
-    radial-gradient(circle at 56% 48%, color-mix(in srgb, var(--focus) 10%, transparent), transparent 32%),
-    radial-gradient(circle at 78% 26%, color-mix(in srgb, var(--volume) 5%, transparent), transparent 26%),
-    radial-gradient(circle at 31% 78%, color-mix(in srgb, var(--face) 3%, transparent), transparent 30%),
-    linear-gradient(135deg, #1c1c1c 0%, #202024 48%, #1c1c1c 100%);
+    radial-gradient(circle at 56% 48%, color-mix(in srgb, var(--focus) 13%, transparent), transparent 32%),
+    radial-gradient(circle at 78% 26%, color-mix(in srgb, var(--root) 6%, transparent), transparent 26%),
+    radial-gradient(circle at 31% 78%, color-mix(in srgb, var(--point) 5%, transparent), transparent 30%),
+    linear-gradient(135deg, #080a16 0%, #10142a 48%, #090b16 100%);
 }
 
 body::after {
-  opacity: 0.16;
+  opacity: 0.18;
   background-image:
-    linear-gradient(rgba(218, 218, 218, 0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(218, 218, 218, 0.014) 1px, transparent 1px);
+    linear-gradient(rgba(170, 185, 235, 0.024) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(170, 185, 235, 0.017) 1px, transparent 1px);
   background-size: 72px 72px;
   mask-image: radial-gradient(circle at center, black, transparent 82%);
 }
@@ -154,7 +154,7 @@ button {
   flex: none;
   border: 1px solid var(--border-bright);
   border-radius: 50%;
-  background: rgba(218, 218, 218, 0.035);
+  background: rgba(236, 234, 242, 0.035);
   box-shadow: inset 0 0 20px color-mix(in srgb, var(--root) 8%, transparent), 0 0 24px color-mix(in srgb, var(--focus) 8%, transparent);
 }
 
@@ -200,7 +200,7 @@ button {
   padding: 0 8px 0 10px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: rgba(35, 35, 35, 0.68);
+  background: rgba(17, 20, 37, 0.68);
   color: var(--muted);
   cursor: pointer;
   transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
@@ -265,7 +265,7 @@ button {
   padding: 4px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: rgba(35, 35, 35, 0.74);
+  background: rgba(17, 20, 37, 0.74);
   box-shadow: 0 12px 42px rgba(0, 0, 0, 0.24);
   backdrop-filter: blur(20px);
 }
@@ -555,7 +555,7 @@ button {
 .model-flow i {
   width: 17px;
   height: 1px;
-  background: linear-gradient(90deg, rgba(218, 218, 218, 0.08), rgba(218, 218, 218, 0.36));
+  background: linear-gradient(90deg, rgba(236, 234, 242, 0.08), rgba(236, 234, 242, 0.36));
 }
 
 .status {
@@ -1582,7 +1582,7 @@ button {
   padding: 3px 8px;
   border: 1px solid rgba(255, 255, 255, 0.11);
   border-radius: 999px;
-  background: rgba(28, 28, 28, 0.84);
+  background: rgba(9, 11, 22, 0.84);
   box-shadow: 0 7px 20px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.04);
   color: var(--text);
   cursor: pointer;

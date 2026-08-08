@@ -1,31 +1,31 @@
 /**
  * Shared visual palette for the localhost model viewer and constellation card.
  *
- * The dense evidence field stays neutral. Chroma is reserved for promoted
- * structure and focus so the graph remains readable at real-model scale.
+ * The original semantic hues stay recognizable while their saturation and
+ * luminance are restrained for a dense, deep-space canvas.
  */
 export const MODEL_PALETTE = Object.freeze({
-  canvas: "#1c1c1c",
-  surface: "#232323",
-  surfaceRaised: "#282828",
-  text: "#dadada",
-  muted: "#a6a6ae",
-  dim: "#8a8a94",
-  point: "#b3b3b3",
-  line: "#666666",
-  lineUi: "#92929b",
-  face: "#53dfdd",
-  volume: "#a882ff",
-  root: "#fa99cd",
-  focus: "#a68af9",
-  entity: "#76767f",
-  guide: "#3f3f3f",
-  guideUi: "#8a8a94",
-  relation: "#44cf6e",
-  historical: "#666666",
-  success: "#44cf6e",
-  warning: "#e0de71",
-  error: "#fb7378",
+  canvas: "#090b16",
+  surface: "#111425",
+  surfaceRaised: "#181c33",
+  text: "#eceaf2",
+  muted: "#aaa6b8",
+  dim: "#878299",
+  point: "#72d8c0",
+  line: "#9f7a52",
+  lineUi: "#c5a16f",
+  face: "#e47bc9",
+  volume: "#8298ee",
+  root: "#ee809b",
+  focus: "#aa96ef",
+  entity: "#7f8196",
+  guide: "#34374d",
+  guideUi: "#898da4",
+  relation: "#68c69c",
+  historical: "#625f73",
+  success: "#59c995",
+  warning: "#d5b76a",
+  error: "#eb767f",
 });
 
 function colorNumber(value) {

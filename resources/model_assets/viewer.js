@@ -136,9 +136,9 @@ scene.add(new THREE.HemisphereLight(COLORS.text, COLORS.canvas, 2.05));
 const keyLight = new THREE.DirectionalLight(COLORS.text, 2.35);
 keyLight.position.set(5, 11, 8);
 scene.add(keyLight);
-const faceLight = new THREE.PointLight(COLORS.faces, 7, 22, 2);
-faceLight.position.set(-5, -1, 3);
-scene.add(faceLight);
+const pointLight = new THREE.PointLight(COLORS.points, 7, 22, 2);
+pointLight.position.set(-5, -1, 3);
+scene.add(pointLight);
 const violetLight = new THREE.PointLight(COLORS.volumes, 8, 24, 2);
 violetLight.position.set(5, 4, -4);
 scene.add(violetLight);
@@ -839,7 +839,7 @@ function addModelLine(line) {
   const targetCluster = currentLayout?.pointClusterById.get(line.target);
   const sameCluster = sourceCluster && sourceCluster === targetCluster;
   // Transparent strokes keep a large model calm, but each semantic relation
-  // still needs to survive compositing against the charcoal canvas.
+  // still needs to survive compositing against the deep-space canvas.
   const opacity = evolution ? (sameCluster ? 0.5 : 0.2) : 0.36;
   const lineObject = addLine(
     start,

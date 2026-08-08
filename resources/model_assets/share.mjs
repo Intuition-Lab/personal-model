@@ -302,7 +302,7 @@ export function drawConstellationCard(context, source, model = {}) {
   context.fillText("A LIVING MAP OF WHAT YOU NOTICE, REPEAT, AND BECOME", 54, 286);
 
   const headline = context.createLinearGradient(54, 310, 430, 430);
-  headline.addColorStop(0, "#f0f0f2");
+  headline.addColorStop(0, MODEL_PALETTE.text);
   headline.addColorStop(0.52, MODEL_PALETTE.focus);
   headline.addColorStop(1, MODEL_PALETTE.volume);
   context.fillStyle = headline;
