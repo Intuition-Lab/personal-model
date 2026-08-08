@@ -754,6 +754,7 @@ _MODEL_ASSETS = {
     "explore.mjs",
     "onboarding.css",
     "onboarding.js",
+    "palette.mjs",
     "three.module.js",
     "layout.mjs",
     "share.mjs",

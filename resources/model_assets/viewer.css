@@ -1,19 +1,31 @@
 :root {
   color-scheme: dark;
-  --bg: #05040a;
-  --surface: rgba(13, 12, 24, 0.76);
-  --surface-strong: rgba(11, 10, 20, 0.94);
-  --surface-soft: rgba(14, 13, 27, 0.56);
-  --border: rgba(255, 255, 255, 0.11);
-  --border-bright: rgba(255, 255, 255, 0.2);
-  --text: #f8f6ff;
-  --muted: #a5a0b5;
-  --dim: #706a80;
-  --point: #4ef0c3;
-  --line: #ffc45e;
-  --face: #ff64d6;
-  --volume: #7798ff;
-  --root: #ff6b8a;
+  --bg: #1c1c1c;
+  --surface: rgba(35, 35, 35, 0.82);
+  --surface-strong: rgba(28, 28, 28, 0.96);
+  --surface-soft: rgba(40, 40, 40, 0.64);
+  --surface-modal: rgba(28, 28, 28, 0.98);
+  --overlay: rgba(14, 14, 16, 0.72);
+  --border: rgba(218, 218, 218, 0.12);
+  --border-bright: rgba(218, 218, 218, 0.22);
+  --text: #dadada;
+  --muted: #a6a6ae;
+  --dim: #8a8a94;
+  --point: #b3b3b3;
+  --line: #92929b;
+  --line-stroke: #666666;
+  --face: #53dfdd;
+  --volume: #a882ff;
+  --root: #fa99cd;
+  --focus: #a68af9;
+  --entity: #76767f;
+  --guide: #3f3f3f;
+  --guide-ui: #8a8a94;
+  --relation: #44cf6e;
+  --historical: #666666;
+  --success: #44cf6e;
+  --warning: #e0de71;
+  --danger: #fb7378;
   --radius: 18px;
 }
 
@@ -52,17 +64,17 @@ body::after {
 
 body::before {
   background:
-    radial-gradient(circle at 56% 48%, rgba(117, 74, 255, 0.21), transparent 30%),
-    radial-gradient(circle at 78% 26%, rgba(255, 75, 183, 0.11), transparent 24%),
-    radial-gradient(circle at 31% 78%, rgba(25, 216, 185, 0.08), transparent 28%),
-    linear-gradient(135deg, #05040a 0%, #090716 48%, #05040a 100%);
+    radial-gradient(circle at 56% 48%, color-mix(in srgb, var(--focus) 10%, transparent), transparent 32%),
+    radial-gradient(circle at 78% 26%, color-mix(in srgb, var(--volume) 5%, transparent), transparent 26%),
+    radial-gradient(circle at 31% 78%, color-mix(in srgb, var(--face) 3%, transparent), transparent 30%),
+    linear-gradient(135deg, #1c1c1c 0%, #202024 48%, #1c1c1c 100%);
 }
 
 body::after {
-  opacity: 0.2;
+  opacity: 0.16;
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+    linear-gradient(rgba(218, 218, 218, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(218, 218, 218, 0.014) 1px, transparent 1px);
   background-size: 72px 72px;
   mask-image: radial-gradient(circle at center, black, transparent 82%);
 }
@@ -140,24 +152,25 @@ button {
   width: 32px;
   height: 32px;
   flex: none;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid var(--border-bright);
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.04);
-  box-shadow: inset 0 0 20px rgba(255, 107, 138, 0.08), 0 0 26px rgba(255, 107, 138, 0.09);
+  background: rgba(218, 218, 218, 0.035);
+  box-shadow: inset 0 0 20px color-mix(in srgb, var(--root) 8%, transparent), 0 0 24px color-mix(in srgb, var(--focus) 8%, transparent);
 }
 
 .brand-mark i {
+  --mark-color: var(--root);
   position: absolute;
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--root);
-  box-shadow: 0 0 10px rgba(255, 107, 138, 0.9);
+  background: var(--mark-color);
+  box-shadow: 0 0 9px var(--mark-color);
 }
 
 .brand-mark i:nth-child(1) { top: 8px; left: 13px; }
-.brand-mark i:nth-child(2) { top: 17px; left: 8px; background: var(--face); }
-.brand-mark i:nth-child(3) { top: 17px; left: 18px; background: var(--volume); }
+.brand-mark i:nth-child(2) { --mark-color: var(--face); top: 17px; left: 8px; }
+.brand-mark i:nth-child(3) { --mark-color: var(--volume); top: 17px; left: 18px; }
 
 .brand-lockup {
   display: grid;
@@ -185,16 +198,16 @@ button {
   min-width: 0;
   min-height: 36px;
   padding: 0 8px 0 10px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--border);
   border-radius: 999px;
-  background: rgba(13, 12, 24, 0.6);
+  background: rgba(35, 35, 35, 0.68);
   color: var(--muted);
   cursor: pointer;
   transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
 }
 
 .search-trigger > span {
-  color: #d7d2e2;
+  color: var(--text);
   font-size: 17px;
   line-height: 1;
 }
@@ -222,9 +235,10 @@ button {
 
 .search-trigger:hover,
 .search-trigger:focus-visible {
-  border-color: rgba(119, 152, 255, 0.42);
-  outline: none;
-  background: rgba(119, 152, 255, 0.1);
+  border-color: var(--focus);
+  outline: 2px solid color-mix(in srgb, var(--focus) 72%, transparent);
+  outline-offset: 2px;
+  background: color-mix(in srgb, var(--focus) 9%, var(--surface));
   color: var(--text);
 }
 
@@ -251,7 +265,7 @@ button {
   padding: 4px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: rgba(13, 12, 24, 0.7);
+  background: rgba(35, 35, 35, 0.74);
   box-shadow: 0 12px 42px rgba(0, 0, 0, 0.24);
   backdrop-filter: blur(20px);
 }
@@ -306,7 +320,7 @@ button {
 .layers button[data-layer="root"] { color: var(--root); }
 
 .layers button:not([aria-pressed="true"]) {
-  color: #666173;
+  color: var(--dim);
 }
 
 .layers button:hover,
@@ -358,7 +372,7 @@ button {
   min-height: 40px;
   padding: 0 5px;
   border-radius: 999px;
-  color: #d8d3e5;
+  color: var(--text);
   cursor: pointer;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
@@ -373,7 +387,7 @@ button {
 }
 
 .zoom-controls button:focus-visible {
-  outline: 2px solid var(--volume);
+  outline: 2px solid var(--focus);
   outline-offset: 1px;
 }
 
@@ -393,8 +407,8 @@ button {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--point);
-  box-shadow: 0 0 9px rgba(78, 240, 195, 0.75);
+  background: var(--success);
+  box-shadow: 0 0 9px color-mix(in srgb, var(--success) 72%, transparent);
 }
 
 .share-button {
@@ -403,10 +417,10 @@ button {
   gap: 7px;
   min-height: 40px;
   padding: 0 13px 0 10px;
-  border: 1px solid rgba(255, 100, 214, 0.26);
+  border: 1px solid color-mix(in srgb, var(--focus) 30%, transparent);
   border-radius: 999px;
-  background: linear-gradient(110deg, rgba(255, 100, 214, 0.15), rgba(119, 152, 255, 0.13));
-  color: #f5eefa;
+  background: linear-gradient(110deg, color-mix(in srgb, var(--focus) 13%, transparent), color-mix(in srgb, var(--volume) 9%, transparent));
+  color: var(--text);
   cursor: pointer;
   transition: color 160ms ease, background 160ms ease, border-color 160ms ease, transform 160ms ease;
 }
@@ -454,9 +468,9 @@ button {
 }
 
 .icon-button[aria-pressed="true"] {
-  border-color: rgba(119, 152, 255, 0.35);
-  background: rgba(119, 152, 255, 0.12);
-  color: #b5c5ff;
+  border-color: color-mix(in srgb, var(--focus) 48%, transparent);
+  background: color-mix(in srgb, var(--focus) 11%, transparent);
+  color: var(--focus);
 }
 
 .story {
@@ -473,7 +487,7 @@ button {
   align-items: center;
   gap: 9px;
   margin: 0 0 18px;
-  color: #bdb7cc;
+  color: var(--muted);
   font-size: 9px;
   font-weight: 750;
   letter-spacing: 0.19em;
@@ -485,7 +499,7 @@ button {
   height: 6px;
   border-radius: 50%;
   background: var(--root);
-  box-shadow: 0 0 0 5px rgba(255, 107, 138, 0.08), 0 0 17px rgba(255, 107, 138, 0.85);
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--root) 7%, transparent), 0 0 15px color-mix(in srgb, var(--root) 72%, transparent);
   animation: signal 2.4s ease-in-out infinite;
 }
 
@@ -496,7 +510,7 @@ button {
 
 .story h1 {
   margin: 0;
-  color: rgba(249, 247, 255, 0.97);
+  color: var(--text);
   font-size: clamp(36px, 4.2vw, 60px);
   font-weight: 660;
   letter-spacing: -0.065em;
@@ -508,7 +522,7 @@ button {
   color: transparent;
   font-style: normal;
   font-weight: 560;
-  background: linear-gradient(104deg, #ff8aa2 6%, #ff63d4 45%, #8b9cff 91%);
+  background: linear-gradient(104deg, #f0f0f2 6%, var(--focus) 48%, var(--volume) 91%);
   background-clip: text;
   -webkit-background-clip: text;
 }
@@ -518,7 +532,7 @@ button {
   max-width: 310px;
   margin: 26px 0 0;
   overflow: hidden;
-  color: rgba(218, 213, 229, 0.78);
+  color: var(--muted);
   font-size: 13px;
   line-height: 1.7;
   text-wrap: balance;
@@ -541,7 +555,7 @@ button {
 .model-flow i {
   width: 17px;
   height: 1px;
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.42));
+  background: linear-gradient(90deg, rgba(218, 218, 218, 0.08), rgba(218, 218, 218, 0.36));
 }
 
 .status {
@@ -610,8 +624,8 @@ button {
 .stat[data-kind="root"] { --stat-color: var(--root); }
 
 .build-state {
-  --build-color: #8d8799;
-  --build-glow: rgba(141, 135, 153, 0.48);
+  --build-color: var(--dim);
+  --build-glow: color-mix(in srgb, var(--dim) 48%, transparent);
   display: flex;
   align-items: center;
   gap: 7px;
@@ -630,23 +644,23 @@ button {
 }
 
 .build-state--not-built {
-  --build-color: #8d8799;
-  --build-glow: rgba(141, 135, 153, 0.48);
+  --build-color: var(--dim);
+  --build-glow: color-mix(in srgb, var(--dim) 48%, transparent);
 }
 
 .build-state--building {
-  --build-color: var(--line);
-  --build-glow: rgba(255, 196, 94, 0.68);
+  --build-color: var(--warning);
+  --build-glow: color-mix(in srgb, var(--warning) 68%, transparent);
 }
 
 .build-state--degraded {
-  --build-color: var(--root);
-  --build-glow: rgba(255, 107, 138, 0.68);
+  --build-color: var(--danger);
+  --build-glow: color-mix(in srgb, var(--danger) 68%, transparent);
 }
 
 .build-state--complete {
-  --build-color: var(--point);
-  --build-glow: rgba(78, 240, 195, 0.72);
+  --build-color: var(--success);
+  --build-glow: color-mix(in srgb, var(--success) 72%, transparent);
 }
 
 .legend {
@@ -680,7 +694,7 @@ button {
 }
 
 .legend > summary::after {
-  color: #898397;
+  color: var(--dim);
   content: "−";
   font-size: 12px;
   font-weight: 400;
@@ -693,7 +707,7 @@ button {
 
 .legend > summary small {
   margin-left: auto;
-  color: #706a80;
+  color: var(--dim);
   font-size: 7px;
   font-weight: 650;
   letter-spacing: 0.08em;
@@ -711,19 +725,19 @@ button {
   align-items: center;
   gap: 7px;
   min-height: 22px;
-  color: #858092;
+  color: var(--dim);
   font-size: 9px;
 }
 
 .legend-body b {
-  color: #d8d4e1;
+  color: var(--text);
   font-size: 9px;
   font-weight: 650;
 }
 
 .legend > summary:focus-visible {
   border-radius: 5px;
-  outline: 2px solid var(--volume);
+  outline: 2px solid var(--focus);
   outline-offset: 5px;
 }
 
@@ -737,9 +751,9 @@ button {
 .swatch.point { color: var(--point); background: var(--point); }
 .swatch.line { color: var(--line); height: 1px; border-radius: 0; background: var(--line); }
 .swatch.guide {
-  color: var(--muted);
+  color: var(--guide-ui);
   height: 1px;
-  border-top: 1px dashed var(--muted);
+  border-top: 1px dashed var(--guide-ui);
   border-radius: 0;
   box-shadow: none;
 }
@@ -748,11 +762,10 @@ button {
 /* Entities render as small grey cubes, so the swatch is a square rather than a
    dot and carries no glow — they are context, not a claim about the owner. */
 .swatch.context {
-  color: var(--muted);
+  color: var(--entity);
   border-radius: 1px;
-  background: var(--muted);
+  background: var(--entity);
   box-shadow: none;
-  opacity: 0.8;
 }
 .swatch.root { color: var(--root); background: var(--root); transform: rotate(45deg); border-radius: 2px; }
 
@@ -777,7 +790,7 @@ button {
 
 .mobile-guide > summary::after {
   grid-column: 4;
-  color: #898397;
+  color: var(--dim);
   content: "+";
 }
 
@@ -786,14 +799,14 @@ button {
 }
 
 .mobile-guide > summary b {
-  color: #d8d4e1;
+  color: var(--text);
   font-size: 10px;
   font-weight: 650;
 }
 
 .mobile-guide > summary span:last-of-type {
   overflow: hidden;
-  color: #aaa4b6;
+  color: var(--muted);
   font-size: 10px;
   font-weight: 600;
   text-overflow: ellipsis;
@@ -802,7 +815,7 @@ button {
 
 .mobile-guide > summary:focus-visible {
   border-radius: 5px;
-  outline: 2px solid var(--volume);
+  outline: 2px solid var(--focus);
   outline-offset: 5px;
 }
 
@@ -810,7 +823,7 @@ button {
   margin: 9px 0 0;
   padding-top: 8px;
   border-top: 1px solid rgba(255, 255, 255, 0.07);
-  color: #858092;
+  color: var(--dim);
   font-size: 9px;
   line-height: 1.5;
 }
@@ -823,7 +836,7 @@ button {
   align-items: start;
   justify-items: center;
   padding: clamp(76px, 10vh, 118px) 20px 24px;
-  background: rgba(3, 2, 8, 0.7);
+  background: var(--overlay);
   backdrop-filter: blur(12px) saturate(115%);
   -webkit-backdrop-filter: blur(12px) saturate(115%);
 }
@@ -837,11 +850,11 @@ button {
   max-height: min(720px, calc(100dvh - 112px));
   overflow: hidden auto;
   padding: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  border: 1px solid var(--border-bright);
   border-radius: 22px;
   background:
-    radial-gradient(circle at 78% 0%, rgba(119, 152, 255, 0.12), transparent 35%),
-    rgba(10, 9, 19, 0.97);
+    radial-gradient(circle at 78% 0%, color-mix(in srgb, var(--focus) 7%, transparent), transparent 38%),
+    var(--surface-modal);
   box-shadow: 0 36px 120px rgba(0, 0, 0, 0.58), inset 0 1px 0 rgba(255, 255, 255, 0.055);
   color: var(--text);
   overscroll-behavior: contain;
@@ -857,7 +870,7 @@ button {
 
 .search-kicker {
   margin: 0 0 5px;
-  color: var(--volume);
+  color: var(--focus);
   font-size: 8px;
   font-weight: 750;
   letter-spacing: 0.16em;
@@ -878,18 +891,18 @@ button {
   gap: 7px;
   margin-top: 16px;
   padding: 5px 7px 5px 12px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border);
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.045);
 }
 
 .search-field:focus-within {
-  border-color: rgba(119, 152, 255, 0.62);
-  box-shadow: 0 0 0 3px rgba(119, 152, 255, 0.09), 0 0 28px rgba(119, 152, 255, 0.08);
+  border-color: var(--focus);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 16%, transparent), 0 0 24px color-mix(in srgb, var(--focus) 9%, transparent);
 }
 
 .search-field > span {
-  color: #c4bfd0;
+  color: var(--text);
   font-size: 19px;
 }
 
@@ -906,7 +919,7 @@ button {
 }
 
 .search-field input::placeholder {
-  color: #726d7f;
+  color: var(--dim);
 }
 
 .search-field kbd {
@@ -991,9 +1004,13 @@ button {
 .search-result:hover,
 .search-result:focus-visible,
 .search-result[aria-selected="true"] {
-  border-color: color-mix(in srgb, var(--result-accent) 42%, transparent);
-  outline: none;
+  border-color: color-mix(in srgb, var(--result-accent) 56%, transparent);
   background: color-mix(in srgb, var(--result-accent) 9%, transparent);
+}
+
+.search-result:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 
 .search-dialog > footer {
@@ -1003,13 +1020,13 @@ button {
   margin-top: 12px;
   padding: 10px 2px 0;
   border-top: 1px solid rgba(255, 255, 255, 0.07);
-  color: #6e6979;
+  color: var(--dim);
   font-size: 8px;
 }
 
 .search-dialog > footer span:last-child {
   margin-left: auto;
-  color: #696475;
+  color: var(--dim);
 }
 
 .search-dialog > footer kbd {
@@ -1072,14 +1089,14 @@ button {
   padding: 7px 9px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 9px;
-  background: #12101d;
+  background: var(--surface);
   color: var(--text);
   font: 10px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
 }
 
 .line-explorer select:focus-visible {
-  border-color: var(--line);
-  outline: 2px solid color-mix(in srgb, var(--line) 65%, transparent);
+  border-color: var(--focus);
+  outline: 2px solid color-mix(in srgb, var(--focus) 72%, transparent);
   outline-offset: 2px;
 }
 
@@ -1158,7 +1175,7 @@ button {
 }
 
 .focus-note b {
-  color: #dcd7e7;
+  color: var(--text);
   font-size: 9px;
   font-weight: 650;
 }
@@ -1175,7 +1192,7 @@ button {
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.045);
-  color: #c9c3d3;
+  color: var(--muted);
   cursor: pointer;
   font-size: 8px;
 }
@@ -1183,9 +1200,13 @@ button {
 .focus-note button:hover,
 .focus-note button:focus-visible {
   border-color: color-mix(in srgb, var(--detail-accent, var(--root)) 48%, transparent);
-  outline: none;
   background: color-mix(in srgb, var(--detail-accent, var(--root)) 10%, transparent);
   color: var(--text);
+}
+
+.focus-note button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 
 /* The claim's box lives on `.detail-claim` alone, so the heading and the
@@ -1211,7 +1232,7 @@ button {
 
 .detail-receipts {
   margin-top: 10px;
-  color: #858091;
+  color: var(--dim);
   font: 9px/1.55 ui-monospace, "SFMono-Regular", Menlo, monospace;
   overflow-wrap: anywhere;
 }
@@ -1299,7 +1320,7 @@ button {
 
 .evidence-link b {
   overflow-wrap: anywhere;
-  color: #d8d4e1;
+  color: var(--text);
   font: 9px/1.45 ui-monospace, "SFMono-Regular", Menlo, monospace;
   font-weight: 500;
 }
@@ -1314,7 +1335,11 @@ button {
   border-color: var(--detail-accent, var(--root));
   background: rgba(255, 255, 255, 0.075);
   color: var(--text);
-  outline: none;
+}
+
+.evidence-link:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
 }
 
 .evidence-technical {
@@ -1333,7 +1358,7 @@ button {
 
 .evidence-technical div {
   padding: 0 9px 8px;
-  color: #777181;
+  color: var(--dim);
   font: 8px/1.5 ui-monospace, "SFMono-Regular", Menlo, monospace;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -1342,7 +1367,7 @@ button {
 .evidence-summary,
 .evidence-note {
   margin: 7px 0 9px;
-  color: #b8b3c4;
+  color: var(--muted);
   font: 10px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
   white-space: pre-wrap;
 }
@@ -1353,14 +1378,14 @@ button {
 }
 
 .evidence-missing {
-  color: #ff9cae;
+  color: var(--danger);
 }
 
 .evidence-fact,
 .evidence-preview,
 .evidence-loading {
   margin-top: 5px;
-  color: #858091;
+  color: var(--dim);
   font: 9px/1.55 ui-monospace, "SFMono-Regular", Menlo, monospace;
   overflow-wrap: anywhere;
 }
@@ -1368,7 +1393,7 @@ button {
 .evidence-preview {
   padding: 7px 0 0;
   border-top: 1px solid rgba(255, 255, 255, 0.055);
-  color: #a7a1b2;
+  color: var(--muted);
 }
 
 .timeline {
@@ -1392,7 +1417,7 @@ button {
 }
 
 .timeline-copy strong {
-  color: #d9d5e3;
+  color: var(--text);
   font-size: 9px;
   font-weight: 700;
 }
@@ -1419,7 +1444,7 @@ button {
 .timeline input {
   width: 100%;
   height: 2px;
-  accent-color: var(--face);
+  accent-color: var(--focus);
   cursor: ew-resize;
 }
 
@@ -1429,7 +1454,7 @@ button {
   right: 26px;
   bottom: 29px;
   margin: 0;
-  color: #625d70;
+  color: var(--dim);
   font-size: 8px;
   font-weight: 650;
   letter-spacing: 0.06em;
@@ -1439,7 +1464,7 @@ button {
 
 .gesture-hint span {
   margin-right: 5px;
-  color: #8d879c;
+  color: var(--muted);
 }
 
 .empty,
@@ -1467,7 +1492,7 @@ button {
 }
 
 .error {
-  color: #ff9cae;
+  color: var(--danger);
 }
 
 .error p {
@@ -1477,15 +1502,15 @@ button {
 .error button {
   margin-top: 14px;
   padding: 8px 15px;
-  border: 1px solid rgba(255, 156, 174, 0.34);
+  border: 1px solid color-mix(in srgb, var(--danger) 42%, transparent);
   border-radius: 999px;
-  background: rgba(255, 156, 174, 0.1);
-  color: #ffd4dc;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
   cursor: pointer;
 }
 
 .error button:hover {
-  background: rgba(255, 156, 174, 0.18);
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
 }
 
 .share-notice {
@@ -1498,9 +1523,9 @@ button {
   gap: 11px;
   width: min(330px, calc(100vw - 48px));
   padding: 13px 15px;
-  border: 1px solid rgba(78, 240, 195, 0.24);
+  border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
   border-radius: 15px;
-  background: rgba(10, 9, 19, 0.92);
+  background: var(--surface-strong);
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.045);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
@@ -1517,8 +1542,8 @@ button {
   flex: none;
   place-items: center;
   border-radius: 50%;
-  background: rgba(78, 240, 195, 0.11);
-  color: var(--point);
+  background: color-mix(in srgb, var(--success) 11%, transparent);
+  color: var(--success);
   font-size: 16px;
 }
 
@@ -1539,12 +1564,12 @@ button {
 }
 
 .share-notice.failed {
-  border-color: rgba(255, 107, 138, 0.28);
+  border-color: color-mix(in srgb, var(--danger) 34%, transparent);
 }
 
 .share-notice.failed > span {
-  background: rgba(255, 107, 138, 0.11);
-  color: var(--root);
+  background: color-mix(in srgb, var(--danger) 11%, transparent);
+  color: var(--danger);
 }
 
 .model-label {
@@ -1557,9 +1582,9 @@ button {
   padding: 3px 8px;
   border: 1px solid rgba(255, 255, 255, 0.11);
   border-radius: 999px;
-  background: rgba(7, 6, 13, 0.78);
+  background: rgba(28, 28, 28, 0.84);
   box-shadow: 0 7px 20px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.04);
-  color: #dcd8e5;
+  color: var(--text);
   cursor: pointer;
   font-size: 9px;
   line-height: 14px;
@@ -1595,19 +1620,19 @@ button {
 .model-label[data-kind="face"] { --label-accent: var(--face); }
 .model-label[data-kind="volume"] { --label-accent: var(--volume); }
 .model-label[data-kind="root"] { --label-accent: var(--root); }
-.model-label[data-kind="context"] { --label-accent: var(--muted); }
+.model-label[data-kind="context"] { --label-accent: var(--entity); }
 
 /* No `transform` lift here: the renderer owns this element's transform and
    overwrites any rule with an inline one, so the lift never rendered. */
 .model-label:hover,
 .model-label:focus-visible {
   border-color: var(--label-accent);
-  background: rgba(20, 17, 34, 0.96);
+  background: var(--surface-strong);
 }
 
 .model-label[aria-expanded="true"] {
   border-color: var(--label-accent);
-  background: rgba(24, 20, 40, 0.98);
+  background: var(--surface-modal);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--label-accent) 65%, transparent), 0 8px 26px rgba(0, 0, 0, 0.42), 0 0 24px color-mix(in srgb, var(--label-accent) 18%, transparent);
 }
 
@@ -1634,7 +1659,7 @@ button {
 
 .model-label.focus-neighbor:not([aria-expanded="true"]) {
   border-color: color-mix(in srgb, var(--label-accent) 38%, transparent);
-  background: rgba(12, 10, 22, 0.9);
+  background: var(--surface-strong);
 }
 
 @media (min-width: 1361px) and (max-width: 1640px) {
@@ -2038,9 +2063,9 @@ button {
   max-width: min(720px, calc(100vw - 32px));
   padding: 8px 14px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 176, 32, 0.55);
-  background: rgba(64, 44, 6, 0.92);
-  color: #ffd88a;
+  border: 1px solid color-mix(in srgb, var(--warning) 56%, transparent);
+  background: color-mix(in srgb, var(--warning) 14%, var(--surface-strong));
+  color: var(--warning);
   font-size: 13px;
   line-height: 1.4;
   text-align: center;
@@ -2136,9 +2161,9 @@ button {
   display: none;
 }
 
-.detail-status[data-tone="error"] { color: #ff9e94; }
-.detail-status[data-tone="warn"] { color: #ffd58a; }
-.detail-status[data-tone="ok"] { color: #96e2b2; }
+.detail-status[data-tone="error"] { color: var(--danger); }
+.detail-status[data-tone="warn"] { color: var(--warning); }
+.detail-status[data-tone="ok"] { color: var(--success); }
 
 /* Properties, not a table. One quiet line that wraps. */
 .detail-meta {
@@ -2159,7 +2184,7 @@ button {
 
 .detail-meta strong {
   margin-right: 4px;
-  color: #57525f;
+  color: var(--muted);
   font-weight: 600;
 }
 
@@ -2252,7 +2277,7 @@ button {
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
-  color: #8d8798;
+  color: var(--dim);
   cursor: pointer;
   font-size: 11px;
   font-weight: 600;
@@ -2260,9 +2285,9 @@ button {
 }
 
 .detail-reject:hover:not(:disabled) {
-  border-color: rgba(255, 138, 128, 0.3);
-  background: rgba(255, 106, 92, 0.1);
-  color: #ffb0a8;
+  border-color: color-mix(in srgb, var(--danger) 38%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
 }
 
 .detail-reject:disabled {
@@ -2271,7 +2296,7 @@ button {
 }
 
 .detail-authored {
-  color: #96e2b2;
+  color: var(--success);
 }
 
 /* Sits above the model-load banner so a save failure is never stacked
