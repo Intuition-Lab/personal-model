@@ -75,18 +75,25 @@ function fixture(extraPoints = []) {
 }
 
 test("lays the hierarchy out as centered, three-dimensional clusters", () => {
-  const layout = computeClusterLayout(fixture());
+  const model = fixture();
+  const layout = computeClusterLayout(model);
   const root = layout.positions.get("root");
 
   assert.deepEqual(root, [0, 0, 0]);
   assert.equal(layout.diagnostics.rootAtCenter, true);
-  assert.ok(layout.diagnostics.averageRadius.volumes > 1.5);
+  assert.ok(layout.diagnostics.averageRadius.volumes > 2.35);
   assert.ok(layout.diagnostics.averageRadius.faces > layout.diagnostics.averageRadius.volumes);
   assert.ok(layout.diagnostics.pointYSpread > 0.75);
   assert.equal(layout.diagnostics.directPoints, 18);
   assert.equal(layout.diagnostics.volumeMembershipEdges, 3);
   assert.ok(layout.diagnostics.sourceClusterPoints >= 6);
   assert.ok(layout.contextIds.includes("self"));
+  model.volumes.forEach((volume) => {
+    assert.ok(layoutMath.distance(layout.positions.get(volume.id), root) >= 2.4);
+  });
+  layout.contextIds.forEach((id) => {
+    assert.ok(layoutMath.distance(layout.positions.get(id), root) > 1.09);
+  });
   assert.ok(layoutMath.distance(layout.positions.get("face-focus"), root) > 3);
 });
 
@@ -122,6 +129,19 @@ test("keeps a point-only degraded model close to the center", () => {
   assert.equal(layout.diagnostics.sourceClusterPoints, 1);
   assert.ok(layout.diagnostics.averageRadius.points < 2);
   assert.ok(layout.diagnostics.bounds.radius < 3);
+});
+
+test("does not widen a rootless degraded hierarchy", () => {
+  const model = { ...fixture(), root: null };
+  const layout = computeClusterLayout(model);
+  const center = [0, 0, 0];
+
+  model.volumes.forEach((volume) => {
+    assert.ok(layoutMath.distance(layout.positions.get(volume.id), center) < 2.3);
+  });
+  layout.contextIds.forEach((id) => {
+    assert.ok(layoutMath.distance(layout.positions.get(id), center) < 1.41);
+  });
 });
 
 test("steps fitted zoom predictably through rapid actions and clamps its range", () => {

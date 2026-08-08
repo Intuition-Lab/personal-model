@@ -325,7 +325,7 @@ function placePointClouds(points, pointClusterById, positions, sourceOrbitRadius
   return groups;
 }
 
-function placeContextNodes(lines, pointIds, positions) {
+function placeContextNodes(lines, pointIds, positions, hasRoot) {
   const ids = new Set();
   lines.filter((line) => line.kind === "relation").forEach((line) => {
     if (!pointIds.has(line.source)) ids.add(line.source);
@@ -333,7 +333,9 @@ function placeContextNodes(lines, pointIds, positions) {
   });
   const contextIds = [...ids].filter(Boolean).sort();
   contextIds.forEach((id) => {
-    const radius = 0.72 + stableHash(`context:${id}:radius`) * 0.68;
+    const radius = hasRoot
+      ? 1.1 + stableHash(`context:${id}:radius`) * 0.5
+      : 0.72 + stableHash(`context:${id}:radius`) * 0.68;
     positions.set(id, scale(unitVector(`context:${id}`), radius));
   });
   return contextIds;
@@ -379,7 +381,7 @@ export function computeClusterLayout(model) {
   if (root) positions.set(root.id, [0, 0, 0]);
   placeStableOrbit(volumes, positions, {
     phase: 0.2,
-    radius: 2,
+    radius: root ? 2.4 : 2,
     radialStep: 0.12,
     heightStep: 0.14,
   });
@@ -389,7 +391,7 @@ export function computeClusterLayout(model) {
   const sourceOrbitRadius = faces.length ? 7.2 : (volumes.length || root ? 4.2 : 1.2);
   const groups = placePointClouds(points, assignments.pointClusterById, positions, sourceOrbitRadius);
   const pointIds = new Set(points.map((point) => point.id));
-  const contextIds = placeContextNodes(lines, pointIds, positions);
+  const contextIds = placeContextNodes(lines, pointIds, positions, Boolean(root));
 
   const volumeIds = new Set(volumes.map((volume) => volume.id));
   const rootVolumeIds = root?.members?.filter((id) => volumeIds.has(id)) || [];

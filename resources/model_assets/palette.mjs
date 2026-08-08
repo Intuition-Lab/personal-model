@@ -16,7 +16,7 @@ export const MODEL_PALETTE = Object.freeze({
   lineUi: "#c5a16f",
   face: "#e47bc9",
   volume: "#8298ee",
-  root: "#ee809b",
+  root: "#ff718f",
   focus: "#aa96ef",
   entity: "#7f8196",
   guide: "#34374d",

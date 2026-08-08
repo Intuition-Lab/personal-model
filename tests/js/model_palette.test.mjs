@@ -88,10 +88,11 @@ test("keeps the original semantic hues restrained on a deep-space canvas", () =>
   assert.equal(MODEL_PALETTE.line, "#9f7a52");
   assert.equal(MODEL_PALETTE.face, "#e47bc9");
   assert.equal(MODEL_PALETTE.volume, "#8298ee");
-  assert.equal(MODEL_PALETTE.root, "#ee809b");
+  assert.equal(MODEL_PALETTE.root, "#ff718f");
   assert.ok(chroma(MODEL_PALETTE.canvas) >= 10, "canvas should remain blue-black, not charcoal");
   assert.ok(chroma(MODEL_PALETTE.point) >= 60, "dense points should retain their mint hue");
   assert.ok(chroma(MODEL_PALETTE.line) >= 50, "dense lines should retain their warm amber hue");
+  assert.ok(chroma(MODEL_PALETTE.root) >= 120, "the Root should stay clearly coral, not dusty pink");
   assert.notEqual(MODEL_PALETTE.face, MODEL_PALETTE.volume);
   assert.notEqual(MODEL_PALETTE.volume, MODEL_PALETTE.root);
   assert.notEqual(MODEL_PALETTE.root, MODEL_PALETTE.face);

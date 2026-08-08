@@ -785,14 +785,14 @@ function addRoot(root) {
   const position = positions.get(root.id);
   if (!position) return;
   const rootKey = selectionKey("root", root.id);
-  addGlow(position, COLORS.root, 4.2, 0.3, "root", 0.075, [rootKey]);
+  addGlow(position, COLORS.root, 4.2, 0.38, "root", 0.075, [rootKey]);
   const mesh = registerPickable(
     new THREE.Mesh(
       new THREE.DodecahedronGeometry(0.62, 0),
       new THREE.MeshPhysicalMaterial({
         color: COLORS.root,
         emissive: COLORS.root,
-        emissiveIntensity: 0.56,
+        emissiveIntensity: 0.68,
         roughness: 0.18,
         metalness: 0.08,
         clearcoat: 1,
