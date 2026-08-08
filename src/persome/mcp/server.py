@@ -243,6 +243,7 @@ def _search(  # type: ignore[no-untyped-def]
     until: str | None = None,
     top_k: int = 5,
     include_superseded: bool = False,
+    include_chains: bool = True,
     breadth: float = 0.0,
     entities: list[str] | None = None,
     include_bodies: bool = False,
@@ -266,17 +267,21 @@ def _search(  # type: ignore[no-untyped-def]
         # (kill-switch [search] associative_read_enabled)
         from ..retrieval import associative as assoc_mod
 
-        hits, chains_text = assoc_mod.associative_read(
+        read_result = assoc_mod.associative_read(
             conn,
             query=query,
             path_patterns=paths,
             since=since,
             until=until,
             top_k=top_k,
-            with_chains=True,
+            with_chains=include_chains,
             entities=entities,
             mmr_diversity=breadth,
         )
+        if include_chains:
+            hits, chains_text = read_result
+        else:
+            hits = read_result
     metas = fts.entry_metadata_map(conn, [h.id for h in hits])
     face_index = (
         _face_membership_index(conn, include_bodies=include_bodies)
@@ -904,7 +909,7 @@ top-down — who they are (resident), what happened (recall), what was on screen
 
 ### Compressed memory (recall)
 
-- `search(query, paths?, since?, until?, top_k?, breadth?, entities?, include_bodies?)`
+- `search(query, paths?, since?, until?, top_k?, breadth?, entities?, include_bodies?, include_chains?)`
   — semantic + keyword recall over distilled facts. Natural language works; you do
   not need the user's original phrasing. Knobs:
   - `entities=["Alex"]` when you KNOW who the question is about (aliases resolve;
@@ -912,6 +917,8 @@ top-down — who they are (resident), what happened (recall), what was on screen
   - `breadth=0.3–0.7` for survey/research questions (diverse angles over
     near-duplicate top hits); leave 0 when grounding a specific fact.
   - `include_bodies=true` to also attach higher-level cross-domain patterns.
+  - `include_chains=false` when a latency-sensitive consumer only needs ranked
+    hits and their IDs, not relation-chain narration.
 - `verify_fact(claim, top_k?, fresh_within_days?)` — freshness check for ONE claim.
   Call before stating time-sensitive facts (versions, task status, who-does-what,
   schedules) as current. It judges TIME only, but explains any existing open
@@ -964,7 +971,7 @@ Each hit carries more than text — use all of it:
   instance of a verified pattern, so the pattern likely holds in new situations.
 - `confidence` / `conflicted` — reliability metadata; `conflicted: true` means an
   unresolved contradiction exists — do not present that fact as settled.
-- `chains` (top-level) — how the hits connect back to the user, with receipt
+- `chains` (top-level, when requested and available) — how the hits connect back to the user, with receipt
   pointers `⟨entry_id:path⟩`. Anchors listed as orphans have no proven link yet.
 
 ## Combining tools
@@ -1204,6 +1211,7 @@ def build_server(
         until: str | None = None,
         top_k: int = default_top_k,
         include_superseded: bool = False,
+        include_chains: bool = True,
         breadth: float = 0.0,
         entities: list[str] | None = None,
         include_bodies: bool = False,
@@ -1249,6 +1257,10 @@ def build_server(
         directly when you KNOW who the question is about (e.g.
         `entities=["Alex"]` while the query text paraphrases) — unknown names
         are ignored, never an error.
+
+        `include_chains=false` skips relation-chain narration for latency-sensitive
+        consumers that only need ranked hits. Result IDs still remain available as
+        evidence handles. The default stays true for backwards compatibility.
         """
         query = bounded_text("query", query, maximum=20_000)
         paths = bounded_text_list(
@@ -1277,6 +1289,7 @@ def build_server(
                     until=until,
                     top_k=top_k,
                     include_superseded=include_superseded,
+                    include_chains=include_chains,
                     breadth=breadth,
                     entities=entities,
                     include_bodies=include_bodies,

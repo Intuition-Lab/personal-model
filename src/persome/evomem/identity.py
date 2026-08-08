@@ -155,22 +155,40 @@ def resolve_identity(mention: str, roster: Roster) -> Resolution:
 def scan_mentions(text: str, roster: Roster) -> list[str]:
     """§3.2 associative-Q entity slot — ZERO-LLM distillation of the present.
 
-    Scan the (normalized) text for every roster canonical/alias as a substring
-    and return the matched CANONICAL identities, deduped, ordered by first
-    occurrence. This is the "weights arm perception" loop made literal: the
-    bigger the graph's roster, the more the runtime can see. Substring matching
-    is deliberate — Chinese runs tokenize as one FTS token, so word-boundary
-    matching would go blind exactly where the entity head matters most.
+    Scan the (normalized) text for every roster canonical/alias and return the
+    matched CANONICAL identities, deduped, ordered by first occurrence. Chinese
+    names keep substring matching because Chinese runs tokenize as one FTS token.
+    ASCII word edges must be bounded, however: a one-letter identity such as
+    ``D`` must not arm the relation head merely because a query says
+    ``evidence``. This is the "weights arm perception" loop made literal without
+    turning ordinary English substrings into people.
     """
     hay = norm(text)
     if not hay:
         return []
     found: list[tuple[int, str]] = []
     seen: set[str] = set()
+
+    def ascii_word(char: str) -> bool:
+        return char.isascii() and (char.isalnum() or char == "_")
+
+    def mention_position(key: str) -> int:
+        start = 0
+        while True:
+            pos = hay.find(key, start)
+            if pos < 0:
+                return -1
+            end = pos + len(key)
+            left_ok = not (ascii_word(key[0]) and pos > 0 and ascii_word(hay[pos - 1]))
+            right_ok = not (ascii_word(key[-1]) and end < len(hay) and ascii_word(hay[end]))
+            if left_ok and right_ok:
+                return pos
+            start = pos + 1
+
     for key, canonical in roster._by_norm.items():
         if canonical in seen:
             continue
-        pos = hay.find(key)
+        pos = mention_position(key)
         if pos >= 0:
             found.append((pos, canonical))
             seen.add(canonical)

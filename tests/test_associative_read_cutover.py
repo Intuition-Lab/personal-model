@@ -139,6 +139,14 @@ class TestMcpSearchCutover:
             out = mcp_server._search(conn, query="\u5f20\u4f1f \u5728\u5fd9\u4ec0\u4e48", top_k=5)
             assert zw in {r["id"] for r in out["results"]}
             assert "chains" in out and "\u5f20\u4f1f" in out["chains"]
+            hits_only = mcp_server._search(
+                conn,
+                query="\u5f20\u4f1f \u5728\u5fd9\u4ec0\u4e48",
+                top_k=5,
+                include_chains=False,
+            )
+            assert zw in {r["id"] for r in hits_only["results"]}
+            assert "chains" not in hits_only
             # archaeology mode: include_superseded is not an associative question
             out2 = mcp_server._search(
                 conn,
