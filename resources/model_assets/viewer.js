@@ -797,7 +797,10 @@ function addRoot(root) {
         metalness: 0.08,
         clearcoat: 1,
         clearcoatRoughness: 0.22,
+        transparent: true,
+        opacity: 1,
         depthTest: false,
+        depthWrite: false,
       })
     ),
     "root",
