@@ -797,6 +797,7 @@ function addRoot(root) {
         metalness: 0.08,
         clearcoat: 1,
         clearcoatRoughness: 0.22,
+        depthTest: false,
       })
     ),
     "root",
@@ -804,6 +805,7 @@ function addRoot(root) {
     root
   );
   mesh.position.copy(position);
+  mesh.renderOrder = 2;
   addLabel(
     root.signature,
     position.clone().add(new THREE.Vector3(0, 0.66, 0)),
