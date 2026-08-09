@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
+import { MODEL_COLORS as COLORS, MODEL_PALETTE } from "./palette.mjs";
 import {
   computeClusterLayout,
   fittedOverviewPose,
@@ -38,16 +39,6 @@ import {
   drawConstellationCard,
   drawHumanCard,
 } from "./share.mjs";
-
-const COLORS = {
-  points: 0x4ef0c3,
-  lines: 0xffc45e,
-  faces: 0xff64d6,
-  volumes: 0x7798ff,
-  root: 0xff6b8a,
-  context: 0xa5a0b5,
-  hierarchy: 0x6e6688,
-};
 
 const canvasHost = document.getElementById("canvas");
 const viewerEl = document.getElementById("viewer");
@@ -98,7 +89,7 @@ const layerCountEls = Object.fromEntries(
 );
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.FogExp2(0x070610, 0.026);
+scene.fog = new THREE.FogExp2(COLORS.canvas, 0.026);
 
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
 // No `preserveDrawingBuffer`: it makes the browser copy the whole framebuffer
@@ -116,7 +107,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.18;
+renderer.toneMappingExposure = 1.04;
 renderer.domElement.setAttribute("aria-hidden", "true");
 canvasHost.appendChild(renderer.domElement);
 
@@ -141,14 +132,14 @@ controls.dampingFactor = 0.07;
 controls.zoomToCursor = true;
 controls.target.set(0, 2.2, 0);
 
-scene.add(new THREE.HemisphereLight(0xdad6ff, 0x080710, 2.25));
-const keyLight = new THREE.DirectionalLight(0xffeafa, 2.65);
+scene.add(new THREE.HemisphereLight(COLORS.text, COLORS.canvas, 2.05));
+const keyLight = new THREE.DirectionalLight(COLORS.text, 2.35);
 keyLight.position.set(5, 11, 8);
 scene.add(keyLight);
-const cyanLight = new THREE.PointLight(COLORS.points, 12, 22, 2);
-cyanLight.position.set(-5, -1, 3);
-scene.add(cyanLight);
-const violetLight = new THREE.PointLight(COLORS.volumes, 13, 24, 2);
+const pointLight = new THREE.PointLight(COLORS.points, 7, 22, 2);
+pointLight.position.set(-5, -1, 3);
+scene.add(pointLight);
+const violetLight = new THREE.PointLight(COLORS.volumes, 8, 24, 2);
 violetLight.position.set(5, 4, -4);
 scene.add(violetLight);
 
@@ -272,7 +263,7 @@ function addAtmosphere() {
   const stars = new THREE.Points(
     geometry,
     new THREE.PointsMaterial({
-      color: 0xc9c2ff,
+      color: COLORS.focus,
       size: 0.035,
       transparent: true,
       opacity: 0.38,
@@ -604,19 +595,19 @@ function addPoint(point, position, baseRadius, showLabel, promoted) {
   const material = new THREE.MeshStandardMaterial({
     color: COLORS.points,
     emissive: COLORS.points,
-    emissiveIntensity: active ? (promoted ? 0.72 : 0.34) : 0.12,
+    emissiveIntensity: active ? (promoted ? 0.44 : 0.2) : 0.06,
     transparent: true,
-    opacity: active ? (promoted ? 1 : 0.72) : (promoted ? 0.42 : 0.22),
+    opacity: active ? (promoted ? 0.9 : 0.58) : (promoted ? 0.3 : 0.16),
     roughness: 0.26,
   });
   const mesh = registerPickable(new THREE.Mesh(geometry, material), "points", "point", point);
   mesh.position.copy(position);
-  if (active && promoted && hash(`${point.id}:glow`) < 0.08) {
+  if (active && promoted && hash(`${point.id}:glow`) < 0.05) {
     addGlow(
       position,
       COLORS.points,
       radius * 5.4,
-      0.2,
+      0.1,
       "points",
       0.08,
       [selectionKey("point", point.id)],
@@ -690,14 +681,14 @@ function addFace(face, showLabel) {
   const memberIds = currentLayout?.facePointIds.get(face.id) || [];
   const memberPositions = memberIds.map((id) => positions.get(id)).filter(Boolean);
   addClusterHalo(memberPositions, position, [faceKey]);
-  addGlow(position, COLORS.faces, 1.55, 0.22, "faces", 0.07, [faceKey]);
+  addGlow(position, COLORS.faces, 1.55, 0.16, "faces", 0.07, [faceKey]);
   const node = registerPickable(
     new THREE.Mesh(
       new THREE.OctahedronGeometry(0.28, 0),
       new THREE.MeshStandardMaterial({
         color: COLORS.faces,
         emissive: COLORS.faces,
-        emissiveIntensity: 0.58,
+        emissiveIntensity: 0.42,
         roughness: 0.26,
       })
     ),
@@ -736,14 +727,14 @@ function addVolume(volume, showLabel) {
   const position = positions.get(volume.id);
   if (!position) return;
   const volumeKey = selectionKey("volume", volume.id);
-  addGlow(position, COLORS.volumes, 2.35, 0.25, "volumes", 0.06, [volumeKey]);
+  addGlow(position, COLORS.volumes, 2.35, 0.18, "volumes", 0.06, [volumeKey]);
   const mesh = registerPickable(
     new THREE.Mesh(
       new THREE.IcosahedronGeometry(0.48, 1),
       new THREE.MeshStandardMaterial({
         color: COLORS.volumes,
         emissive: COLORS.volumes,
-        emissiveIntensity: 0.42,
+        emissiveIntensity: 0.32,
         transparent: true,
         opacity: 0.72,
         wireframe: true,
@@ -794,18 +785,22 @@ function addRoot(root) {
   const position = positions.get(root.id);
   if (!position) return;
   const rootKey = selectionKey("root", root.id);
-  addGlow(position, COLORS.root, 4.2, 0.42, "root", 0.075, [rootKey]);
+  addGlow(position, COLORS.root, 4.2, 0.38, "root", 0.075, [rootKey]);
   const mesh = registerPickable(
     new THREE.Mesh(
       new THREE.DodecahedronGeometry(0.62, 0),
       new THREE.MeshPhysicalMaterial({
         color: COLORS.root,
         emissive: COLORS.root,
-        emissiveIntensity: 0.72,
+        emissiveIntensity: 0.68,
         roughness: 0.18,
         metalness: 0.08,
         clearcoat: 1,
         clearcoatRoughness: 0.22,
+        transparent: true,
+        opacity: 1,
+        depthTest: false,
+        depthWrite: false,
       })
     ),
     "root",
@@ -813,6 +808,7 @@ function addRoot(root) {
     root
   );
   mesh.position.copy(position);
+  mesh.renderOrder = 2;
   addLabel(
     root.signature,
     position.clone().add(new THREE.Vector3(0, 0.66, 0)),
@@ -847,11 +843,13 @@ function addModelLine(line) {
   const sourceCluster = currentLayout?.pointClusterById.get(line.source);
   const targetCluster = currentLayout?.pointClusterById.get(line.target);
   const sameCluster = sourceCluster && sourceCluster === targetCluster;
-  const opacity = evolution ? (sameCluster ? 0.5 : 0.16) : 0.46;
+  // Transparent strokes keep a large model calm, but each semantic relation
+  // still needs to survive compositing against the deep-space canvas.
+  const opacity = evolution ? (sameCluster ? 0.5 : 0.2) : 0.36;
   const lineObject = addLine(
     start,
     end,
-    evolution ? COLORS.lines : 0x6ebf8e,
+    evolution ? COLORS.lines : COLORS.relation,
     opacity,
     !evolution,
   );
@@ -878,13 +876,13 @@ function addGround() {
   [0.34, 0.58, 0.84, 1.08].forEach((factor, index) => {
     addOrbitRing(
       radius * factor,
-      index % 2 ? COLORS.volumes : COLORS.faces,
-      Math.max(0.025, 0.075 - index * 0.012),
+      COLORS.hierarchy,
+      Math.max(0.014, 0.038 - index * 0.007),
       [0.12 + index * 0.035, index * 0.18, 0.05 - index * 0.02],
       ringLayer
     );
   });
-  addOrbitRing(radius * 0.72, COLORS.root, 0.055, [Math.PI / 2.8, 0.42, 0.18], ringLayer);
+  addOrbitRing(radius * 0.72, COLORS.focus, 0.03, [Math.PI / 2.8, 0.42, 0.18], ringLayer);
 }
 
 function buildScene({
@@ -1460,11 +1458,11 @@ function paintConstellationHandoff(popup) {
   if (!popup) return;
   popup.document.title = "Preparing your Persome constellation";
   popup.document.body.innerHTML = `
-    <main style="min-height:100vh;display:grid;place-items:center;margin:0;background:#070610;color:#f7f4ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-      <section style="width:min(440px,calc(100vw - 48px));padding:38px;border:1px solid rgba(255,255,255,.12);border-radius:24px;background:linear-gradient(145deg,rgba(255,100,214,.11),rgba(119,152,255,.08));box-shadow:0 30px 100px rgba(0,0,0,.45)">
-        <p style="margin:0 0 18px;color:#ff83cf;font-size:11px;font-weight:750;letter-spacing:.16em">PERSOME · SHARE TO X</p>
+    <main style="min-height:100vh;display:grid;place-items:center;margin:0;background:${MODEL_PALETTE.canvas};color:${MODEL_PALETTE.text};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+      <section style="width:min(440px,calc(100vw - 48px));padding:38px;border:1px solid rgba(218,218,218,.14);border-radius:24px;background:${MODEL_PALETTE.surface};box-shadow:0 30px 100px rgba(0,0,0,.45)">
+        <p style="margin:0 0 18px;color:${MODEL_PALETTE.focus};font-size:11px;font-weight:750;letter-spacing:.16em">PERSOME · SHARE TO X</p>
         <h1 style="margin:0;font-size:34px;line-height:1.05;letter-spacing:-.045em">Your constellation is downloading.</h1>
-        <p style="margin:18px 0 0;color:#b8b1c7;font-size:15px;line-height:1.65">In X, add <strong style="color:#fff">${CONSTELLATION_FILE_NAME}</strong> with the image button. Review the image before posting.</p>
+        <p style="margin:18px 0 0;color:${MODEL_PALETTE.muted};font-size:15px;line-height:1.65">In X, add <strong style="color:${MODEL_PALETTE.text}">${CONSTELLATION_FILE_NAME}</strong> with the image button. Review the image before posting.</p>
       </section>
     </main>`;
 }
@@ -1574,7 +1572,9 @@ function syncSelectionState() {
         target.element.setAttribute("aria-expanded", String(active));
       } else if (target.isLine && target.material) {
         const baseOpacity = Number(target.userData.baseOpacity || 0);
+        target.userData.baseColor ??= target.material.color.getHex();
         if (active) target.material.opacity = Math.min(1, baseOpacity * 2 + 0.24);
+        target.material.color.setHex(active ? COLORS.focus : target.userData.baseColor);
         target.renderOrder = active ? 5 : 0;
       } else if (target.isMesh) {
         target.userData.selectionBaseScale ||= target.scale.clone();

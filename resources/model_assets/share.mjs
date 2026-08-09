@@ -1,3 +1,5 @@
+import { MODEL_PALETTE, colorWithAlpha } from "./palette.mjs";
+
 export const HUMAN_CARD_WIDTH = 1080;
 export const HUMAN_CARD_HEIGHT = 1350;
 export const HUMAN_CARD_FILE_NAME = "my-human-card.png";
@@ -223,18 +225,18 @@ function drawCover(context, source, width, height) {
 
 function drawBrandMark(context, x, y) {
   context.save();
-  context.strokeStyle = "rgba(255, 255, 255, 0.22)";
+  context.strokeStyle = colorWithAlpha(MODEL_PALETTE.text, 0.22);
   context.lineWidth = 1;
   context.beginPath();
   context.arc(x, y, 18, 0, Math.PI * 2);
   context.stroke();
 
   const nodes = [
-    [0, -6, "#ff6b8a"],
-    [-6, 5, "#ff64d6"],
-    [7, 5, "#7798ff"],
+    [0, -6, MODEL_PALETTE.root],
+    [-6, 5, MODEL_PALETTE.face],
+    [7, 5, MODEL_PALETTE.volume],
   ];
-  context.strokeStyle = "rgba(255, 255, 255, 0.19)";
+  context.strokeStyle = colorWithAlpha(MODEL_PALETTE.text, 0.19);
   context.beginPath();
   context.moveTo(x, y - 6);
   context.lineTo(x - 6, y + 5);
@@ -258,13 +260,13 @@ export function drawConstellationCard(context, source, model = {}) {
   const narrative = shareNarrative(model);
 
   context.save();
-  context.fillStyle = "#070610";
+  context.fillStyle = MODEL_PALETTE.canvas;
   context.fillRect(0, 0, width, height);
 
   const aura = context.createRadialGradient(760, 300, 20, 760, 300, 610);
-  aura.addColorStop(0, "rgba(105, 92, 210, 0.24)");
-  aura.addColorStop(0.46, "rgba(49, 35, 91, 0.13)");
-  aura.addColorStop(1, "rgba(7, 6, 16, 0)");
+  aura.addColorStop(0, colorWithAlpha(MODEL_PALETTE.focus, 0.14));
+  aura.addColorStop(0.46, colorWithAlpha(MODEL_PALETTE.volume, 0.06));
+  aura.addColorStop(1, colorWithAlpha(MODEL_PALETTE.canvas, 0));
   context.fillStyle = aura;
   context.fillRect(0, 0, width, height);
 
@@ -274,44 +276,44 @@ export function drawConstellationCard(context, source, model = {}) {
   context.restore();
 
   const textScrim = context.createLinearGradient(0, 0, 680, 0);
-  textScrim.addColorStop(0, "rgba(7, 6, 16, 0.96)");
-  textScrim.addColorStop(0.56, "rgba(7, 6, 16, 0.46)");
-  textScrim.addColorStop(1, "rgba(7, 6, 16, 0)");
+  textScrim.addColorStop(0, colorWithAlpha(MODEL_PALETTE.canvas, 0.96));
+  textScrim.addColorStop(0.56, colorWithAlpha(MODEL_PALETTE.canvas, 0.52));
+  textScrim.addColorStop(1, colorWithAlpha(MODEL_PALETTE.canvas, 0));
   context.fillStyle = textScrim;
   context.fillRect(0, 0, 760, height);
 
   const edge = context.createLinearGradient(0, height - 170, 0, height);
-  edge.addColorStop(0, "rgba(7, 6, 16, 0)");
-  edge.addColorStop(1, "rgba(7, 6, 16, 0.88)");
+  edge.addColorStop(0, colorWithAlpha(MODEL_PALETTE.canvas, 0));
+  edge.addColorStop(1, colorWithAlpha(MODEL_PALETTE.canvas, 0.88));
   context.fillStyle = edge;
   context.fillRect(0, height - 170, width, 170);
 
   drawBrandMark(context, 72, 66);
   context.shadowBlur = 0;
-  context.fillStyle = "rgba(248, 246, 255, 0.96)";
+  context.fillStyle = colorWithAlpha(MODEL_PALETTE.text, 0.96);
   context.font = "700 22px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   context.fillText("Persome", 105, 62);
-  context.fillStyle = "rgba(164, 158, 181, 0.9)";
+  context.fillStyle = colorWithAlpha(MODEL_PALETTE.muted, 0.9);
   context.font = "700 10px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   context.fillText("PERSONAL MODEL", 105, 80);
 
-  context.fillStyle = "rgba(195, 188, 210, 0.86)";
+  context.fillStyle = colorWithAlpha(MODEL_PALETTE.muted, 0.86);
   context.font = "700 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   context.fillText("A LIVING MAP OF WHAT YOU NOTICE, REPEAT, AND BECOME", 54, 286);
 
   const headline = context.createLinearGradient(54, 310, 430, 430);
-  headline.addColorStop(0, "#fff8fc");
-  headline.addColorStop(0.52, "#ff85cf");
-  headline.addColorStop(1, "#8ea4ff");
+  headline.addColorStop(0, MODEL_PALETTE.text);
+  headline.addColorStop(0.52, MODEL_PALETTE.focus);
+  headline.addColorStop(1, MODEL_PALETTE.volume);
   context.fillStyle = headline;
   context.font = "650 52px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   context.fillText("My personal", 52, 349);
   context.fillText("constellation.", 52, 403);
 
-  context.fillStyle = "rgba(255, 100, 214, 0.9)";
+  context.fillStyle = colorWithAlpha(MODEL_PALETTE.focus, 0.9);
   context.font = "750 9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   context.fillText("CURRENT MODEL", 55, 442);
-  context.fillStyle = "rgba(229, 224, 238, 0.88)";
+  context.fillStyle = colorWithAlpha(MODEL_PALETTE.text, 0.88);
   context.font = "500 14px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   drawWrappedText(context, narrative.root, 54, 466, 430, 20, 3);
 
@@ -320,23 +322,25 @@ export function drawConstellationCard(context, source, model = {}) {
     const panelY = 468;
     const panelWidth = 404;
     const panelHeight = 132;
-    context.fillStyle = "rgba(9, 8, 18, 0.78)";
-    context.strokeStyle = "rgba(255, 255, 255, 0.12)";
+    context.fillStyle = colorWithAlpha(MODEL_PALETTE.surface, 0.86);
+    context.strokeStyle = colorWithAlpha(MODEL_PALETTE.text, 0.12);
     context.lineWidth = 1;
     context.beginPath();
     context.roundRect(panelX, panelY, panelWidth, panelHeight, 16);
     context.fill();
     context.stroke();
-    context.fillStyle = "rgba(162, 154, 181, 0.9)";
+    context.fillStyle = colorWithAlpha(MODEL_PALETTE.muted, 0.9);
     context.font = "750 9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     context.fillText("KEY PATTERNS", panelX + 18, panelY + 24);
     narrative.highlights.forEach((highlight, index) => {
       const rowY = panelY + 49 + index * 25;
-      context.fillStyle = highlight.kind === "VOLUME" ? "#7798ff" : "#ff64d6";
+      context.fillStyle = highlight.kind === "VOLUME"
+        ? MODEL_PALETTE.volume
+        : MODEL_PALETTE.face;
       context.beginPath();
       context.arc(panelX + 20, rowY - 4, 3, 0, Math.PI * 2);
       context.fill();
-      context.fillStyle = "rgba(226, 221, 237, 0.9)";
+      context.fillStyle = colorWithAlpha(MODEL_PALETTE.text, 0.9);
       context.font = "550 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
       const line = wrappedLines(context, highlight.text, panelWidth - 52, 1)[0] || "";
       context.fillText(line, panelX + 32, rowY);
@@ -345,16 +349,16 @@ export function drawConstellationCard(context, source, model = {}) {
 
   let statX = 56;
   shareStats(model).forEach(([label, value]) => {
-    context.fillStyle = "rgba(248, 246, 255, 0.94)";
+    context.fillStyle = colorWithAlpha(MODEL_PALETTE.text, 0.94);
     context.font = "650 18px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     context.fillText(String(value), statX, 566);
-    context.fillStyle = "rgba(137, 130, 153, 0.92)";
+    context.fillStyle = colorWithAlpha(MODEL_PALETTE.dim, 0.92);
     context.font = "700 9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     context.fillText(label, statX, 583);
     statX += label === "VOLUMES" ? 92 : 78;
   });
 
-  context.fillStyle = "rgba(152, 145, 171, 0.9)";
+  context.fillStyle = colorWithAlpha(MODEL_PALETTE.dim, 0.9);
   context.font = "650 10px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   context.fillText("GENERATED LOCALLY · SHARED BY YOU", 54, 628);
   context.textAlign = "right";
