@@ -65,8 +65,11 @@ refuses to replace an unmarked file at that path.
 `start` holds `<PERSOME_ROOT>/.daemon.lock` from preflight through the entire
 foreground or background daemon lifetime. Background start transfers that held
 lock into a fresh `posix_spawn`/exec process instead of running Runtime code in a
-fork-cloned Python/SQLite process. This prevents two concurrent starters from
-both passing the PID check. The daemon writes a numeric `.pid` for
+fork-cloned Python/SQLite process. The child also uses Python's safe-path mode
+and ignores caller-provided Python package/home/virtualenv overrides, so a
+checkout in the caller's working directory cannot shadow the installed Runtime
+while it operates on the configured data root. This prevents two concurrent
+starters from both passing the PID check. The daemon writes a numeric `.pid` for
 one-release compatibility plus an owner-only `.runtime-state.json` containing
 its random generation, start/update times, readiness phase, effective capture
 and OCR policy, native permission probes, and the last capture/privacy receipt.

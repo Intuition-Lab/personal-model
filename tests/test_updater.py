@@ -455,6 +455,8 @@ def test_cli_update_runs_download_stop_install_and_restore(
     assert "preserved" in result.output
     assert "Restart every editor/client connected to Persome" in result.output
     assert "previous release" in result.output
+    assert "Reopen any /model tab from before the update" in result.output
+    assert "persome model open" in result.output
     assert "Checking for an interrupted update" in result.output
     assert "Downloading the latest official main revision" in result.output
 

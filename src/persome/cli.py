@@ -135,6 +135,19 @@ def _spawn_background_runtime(daemon_lock, *, capture_only: bool) -> int:  # typ
     child_lock_fd = 4 if parent_lock_fd == 3 else 3
     command = _background_daemon_command(capture_only=capture_only)
     env = dict(os.environ)
+    # ``python -m`` normally prepends the caller's working directory to
+    # ``sys.path``. An update started from another checkout could therefore
+    # restart into that checkout's package while still using the real data
+    # root. Keep the fresh interpreter bound to its installed Runtime.
+    env["PYTHONSAFEPATH"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+    for variable in (
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "__PYVENV_LAUNCHER__",
+    ):
+        env.pop(variable, None)
     # Unlike ``start --foreground`` owned by the Desktop app, plain background
     # start has always outlived its launching shell/app. Do not let the fresh
     # exec accidentally opt into the foreground parent-death watcher.
@@ -1390,6 +1403,11 @@ def update(
         "[yellow]Restart every editor/client connected to Persome before resuming writes.[/yellow] "
         "A stdio MCP process loaded from the previous release cannot join the new SQLite "
         "maintenance gate until it reconnects."
+    )
+    console.print(
+        "[yellow]Reopen any /model tab from before the update with "
+        "[bold]persome model open[/bold].[/yellow] The open page still belongs to the "
+        "previous Runtime."
     )
 
 
