@@ -178,6 +178,8 @@ def test_installer_uses_update_mode_without_shell_interpolation(
     source = updater.UpdateSource(_source_tree(tmp_path / "source"), "c" * 40, False)
     seen: dict[str, object] = {}
     monkeypatch.setenv("SSL_CERT_FILE", str(paths.root() / "venv" / "cert.pem"))
+    monkeypatch.setenv("PYTHONEXECUTABLE", "/tmp/foreign-python")
+    monkeypatch.setenv("PYTHONPLATLIBDIR", "/tmp/foreign-lib")
 
     class Process:
         def __init__(self, command: list[str], **kwargs: object) -> None:
@@ -201,7 +203,9 @@ def test_installer_uses_update_mode_without_shell_interpolation(
     assert env["PERSOME_ROOT"] == str(paths.root())
     assert env["PERSOME_INSTALL_HOME"] == str(paths.root())
     assert "SSL_CERT_FILE" not in env
+    assert "PYTHONEXECUTABLE" not in env
     assert "PYTHONPATH" not in env
+    assert "PYTHONPLATLIBDIR" not in env
     assert env["PERSOME_UPDATE_DEFER_COMMIT"] == "1"
     assert env["PERSOME_UPDATE_REPLACEMENT"] == str(paths.root() / "venv.replacement.update")
     assert env["PERSOME_UPDATE_TRANSACTION_ID"] == transaction_id
@@ -455,6 +459,8 @@ def test_cli_update_runs_download_stop_install_and_restore(
     assert "preserved" in result.output
     assert "Restart every editor/client connected to Persome" in result.output
     assert "previous release" in result.output
+    assert "Reopen any /model tab from before the update" in result.output
+    assert "persome model open" in result.output
     assert "Checking for an interrupted update" in result.output
     assert "Downloading the latest official main revision" in result.output
 
