@@ -177,9 +177,12 @@ def test_background_spawn_execs_fresh_interpreter_and_transfers_lock(
         return 4242
 
     monkeypatch.delattr(cli.sys, "frozen", raising=False)
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     monkeypatch.setenv("PERSOME_PARENT_PID", "1234")
+    monkeypatch.setenv("PYTHONEXECUTABLE", "/tmp/foreign-python")
     monkeypatch.setenv("PYTHONHOME", "/tmp/foreign-python")
     monkeypatch.setenv("PYTHONPATH", "/tmp/foreign-package")
+    monkeypatch.setenv("PYTHONPLATLIBDIR", "/tmp/foreign-lib")
     monkeypatch.setenv("VIRTUAL_ENV", "/tmp/foreign-venv")
     monkeypatch.setenv("__PYVENV_LAUNCHER__", "/tmp/foreign-python")
     monkeypatch.setattr(cli.os, "posix_spawn", fake_posix_spawn)
@@ -199,9 +202,11 @@ def test_background_spawn_execs_fresh_interpreter_and_transfers_lock(
     assert seen["env"][cli._BACKGROUND_DAEMON_LOCK_FD_ENV] == "3"
     assert "PERSOME_PARENT_PID" not in seen["env"]
     assert seen["env"]["PYTHONSAFEPATH"] == "1"
-    assert seen["env"]["PYTHONNOUSERSITE"] == "1"
+    assert "PYTHONNOUSERSITE" not in seen["env"]
+    assert "PYTHONEXECUTABLE" not in seen["env"]
     assert "PYTHONHOME" not in seen["env"]
     assert "PYTHONPATH" not in seen["env"]
+    assert "PYTHONPLATLIBDIR" not in seen["env"]
     assert "VIRTUAL_ENV" not in seen["env"]
     assert "__PYVENV_LAUNCHER__" not in seen["env"]
     assert seen["file_actions"] == [

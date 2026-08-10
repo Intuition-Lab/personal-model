@@ -140,10 +140,11 @@ def _spawn_background_runtime(daemon_lock, *, capture_only: bool) -> int:  # typ
     # restart into that checkout's package while still using the real data
     # root. Keep the fresh interpreter bound to its installed Runtime.
     env["PYTHONSAFEPATH"] = "1"
-    env["PYTHONNOUSERSITE"] = "1"
     for variable in (
+        "PYTHONEXECUTABLE",
         "PYTHONHOME",
         "PYTHONPATH",
+        "PYTHONPLATLIBDIR",
         "VIRTUAL_ENV",
         "__PYVENV_LAUNCHER__",
     ):
@@ -1406,8 +1407,8 @@ def update(
     )
     console.print(
         "[yellow]Reopen any /model tab from before the update with "
-        "[bold]persome model open[/bold].[/yellow] The open page still belongs to the "
-        "previous Runtime."
+        "[bold]persome model open[/bold].[/yellow] The open tab keeps assets loaded from "
+        "the previous release."
     )
 
 
