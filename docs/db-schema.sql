@@ -189,6 +189,18 @@ CREATE TRIGGER captures_au AFTER UPDATE ON captures BEGIN
     VALUES (new.rowid, new.app_name, new.window_title, new.focused_value, new.visible_text, new.url);
 END;
 
+-- ---- store/capture_content_receipts.py ----
+
+CREATE TABLE capture_content_receipts (
+        sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+        fingerprint  TEXT NOT NULL,
+        capture_id   TEXT NOT NULL,
+        committed_at TEXT NOT NULL
+    );
+
+CREATE INDEX ix_capture_content_receipts_fingerprint
+        ON capture_content_receipts(fingerprint, sequence);
+
 -- ---- store/relation_edges.py ----
 
 CREATE TABLE relation_edge_effects (

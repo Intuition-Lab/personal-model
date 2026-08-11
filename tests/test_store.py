@@ -768,7 +768,7 @@ def test_runtime_owner_upgrades_previous_schema_revision(ac_root: Path) -> None:
     with fts.cursor() as conn:
         conn.execute(
             "UPDATE runtime_metadata SET value=? WHERE key='schema_revision'",
-            ("2026-08-11.2",),
+            ("2026-08-11.3",),
         )
 
     assert fts.initialize_runtime_schema() == fts._RUNTIME_SCHEMA_REVISION  # noqa: SLF001
@@ -777,6 +777,25 @@ def test_runtime_owner_upgrades_previous_schema_revision(ac_root: Path) -> None:
             "SELECT value FROM runtime_metadata WHERE key='schema_revision'"
         ).fetchone()[0]
     assert revision == fts._RUNTIME_SCHEMA_REVISION  # noqa: SLF001
+
+
+def test_runtime_schema_revision_four_installs_capture_content_receipts(
+    ac_root: Path,
+) -> None:
+    assert fts._RUNTIME_SCHEMA_REVISION == "2026-08-11.4"  # noqa: SLF001
+
+    assert fts.initialize_runtime_schema() == "2026-08-11.4"
+
+    with fts.cursor() as conn:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ("capture_content_receipts",),
+        ).fetchone()
+        revision = conn.execute(
+            "SELECT value FROM runtime_metadata WHERE key='schema_revision'"
+        ).fetchone()[0]
+    assert table is not None
+    assert revision == "2026-08-11.4"
 
 
 def test_runtime_owner_refuses_future_schema_revision_without_republishing(

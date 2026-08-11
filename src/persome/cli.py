@@ -39,8 +39,8 @@ from . import env_file as env_file_mod
 from . import logger as logger_mod
 from .capture.timestamps import newest_capture_path, parse_capture_timestamp
 from .providers import ProviderSpec
+from .store import capture_content_receipts, fts, index_md
 from .store import entries as entries_mod
-from .store import fts, index_md
 
 app = typer.Typer(
     add_completion=False,
@@ -4061,6 +4061,11 @@ def rebuild_captures_index(
         # Runtime that starts after this point blocks on the exclusive gate.
         _require_stopped_for_capture_rebuild()
         with fts.cursor() as conn:
+            # This recovery command must also work before a newly upgraded daemon
+            # has published the complete .4 schema. Establish the additive table
+            # before the explicit replacement transaction; the receipt reset below
+            # then rolls back with the capture replacement.
+            capture_content_receipts.ensure_schema(conn)
             # One explicit transaction prevents each capture upsert from becoming
             # its own FTS5 commit. On a large retained buffer, per-row autocommit
             # can amplify a small index into a multi-gigabyte WAL and WAL-index,
@@ -4103,6 +4108,11 @@ def rebuild_captures_index(
                     if merge
                     else {}
                 )
+                # A rebuild cannot recover commit order for a bounded admission
+                # receipt. Snapshot receipts are especially stale relative to
+                # surviving buffer JSON applied by --merge, so both modes discard
+                # them and allow one fail-open capture after Runtime restarts.
+                conn.execute("DELETE FROM capture_content_receipts")
                 # Exact rebuild is reconciliation, not just an upsert pass. Recovery
                 # merge intentionally preserves older snapshot rows whose source JSON
                 # has already aged out of the bounded capture buffer.
@@ -4255,7 +4265,7 @@ def _private_atomic_crash_artifacts(*targets: Path) -> tuple[Path, ...]:
 
 
 def _clean_captures() -> tuple[int, int]:
-    """Delete capture state as one operation relative to stdio DB clients."""
+    """Delete capture files, projections, and dedup receipts under one gate."""
     with fts.exclusive_database_maintenance():
         return _clean_captures_locked()
 
@@ -4264,12 +4274,15 @@ def _clean_captures_locked() -> tuple[int, int]:
     from .evomem import backup as evo_backup
 
     # Recovery copies are part of the deletion boundary too.
-    evo_backup.scrub_snapshots(("captures",))
-    evo_backup.scrub_database_copies(("captures",), _quarantined_index_db_mains())
+    capture_tables = ("capture_content_receipts", "captures")
+    evo_backup.scrub_snapshots(capture_tables)
+    evo_backup.scrub_database_copies(capture_tables, _quarantined_index_db_mains())
     _remove_quarantined_index_sidecars()
     buf = paths.capture_buffer_dir()
     with fts.cursor() as conn:
+        capture_content_receipts.ensure_schema(conn)
         rows = int(conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
+        conn.execute("DELETE FROM capture_content_receipts")
         conn.execute("DELETE FROM captures")
         fts.purge_deleted_content(conn)
     files = 0
@@ -4403,18 +4416,22 @@ def _clean_memory_locked() -> tuple[int, int, int, int]:
 def clean_captures(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
 ) -> None:
-    """Delete all files in the capture buffer."""
+    """Delete capture files, indexed rows, and content-dedup receipts."""
     _require_stopped_for_clean()
     _init()
     buf = paths.capture_buffer_dir()
     count = sum(1 for p in buf.iterdir() if p.suffix == ".json") if buf.exists() else 0
-    console.print(f"About to delete {count} capture file(s) under {buf}")
+    console.print(
+        f"About to delete {count} capture file(s) under {buf}, plus indexed capture "
+        "and content-dedup receipt state."
+    )
     if not _confirm("Proceed?", yes):
         console.print("[yellow]Aborted.[/yellow]")
         raise typer.Exit(1)
     files, rows = _clean_captures()
     console.print(
-        f"[green]Deleted {files} capture file(s) and {rows} indexed capture row(s).[/green]"
+        f"[green]Deleted {files} capture file(s), {rows} indexed capture row(s), "
+        "and all capture content-dedup receipts.[/green]"
     )
 
 

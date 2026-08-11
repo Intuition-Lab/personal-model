@@ -38,10 +38,8 @@ class CaptureConfig:
     heartbeat_minutes: int = 10  # periodic capture even without events
     debounce_seconds: float = 3.0  # for AXValueChanged bursts
     min_capture_gap_seconds: float = 2.0  # between consecutive captures
-    dedup_interval_seconds: float = 1.0  # per-event-type dedup window
-    same_window_dedup_seconds: float = (
-        5.0  # skip repeat non-focus capture in same window within this window
-    )
+    dedup_interval_seconds: float = 1.0  # per-event-family + surface dedup window
+    same_window_dedup_seconds: float = 5.0  # same-surface event gate + recent A-B-A content horizon
     # Legacy timer knob (kept for back-compat; also treated as a floor on heartbeat)
     interval_minutes: int = 10
     # Tiered buffer retention:
@@ -667,8 +665,8 @@ event_driven = true           # capture on window/app/typing events via mac-ax-w
 heartbeat_minutes = 10        # periodic capture even when nothing happens
 debounce_seconds = 3.0        # for AXValueChanged bursts
 min_capture_gap_seconds = 2.0 # minimum gap between consecutive captures
-dedup_interval_seconds = 1.0  # per-event-type dedup window
-same_window_dedup_seconds = 5.0  # don't re-capture the same bundle+window unless 5s have passed (or it's a focus change)
+dedup_interval_seconds = 1.0  # per-event-family + surface dedup window
+same_window_dedup_seconds = 5.0  # same-surface event gate + recent A-B-A content horizon
 buffer_retention_hours = 168           # 7 days; stale absorbed captures past this are deleted
 screenshot_retention_hours = 24        # after 24h, strip screenshot (77% of bytes) but keep AX+text
 screenshot_thumbnail_hours = 0         # Downsample older screenshots to <=480px thumbnails; 0 disables

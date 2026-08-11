@@ -19,6 +19,11 @@ capture evidence
 
 - Secure or paused capture follows the existing privacy boundary. Gator never restores content
   removed there.
+- Successful writes through the live capture runner publish a bounded content-fingerprint receipt.
+  The latest committed head survives daemon restart while its backing raw capture exists, window
+  title remains part of exact context identity, and the receipt is never used as a substitute for
+  the explicit identity of a mobile event. Raw retention removes the matching receipt; direct
+  maintenance/one-shot writes deliberately fail open instead of minting one.
 - Timeline requires sanitized content signal before calling its LLM. Metadata-only windows are
   recorded but are not model evidence.
 - Timeline fallback and explicit-empty outcomes carry a durable `normalization_status`; downstream
@@ -78,8 +83,8 @@ the next promotion hardening slice.
 ## Next hardening slices
 
 1. Per-entry source receipts and evidence-span validation before normalized claims can promote.
-2. Durable S0/source event receipts and bounded content deduplication across watcher restart, plus
-   explicit trigger-to-capture alignment under queue pressure.
+2. Durable source-event receipts and trigger-to-captured-content snapshot alignment when queueing
+   delays observation.
 3. An owner-visible dirty-data repair workflow for legacy open-Line collision reports.
 4. Candidate/receipt diagnostics in owner-facing model health surfaces without exposing raw capture
    content.

@@ -91,6 +91,7 @@ def _index_db_steps() -> list[tuple[str, Callable[[sqlite3.Connection], None]]]:
     from ..evomem import integrity as evo_integrity
     from ..evomem import store as evo_store
     from . import (
+        capture_content_receipts,
         contradictions,
         event_occurrences,
         health_events,
@@ -105,6 +106,7 @@ def _index_db_steps() -> list[tuple[str, Callable[[sqlite3.Connection], None]]]:
     )
 
     return [
+        ("store/capture_content_receipts.py", capture_content_receipts.ensure_schema),
         ("store/relation_edges.py", relation_edges.ensure_schema),
         ("store/event_occurrences.py", event_occurrences.ensure_schema),
         ("store/memory_delta_items.py", memory_delta_items.ensure_schema),
