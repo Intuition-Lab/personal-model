@@ -33,6 +33,7 @@ CLAIM_EXTRACTING = "extracting"
 CLAIM_FAILED = "failed"
 CLAIM_PERSISTED = "persisted"
 DEFAULT_CLAIM_LEASE_SECONDS = 15 * 60
+ITEM_LEDGER_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS memory_deltas (
     apply_status TEXT NOT NULL DEFAULT 'unknown',
     window_start TEXT NOT NULL DEFAULT '',
     window_end TEXT NOT NULL DEFAULT '',
-    is_final INTEGER NOT NULL DEFAULT 1
+    is_final INTEGER NOT NULL DEFAULT 1,
+    item_ledger_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memory_deltas_session ON memory_deltas(session_id);
 CREATE INDEX IF NOT EXISTS idx_memory_deltas_created ON memory_deltas(created_at DESC);
@@ -141,6 +143,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE memory_deltas ADD COLUMN window_end TEXT NOT NULL DEFAULT ''")
     if "is_final" not in columns:
         conn.execute("ALTER TABLE memory_deltas ADD COLUMN is_final INTEGER NOT NULL DEFAULT 1")
+    if "item_ledger_version" not in columns:
+        # Pre-ledger rows may already have committed a subset of their effects.
+        # Keep them explicitly unversioned so recovery can fail closed instead
+        # of inventing exactly-once receipts after the fact.
+        conn.execute(
+            "ALTER TABLE memory_deltas ADD COLUMN item_ledger_version INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def insert(
@@ -388,6 +397,16 @@ def insert_for_claim(
             window_start=window_start,
             window_end=window_end,
             is_final=is_final,
+        )
+        # Seed the immutable item ledger inside the same transaction as the
+        # parent payload. A malformed/divergent item set rolls both back, so a
+        # persisted delta is never published without its retry definition.
+        from . import memory_delta_items
+
+        memory_delta_items.seed(conn, delta_id=delta_id, payload=payload)
+        conn.execute(
+            "UPDATE memory_deltas SET item_ledger_version=? WHERE id=?",
+            (ITEM_LEDGER_VERSION, delta_id),
         )
         bound = conn.execute(
             "UPDATE memory_delta_window_claims SET state=?, claim_token='', lease_until='',"

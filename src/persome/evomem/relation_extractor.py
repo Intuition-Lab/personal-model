@@ -298,6 +298,7 @@ def _upsert_shadow(
     source_id: str | None = None,
     source_receipt: str | None = None,
     status: str = "shadow",
+    effect_key: str | None = None,
 ) -> None:
     """New evidence adds an edge; existing open edge ratchets its strength.
 
@@ -309,67 +310,109 @@ def _upsert_shadow(
 
     The database is the final arbiter when two connections race to create the
     same canonical edge. A loser reuses the winning row. MAX reinforcement is
-    safe to replay; an additive loser deliberately does not increment because
-    it may be the same effect retry. Once an additive edge already exists,
-    exactly-once delivery still belongs to the caller because no persistent
-    per-effect receipt ledger exists here.
+    safe to replay. For additive writes, pass a relation-specific ``effect_key``:
+    initial creation records it atomically, and reinforcement increments only
+    if that receipt is new. Legacy additive callers without a key retain the
+    conservative creation-race behavior and at-least-once reinforcement.
     """
+    if effect_key is not None and not additive:
+        raise ValueError("relation_extractor: effect_key requires additive=True")
     key = _edge_key(src, dst, predicate.value)
-    eid = seen.get(key)
-    if eid is not None:
-        if edges_store.reinforce_edge(
-            conn, edge_id=eid, observations=observations, confidence=confidence, additive=additive
-        ):
-            tally.reinforced += 1
-        if status == "active":
-            conn.execute(
-                "UPDATE relation_edges SET status='active' WHERE edge_id=? AND status='shadow'",
-                (eid,),
-            )
+    # A receipt survives the physical edge interval. Check it before looking
+    # for an open row so a crash retry after close is a successful no-op rather
+    # than an attempt to manufacture a replacement Line.
+    if effect_key is not None and edges_store.effect_already_applied(
+        conn,
+        effect_key=effect_key,
+        edge_key=key,
+    ):
         return
-    try:
-        new_id = edges_store.add_edge(
-            conn,
-            src_identity=src,
-            dst_identity=dst,
-            predicate=predicate,
-            src_kind=src_kind or _kind_of(src),
-            dst_kind=dst_kind or _kind_of(dst),
-            provenance=provenance,
-            confidence=confidence,
-            label=label,
-            quote=(quote or "")[:_QUOTE_MAX] or None,
-            observations=observations,
-            valid_from=valid_from,
-            polarity=polarity,
-            source_kind=source_kind,
-            source_id=source_id,
-            source_receipt=source_receipt,
-            status=status,
-        )
-    except sqlite3.IntegrityError:
-        # Another connection may have inserted the same open canonical edge
-        # after this caller built its local ``seen`` map. Only recover when the
-        # logical winner now exists; unrelated integrity failures still raise.
-        winner = edges_store.find_open_edge(conn, edge_key=key)
-        if winner is None:
-            raise
-        seen[key] = winner
-        if not additive and edges_store.reinforce_edge(
-            conn,
-            edge_id=winner,
-            observations=observations,
-            confidence=confidence,
-        ):
-            tally.reinforced += 1
-        if status == "active":
-            conn.execute(
-                "UPDATE relation_edges SET status='active' WHERE edge_id=? AND status='shadow'",
-                (winner,),
+
+    # A ``seen`` snapshot can race with a close on another connection. Bounded
+    # retries re-resolve the canonical open row; an effect-keyed item only
+    # returns success after its receipt exists or a new edge owns it.
+    for _attempt in range(3):
+        eid = seen.get(key) or edges_store.find_open_edge(conn, edge_key=key)
+        if eid is not None:
+            changed = edges_store.reinforce_edge(
+                conn,
+                edge_id=eid,
+                observations=observations,
+                confidence=confidence,
+                additive=additive,
+                effect_key=effect_key,
             )
+            if effect_key is not None and not edges_store.effect_already_applied(
+                conn,
+                effect_key=effect_key,
+                edge_key=key,
+            ):
+                # The edge closed after the caller took its snapshot, so no
+                # receipt or mutation was committed. Resolve/create again.
+                seen.pop(key, None)
+                continue
+            if not changed and effect_key is None:
+                # MAX/legacy-additive writes have no receipt to distinguish a
+                # genuine open-edge no-op from a stale snapshot. Re-resolve the
+                # canonical row: only the same still-open edge may complete as
+                # a no-op; a close or replacement must retry against current
+                # state so a one-shot semantic relation is not silently lost.
+                current = edges_store.find_open_edge(conn, edge_key=key)
+                if current != eid:
+                    if current is None:
+                        seen.pop(key, None)
+                    else:
+                        seen[key] = current
+                    continue
+            if changed:
+                tally.reinforced += 1
+            if status == "active":
+                conn.execute(
+                    "UPDATE relation_edges SET status='active'"
+                    " WHERE edge_id=? AND status='shadow' AND valid_to IS NULL",
+                    (eid,),
+                )
+            return
+        try:
+            new_id = edges_store.add_edge(
+                conn,
+                src_identity=src,
+                dst_identity=dst,
+                predicate=predicate,
+                src_kind=src_kind or _kind_of(src),
+                dst_kind=dst_kind or _kind_of(dst),
+                provenance=provenance,
+                confidence=confidence,
+                label=label,
+                quote=(quote or "")[:_QUOTE_MAX] or None,
+                observations=observations,
+                valid_from=valid_from,
+                polarity=polarity,
+                source_kind=source_kind,
+                source_id=source_id,
+                source_receipt=source_receipt,
+                status=status,
+                effect_key=effect_key if additive else None,
+            )
+        except sqlite3.IntegrityError:
+            # The canonical edge or the effect receipt may have won on another
+            # connection. A matching durable receipt completes this retry even
+            # when the winning physical edge has since closed.
+            if effect_key is not None and edges_store.effect_already_applied(
+                conn,
+                effect_key=effect_key,
+                edge_key=key,
+            ):
+                return
+            winner = edges_store.find_open_edge(conn, edge_key=key)
+            if winner is None:
+                raise
+            seen[key] = winner
+            continue
+        seen[key] = new_id
+        tally.new += 1
         return
-    seen[key] = new_id
-    tally.new += 1
+    raise RuntimeError("relation_extractor: canonical edge changed repeatedly during apply")
 
 
 # ── the passes ────────────────────────────────────────────────────────────────

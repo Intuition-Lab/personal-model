@@ -97,9 +97,16 @@ instruction without constructing or sending an unbounded result. This keeps
 historical shadow Points and their evolution/receipt chain in the canonical
 contract while keeping transport behavior safe.
 
+New machine-derived entity and assertion Points remain outside the snapshot as auditable candidates
+until the same canonical candidate has evidence from two known, distinct sessions. Repeated windows
+inside one session do not satisfy that independence gate. Existing Points and explicit owner edits
+retain their established authority.
+
 A Face becomes active only after mined and emergent signals agree across stable footprints. A
 Volume has one honest producer (the cross-domain sweeper), so it becomes active after two stable
-sweeper resamples. This preserves the two-observation bar without inventing a second extractor.
+sweeper resamples. Production samples carry `(producer, UTC day, canonical input hash)` receipts, so
+a same-day retry cannot provide a second vote. Root synthesis uses the same receipt boundary to
+avoid replacing the live apex for an identical same-day input.
 
 ## Viewer layout
 

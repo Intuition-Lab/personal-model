@@ -182,8 +182,10 @@ def test_fresh_root_ingest_build_export_contract(ac_root, monkeypatch, fake_llm)
         [
             datetime(2026, 7, 10, 9, 4, tzinfo=UTC),
             datetime(2026, 7, 10, 9, 4, 2, tzinfo=UTC),
-            datetime(2026, 7, 10, 9, 5, tzinfo=UTC),
-            datetime(2026, 7, 10, 9, 5, 2, tzinfo=UTC),
+            # Structural promotion requires an independent UTC-day receipt;
+            # replaying the same build input on one day is not a second vote.
+            datetime(2026, 7, 11, 9, 5, tzinfo=UTC),
+            datetime(2026, 7, 11, 9, 5, 2, tzinfo=UTC),
         ]
     )
     first = run_model_build(cfg, trigger="runtime-fixture", now=lambda: next(moments))

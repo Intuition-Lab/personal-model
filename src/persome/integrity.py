@@ -1351,7 +1351,9 @@ def _repopulate_after_quarantine(
             # and Root: one rebuild cannot replay the historical resampling gate.
             tables_to_invalidate: list[str] = []
             if not snapshot_restored or stale_node_keys or changed_node_keys:
-                tables_to_invalidate.extend(["schema_faces", "cross_domain_probe_state"])
+                tables_to_invalidate.extend(
+                    ["schema_input_receipts", "schema_faces", "cross_domain_probe_state"]
+                )
             # Relation edges are retained for a known evomem snapshot, but must
             # be cleared when current Markdown/direct sources removed or changed
             # Points that those relations may expose.
@@ -1360,7 +1362,7 @@ def _repopulate_after_quarantine(
                 or stale_node_keys
                 or direct_nodes_removed
             ):
-                tables_to_invalidate.append("relation_edges")
+                tables_to_invalidate.extend(["relation_edge_effects", "relation_edges"])
             for table in tables_to_invalidate:
                 if conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",

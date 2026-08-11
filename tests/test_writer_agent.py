@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from persome import config as config_mod
 from persome.session import store as session_store
 from persome.store import fts
@@ -15,6 +17,7 @@ from persome.store import memory_deltas as deltas_store
 from persome.timeline import store as timeline_store
 from persome.writer import agent
 from persome.writer import llm as llm_mod
+from persome.writer import memory_delta as delta_mod
 
 _TZ = timezone(timedelta(hours=8))
 
@@ -214,7 +217,7 @@ def test_terminal_finalizer_applies_default_person_model(
     assert delta is not None and delta["apply_status"] == "applied"
 
 
-def test_active_session_flush_mints_model_before_session_end(
+def test_active_session_flush_records_candidate_before_session_end(
     ac_root: Path,
     fake_llm,
 ) -> None:
@@ -270,11 +273,92 @@ def test_active_session_flush_mints_model_before_session_end(
         point_count = conn.execute(
             "SELECT COUNT(*) FROM evo_nodes WHERE file_name='person-\u5f20\u4e09.md'"
         ).fetchone()[0]
+        candidate = conn.execute(
+            "SELECT status, evidence_count, independent_sessions FROM model_candidates"
+        ).fetchone()
         dirty = session_store.get_system_state(conn, "model_structure_dirty")
     assert row is not None and row.status == "active"
     assert row.delta_end == end and row.modeled_at is None
-    assert point_count == 1
+    assert point_count == 0
+    assert tuple(candidate) == ("pending", 1, 1)
+    assert dirty == "0"
+
+
+def test_active_model_marks_structure_dirty_after_pending_parent_crash(
+    ac_root: Path,
+    fake_llm,
+    monkeypatch,
+) -> None:
+    start = datetime(2026, 7, 10, 10, 5, tzinfo=_TZ)
+    end = start + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=['[Feishu] \u804a\u5929: "\u5468\u4e94\u7248\u672c\u53ef\u4ee5\u53d1"'],
+                apps_used=["Feishu"],
+                capture_count=1,
+                normalization_status="llm",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(id="sess_pending_geometry", start_time=start, status="active"),
+        )
+        session_store.set_flush_end(conn, "sess_pending_geometry", end)
+
+    fake_llm.set_default(
+        "memory_delta",
+        json.dumps(
+            {
+                "entities": [],
+                "assertions": [],
+                "relations": [],
+                "events": [
+                    {
+                        "title": "Friday release review",
+                        "participants": [{"ref": "self"}],
+                        "quote": "\u5468\u4e94\u7248\u672c\u53ef\u4ee5\u53d1",
+                        "confidence": 0.9,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    cfg = config_mod.load(ac_root / "config.toml")
+    real_set_apply_status = deltas_store.set_apply_status
+
+    def die_before_parent_publish(*_args, **_kwargs):
+        raise SystemExit("synthetic process death after item acknowledgement")
+
+    monkeypatch.setattr(deltas_store, "set_apply_status", die_before_parent_publish)
+    with pytest.raises(SystemExit, match="after item acknowledgement"):
+        delta_mod.run_after_session(
+            cfg,
+            session_id="sess_pending_geometry",
+            start_time=start,
+            end_time=end,
+            is_final=False,
+        )
+    monkeypatch.setattr(deltas_store, "set_apply_status", real_set_apply_status)
+
+    result = agent.model_active_session(cfg, session_id="sess_pending_geometry")
+
+    assert result.completed is True
+    assert result.delta.applied is True
+    assert result.delta.geometry_changed is True
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_pending_geometry")
+        parent = deltas_store.latest_for_session(conn, "sess_pending_geometry")
+        dirty = session_store.get_system_state(conn, "model_structure_dirty")
+        occurrences = conn.execute("SELECT COUNT(*) FROM event_occurrences").fetchone()[0]
+    assert row is not None and row.delta_end == end
+    assert parent is not None and parent["apply_status"] == "applied"
     assert dirty == "1"
+    assert occurrences == 1
 
 
 def test_active_model_chunks_long_window_oldest_first(ac_root: Path, fake_llm) -> None:
@@ -512,3 +596,80 @@ def test_active_model_resumes_failed_apply_before_new_tail(ac_root: Path, fake_l
         (middle.isoformat(), end.isoformat()),
     ]
     assert all(item["apply_status"] == "applied" for item in windows)
+
+
+def test_legacy_ambiguous_delta_is_quarantined_without_blocking_session(
+    ac_root: Path,
+    fake_llm,
+    monkeypatch,
+) -> None:
+    start = datetime(2026, 7, 10, 12, 0, tzinfo=_TZ)
+    end = start + timedelta(minutes=1)
+    payload = {
+        "entities": [
+            {
+                "new_entity": "\u5f20\u4e09",
+                "kind": "person",
+                "quote": "\u548c\u5f20\u4e09\u786e\u8ba4\u4e86\u8bc4\u5ba1\u7ed3\u8bba",
+                "confidence": 0.9,
+            }
+        ],
+        "assertions": [],
+        "relations": [],
+        "events": [],
+    }
+    with fts.cursor() as conn:
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess_legacy_quarantine",
+                start_time=start,
+                end_time=end,
+                status="reduced",
+            ),
+        )
+        delta_id = deltas_store.insert(
+            conn,
+            session_id="sess_legacy_quarantine",
+            payload=payload,
+            apply_status="failed",
+            window_start=start,
+            window_end=end,
+            is_final=True,
+        )
+
+    no_work = SimpleNamespace(committed=False, skipped_reason="disabled")
+    monkeypatch.setattr(
+        agent.classifier_mod,
+        "classify_after_reduce",
+        lambda *_args, **_kwargs: no_work,
+    )
+    monkeypatch.setattr(
+        agent.pattern_detector_mod,
+        "detect_after_classify",
+        lambda *_args, **_kwargs: no_work,
+    )
+
+    result = agent.finalize_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id="sess_legacy_quarantine",
+    )
+
+    assert result.completed is True
+    assert result.delta.skipped_reason == "legacy_apply_ambiguous"
+    assert result.delta.applied is False
+    assert fake_llm.calls == []
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_legacy_quarantine")
+        parent = conn.execute(
+            "SELECT apply_status, item_ledger_version FROM memory_deltas WHERE id=?",
+            (delta_id,),
+        ).fetchone()
+        dirty = session_store.get_system_state(conn, "model_structure_dirty")
+        item_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_delta_items'"
+        ).fetchone()
+    assert row is not None and row.delta_end == end and row.modeled_at is not None
+    assert tuple(parent) == ("failed", 0)
+    assert dirty == "1"
+    assert item_table is None

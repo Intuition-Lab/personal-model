@@ -86,6 +86,26 @@ class DeltaResult:
     counts: dict[str, int] = field(default_factory=dict)
     dropped: int = 0
     skipped_reason: str = ""
+    # ``None`` preserves the conservative legacy/recovery fallback. Fresh
+    # itemized applies set an exact value so pending candidates do not schedule
+    # a structural rebuild before any Point or Line changed.
+    geometry_changed: bool | None = None
+
+
+def _geometry_changed(apply_result: Any) -> bool:
+    return any(
+        int(getattr(apply_result, field, 0) or 0) > 0
+        for field in (
+            "entities_minted",
+            "assertions_minted",
+            "edges_new",
+            "edges_reinforced",
+            "edges_closed",
+            "events_minted",
+            "floor_edges",
+            "supersedes_applied",
+        )
+    )
 
 
 def window_block_limit(cfg: Any) -> int:
@@ -617,7 +637,7 @@ def run_after_session(
             from . import delta_apply
 
             with fts.cursor() as conn:
-                ar = delta_apply.apply_delta(
+                ar = delta_apply.apply_persisted_delta(
                     conn,
                     cfg,
                     clean,
@@ -628,6 +648,8 @@ def run_after_session(
                 )
                 if ar.errors:
                     deltas_store.set_apply_status(conn, delta_id, "failed")
+                elif ar.skipped_reason == "item_in_progress":
+                    deltas_store.set_apply_status(conn, delta_id, "pending")
                 else:
                     deltas_store.set_apply_status(conn, delta_id, "applied")
             if ar.errors:
@@ -638,6 +660,8 @@ def run_after_session(
                     len(ar.errors),
                     "; ".join(ar.errors[:3]),
                 )
+            elif ar.skipped_reason == "item_in_progress":
+                result.skipped_reason = "apply_in_progress"
             else:
                 logger.info(
                     "memory_delta %s: applied (entities +%d/=%d, edges +%d~%d closed %d, events %d)",
@@ -650,6 +674,7 @@ def run_after_session(
                     ar.events_minted,
                 )
                 result.applied = True
+                result.geometry_changed = _geometry_changed(ar) or ar.geometry_changed is not False
         except Exception:  # noqa: BLE001 — apply
             with fts.cursor() as conn:
                 deltas_store.set_apply_status(conn, delta_id, "failed")
@@ -782,6 +807,10 @@ def _ensure_window(
         skipped_reason="already_processed",
     )
     status = str(existing["apply_status"] or "unknown")
+    prior_apply_status = status
+    legacy_unwindowed = not str(existing["window_start"] or "") or not str(
+        existing["window_end"] or ""
+    )
     try:
         payload = json.loads(existing["payload"] or "{}")
     except (TypeError, ValueError):
@@ -795,24 +824,63 @@ def _ensure_window(
     }:
         return result
 
+    # Before the item ledger existed, a pending/failed row could already have
+    # committed any subset of its effects. There is no durable fact that lets
+    # recovery distinguish "not attempted" from "effect committed, parent ack
+    # lost". Never synthesize new receipts and replay an additive Line in that
+    # ambiguous state; leave the row failed for explicit audit/repair. A
+    # not_requested row is safe because it explicitly records that application
+    # never began.
+    ledger_version = int(existing["item_ledger_version"] or 0)
+    has_effect_items = any(
+        isinstance(payload.get(head), list)
+        and any(isinstance(item, dict) for item in payload.get(head) or [])
+        for head in ("entities", "assertions", "relations", "events")
+    )
+    if (
+        ledger_version < deltas_store.ITEM_LEDGER_VERSION
+        and status in {"pending", "failed"}
+        and has_effect_items
+    ):
+        result.applied = False
+        result.skipped_reason = "legacy_apply_ambiguous"
+        logger.warning(
+            "memory_delta %s: legacy row %d may contain partial effects; refusing replay",
+            session_id,
+            result.delta_id,
+        )
+        return result
+
     try:
         from . import delta_apply
 
         with fts.cursor() as conn:
-            ar = delta_apply.apply_delta(
-                conn,
-                cfg,
-                payload,
-                delta_id=result.delta_id,
-                session_id=session_id,
-                window_start=start_time,
-                window_end=end_time,
-            )
-            deltas_store.set_apply_status(
-                conn,
-                result.delta_id,
-                "failed" if ar.errors else "applied",
-            )
+            ledger_geometry_changed: bool | None = False
+            if legacy_unwindowed:
+                # A pre-window row has no occurrence/candidate provenance to
+                # recover. Preserve its historical context-free apply instead
+                # of laundering this recovery call's bounds into new receipts.
+                ar = delta_apply.apply_delta(
+                    conn,
+                    cfg,
+                    payload,
+                    delta_id=result.delta_id,
+                )
+            else:
+                ar = delta_apply.apply_persisted_delta(
+                    conn,
+                    cfg,
+                    payload,
+                    delta_id=result.delta_id,
+                    session_id=session_id,
+                    window_start=start_time,
+                    window_end=end_time,
+                )
+                ledger_geometry_changed = ar.geometry_changed
+            status = "failed" if ar.errors else "applied"
+            if ar.skipped_reason == "item_in_progress":
+                status = "pending"
+            deltas_store.set_apply_status(conn, result.delta_id, status)
         if ar.errors:
             result.skipped_reason = "apply_failed"
             logger.warning(
@@ -822,7 +890,19 @@ def _ensure_window(
                 "; ".join(ar.errors[:3]),
             )
             return result
+        if ar.skipped_reason == "item_in_progress":
+            result.skipped_reason = "apply_in_progress"
+            return result
         result.applied = True
+        # A prior failed apply may have committed an idempotent effect before
+        # losing its item acknowledgement. The successful replay then reports
+        # zero new effects, but the structure still changed since the watermark
+        # last advanced and must be rebuilt.
+        result.geometry_changed = (
+            _geometry_changed(ar)
+            or ledger_geometry_changed is not False
+            or prior_apply_status == "failed"
+        )
         result.skipped_reason = "resumed_apply"
     except Exception:  # noqa: BLE001 - leave retryable state for the next finalizer run
         with fts.cursor() as conn:

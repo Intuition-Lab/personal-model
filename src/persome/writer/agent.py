@@ -62,12 +62,22 @@ def _delta_completed(cfg: Config, delta: Any) -> bool:
         "no_window",
         "already_processed",
         "resumed_apply",
+        # A pre-ledger pending/failed apply cannot be replayed safely because
+        # any additive subset may already have committed. Quarantine the parent
+        # row, but let the session watermark move past this terminal audit state.
+        "legacy_apply_ambiguous",
     }
     complete = bool(delta.written or delta.skipped_reason in benign)
     if getattr(cfg.memory_delta, "apply_enabled", False):
         complete = complete and bool(
             delta.applied
-            or delta.skipped_reason in {"no_blocks", "no_eligible_evidence", "no_window"}
+            or delta.skipped_reason
+            in {
+                "no_blocks",
+                "no_eligible_evidence",
+                "no_window",
+                "legacy_apply_ambiguous",
+            }
         )
     return complete
 
@@ -79,7 +89,10 @@ def _advance_delta_watermark(
 ) -> None:
     with fts.cursor() as conn:
         session_store.set_delta_end(conn, session_id, window_end)
-        if sum(delta.counts.values()) > 0:
+        geometry_changed = getattr(delta, "geometry_changed", None)
+        if geometry_changed is True or (
+            geometry_changed is None and sum(delta.counts.values()) > 0
+        ):
             session_store.increment_system_state(conn, "model_structure_dirty")
 
 

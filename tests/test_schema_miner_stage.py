@@ -13,7 +13,7 @@ The fake-llm injection mirrors ``tests/test_evomem/test_schema_miner.py``.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from persome import config as config_mod
@@ -166,21 +166,80 @@ def test_remine_promotes_forming_schema_to_active(ac_root):
         "\u62d2\u7edd litellm\uff0c\u624b\u5199 Anthropic SDK \u5c01\u88c5",
         "\u503e\u5411\u547d\u4ee4\u884c\u5de5\u5177\u800c\u975e\u91cd\u578b IDE \u63d2\u4ef6",
     ]
+    sampled = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
     with fts.cursor() as conn:
         _seed_facts(conn, name="project-tooling.md", facts=facts)
         # ① first mine is weak → forming → dormant.
         r1 = stage.mine_schemas_for_user(
-            cfg, conn, llm_call=_fake_llm({**_STABLE_PAYLOAD, "confidence": 0.3})
+            cfg,
+            conn,
+            llm_call=_fake_llm({**_STABLE_PAYLOAD, "confidence": 0.3}),
+            sampled_at=sampled,
         )
         path = r1.written[0].path
         assert fts.get_file(conn, path).status == "dormant"
 
         # ② re-mine the same source as stable → promoted to active in both places.
-        r2 = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        r2 = stage.mine_schemas_for_user(
+            cfg,
+            conn,
+            llm_call=_fake_llm(_STABLE_PAYLOAD),
+            sampled_at=sampled + timedelta(days=1),
+        )
         assert r2.written[0].status == "stable"
         assert fts.get_file(conn, path).status == "active"
         assert files_mod.read_file(files_mod.memory_path(path)).status == "active"
         assert path in [f.path for f in fts.list_files(conn, include_dormant=False)]
+
+
+def test_same_day_same_input_receipt_does_not_promote_face(ac_root):
+    cfg = config_mod.load(ac_root / "config.toml")
+    cfg.memory_delta.apply_enabled = False
+    facts = ["evidence one", "evidence two", "evidence three", "evidence four"]
+    sampled = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
+    calls = 0
+
+    def counted(messages):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        payload = (
+            _STABLE_PAYLOAD
+            if calls == 1
+            else {
+                **_STABLE_PAYLOAD,
+                "central_proposition": "same input must not replace the first projection",
+            }
+        )
+        return _fake_llm(payload)(messages)
+
+    with fts.cursor() as conn:
+        _seed_facts(conn, name="project-repeat.md", facts=facts)
+        first = stage.mine_schemas_for_user(
+            cfg,
+            conn,
+            sampled_at=sampled,
+            llm_call=counted,
+        )
+        path = files_mod.memory_path(first.written[0].path)
+        projection_before = path.read_text(encoding="utf-8")
+
+        duplicate = stage.mine_schemas_for_user(
+            cfg,
+            conn,
+            sampled_at=sampled + timedelta(hours=2),
+            llm_call=counted,
+        )
+        row = conn.execute(
+            "SELECT status, observations, footprints FROM schema_faces"
+            " WHERE level=1 AND valid_to IS NULL",
+        ).fetchone()
+
+    assert first.written_count == 1
+    assert duplicate.written_count == 0
+    assert calls == 1
+    assert path.read_text(encoding="utf-8") == projection_before
+    assert tuple(row[:2]) == ("shadow", 1)
+    assert len(json.loads(row[2])) == 1
 
 
 def test_bundle_below_min_facts_is_skipped(ac_root):
@@ -226,6 +285,7 @@ def test_remine_updates_same_file_not_a_new_one(ac_root):
     """
     cfg = config_mod.load(ac_root / "config.toml")
     cfg.memory_delta.apply_enabled = False
+    sampled = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
     facts = [
         "\u7528 uv \u7ba1\u7406\u4f9d\u8d56\u800c\u975e pip",
         "\u7528 ruff \u53d6\u4ee3 black+flake8",
@@ -235,12 +295,14 @@ def test_remine_updates_same_file_not_a_new_one(ac_root):
     with fts.cursor() as conn:
         _seed_facts(conn, name="project-tooling.md", facts=facts)
 
-        first = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD))
+        first = stage.mine_schemas_for_user(
+            cfg, conn, llm_call=_fake_llm(_STABLE_PAYLOAD), sampled_at=sampled
+        )
         assert first.written_count == 1
         assert first.written[0].path == "schema-project-tooling.md"
         assert first.written[0].updated_in_place is False
 
-        # Second run over the same (unchanged) cluster: same file, superseded.
+        # A later UTC-day resample over the same cluster updates the same file.
         updated_payload = {
             **_STABLE_PAYLOAD,
             "central_proposition": "\u7528\u6237\u5bf9\u5de5\u5177\u94fe\u7684\u6781\u7b80\u504f\u597d\u8fdb\u4e00\u6b65\u56fa\u5316",
@@ -248,7 +310,12 @@ def test_remine_updates_same_file_not_a_new_one(ac_root):
                 "\u65b0\u7684\u63a8\u8bba\uff1a\u4f1a\u4e3b\u52a8\u5220\u4f9d\u8d56"
             ],
         }
-        second = stage.mine_schemas_for_user(cfg, conn, llm_call=_fake_llm(updated_payload))
+        second = stage.mine_schemas_for_user(
+            cfg,
+            conn,
+            llm_call=_fake_llm(updated_payload),
+            sampled_at=sampled + timedelta(days=1),
+        )
         assert second.written_count == 1
         assert second.written[0].path == "schema-project-tooling.md"
         assert second.written[0].updated_in_place is True

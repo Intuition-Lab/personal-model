@@ -228,6 +228,49 @@ def test_ended_relation_closes_edge(ac_root):
     assert vt is not None
 
 
+def test_itemized_ended_relation_replay_does_not_duplicate_closed_line(ac_root):
+    clean = {
+        "entities": [{"ref": "Alice", "kind": "person", "ended": False, "quote": "x"}],
+        "relations": [
+            {
+                "src": {"ref": "self"},
+                "dst": {"ref": "Alice"},
+                "predicate": "reports_to",
+                "polarity": "0",
+                "ended": True,
+                "quote": "no longer reports to Alice",
+                "confidence": 0.9,
+            }
+        ],
+        "events": [],
+        "assertions": [],
+    }
+    with fts.cursor() as conn:
+        first = delta_apply.ApplyResult()
+        delta_apply._apply_relations(
+            conn,
+            clean,
+            {"Alice": "person"},
+            first,
+            effect_key="memory-delta:1:relation:end-alice",
+        )
+        replay = delta_apply.ApplyResult()
+        delta_apply._apply_relations(
+            conn,
+            clean,
+            {"Alice": "person"},
+            replay,
+            effect_key="memory-delta:1:relation:end-alice",
+        )
+        rows = conn.execute(
+            "SELECT edge_id, valid_to FROM relation_edges WHERE predicate='reports_to'"
+        ).fetchall()
+
+    assert (first.edges_new, first.edges_closed) == (1, 1)
+    assert (replay.edges_new, replay.edges_reinforced, replay.edges_closed) == (0, 0, 0)
+    assert len(rows) == 1 and rows[0][1] is not None
+
+
 def test_events_mint_activity_point_and_edge(ac_root):
     clean = {
         "entities": [],

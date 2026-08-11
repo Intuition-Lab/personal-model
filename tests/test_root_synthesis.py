@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from persome.evomem.identity import Roster
@@ -97,6 +98,48 @@ def test_synthesize_writes_root_born_active(ac_root):
         assert root is not None and root["status"] == MemoryStatus.ACTIVE.value
         assert "\u5de5\u7a0b\u5e08" in root["signature"]
         assert json.loads(root["anchors"]) == ["\u5f20\u4e09"]  # scan_mentions → anchors
+
+
+def test_same_day_same_input_receipt_does_not_supersede_root(ac_root):
+    calls = 0
+    response = _llm("\u7a33\u5b9a apex")
+
+    def counted(messages):
+        nonlocal calls
+        calls += 1
+        return response(messages)
+
+    sampled = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
+    with fts.cursor() as conn:
+        _seed_body(conn, "\u7a33\u5b9a Volume")
+        first = rs.synthesize_root(
+            _cfg(), conn, llm_call=counted, roster=Roster(), sampled_at=sampled
+        )
+        duplicate = rs.synthesize_root(
+            _cfg(),
+            conn,
+            llm_call=counted,
+            roster=Roster(),
+            sampled_at=sampled + timedelta(hours=2),
+        )
+        assert first.reason == "written"
+        assert duplicate == rs.RootResult(first.face_id, "skip_duplicate_input")
+        assert calls == 1
+        assert _live_roots(conn) == 1
+        assert conn.execute("SELECT COUNT(*) FROM schema_faces WHERE level=3").fetchone()[0] == 1
+
+        next_day = rs.synthesize_root(
+            _cfg(),
+            conn,
+            llm_call=counted,
+            roster=Roster(),
+            sampled_at=sampled + timedelta(days=1),
+        )
+        assert next_day.reason == "written" and next_day.face_id != first.face_id
+        assert calls == 2
+        assert _live_roots(conn) == 1
+        assert conn.execute("SELECT COUNT(*) FROM schema_faces WHERE level=3").fetchone()[0] == 2
+        assert faces.resident_root(conn)["observations"] == 2
 
 
 def test_empty_input_skips(ac_root):

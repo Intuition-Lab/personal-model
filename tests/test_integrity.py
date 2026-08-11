@@ -839,8 +839,13 @@ def test_markdown_authority_does_not_resurrect_forgotten_snapshot_node(ac_root: 
         )
     )
     with fts.cursor() as conn:
-        schema_faces.upsert_root(
+        schema_faces.upsert_root_with_receipt(
             conn,
+            receipt=schema_faces.make_input_receipt(
+                producer="root_synthesis",
+                sampled_at=datetime(2026, 7, 12, 8, 0, tzinfo=UTC),
+                input_value={"members": [entry_id]},
+            ),
             signature="Root derived from the soon-forgotten memory",
             members=[entry_id],
         )
@@ -854,6 +859,7 @@ def test_markdown_authority_does_not_resurrect_forgotten_snapshot_node(ac_root: 
             provenance="inferred",
             confidence=0.9,
             status="active",
+            effect_key="integrity:forgotten-project",
         )
         conn.execute(
             "INSERT INTO cross_domain_probe_state"
@@ -888,7 +894,9 @@ def test_markdown_authority_does_not_resurrect_forgotten_snapshot_node(ac_root: 
             (entry_id,),
         ).fetchone()
         assert conn.execute("SELECT count(*) FROM relation_edges").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM relation_edge_effects").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM schema_faces").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM schema_input_receipts").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM cross_domain_probe_state").fetchone()[0] == 0
     assert other_scope is not None and other_scope[0] == "OTHER SCOPE REMAINS CANONICAL"
     database = json.loads(paths.integrity_recovery_marker().read_text())["database_recovery"]

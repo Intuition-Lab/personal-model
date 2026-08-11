@@ -234,7 +234,9 @@ the database after shutdown. Startup integrity recovery and explicit secure
 clean operations use the same reentrant exclusive boundary. The daemon
 initializes the complete registered schema before atomically publishing
 its exact revision and schema fingerprint; clients reject mismatched receipts
-and fail closed on attempted DDL,
+and fail closed on attempted DDL. The schema owner also refuses a published
+higher or unknown revision instead of letting an older binary rewrite a future
+database receipt as a downgrade,
 while explicit row-level memory writes remain supported. Integrity checks and
 rebuild commands are documented in [`troubleshooting.md`](troubleshooting.md). Daily
 snapshots reject structural corruption; logical projection drift is alerted but

@@ -82,6 +82,13 @@ class EditResult:
     # scoped to its subject: the same sentence about someone else is a
     # different claim.
     file_name: str = ""
+    # Candidate identity for a delta-produced Point.  This lets an owner
+    # withdrawal land in the independent candidate ledger before the
+    # best-effort human-readable audit is attempted.  Empty for Points that do
+    # not map to the windowed candidate path and for schema objects.
+    candidate_kind: str = ""
+    candidate_subject: str = ""
+    candidate_text: str = ""
     reason: str = ""
     shadow_misses: int = 0
     applied: list[str] = field(default_factory=list)
@@ -385,31 +392,187 @@ def _audit(
     reason: str,
     new_id: str,
     file_name: str,
-) -> None:
-    """Record what this edit displaced. Never fatal — the edit itself has landed."""
+) -> bool:
+    """Record what this edit displaced and report whether the receipt landed.
+
+    The edit itself may already have committed through the Markdown/evomem
+    writer, so this remains non-throwing.  Point edits have a second durable
+    suppression receipt in ``model_candidates``; the caller only reports a
+    clean success when at least one of the two receipts survives.
+    """
     from ..store import memory_deltas
 
+    payload = {
+        "owner_edit": {
+            "kind": kind,
+            "target_id": target_id,
+            "op": op,
+            "prior_text": prior_text,
+            "new_text": new_text,
+            "reason": reason,
+            "new_id": new_id,
+            "file_name": file_name,
+        }
+    }
     try:
         memory_deltas.insert(
             conn,
             session_id=AUDIT_SESSION_ID,
-            payload={
-                "owner_edit": {
-                    "kind": kind,
-                    "target_id": target_id,
-                    "op": op,
-                    "prior_text": prior_text,
-                    "new_text": new_text,
-                    "reason": reason,
-                    "new_id": new_id,
-                    "file_name": file_name,
-                }
-            },
+            payload=payload,
             status="active",
             apply_status="applied",
         )
-    except Exception:  # noqa: BLE001 — an unrecorded audit must not undo a real edit
-        logger.exception("owner edit audit row failed for %s %s", kind, target_id)
+        return True
+    except Exception:  # noqa: BLE001 — attempt the narrow recovery path below
+        logger.warning(
+            "owner edit audit DAO failed for %s %s; attempting direct receipt recovery",
+            kind,
+            target_id,
+            exc_info=True,
+        )
+
+    # A caller wrapper can fail after the DAO committed.  Detect that exact
+    # receipt before falling back so recovery does not duplicate the audit.
+    try:
+        for (raw,) in conn.execute(
+            "SELECT payload FROM memory_deltas WHERE session_id=?",
+            (AUDIT_SESSION_ID,),
+        ).fetchall():
+            try:
+                if (json.loads(str(raw or "{}")) or {}).get("owner_edit") == payload["owner_edit"]:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    except sqlite3.Error:
+        pass
+
+    try:
+        # Keep this independent of ``insert``: its purpose is recovery when that
+        # public DAO seam itself failed.  ``_insert_row`` is the one canonical SQL
+        # encoder underneath it and avoids a second hand-maintained row shape.
+        memory_deltas.ensure_schema(conn)
+        memory_deltas._insert_row(  # noqa: SLF001
+            conn,
+            session_id=AUDIT_SESSION_ID,
+            payload=payload,
+            model="",
+            dropped=0,
+            status="active",
+            apply_status="applied",
+            created_at=None,
+            window_start=None,
+            window_end=None,
+            is_final=True,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — the edit itself has already landed
+        logger.exception("owner edit audit recovery failed for %s %s", kind, target_id)
+        return False
+
+
+_ENTITY_CANDIDATE_KIND_BY_PREFIX = {
+    "person-": "person",
+    "org-": "org",
+    "project-": "project",
+    "tool-": "artifact",
+}
+
+
+def _candidate_file_matches_subject(file_name: str, subject: str) -> bool:
+    from ..evomem.person_graph import _slug
+
+    suffix = f"-{_slug(subject)}.md"
+    return any(
+        file_name == f"{prefix.removesuffix('-')}{suffix}"
+        for prefix in _ENTITY_CANDIDATE_KIND_BY_PREFIX
+    )
+
+
+def _point_candidate_identity(
+    conn: sqlite3.Connection,
+    *,
+    file_name: str,
+    prior_text: str,
+    tags: list[str],
+) -> tuple[str, str, str] | None:
+    """Resolve the exact candidate a delta-produced Point materialized from."""
+    tag_set = set(tags)
+    if "entity" in tag_set:
+        for prefix, candidate_kind in _ENTITY_CANDIDATE_KIND_BY_PREFIX.items():
+            if file_name.startswith(prefix):
+                return candidate_kind, prior_text, prior_text
+        return None
+    if "fact" not in tag_set:
+        return None
+
+    # New windowed assertions always have a candidate row.  Prefer that exact
+    # subject because a storage slug is intentionally lossy (punctuation and
+    # whitespace collapse).  The file check keeps identical wording about two
+    # people from sharing one owner rejection.
+    try:
+        from ..store import model_candidates
+
+        model_candidates.ensure_schema(conn)
+        canonical = model_candidates.canonical_text(prior_text)
+        rows = conn.execute(
+            "SELECT subject FROM model_candidates WHERE candidate_kind='assertion' "
+            "AND canonical_text=?",
+            (canonical,),
+        ).fetchall()
+        subjects = {
+            str(row[0]) for row in rows if _candidate_file_matches_subject(file_name, str(row[0]))
+        }
+        if len(subjects) == 1:
+            subject = subjects.pop()
+            return model_candidates.KIND_ASSERTION, subject, prior_text
+    except sqlite3.Error:
+        pass
+
+    # Legacy/evo-native assertions may predate the candidate table.  Their
+    # entity Point, when present, carries the non-lossy canonical subject in the
+    # same file.
+    try:
+        rows = conn.execute(
+            "SELECT content, tags FROM evo_nodes WHERE file_name=? "
+            "AND is_latest=1 AND status='active'",
+            (file_name,),
+        ).fetchall()
+        subjects = {
+            str(row[0]).strip()
+            for row in rows
+            if "entity" in str(row[1] or "").split() and str(row[0] or "").strip()
+        }
+        if len(subjects) == 1:
+            return "assertion", subjects.pop(), prior_text
+    except sqlite3.Error:
+        pass
+    return None
+
+
+def _record_point_candidate_rejection(
+    conn: sqlite3.Connection,
+    *,
+    result: EditResult,
+) -> bool:
+    """Persist owner suppression independently of the best-effort audit row."""
+    if not result.candidate_kind or not result.candidate_subject or not result.candidate_text:
+        return False
+    try:
+        from ..store import model_candidates
+
+        state = model_candidates.record_owner_decision(
+            conn,
+            candidate_kind=result.candidate_kind,
+            subject=result.candidate_subject,
+            text=result.candidate_text,
+            decision=model_candidates.DECISION_REJECT,
+            source_receipt=f"⟨{result.target_id}:{result.op}:owner-point⟩",
+            reason="owner withdrew this Point",
+        )
+        return state is not None and state.status == model_candidates.STATUS_REJECTED
+    except Exception:  # noqa: BLE001 — the independent audit remains a fallback
+        logger.exception("owner Point candidate rejection failed for %s", result.target_id)
+        return False
 
 
 def _mark_structure_dirty(conn: sqlite3.Connection) -> None:
@@ -496,6 +659,13 @@ def _edit_point(
         supersedes={str(v) for v in json.loads(str(row["supersedes"] or "[]") or "[]")},
     )
     tags = _semantic_tags(row["tags"])
+    candidate = _point_candidate_identity(
+        conn,
+        file_name=file_name,
+        prior_text=prior_text,
+        tags=tags,
+    )
+    candidate_kind, candidate_subject, candidate_text = candidate or ("", "", "")
 
     writer = entries if backing == "markdown" else evo_inversion
     if backing == "evomem":
@@ -521,6 +691,9 @@ def _edit_point(
             new_id=str(new_id),
             prior_text=prior_text,
             file_name=file_name,
+            candidate_kind=candidate_kind,
+            candidate_subject=candidate_subject,
+            candidate_text=candidate_text,
             applied=[f"superseded {target_id} -> {new_id} in {file_name}"],
         )
 
@@ -533,6 +706,9 @@ def _edit_point(
         new_id=target_id,
         prior_text=prior_text,
         file_name=file_name,
+        candidate_kind=candidate_kind,
+        candidate_subject=candidate_subject,
+        candidate_text=candidate_text,
         applied=[f"retired {target_id} in {file_name}"],
     )
 
@@ -650,7 +826,11 @@ def apply_model_edit(
     if not result.ok:
         return result
 
-    _audit(
+    candidate_rejected = kind != "point" or _record_point_candidate_rejection(
+        conn,
+        result=result,
+    )
+    audit_recorded = _audit(
         conn,
         kind=kind,
         target_id=target_id,
@@ -662,6 +842,16 @@ def apply_model_edit(
         file_name=result.file_name,
     )
     _mark_structure_dirty(conn)
+
+    # A Point retirement/rewrite without either receipt can be resurrected by
+    # the next two independent observations.  The mutation has already landed,
+    # so fail loudly instead of returning an unqualified success that cannot be
+    # made durable.  Ordinary non-candidate Points still use the legacy audit as
+    # their suppression receipt.
+    if kind == "point" and not (candidate_rejected or audit_recorded):
+        raise RuntimeError(
+            "owner Point edit landed but neither candidate suppression nor audit receipt persisted"
+        )
 
     misses = max(0, evo_shadow.miss_count() - misses_before)
     if misses:
@@ -683,6 +873,9 @@ def apply_model_edit(
         new_id=result.new_id,
         prior_text=result.prior_text,
         file_name=result.file_name,
+        candidate_kind=result.candidate_kind,
+        candidate_subject=result.candidate_subject,
+        candidate_text=result.candidate_text,
         shadow_misses=misses,
         applied=result.applied,
     )

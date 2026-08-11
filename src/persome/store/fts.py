@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -52,7 +53,8 @@ _PRIVATE_SQLITE_FILE_MODE = 0o600
 # independent from PRAGMA user_version, which already tracks the secure-FTS
 # migration. Clients require an exact match: an older binary must not assume a
 # future schema is backward compatible.
-_RUNTIME_SCHEMA_REVISION = "2026-08-11.2"
+_RUNTIME_SCHEMA_REVISION = "2026-08-11.3"
+_RUNTIME_SCHEMA_REVISION_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\.(\d+)$")
 _ENTRIES_FTS_OBJECTS = (
     "entries",
     "entries_data",
@@ -246,6 +248,43 @@ def is_client_process() -> bool:
     return _CLIENT_PROCESS
 
 
+def _runtime_schema_revision_order(value: object) -> tuple[int, int, int, int] | None:
+    match = _RUNTIME_SCHEMA_REVISION_RE.fullmatch(str(value or "").strip())
+    if match is None:
+        return None
+    year, month, day, sequence = (int(part) for part in match.groups())
+    return year, month, day, sequence
+
+
+def _refuse_future_runtime_schema(conn: sqlite3.Connection) -> None:
+    """Reject a newer/unknown published owner schema before any local DDL.
+
+    This check must run in ``connect`` before WAL/security/schema setup as well
+    as in explicit initialization. Otherwise an older owner could mutate a
+    future database and only discover the incompatible receipt afterwards.
+    """
+    if not _table_exists(conn, "runtime_metadata"):
+        return
+    row = conn.execute(
+        "SELECT value FROM runtime_metadata WHERE key='schema_revision' LIMIT 1"
+    ).fetchone()
+    published = str(row[0]) if row is not None and str(row[0] or "").strip() else None
+    if published is None:
+        return
+    published_order = _runtime_schema_revision_order(published)
+    current_order = _runtime_schema_revision_order(_RUNTIME_SCHEMA_REVISION)
+    if published_order is None or current_order is None:
+        raise RuntimeError(
+            f"index database has unknown runtime schema revision {published!r}; "
+            "start it with the Persome version that created it"
+        )
+    if published_order > current_order:
+        raise RuntimeError(
+            f"index database schema revision {published!r} is newer than this "
+            f"Persome runtime ({_RUNTIME_SCHEMA_REVISION}); refusing to downgrade it"
+        )
+
+
 def initialize_runtime_schema(conn: sqlite3.Connection | None = None) -> str:
     """Apply every daemon-owned lazy schema step and publish its schema receipt.
 
@@ -262,9 +301,11 @@ def initialize_runtime_schema(conn: sqlite3.Connection | None = None) -> str:
         with cursor() as owned:
             return initialize_runtime_schema(owned)
 
+    owned = conn
+    _refuse_future_runtime_schema(owned)
+
     from . import schema_dump
 
-    owned = conn
     schema_dump.apply_index_db_steps(owned)
     fingerprint = _schema_fingerprint(owned)
     desired = {
@@ -840,6 +881,12 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
                 )
             raise CorruptDatabaseError(f"{db_path.name} is damaged ({exc}). {recovery}") from exc
         raise
+    if not _CLIENT_PROCESS:
+        try:
+            _refuse_future_runtime_schema(conn)
+        except Exception:
+            conn.close()
+            raise
     # SQLite's built-in date parser does not understand every ISO form Python's
     # historical ingest accepted (notably basic ISO), and interprets naive
     # values as UTC instead of local wall time. Keep one shared parser for all
