@@ -17,6 +17,7 @@ from ..evomem.person_graph import _slug as _entity_slug
 from ..logger import get
 from ..model.edit import AUDIT_SESSION_ID as _OWNER_EDIT_SESSION
 from ..store import entries as entries_store
+from ..store import event_occurrences as occurrences_store
 from ..store import relation_edges as edges_store
 from ..store.relation_edges import EntityKind, Predicate
 
@@ -51,6 +52,14 @@ class ApplyResult:
     supersedes_applied: int = 0
     skipped_reason: str = ""
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _EventWindowContext:
+    delta_id: int | None
+    session_id: str
+    window_start: datetime | str
+    window_end: datetime | str
 
 
 def _canonical_of(who: dict[str, Any] | None) -> str | None:
@@ -298,8 +307,62 @@ def _apply_relations(
             r.errors.append(f"relation: {exc}")
 
 
+def _event_window_context(
+    conn: sqlite3.Connection,
+    *,
+    delta_id: int | None,
+    session_id: str | None,
+    window_start: datetime | str | None,
+    window_end: datetime | str | None,
+) -> _EventWindowContext | None:
+    """Resolve the occurrence namespace without guessing from payload equality.
+
+    Windowed modeling passes the full context explicitly.  A caller that only
+    has a ``delta_id`` may resolve that exact row; context-free legacy callers
+    retain the historical title-hash endpoint.  Identical JSON in an unrelated
+    window is never treated as provenance.
+    """
+    explicit = (session_id, window_start, window_end)
+    if any(value is not None for value in explicit):
+        if not all(value is not None for value in explicit):
+            raise ValueError("event occurrence context requires session_id and both window bounds")
+        return _EventWindowContext(
+            delta_id=delta_id,
+            session_id=str(session_id),
+            window_start=window_start,  # type: ignore[arg-type]
+            window_end=window_end,  # type: ignore[arg-type]
+        )
+
+    try:
+        if delta_id is not None:
+            rows = conn.execute(
+                "SELECT id, session_id, window_start, window_end, payload "
+                "FROM memory_deltas WHERE id = ? LIMIT 1",
+                (delta_id,),
+            ).fetchall()
+        else:
+            return None
+    except sqlite3.Error:
+        return None
+
+    if len(rows) != 1 or not str(rows[0][2] or "") or not str(rows[0][3] or ""):
+        return None
+    row = rows[0]
+    return _EventWindowContext(
+        delta_id=int(row[0]),
+        session_id=str(row[1]),
+        window_start=str(row[2]),
+        window_end=str(row[3]),
+    )
+
+
 def _apply_events(
-    conn: sqlite3.Connection, clean: dict, kinds: dict[str, str], r: ApplyResult
+    conn: sqlite3.Connection,
+    clean: dict,
+    kinds: dict[str, str],
+    r: ApplyResult,
+    *,
+    context: _EventWindowContext | None,
 ) -> None:
     seen = rex._open_edges(conn)  # noqa: SLF001
     tally = rex._Tally()  # noqa: SLF001
@@ -310,12 +373,43 @@ def _apply_events(
             title = str(ev.get("title") or "").strip()
             if not title:
                 continue
-            eid = EVENT_PREFIX + hashlib.sha1(title.encode("utf-8")).hexdigest()[:12]  # noqa: S324
-            r.events_minted += 1
-            for p in ev.get("participants") or []:
-                pc = _canonical_of(p)
-                if not pc:
-                    continue
+            participants = [
+                canonical
+                for participant in (ev.get("participants") or [])
+                if (canonical := _canonical_of(participant))
+            ]
+            occurrence = None
+            if context is not None:
+                item_key = occurrences_store.make_item_key(
+                    title=title,
+                    participants=participants,
+                    quote=str(ev.get("quote") or ""),
+                    explicit=ev.get("item_key"),
+                )
+                occurrence, created = occurrences_store.upsert(
+                    conn,
+                    delta_id=context.delta_id,
+                    session_id=context.session_id,
+                    window_start=context.window_start,
+                    window_end=context.window_end,
+                    item_key=item_key,
+                    title=title,
+                    participants=participants,
+                    quote=str(ev.get("quote") or ""),
+                    confidence=float(ev.get("confidence", 0.5)),
+                )
+                eid = occurrence.endpoint
+                if created:
+                    r.events_minted += 1
+            else:
+                # Pre-windowed callers and already-existing endpoints retain the
+                # historical title hash.  Do not pretend they have occurrence
+                # receipts or synthesize rows for evidence that predates them.
+                eid = (
+                    EVENT_PREFIX + hashlib.sha1(title.encode("utf-8")).hexdigest()[:12]  # noqa: S324
+                )
+                r.events_minted += 1
+            for pc in participants:
                 try:
                     rex._upsert_shadow(  # noqa: SLF001
                         conn,
@@ -330,6 +424,12 @@ def _apply_events(
                         observations=1,
                         src_kind=_endpoint_kind(pc, kinds),
                         dst_kind=EntityKind.EVENT.value,
+                        valid_from=(occurrence.window_end if occurrence is not None else None),
+                        source_kind=("occurrence" if occurrence is not None else None),
+                        source_id=(occurrence.occurrence_id if occurrence is not None else None),
+                        source_receipt=(
+                            occurrence.source_receipt if occurrence is not None else None
+                        ),
                     )
                 except ValueError:
                     continue
@@ -407,6 +507,10 @@ def apply_delta(
     clean: dict,
     *,
     memory: EvoMemory | None = None,
+    delta_id: int | None = None,
+    session_id: str | None = None,
+    window_start: datetime | str | None = None,
+    window_end: datetime | str | None = None,
 ) -> ApplyResult:
     r = ApplyResult()
     if not clean:
@@ -414,6 +518,13 @@ def apply_delta(
         return r
     mem = memory or EvoMemory()
     kinds = _entity_kind_map(clean)
+    event_context = _event_window_context(
+        conn,
+        delta_id=delta_id,
+        session_id=session_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
     _apply_supersede(conn, clean, r)
     _apply_entities(conn, mem, clean, r)
 
@@ -421,7 +532,13 @@ def apply_delta(
         _apply_assertions(conn, mem, clean, kinds, r)
     _apply_floor(conn, clean, kinds, r)
     _apply_relations(conn, clean, kinds, r)
-    _apply_events(conn, clean, kinds, r)
+    _apply_events(
+        conn,
+        clean,
+        kinds,
+        r,
+        context=event_context,
+    )
     return r
 
 

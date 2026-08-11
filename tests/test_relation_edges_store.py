@@ -7,6 +7,8 @@ append-only stamping, and ``edges_as_of`` valid-time + status filtering.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from persome.evomem.models import MemoryStatus
@@ -45,7 +47,118 @@ def test_ensure_schema_idempotent_and_indexes(ac_root) -> None:
             ).fetchall()
         }
     assert tbl is not None
-    assert {"ix_edges_src", "ix_edges_dst"} <= idx
+    assert {"ix_edges_src", "ix_edges_dst", "uq_relation_edges_open_edge_key"} <= idx
+
+
+def test_canonical_edge_key_is_shared_and_knows_is_symmetric() -> None:
+    assert edges.canonical_edge_key(" Alice ", "Bob", "knows") == edges.canonical_edge_key(
+        "Bob", "Alice", edges.Predicate.KNOWS
+    )
+    assert edges.canonical_edge_key(
+        "event:legacy-1", "Alice", "participates_in"
+    ) == edges.canonical_edge_key("event:intent:legacy-1", "Alice", "participates_in")
+    assert edges.canonical_edge_key("Alice", "Bob", "reports_to") != edges.canonical_edge_key(
+        "Bob", "Alice", "reports_to"
+    )
+
+
+def test_open_edge_unique_close_reopen_and_retired_non_conflict(ac_root) -> None:
+    common = dict(
+        predicate="knows",
+        src_kind="person",
+        dst_kind="person",
+        provenance="inferred",
+        confidence=0.8,
+    )
+    with fts.cursor() as conn:
+        first = edges.add_edge(conn, src_identity="Alice", dst_identity="Bob", **common)
+        with pytest.raises(sqlite3.IntegrityError):
+            edges.add_edge(
+                conn,
+                src_identity="Bob",
+                dst_identity="Alice",
+                status=MemoryStatus.ACTIVE,
+                **common,
+            )
+
+        assert edges.close_edge(conn, edge_id=first, at=T_2026_06)
+        reopened = edges.add_edge(
+            conn,
+            src_identity="Bob",
+            dst_identity="Alice",
+            status=MemoryStatus.ACTIVE,
+            **common,
+        )
+        archived = edges.add_edge(
+            conn,
+            src_identity="Alice",
+            dst_identity="Bob",
+            status=MemoryStatus.ARCHIVED,
+            **common,
+        )
+        superseded = edges.add_edge(
+            conn,
+            src_identity="Bob",
+            dst_identity="Alice",
+            status=MemoryStatus.SUPERSEDED,
+            **common,
+        )
+        rows = conn.execute(
+            "SELECT edge_id, valid_to, status, edge_key FROM relation_edges ORDER BY edge_id"
+        ).fetchall()
+
+    assert {str(row[0]) for row in rows} == {first, reopened, archived, superseded}
+    assert len({str(row[3]) for row in rows}) == 1
+    assert sum(row[1] is None and row[2] in {"active", "shadow"} for row in rows) == 1
+
+
+def test_dirty_open_edge_migration_fails_closed_without_summing() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE relation_edges (
+            edge_id TEXT PRIMARY KEY, src_identity TEXT NOT NULL,
+            dst_identity TEXT NOT NULL, predicate TEXT NOT NULL, label TEXT,
+            valid_from TEXT NOT NULL, valid_to TEXT, provenance TEXT NOT NULL,
+            confidence REAL NOT NULL, quote TEXT, status TEXT NOT NULL,
+            created_at TEXT NOT NULL, observations INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO relation_edges VALUES
+            ('e1','Alice','Bob','knows',NULL,'2026-01-01',NULL,
+             'inferred',0.5,NULL,'shadow','2026-01-01',2),
+            ('e2','Bob','Alice','knows',NULL,'2026-02-01',NULL,
+             'inferred',0.7,NULL,'active','2026-02-01',7);
+        """
+    )
+
+    with pytest.raises(edges.RelationEdgeMigrationError) as raised:
+        edges.ensure_schema(conn)
+
+    message = str(raised.value)
+    assert "e1" in message and "e2" in message
+    assert "observations were not summed" in message
+    assert conn.execute(
+        "SELECT edge_id, observations FROM relation_edges ORDER BY edge_id"
+    ).fetchall() == [("e1", 2), ("e2", 7)]
+    assert "uq_relation_edges_open_edge_key" not in {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+
+    # Explicit adjudication (closing one history row) makes the migration safe;
+    # the closed row remains intact and receives the same canonical audit key.
+    conn.execute("UPDATE relation_edges SET valid_to='2026-02-01' WHERE edge_id='e1'")
+    edges.ensure_schema(conn)
+    assert (
+        len(
+            {
+                row[0]
+                for row in conn.execute(
+                    "SELECT edge_key FROM relation_edges WHERE edge_id IN ('e1','e2')"
+                )
+            }
+        )
+        == 1
+    )
 
 
 def test_add_edge_defaults_shadow_open_and_returns_id(ac_root) -> None:
@@ -589,8 +702,6 @@ def test_polarity_closed_set(ac_root) -> None:
 
 
 def test_ensure_schema_backfills_axis_columns(ac_root) -> None:
-    import sqlite3
-
     # simulate a pre-axis DB: the originally-shipped CREATE (no extra columns)
     c = sqlite3.connect(":memory:")
     c.execute(

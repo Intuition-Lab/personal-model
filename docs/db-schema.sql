@@ -193,6 +193,7 @@ END;
 
 CREATE TABLE relation_edges (
     edge_id      TEXT PRIMARY KEY,
+    edge_key     TEXT NOT NULL,          -- canonical logical identity; not a display label
     src_identity TEXT NOT NULL,          -- stable canonical identity, never a version node ID
     dst_identity TEXT NOT NULL,
     predicate    TEXT NOT NULL,          -- one closed-set predicate
@@ -212,6 +213,35 @@ CREATE TABLE relation_edges (
 CREATE INDEX ix_edges_dst ON relation_edges(dst_identity, valid_from);
 
 CREATE INDEX ix_edges_src ON relation_edges(src_identity, valid_from);
+
+CREATE UNIQUE INDEX uq_relation_edges_open_edge_key
+ON relation_edges(edge_key)
+WHERE valid_to IS NULL AND status IN ('active', 'shadow')
+;
+
+-- ---- store/event_occurrences.py ----
+
+CREATE TABLE event_occurrences (
+    occurrence_id TEXT PRIMARY KEY,
+    series_id TEXT NOT NULL,
+    delta_id INTEGER,
+    session_id TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    participants TEXT NOT NULL DEFAULT '[]',
+    quote TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, window_start, window_end, item_key)
+);
+
+CREATE INDEX ix_event_occurrences_series
+        ON event_occurrences(series_id, window_start);
+
+CREATE INDEX ix_event_occurrences_session
+        ON event_occurrences(session_id, window_start);
 
 -- ---- store/contradictions.py ----
 
@@ -256,6 +286,19 @@ CREATE INDEX idx_health_events_provider_time
 
 -- ---- store/memory_deltas.py ----
 
+CREATE TABLE memory_delta_window_claims (
+    session_id TEXT NOT NULL,
+    window_key TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    state TEXT NOT NULL,
+    claim_token TEXT NOT NULL DEFAULT '',
+    lease_until TEXT NOT NULL DEFAULT '',
+    delta_id INTEGER,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, window_key)
+);
+
 CREATE TABLE memory_deltas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -269,6 +312,9 @@ CREATE TABLE memory_deltas (
     window_end TEXT NOT NULL DEFAULT '',
     is_final INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE UNIQUE INDEX idx_memory_delta_window_claim_delta
+    ON memory_delta_window_claims(delta_id) WHERE delta_id IS NOT NULL;
 
 CREATE INDEX idx_memory_deltas_created ON memory_deltas(created_at DESC);
 

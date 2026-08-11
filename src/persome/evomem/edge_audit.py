@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..logger import get
+from ..store import event_occurrences as occurrences_store
 from ..store import relation_edges as edges_store
 
 logger = get("persome.evomem.edge_audit")
@@ -55,7 +56,17 @@ def _activity_source(identity: str) -> tuple[str, str] | None:
 
     normalized = normalize_activity_identity(identity)
     parts = normalized.split(":", 2)
-    if len(parts) != 3 or parts[0] != "event" or parts[1] not in {"intent", "entry", "session"}:
+    if (
+        len(parts) != 3
+        or parts[0] != "event"
+        or parts[1]
+        not in {
+            "occurrence",
+            "intent",
+            "entry",
+            "session",
+        }
+    ):
         return None
     return parts[1], parts[2]
 
@@ -75,6 +86,18 @@ def _activity_evidence(conn, identity: str, row: Any | None = None) -> tuple[boo
         return False, [], "unknown"
     kind, source_id = source
     try:
+        if kind == "occurrence":
+            if row is not None:
+                try:
+                    receipt = str(row["source_receipt"] or "")
+                except (IndexError, KeyError, TypeError):
+                    receipt = ""
+                if receipt and occurrences_store.parse_receipt(receipt) != source_id:
+                    return False, [], kind
+            occurrence = occurrences_store.get(conn, source_id)
+            if occurrence is None:
+                return False, [], kind
+            return True, [occurrence.title, occurrence.quote], kind
         if kind == "intent":
             record = conn.execute(
                 "SELECT status, rationale, resolution_outcome FROM intents WHERE id = ?",
@@ -96,13 +119,8 @@ def _activity_evidence(conn, identity: str, row: Any | None = None) -> tuple[boo
         if kind == "session":
             from ..model.activity_source import ActivitySource
 
-            event = next(
-                (
-                    item
-                    for item in ActivitySource(conn, include_legacy_intents=False).events()
-                    if item.stable_id == f"event:session:{source_id}"
-                ),
-                None,
+            event = ActivitySource(conn, include_legacy_intents=False).event(
+                f"event:session:{source_id}"
             )
             return event is not None, [event.summary] if event else [], kind
     except Exception:  # noqa: BLE001 — old/missing stores are an honest unavailable source

@@ -121,8 +121,9 @@ def test_relation_head_reaches_unmentioned_neighbor(ac_root):
             relation_include_shadow=False,
         )
         assert "e-bob" not in [h.id for h in hits]
-        # promoted (ACTIVE) edge → Bob's entry reachable without being mentioned
-        edges_store.add_edge(conn, status=MemoryStatus.ACTIVE, **edge_kwargs)
+        # Promote the one canonical open edge rather than creating a parallel
+        # ACTIVE copy of the same logical relation.
+        assert edges_store.promote_edges(conn, min_observations=1, max_per_identity=20) == 1
         hits = fts.search_associative(
             conn, query="\u5f20\u4f1f\u7684\u642d\u6863", entities=["\u5f20\u4f1f"], top_k=5
         )

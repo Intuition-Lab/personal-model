@@ -52,6 +52,7 @@ live Point/Line path is:
 
 ```text
 new timeline window + structured focus evidence
+  -> canonical SQLite window claim before inference
   -> one memory_delta LLM extraction
   -> owner-alias evidence + quote / roster / predicate / confidence gates
   -> repeated owner evidence resolves names and handles to reserved self
@@ -96,10 +97,25 @@ co-occurrence increments their independent observation count; the background
 structural build promotes only candidates meeting the evidence floor and
 per-identity fan-out cap.
 
-Persist-before-apply is deliberate. `apply_status` is `pending`, `applied`, or
-`failed`; a retry reuses the stored window payload and only resumes apply.
-`sessions.delta_end` advances only after success, keeping cost and
-relation-observation counts idempotent. Long recovery ranges are processed oldest-first in bounded
+Persist-before-apply is deliberate. A separate `memory_delta_window_claims` row canonicalizes UTC
+window bounds and serializes extraction before the LLM call. Its lease/token CAS lets a crashed
+claim be reclaimed without allowing the stale worker to bind a second payload; legacy and
+owner-edit audit rows remain append-only and outside this uniqueness policy.
+
+`apply_status` is `pending`, `applied`, or `failed`; a retry reuses the stored window payload and only
+resumes apply. The parent becomes `applied` only when deterministic apply returns no item errors.
+Open active/shadow relations have a canonical unique `edge_key` (`knows` is symmetric); a dirty
+legacy collision is reported and never merged implicitly. Default MAX reinforcement and event
+occurrence upsert are retry-idempotent. Additive reinforcement of an already-open Line still needs
+a per-effect receipt to be exactly-once across a crash, so that remaining boundary is not inferred
+from the parent status.
+
+Windowed event identity separates occurrence from series. `event:occurrence:<id>` derives from the
+session, canonical window, and item key; the series ID derives conservatively from normalized title
+and sorted canonical participants. A retry reuses one occurrence, while the same event in a later
+window is a distinct occurrence in the same series. Pre-window legacy title hashes are preserved.
+
+`sessions.delta_end` advances only after the window reaches its terminal writer outcome. Long recovery ranges are processed oldest-first in bounded
 `max_blocks` slices; a direct oversized call fails closed instead of silently claiming a truncated
 window. Terminal finalization processes only the remaining tail.
 

@@ -7,7 +7,11 @@ closed predicate set / confidence floor), persistence, and safe degradation.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta, timezone
+
+import pytest
 
 from persome import config as config_mod
 from persome.store import fts
@@ -128,6 +132,71 @@ def test_delta_persisted_shadow_with_counts(ac_root, fake_llm) -> None:
     sys_blocks = fake_llm.calls[0]["messages"][0]["content"]
     assert sys_blocks[0].get("cache_control") == {"type": "ephemeral"}
     assert blocks[0].get("cache_control") == {"type": "ephemeral"}
+
+
+def test_windowed_apply_mints_occurrence_with_explicit_delta_context(ac_root, fake_llm) -> None:
+    start, end = _seed_session_blocks([SESSION_ENTRY])
+    fake_llm.set_default(
+        delta_mod.STAGE,
+        _payload(
+            entities=[],
+            assertions=[],
+            events=[
+                {
+                    "title": "Friday release review",
+                    "participants": [{"ref": "self"}],
+                    "quote": "\u5468\u4e94\u7248\u672c\u53ef\u4ee5\u53d1",
+                    "confidence": 0.9,
+                }
+            ],
+        ),
+    )
+
+    result = delta_mod.run_after_session(
+        _cfg(),
+        session_id="s-event-context",
+        start_time=start,
+        end_time=end,
+    )
+
+    assert result.written and result.applied
+    with fts.cursor() as conn:
+        occurrence = conn.execute(
+            "SELECT delta_id, session_id, window_start, window_end FROM event_occurrences"
+        ).fetchone()
+        edge = conn.execute(
+            "SELECT dst_identity, source_kind FROM relation_edges WHERE predicate='participates_in'"
+        ).fetchone()
+    assert occurrence is not None
+    assert occurrence["delta_id"] == result.delta_id
+    assert occurrence["session_id"] == "s-event-context"
+    assert edge is not None and edge["dst_identity"].startswith("event:occurrence:")
+    assert edge["source_kind"] == "occurrence"
+
+
+def test_apply_item_errors_leave_parent_delta_retryable(ac_root, fake_llm, monkeypatch) -> None:
+    from persome.writer import delta_apply
+
+    start, end = _seed_session_blocks([SESSION_ENTRY])
+    fake_llm.set_default(delta_mod.STAGE, _payload())
+
+    def apply_with_error(*_args, **_kwargs):
+        return delta_apply.ApplyResult(errors=["entity: synthetic write failure"])
+
+    monkeypatch.setattr(delta_apply, "apply_delta", apply_with_error)
+    result = delta_mod.run_after_session(
+        _cfg(),
+        session_id="s-apply-item-error",
+        start_time=start,
+        end_time=end,
+    )
+
+    assert result.written is True
+    assert result.applied is False
+    assert result.skipped_reason == "apply_failed"
+    with fts.cursor() as conn:
+        row = deltas_store.latest_for_session(conn, "s-apply-item-error")
+    assert row is not None and row["apply_status"] == "failed"
 
 
 def test_roster_reserves_self_and_owner_aliases(ac_root) -> None:
@@ -459,12 +528,17 @@ def test_mixed_quality_prompt_and_quote_gate_exclude_ineligible_text(ac_root, fa
     assert result.dropped == 1
 
 
-def test_stats_aggregates_latest_per_session(ac_root, fake_llm) -> None:
+def test_stats_preserves_legacy_append_rows_but_aggregates_latest(ac_root) -> None:
     start, end = _seed_session_blocks([SESSION_ENTRY])
-    fake_llm.set_default(delta_mod.STAGE, _payload())
-    delta_mod.run_after_session(_cfg(), session_id="s9", start_time=start, end_time=end)
-    delta_mod.run_after_session(_cfg(), session_id="s9", start_time=start, end_time=end)
     with fts.cursor() as conn:
+        for _ in range(2):
+            deltas_store.insert(
+                conn,
+                session_id="s9",
+                payload=json.loads(_payload()),
+                window_start=start,
+                window_end=end,
+            )
         agg = deltas_store.stats(conn)
     assert agg["rows"] == 2 and agg["sessions"] == 1  # latest-per-session, not double-counted
     assert agg["heads"]["entities"] == 1
@@ -509,6 +583,193 @@ def test_active_windows_are_incremental_and_idempotent(ac_root, fake_llm) -> Non
         (start.isoformat(), middle.isoformat(), 0),
         (middle.isoformat(), end.isoformat(), 0),
     ]
+
+
+def test_owner_edit_empty_window_does_not_create_a_claim(ac_root) -> None:
+    with fts.cursor() as conn:
+        deltas_store.insert(conn, session_id="owner-edit", payload={})
+        count = conn.execute("SELECT COUNT(*) FROM memory_delta_window_claims").fetchone()[0]
+    assert count == 0
+
+
+def test_canonical_window_reuses_timezone_equivalent_persisted_delta(ac_root, fake_llm) -> None:
+    start, end = _seed_session_blocks([SESSION_ENTRY])
+    start_utc = start.astimezone(UTC)
+    end_utc = end.astimezone(UTC)
+    start_plus_eight = start_utc.astimezone(timezone(timedelta(hours=8)))
+    end_plus_eight = end_utc.astimezone(timezone(timedelta(hours=8)))
+    fake_llm.set_default(delta_mod.STAGE, _payload())
+    cfg = _cfg()
+
+    first = delta_mod.ensure_active_window(
+        cfg,
+        session_id="s-canonical",
+        start_time=start_utc,
+        end_time=end_utc,
+    )
+    duplicate = delta_mod.ensure_active_window(
+        cfg,
+        session_id="s-canonical",
+        start_time=start_plus_eight,
+        end_time=end_plus_eight,
+    )
+
+    assert first.written
+    assert duplicate.skipped_reason == "already_processed"
+    assert duplicate.delta_id == first.delta_id
+    assert len(fake_llm.calls) == 1
+    assert deltas_store.canonical_window_key(
+        datetime.fromisoformat("2026-07-02T01:00:00Z"),
+        datetime.fromisoformat("2026-07-02T01:02:00+00:00"),
+    ) == deltas_store.canonical_window_key(
+        datetime.fromisoformat("2026-07-02T09:00:00+08:00"),
+        datetime.fromisoformat("2026-07-02T09:02:00+08:00"),
+    )
+
+
+def test_legacy_timezone_window_is_reused_and_backfilled(ac_root, fake_llm) -> None:
+    start, end = _seed_session_blocks([SESSION_ENTRY])
+    legacy_start = start.astimezone(timezone(timedelta(hours=8)))
+    legacy_end = end.astimezone(timezone(timedelta(hours=8)))
+    with fts.cursor() as conn:
+        legacy_id = deltas_store.insert(
+            conn,
+            session_id="s-legacy-window",
+            payload=json.loads(_payload()),
+            window_start=legacy_start,
+            window_end=legacy_end,
+        )
+    fake_llm.set_default(delta_mod.STAGE, _payload())
+
+    result = delta_mod.ensure_active_window(
+        _cfg(),
+        session_id="s-legacy-window",
+        start_time=start.astimezone(UTC),
+        end_time=end.astimezone(UTC),
+    )
+
+    assert result.skipped_reason in {"already_processed", "resumed_apply"}
+    assert result.delta_id == legacy_id
+    assert fake_llm.calls == []
+    with fts.cursor() as conn:
+        row = conn.execute(
+            "SELECT state, delta_id FROM memory_delta_window_claims"
+            " WHERE session_id='s-legacy-window'"
+        ).fetchone()
+    assert tuple(row) == (deltas_store.CLAIM_PERSISTED, legacy_id)
+
+
+def test_two_connections_claim_one_llm_call_for_the_same_window(ac_root) -> None:
+    from persome.writer.llm import _build_response
+
+    start, end = _seed_session_blocks([SESSION_ENTRY])
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocking_llm(_cfg, _stage, _messages):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        entered.set()
+        assert release.wait(timeout=5)
+        return _build_response(_payload())
+
+    cfg = _cfg()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(
+            delta_mod.run_after_session,
+            cfg,
+            session_id="s-concurrent",
+            start_time=start,
+            end_time=end,
+            llm_call=blocking_llm,
+        )
+        assert entered.wait(timeout=5)
+        second_future = pool.submit(
+            delta_mod.run_after_session,
+            cfg,
+            session_id="s-concurrent",
+            start_time=start,
+            end_time=end,
+            llm_call=blocking_llm,
+        )
+        second = second_future.result(timeout=5)
+        release.set()
+        first = first_future.result(timeout=5)
+
+    assert calls == 1
+    assert first.written
+    assert second.skipped_reason == "claim_in_progress"
+    with fts.cursor() as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM memory_deltas WHERE session_id='s-concurrent'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_expired_claim_uses_token_cas_and_rejects_stale_payload(ac_root) -> None:
+    start = datetime(2026, 7, 2, 1, 0, tzinfo=UTC)
+    end = start + timedelta(minutes=2)
+    first_now = datetime(2026, 7, 2, 2, 0, tzinfo=UTC)
+    with fts.cursor() as conn:
+        first = deltas_store.claim_window(
+            conn,
+            session_id="s-lease",
+            window_start=start,
+            window_end=end,
+            now=first_now,
+            lease_seconds=10,
+        )
+    with fts.cursor() as conn:
+        live = deltas_store.claim_window(
+            conn,
+            session_id="s-lease",
+            window_start=start,
+            window_end=end,
+            now=first_now + timedelta(seconds=5),
+            lease_seconds=10,
+        )
+        reclaimed = deltas_store.claim_window(
+            conn,
+            session_id="s-lease",
+            window_start=start,
+            window_end=end,
+            now=first_now + timedelta(seconds=11),
+            lease_seconds=10,
+        )
+
+    assert first.acquired
+    assert not live.acquired
+    assert reclaimed.acquired and reclaimed.token != first.token
+    with fts.cursor() as conn:
+        with pytest.raises(deltas_store.ClaimLostError):
+            deltas_store.insert_for_claim(
+                conn,
+                session_id="s-lease",
+                payload={},
+                token=first.token,
+                window_start=start,
+                window_end=end,
+            )
+        delta_id = deltas_store.insert_for_claim(
+            conn,
+            session_id="s-lease",
+            payload={},
+            token=reclaimed.token,
+            window_start=start,
+            window_end=end,
+        )
+        persisted = deltas_store.persisted_for_window(
+            conn,
+            "s-lease",
+            window_start=start.astimezone(timezone(timedelta(hours=8))),
+            window_end=end.astimezone(timezone(timedelta(hours=8))),
+        )
+    assert persisted is not None and persisted["id"] == delta_id
 
 
 def test_gate_canonicalizes_honorific_ref_through_the_funnel(ac_root) -> None:
