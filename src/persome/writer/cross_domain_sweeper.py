@@ -316,6 +316,49 @@ def _sig_summary(sig: BehaviorSignature) -> str:
     return f"apps=[{apps}]; actions=[{acts}]; blocks={sig.sample_count}"
 
 
+def _receipt_input(
+    a: _StableSchema,
+    b: _StableSchema,
+    sig_a: BehaviorSignature,
+    sig_b: BehaviorSignature,
+) -> dict[str, Any]:
+    """Canonical material that the collision judge actually samples."""
+
+    def one(schema: _StableSchema, behavior: BehaviorSignature) -> dict[str, Any]:
+        return {
+            "name": schema.name,
+            "source_path": schema.source_path,
+            "central": schema.central,
+            "inferences": list(schema.inferences),
+            "confidence": schema.confidence,
+            "behavior": {
+                "apps": sorted(behavior.apps),
+                "actions": behavior.action_dist,
+                "hours": behavior.hours,
+                "sample_count": behavior.sample_count,
+            },
+        }
+
+    return {"target": "volume", "schemas": [one(a, sig_a), one(b, sig_b)]}
+
+
+def _parent_receipt(
+    receipt: schema_faces.InputReceipt, parent: _StableSchema
+) -> schema_faces.InputReceipt:
+    """Derive a distinct parent-Face receipt from the Volume input sample."""
+    return schema_faces.InputReceipt(
+        producer=receipt.producer,
+        sample_day=receipt.sample_day,
+        input_hash=schema_faces.canonical_input_hash(
+            {
+                "target": "face",
+                "parent": parent.name,
+                "volume_input_hash": receipt.input_hash,
+            }
+        ),
+    )
+
+
 def _probe_collision(
     cfg: Config,
     a: _StableSchema,
@@ -400,6 +443,7 @@ def _persist_cross_schema(
     collision: _Collision,
     *,
     stable_threshold: float,
+    receipt: schema_faces.InputReceipt | None = None,
 ) -> stage.WrittenSchema | None:
     central = collision.central_proposition.strip()
     if not central:
@@ -475,25 +519,51 @@ def _persist_cross_schema(
                 if row is not None:
                     with contextlib.suppress(TypeError, ValueError):
                         parent_anchors.update(json.loads(row["anchors"] or "[]"))
-            body_id = schema_faces.record_face(
-                conn,
-                source=schema_faces.PROVENANCE_EMERGENT,
-                signature=central,
-                members=[a.name, b.name],
-                confidence=collision.confidence,
-                level=2,
-                anchors=sorted(parent_anchors),
-            )
-            schema_faces.maybe_promote(conn, body_id)
-            for parent in (a, b):
-                pid = schema_faces.record_face(
+            if receipt is None:
+                body_id = schema_faces.record_face(
                     conn,
                     source=schema_faces.PROVENANCE_EMERGENT,
-                    signature=parent.central,
-                    members=[],
+                    signature=central,
+                    members=[a.name, b.name],
                     confidence=collision.confidence,
+                    level=2,
+                    anchors=sorted(parent_anchors),
                 )
-                schema_faces.maybe_promote(conn, pid)
+                schema_faces.maybe_promote(conn, body_id)
+            else:
+                body_record = schema_faces.record_face_with_receipt(
+                    conn,
+                    receipt=receipt,
+                    source=schema_faces.PROVENANCE_EMERGENT,
+                    signature=central,
+                    members=[a.name, b.name],
+                    confidence=collision.confidence,
+                    level=2,
+                    anchors=sorted(parent_anchors),
+                )
+                if body_record.recorded:
+                    schema_faces.maybe_promote(conn, body_record.face_id)
+            for parent in (a, b):
+                if receipt is None:
+                    pid = schema_faces.record_face(
+                        conn,
+                        source=schema_faces.PROVENANCE_EMERGENT,
+                        signature=parent.central,
+                        members=[],
+                        confidence=collision.confidence,
+                    )
+                    schema_faces.maybe_promote(conn, pid)
+                else:
+                    parent_record = schema_faces.record_face_with_receipt(
+                        conn,
+                        receipt=_parent_receipt(receipt, parent),
+                        source=schema_faces.PROVENANCE_EMERGENT,
+                        signature=parent.central,
+                        members=[],
+                        confidence=collision.confidence,
+                    )
+                    if parent_record.recorded:
+                        schema_faces.maybe_promote(conn, parent_record.face_id)
         except Exception:
             logger.exception("schema_faces record failed for %s", name)
             raise
@@ -640,6 +710,7 @@ def sweep_cross_domain(
     min_confidence: float = _DEFAULT_MIN_CONFIDENCE,
     max_probes: int = _DEFAULT_MAX_PROBES,
     llm_call: Callable[[list[dict]], Any] | None = None,
+    sampled_at: datetime | None = None,
 ) -> CrossSweepResult:
     """Pair stable schemas, behavior-prefilter, LLM-judge collisions, land fusions.
 
@@ -653,6 +724,7 @@ def sweep_cross_domain(
     never aborts (schema is a decoration, must not cascade).
     """
     probe_limit = max(0, int(max_probes))
+    sample_time = sampled_at or datetime.now(UTC)
     schemas = _load_stable_schemas(conn)
     result = CrossSweepResult(probe_limit=probe_limit)
     if len(schemas) < 2:
@@ -695,11 +767,27 @@ def sweep_cross_domain(
 
     candidates.sort(key=lambda candidate: candidate.sort_key)
     result.eligible_pairs = len(candidates)
-    result.pairs_deferred = max(0, len(candidates) - probe_limit)
 
-    for candidate in candidates[:probe_limit]:
-        result.pairs_probed += 1
+    handled_candidates = 0
+    for candidate in candidates:
+        if result.pairs_probed >= probe_limit:
+            break
+        handled_candidates += 1
         a, b = candidate.a, candidate.b
+        # The selected schemas and deterministic behavior signatures fully
+        # determine the structural input receipt.  Check it before the LLM so a
+        # completed same-day collision cannot spend probe budget or rewrite the
+        # xdomain Markdown while the canonical Volume correctly refuses a second
+        # observation.  ``record_face_with_receipt`` remains the atomic write-time
+        # check in case another writer wins after this preflight.
+        receipt = schema_faces.make_input_receipt(
+            producer="cross_domain_sweeper",
+            sampled_at=sample_time,
+            input_value=_receipt_input(a, b, candidate.sig_a, candidate.sig_b),
+        )
+        if schema_faces.receipt_object(conn, receipt) is not None:
+            continue
+        result.pairs_probed += 1
         try:
             collision = _probe_collision(cfg, a, b, candidate.sig_a, candidate.sig_b, call)
         except Exception:  # pragma: no cover - defensive; one bad pair can't kill the sweep
@@ -717,6 +805,7 @@ def sweep_cross_domain(
                 b,
                 collision,
                 stable_threshold=min_confidence,
+                receipt=receipt,
             )
         except Exception:  # pragma: no cover - one failed projection must not monopolize the queue
             logger.exception("cross-domain persistence failed on %s × %s", a.name, b.name)
@@ -731,6 +820,8 @@ def sweep_cross_domain(
         )
         if written is not None:
             result.written.append(written)
+
+    result.pairs_deferred = max(0, len(candidates) - handled_candidates)
 
     if result.pairs_deferred:
         logger.info(

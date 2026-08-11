@@ -4299,11 +4299,22 @@ def _clean_timeline_locked() -> int:
 
 
 _MODEL_TABLES = (
+    "memory_delta_items",
+    "memory_delta_window_claims",
     "memory_deltas",
+    "model_candidate_evidence",
+    "model_candidate_decisions",
+    "model_candidates",
+    "owner_alias_evidence",
+    "owner_aliases",
+    "event_occurrences",
     "memory_contradictions",
+    "relation_edge_effects",
     "relation_edges",
+    "schema_input_receipts",
     "schema_faces",
     "cross_domain_probe_state",
+    "source_imports",
     "evo_nodes",
     "projection_state",
     "entry_metadata",

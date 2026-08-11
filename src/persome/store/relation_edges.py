@@ -29,6 +29,8 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterable
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
@@ -40,6 +42,19 @@ logger = get("persome.store.relation_edges")
 
 class RelationEdgeMigrationError(RuntimeError):
     """The legacy edge set cannot be made canonically unique without adjudication."""
+
+
+class RelationEdgeEffectConflict(RuntimeError):
+    """One effect key was reused for a different logical relation edge."""
+
+
+@dataclass(frozen=True)
+class EndEdgeEffectResult:
+    """Outcome of one receipt-backed create/reinforce-and-close operation."""
+
+    edge_id: str
+    created: bool
+    applied: bool
 
 
 class EntityKind(StrEnum):
@@ -130,6 +145,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS {_OPEN_EDGE_INDEX}
 ON relation_edges(edge_key)
 WHERE valid_to IS NULL AND status IN ('active', 'shadow')
 """
+_EFFECT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS relation_edge_effects (
+    effect_key           TEXT PRIMARY KEY,
+    edge_id              TEXT NOT NULL,
+    edge_key             TEXT NOT NULL,
+    applied_observations INTEGER NOT NULL CHECK (applied_observations = 1),
+    created_at           TEXT NOT NULL
+)
+"""
+_EFFECT_INDEX = (
+    "CREATE INDEX IF NOT EXISTS ix_relation_edge_effects_edge_id ON relation_edge_effects(edge_id)"
+)
 
 # Kept as the importable base schema string. ``ensure_schema`` installs the
 # partial unique index only after its fail-closed legacy-data preflight.
@@ -278,6 +305,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         if not index_exists:
             _backfill_canonical_keys(conn)
             conn.execute(_OPEN_EDGE_INDEX_SQL)
+        conn.execute(_EFFECT_SCHEMA)
+        conn.execute(_EFFECT_INDEX)
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -288,6 +317,64 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _normalize_effect_key(effect_key: str | None) -> str | None:
+    if effect_key is None:
+        return None
+    key = str(effect_key).strip()
+    if not key:
+        raise ValueError("relation_edges: effect_key must be non-empty when supplied")
+    return key
+
+
+def effect_already_applied(
+    conn: sqlite3.Connection,
+    *,
+    effect_key: str,
+    edge_key: str,
+) -> bool:
+    """Return whether one effect receipt already belongs to this logical Line.
+
+    The receipt outlives a physical validity interval. That is deliberate: a
+    retry after the Line closed is still the same effect and must not create a
+    replacement interval. Reusing an effect key for another logical Line fails
+    closed instead of silently stealing the receipt.
+    """
+    ensure_schema(conn)
+    effect = _normalize_effect_key(effect_key)
+    assert effect is not None
+    receipt = conn.execute(
+        "SELECT edge_key FROM relation_edge_effects WHERE effect_key=?",
+        (effect,),
+    ).fetchone()
+    if receipt is None:
+        return False
+    stored_key = str(receipt[0])
+    if stored_key != str(edge_key):
+        raise RelationEdgeEffectConflict(
+            f"relation_edges: effect_key {effect!r} already belongs to "
+            f"edge_key {stored_key!r}, not {edge_key!r}"
+        )
+    return True
+
+
+@contextmanager
+def _effect_transaction(conn: sqlite3.Connection):
+    """Own one atomic receipt+edge mutation while preserving DAO commit semantics."""
+    savepoint = f"relation_edge_effect_{uuid.uuid4().hex}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        yield
+    except Exception:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+    else:
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        # The historical DAO commits every successful write. If the caller had
+        # an outer transaction this deliberately preserves that existing API.
+        conn.commit()
 
 
 def add_edge(
@@ -311,6 +398,7 @@ def add_edge(
     source_kind: str | None = None,
     source_id: str | None = None,
     source_receipt: str | None = None,
+    effect_key: str | None = None,
 ) -> str:
     """Append one relation edge. Returns its ``edge_id``.
 
@@ -320,6 +408,9 @@ def add_edge(
     (the caller is expected to have made a decision; we do not silently coerce).
 
     Defaults to ``status='shadow'`` so the edge is inert until proven (§4.3).
+    ``effect_key`` is the exactly-once receipt for an initial additive effect:
+    the edge and receipt are committed atomically. It must identify this one
+    canonical relation effect, not a window containing several relations.
     """
     ensure_schema(conn)
 
@@ -346,10 +437,19 @@ def add_edge(
         raise ValueError("relation_edges: src_identity / dst_identity must be non-empty")
     edge_key = canonical_edge_key(src, dst, pred)
     st = MemoryStatus(str(status))
+    effect = _normalize_effect_key(effect_key)
 
     obs = int(observations)
     if obs < 1:
         raise ValueError(f"relation_edges: observations {obs} must be >= 1")
+    if effect is not None:
+        if obs != 1:
+            raise ValueError(
+                "relation_edges: an effect-keyed initial edge must represent exactly "
+                "one observation"
+            )
+        if st not in {MemoryStatus.ACTIVE, MemoryStatus.SHADOW}:
+            raise ValueError("relation_edges: effect_key requires an open active/shadow edge")
     pol = str(polarity)
     if pol not in POLARITIES:
         raise ValueError(f"relation_edges: polarity {pol!r} not in {sorted(POLARITIES)}")
@@ -365,39 +465,48 @@ def add_edge(
     eid = edge_id or uuid.uuid4().hex
     vf = valid_from or _now_iso()
     ts = created_at or _now_iso()
-    conn.execute(
-        """
+    insert_sql = """
         INSERT INTO relation_edges
             (edge_id, edge_key, src_identity, dst_identity, predicate, label, valid_from,
              valid_to, provenance, confidence, quote, status, created_at, observations,
              src_kind, dst_kind, polarity, last_observed_at, source_kind, source_id,
              source_receipt)
         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            eid,
-            edge_key,
-            src,
-            dst,
-            pred.value,
-            label,
-            vf,
-            prov,
-            conf,
-            quote,
-            st.value,
-            ts,
-            obs,
-            sk.value,
-            dk.value,
-            pol,
-            vf,  # birth stamp: last observed = the first evidence moment
-            source[0] or None,
-            source[1] or None,
-            source[2] or None,
-        ),
+    """
+    insert_params = (
+        eid,
+        edge_key,
+        src,
+        dst,
+        pred.value,
+        label,
+        vf,
+        prov,
+        conf,
+        quote,
+        st.value,
+        ts,
+        obs,
+        sk.value,
+        dk.value,
+        pol,
+        vf,  # birth stamp: last observed = the first evidence moment
+        source[0] or None,
+        source[1] or None,
+        source[2] or None,
     )
-    conn.commit()
+    if effect is None:
+        conn.execute(insert_sql, insert_params)
+        conn.commit()
+    else:
+        with _effect_transaction(conn):
+            conn.execute(insert_sql, insert_params)
+            conn.execute(
+                "INSERT INTO relation_edge_effects"
+                " (effect_key, edge_id, edge_key, applied_observations, created_at)"
+                " VALUES (?, ?, ?, 1, ?)",
+                (effect, eid, edge_key, ts),
+            )
     return eid
 
 
@@ -426,6 +535,144 @@ def close_edge(conn: sqlite3.Connection, *, edge_id: str, at: str | None = None)
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+def end_edge_with_effect(
+    conn: sqlite3.Connection,
+    *,
+    src_identity: str,
+    dst_identity: str,
+    predicate: str | Predicate,
+    src_kind: str | EntityKind,
+    dst_kind: str | EntityKind,
+    provenance: str,
+    confidence: float,
+    effect_key: str,
+    label: str | None = None,
+    quote: str | None = None,
+    status: str | MemoryStatus = MemoryStatus.SHADOW,
+    polarity: str = "0",
+    at: str | None = None,
+) -> EndEdgeEffectResult:
+    """Apply one relation-ending item exactly once.
+
+    The effect receipt is claimed in the same transaction that either closes
+    the existing open logical Line or creates its closed historical interval.
+    A retry therefore cannot manufacture a second closed row. If a process
+    dies after an earlier open-edge upsert but before this call, the next retry
+    closes that existing row safely.
+    """
+    ensure_schema(conn)
+    pred = Predicate(str(predicate))
+    sk = EntityKind(str(src_kind))
+    dk = EntityKind(str(dst_kind))
+    if (sk, dk) not in _LEGAL_ENDPOINTS[pred]:
+        raise ValueError(
+            f"relation_edges: illegal endpoints {sk.value}->{dk.value} for predicate "
+            f"{pred.value} (§4.2 completeness table)"
+        )
+    prov = str(provenance)
+    if prov not in PROVENANCE:
+        raise ValueError(
+            f"relation_edges: unknown provenance {prov!r} (expected one of {sorted(PROVENANCE)})"
+        )
+    conf = float(confidence)
+    if not 0.0 <= conf <= 1.0:
+        raise ValueError(f"relation_edges: confidence {conf} out of [0,1]")
+    src = str(src_identity).strip()
+    dst = str(dst_identity).strip()
+    if not src or not dst:
+        raise ValueError("relation_edges: src_identity / dst_identity must be non-empty")
+    st = MemoryStatus(str(status))
+    if st not in {MemoryStatus.ACTIVE, MemoryStatus.SHADOW}:
+        raise ValueError("relation_edges: ended effect requires active/shadow status")
+    pol = str(polarity)
+    if pol not in POLARITIES:
+        raise ValueError(f"relation_edges: polarity {pol!r} not in {sorted(POLARITIES)}")
+    effect = _normalize_effect_key(effect_key)
+    assert effect is not None
+    logical_key = canonical_edge_key(src, dst, pred)
+    ts = at or _now_iso()
+
+    with _effect_transaction(conn):
+        receipt = conn.execute(
+            "SELECT edge_id, edge_key FROM relation_edge_effects WHERE effect_key=?",
+            (effect,),
+        ).fetchone()
+        if receipt is not None:
+            if str(receipt[1]) != logical_key:
+                raise RelationEdgeEffectConflict(
+                    f"relation_edges: effect_key {effect!r} already belongs to "
+                    f"edge_key {receipt[1]!r}, not {logical_key!r}"
+                )
+            return EndEdgeEffectResult(str(receipt[0]), created=False, applied=False)
+
+        open_row = conn.execute(
+            "SELECT edge_id FROM relation_edges WHERE edge_key=? AND valid_to IS NULL"
+            " AND status IN ('active','shadow')",
+            (logical_key,),
+        ).fetchone()
+        edge_id = str(open_row[0]) if open_row is not None else uuid.uuid4().hex
+        claimed = conn.execute(
+            "INSERT OR IGNORE INTO relation_edge_effects"
+            " (effect_key, edge_id, edge_key, applied_observations, created_at)"
+            " VALUES (?, ?, ?, 1, ?)",
+            (effect, edge_id, logical_key, ts),
+        )
+        if claimed.rowcount != 1:
+            # A concurrent writer won after our initial read. SQLite serializes
+            # the INSERT; resolve and validate its durable receipt.
+            receipt = conn.execute(
+                "SELECT edge_id, edge_key FROM relation_edge_effects WHERE effect_key=?",
+                (effect,),
+            ).fetchone()
+            if receipt is None or str(receipt[1]) != logical_key:
+                raise RelationEdgeEffectConflict(
+                    f"relation_edges: effect_key {effect!r} changed during ended apply"
+                )
+            return EndEdgeEffectResult(str(receipt[0]), created=False, applied=False)
+
+        if open_row is not None:
+            changed = conn.execute(
+                "UPDATE relation_edges SET confidence=MAX(confidence, ?),"
+                " observations=MAX(observations, 1), last_observed_at=?, valid_to=?,"
+                " status=CASE WHEN ?='active' THEN 'active' ELSE status END"
+                " WHERE edge_id=? AND valid_to IS NULL",
+                (conf, ts, ts, st.value, edge_id),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError(
+                    "relation_edges: ended effect claimed a receipt but its open edge changed"
+                )
+            return EndEdgeEffectResult(edge_id, created=False, applied=True)
+
+        conn.execute(
+            "INSERT INTO relation_edges"
+            " (edge_id, edge_key, src_identity, dst_identity, predicate, label, valid_from,"
+            " valid_to, provenance, confidence, quote, status, created_at, observations,"
+            " src_kind, dst_kind, polarity, last_observed_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+            (
+                edge_id,
+                logical_key,
+                src,
+                dst,
+                pred.value,
+                label,
+                ts,
+                ts,
+                prov,
+                conf,
+                quote,
+                st.value,
+                ts,
+                sk.value,
+                dk.value,
+                pol,
+                ts,
+            ),
+        )
+        return EndEdgeEffectResult(edge_id, created=True, applied=True)
 
 
 def close_edges_quoted_in(
@@ -460,6 +707,69 @@ def close_edges_quoted_in(
     return closed
 
 
+def _reinforce_additive_effect(
+    conn: sqlite3.Connection,
+    *,
+    edge_id: str,
+    effect_key: str,
+    confidence: float | None,
+    at: str,
+) -> bool:
+    """Atomically claim one effect receipt and, only for its winner, add one."""
+    with _effect_transaction(conn):
+        receipt_cur = conn.execute(
+            "INSERT OR IGNORE INTO relation_edge_effects"
+            " (effect_key, edge_id, edge_key, applied_observations, created_at)"
+            " SELECT ?, edge_id, edge_key, 1, ? FROM relation_edges"
+            " WHERE edge_id=? AND valid_to IS NULL",
+            (effect_key, at, edge_id),
+        )
+        receipt_added = receipt_cur.rowcount > 0
+        if not receipt_added:
+            receipt = conn.execute(
+                "SELECT edge_id, edge_key FROM relation_edge_effects WHERE effect_key=?",
+                (effect_key,),
+            ).fetchone()
+            current = conn.execute(
+                "SELECT edge_key FROM relation_edges WHERE edge_id=?", (edge_id,)
+            ).fetchone()
+            current_key = str(current[0]) if current is not None else None
+            if receipt is not None and str(receipt[1]) != current_key:
+                raise RelationEdgeEffectConflict(
+                    f"relation_edges: effect_key {effect_key!r} already belongs to "
+                    f"edge_key {receipt[1]!r}, not {current_key!r}"
+                )
+            if receipt is not None and str(receipt[0]) != str(edge_id):
+                # The same logical Line was closed and later reopened under a
+                # new physical edge_id. The old effect was already counted in
+                # the prior validity interval; its retry is a successful no-op,
+                # not a vote for the reopened interval and not a conflict.
+                return False
+
+        conf_grew = False
+        if confidence is not None:
+            conf_cur = conn.execute(
+                "UPDATE relation_edges SET confidence=MAX(confidence, ?), last_observed_at=?"
+                " WHERE edge_id=? AND valid_to IS NULL AND confidence < ?",
+                (confidence, at, edge_id, confidence),
+            )
+            conf_grew = conf_cur.rowcount > 0
+
+        obs_grew = False
+        if receipt_added:
+            obs_cur = conn.execute(
+                "UPDATE relation_edges SET observations=observations + 1, last_observed_at=?"
+                " WHERE edge_id=? AND valid_to IS NULL",
+                (at, edge_id),
+            )
+            if obs_cur.rowcount != 1:
+                raise RuntimeError(
+                    "relation_edges: effect receipt was claimed but its open edge was not updated"
+                )
+            obs_grew = True
+    return obs_grew or conf_grew
+
+
 def reinforce_edge(
     conn: sqlite3.Connection,
     *,
@@ -468,6 +778,7 @@ def reinforce_edge(
     confidence: float | None = None,
     at: str | None = None,
     additive: bool = False,
+    effect_key: str | None = None,
 ) -> bool:
     """Monotone evidence reinforcement: raise an OPEN edge's strength to ``observations``.
 
@@ -482,12 +793,12 @@ def reinforce_edge(
     count = attention weight. MAX-of-1 (the caller passing 1 every session) would freeze
     it at 1 (the point-layer bug); increment fixes it. Callers must fire once per session
     (the session-end callback does); a re-run repair is the deterministic recompute from
-    ``memory_deltas`` distinct-session count. Unlike the default MAX mode, an
-    additive call against an already-open edge is not retry-idempotent: this
-    table has no per-effect receipt ledger with which to distinguish a retry
-    from genuinely new evidence. The relation upsert prevents a loser in a
-    concurrent *creation* race from incrementing again, but callers remain
-    responsible for once-per-effect delivery after the edge exists.
+    ``memory_deltas`` distinct-session count. Supplying a relation-specific
+    ``effect_key`` makes this additive path exactly-once: claiming its unique
+    receipt and adding one observation happen in the same SQLite transaction.
+    A retry of that effect does not increment; a distinct effect adds one.
+    Legacy additive callers may omit the key and retain the old at-least-once
+    behavior. ``effect_key`` is invalid on the default MAX path.
 
     ``confidence`` **likewise only
     ratchets up (MAX), INDEPENDENTLY of whether ``observations`` grew** (issue #453): the
@@ -501,12 +812,28 @@ def reinforce_edge(
     obs = int(observations)
     if obs < 1:
         raise ValueError(f"relation_edges: observations {obs} must be >= 1")
+    effect = _normalize_effect_key(effect_key)
+    if effect is not None and not additive:
+        raise ValueError("relation_edges: effect_key requires additive=True")
+    if effect is not None and obs != 1:
+        raise ValueError(
+            "relation_edges: an effect-keyed additive reinforcement must add exactly "
+            "one observation"
+        )
     conf = None
     if confidence is not None:
         conf = float(confidence)
         if not 0.0 <= conf <= 1.0:
             raise ValueError(f"relation_edges: confidence {conf} out of [0,1]")
     ts = at or _now_iso()
+    if effect is not None:
+        return _reinforce_additive_effect(
+            conn,
+            edge_id=edge_id,
+            effect_key=effect,
+            confidence=conf,
+            at=ts,
+        )
     # Confidence ratchet — gated ONLY on confidence actually rising, NOT on observations
     # growth (the #453 bug: the MAX used to ride the `observations < ?` UPDATE, so a
     # never-growing observations count froze confidence at its first-seen value). Runs only

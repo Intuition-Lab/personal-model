@@ -134,7 +134,7 @@ def _run_stage(
     }
 
 
-def _run_pipeline(cfg: Any) -> PipelineOutcome:
+def _run_pipeline(cfg: Any, *, sampled_at: datetime | None = None) -> PipelineOutcome:
     """Run the one-shot structural model stages in dependency order."""
     from .. import vectors_tick
     from ..session.tick import _run_evomem_enrichment_once
@@ -190,7 +190,11 @@ def _run_pipeline(cfg: Any) -> PipelineOutcome:
 
     def run_schema() -> dict[str, Any]:
         with fts.cursor() as conn:
-            result = schema_miner_stage.mine_schemas_for_user(cfg, conn)
+            result = schema_miner_stage.mine_schemas_for_user(
+                cfg,
+                conn,
+                sampled_at=sampled_at,
+            )
         return {
             "written": result.written_count,
             "skipped_small": result.skipped_small,
@@ -207,6 +211,7 @@ def _run_pipeline(cfg: Any) -> PipelineOutcome:
                 behavior_max_distance=cfg.schema.cross_domain_behavior_max_distance,
                 min_confidence=cfg.schema.cross_domain_min_confidence,
                 max_probes=cfg.schema.cross_domain_max_probes,
+                sampled_at=sampled_at,
             )
         return {
             "written": result.written_count,
@@ -227,7 +232,11 @@ def _run_pipeline(cfg: Any) -> PipelineOutcome:
 
     def run_root() -> dict[str, Any]:
         with fts.cursor() as conn:
-            result = root_synthesis.run_root_synthesis(cfg, conn)
+            result = root_synthesis.run_root_synthesis(
+                cfg,
+                conn,
+                sampled_at=sampled_at,
+            )
         if result.reason == "error":
             raise RuntimeError("root synthesis returned error")
         return {"reason": result.reason, "root_id": result.face_id}
@@ -459,7 +468,7 @@ def run_model_build(
     wait_seconds: float = DEFAULT_WAIT_SECONDS,
     trigger: str = "cli",
     coordinator: ModelBuildCoordinator | None = None,
-    pipeline_runner: Callable[[Any], PipelineOutcome] = _run_pipeline,
+    pipeline_runner: Callable[[Any], PipelineOutcome] | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> ModelBuildResult:
     """Run one idempotent build and persist its reproducibility manifest."""
@@ -489,7 +498,11 @@ def run_model_build(
             },
         )
         NodeStore()  # ensure the Point store exists even on a completely fresh root
-        outcome = pipeline_runner(cfg)
+        outcome = (
+            _run_pipeline(cfg, sampled_at=started_dt)
+            if pipeline_runner is None
+            else pipeline_runner(cfg)
+        )
 
         with fts.cursor() as conn:
             provisional = build_snapshot(

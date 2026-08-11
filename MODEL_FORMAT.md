@@ -106,6 +106,11 @@ handles learned from quoted owner-identity evidence resolve to `self`; if an
 owner alias was previously minted as a person, promotion retires that live
 projection while preserving its historical Point receipts.
 
+For the default windowed writer, a previously unseen machine-derived entity or assertion is not a
+Point yet. It is held in the owner-local candidate ledger until two distinct known sessions support
+the same canonical candidate. Same-session retries and extra windows are audit evidence, not
+independent promotion votes. Owner edits and already-live Points use their existing authority paths.
+
 ### Line
 
 Lines have two forms:
@@ -129,7 +134,8 @@ separate from the recurring series ID stored in `event_occurrences`.
 
 A Face is one active level-1 `schema_faces` row. It contains a behavioral
 signature, members, observations, confidence, provenance, anchors, and source
-receipts. Promotion requires stable repeated support.
+receipts. Promotion requires stable repeated support. Production observations are deduplicated by
+producer, UTC sample day, and canonical input hash before they can increment the count.
 
 Every projected Point and schema object carries `edit_refusal`: an empty string when the owner can
 correct it, otherwise a stable reason code naming why not — a newer version exists, the object was
@@ -151,13 +157,15 @@ mistaken for a derived one.
 A Volume is one active level-2 cross-domain schema. It relates behavior across
 otherwise separate owner-scoped topics and carries the same audit fields as a
 Face. Person schemas are excluded so evidence about a collaborator cannot be
-fused into the memory owner's behavior.
+fused into the memory owner's behavior. A same-day replay of one cross-domain input cannot satisfy
+the two-resample promotion threshold.
 
 ### Root
 
 `root` is `null` or one active level-3 apex. More than one live Root is a
 contract error. Root receipts aggregate evidence through its members so the
-summary can be expanded back to Points.
+summary can be expanded back to Points. Identical same-day synthesis input reuses its input receipt
+and does not supersede the resident Root.
 
 ## Receipts
 

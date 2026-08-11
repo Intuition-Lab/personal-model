@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -48,6 +49,103 @@ class TestRecordFace:
         assert row["observations"] == 1
         assert json.loads(row["members"]) == sorted(MEMBERS)
         assert json.loads(row["footprints"]) == [sorted(MEMBERS)]
+
+    def test_receipt_dedupes_same_producer_utc_day_and_input(self, conn):
+        sampled = datetime(2026, 8, 11, 23, 30, tzinfo=UTC)
+        receipt = faces.make_input_receipt(
+            producer="schema_miner",
+            sampled_at=sampled,
+            input_value={"members": set(MEMBERS), "source": "project-x.md"},
+        )
+        equivalent = faces.make_input_receipt(
+            producer="schema_miner",
+            sampled_at=sampled.astimezone(timezone(timedelta(hours=8))),
+            input_value={"source": "project-x.md", "members": set(reversed(MEMBERS))},
+        )
+        assert equivalent == receipt
+
+        first = faces.record_face_with_receipt(
+            conn,
+            receipt=receipt,
+            source="mined",
+            signature="Pattern A",
+            members=MEMBERS,
+        )
+        duplicate = faces.record_face_with_receipt(
+            conn,
+            receipt=equivalent,
+            source="mined",
+            signature="Duplicate builds must not overwrite",
+            members=MEMBERS,
+        )
+        other_producer = faces.record_face_with_receipt(
+            conn,
+            receipt=faces.make_input_receipt(
+                producer="cross_domain_sweeper",
+                sampled_at=sampled,
+                input_value={"members": set(MEMBERS), "source": "project-x.md"},
+            ),
+            source="emergent",
+            signature="Pattern A",
+            members=MEMBERS,
+        )
+        next_day = faces.record_face_with_receipt(
+            conn,
+            receipt=faces.make_input_receipt(
+                producer="schema_miner",
+                sampled_at=sampled + timedelta(days=1),
+                input_value={"members": set(MEMBERS), "source": "project-x.md"},
+            ),
+            source="mined",
+            signature="Pattern A",
+            members=MEMBERS,
+        )
+
+        assert first.recorded
+        assert not duplicate.recorded and duplicate.face_id == first.face_id
+        assert other_producer.recorded and next_day.recorded
+        row = _row(conn, first.face_id)
+        assert row["observations"] == 3
+        assert len(json.loads(row["footprints"])) == 3
+        assert row["signature"] == "Pattern A"
+
+    def test_orphan_receipt_is_reclaimed_after_geometry_invalidation(self, conn):
+        receipt = faces.make_input_receipt(
+            producer="schema_miner",
+            sampled_at=datetime(2026, 8, 11, tzinfo=UTC),
+            input_value={"members": MEMBERS, "source": "project-x.md"},
+        )
+        first = faces.record_face_with_receipt(
+            conn,
+            receipt=receipt,
+            source="mined",
+            signature="Pattern A",
+            members=MEMBERS,
+        )
+        conn.execute("DELETE FROM schema_faces WHERE face_id=?", (first.face_id,))
+
+        assert faces.receipt_object(conn, receipt) is None
+        rebuilt = faces.record_face_with_receipt(
+            conn,
+            receipt=receipt,
+            source="mined",
+            signature="Pattern A",
+            members=MEMBERS,
+        )
+        assert rebuilt.recorded and _row(conn, rebuilt.face_id)["observations"] == 1
+
+        # The writer path also repairs an orphan when no caller performs the
+        # optional early duplicate check used by Root synthesis.
+        conn.execute("DELETE FROM schema_faces WHERE face_id=?", (rebuilt.face_id,))
+        rebuilt_again = faces.record_face_with_receipt(
+            conn,
+            receipt=receipt,
+            source="mined",
+            signature="Pattern A",
+            members=MEMBERS,
+        )
+        assert rebuilt_again.recorded
+        assert _row(conn, rebuilt_again.face_id)["observations"] == 1
 
     def test_signature_match_folds_and_same_source_stays(self, conn):
         fid1 = faces.record_face(

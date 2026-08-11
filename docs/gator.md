@@ -11,8 +11,8 @@ capture evidence
   -> S1 focused content
   -> timeline provenance
   -> reducer / memory-delta evidence gate
-  -> Point and Line
-  -> independent-evidence promotion for Face, Volume, Root
+  -> independent-session Point candidates and retry-safe Lines
+  -> independent-input promotion for Face, Volume, Root
 ```
 
 ## Current enforced gates
@@ -42,6 +42,19 @@ capture evidence
   agree. Legacy title-hash endpoints remain untouched instead of receiving fabricated provenance.
 - A parent delta is `applied` only when deterministic apply reports no item errors. Partial failure
   remains retryable and visible as `failed`.
+- Each persisted delta seeds an ordered item ledger in the same transaction as its payload. A
+  leased item resumes independently after failure; additive and relation-ending Line effects carry
+  a unique database receipt in the same transaction as their graph mutation, so a crash after the
+  effect but before the item acknowledgement cannot count or create it twice. Each item also records
+  whether it changed geometry, preserving the structural rebuild signal if the process dies before
+  publishing the parent status.
+- A new entity or assertion is recorded as a candidate on first sighting. It becomes a durable Point
+  only after the same canonical candidate appears in two known, distinct sessions. More windows in
+  one session add audit evidence but do not satisfy independence; invalid or unknown session context
+  fails closed. Existing Points and explicit owner decisions retain their established authority.
+- Face, Volume, and Root producers bind canonical input hashes to UTC-day receipts. Re-running the
+  same producer/input/day does not add an observation, footprint, promotion vote, Root supersession,
+  or duplicate LLM call on the sequential build path. A later UTC day is a new resample.
 
 ## Evidence and compatibility
 
@@ -50,6 +63,14 @@ projection, not a promise that every frame is stored forever. Existing blocks mi
 because their original normalization path cannot be reconstructed safely. No migration guesses from
 entry wording or silently deletes prior model state.
 
+Pre-item-ledger memory deltas keep the same conservative boundary. A legacy row explicitly marked
+`not_requested` can take its historical context-free apply path. A legacy `pending` or `failed` row
+with Point/Line/event effects is not replayed automatically: some effects may already have committed,
+and inventing a receipt after the fact could count an additive Line twice. It remains failed and
+owner-auditable until an explicit repair can establish what happened. The affected window is
+quarantined and its session watermark advances, so one irrecoverable historical receipt cannot block
+all later, fully receipted windows.
+
 An `llm` block has passed content-signal and response-shape checks; it is not yet a per-entry
 cryptographic grounding guarantee. Source receipts plus locally verified evidence spans are part of
 the next promotion hardening slice.
@@ -57,9 +78,8 @@ the next promotion hardening slice.
 ## Next hardening slices
 
 1. Per-entry source receipts and evidence-span validation before normalized claims can promote.
-2. Candidate-state Point/Line promotion based on independent session receipts instead of ordinary
-   first sighting.
-3. Item-level apply receipts, including exactly-once additive Line reinforcement after a process
-   crash. Window-level claims are already enforced but cannot prove every effect committed once.
-4. An owner-visible dirty-data repair workflow for legacy open-Line collision reports.
-5. Independent input receipts for Face, Volume, and Root resamples.
+2. Durable S0/source event receipts and bounded content deduplication across watcher restart, plus
+   explicit trigger-to-capture alignment under queue pressure.
+3. An owner-visible dirty-data repair workflow for legacy open-Line collision reports.
+4. Candidate/receipt diagnostics in owner-facing model health surfaces without exposing raw capture
+   content.

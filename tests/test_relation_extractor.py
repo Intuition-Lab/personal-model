@@ -189,6 +189,7 @@ def test_concurrent_canonical_creation_reuses_one_open_edge_without_additive_ret
                 dst_kind="person",
                 additive=True,
                 status="active",
+                effect_key="delta:1:knows:alice:bob",
             )
             return tally
 
@@ -200,11 +201,185 @@ def test_concurrent_canonical_creation_reuses_one_open_edge_without_additive_ret
             "SELECT src_identity, dst_identity, status, observations FROM relation_edges"
             " WHERE valid_to IS NULL AND status IN ('active','shadow')"
         ).fetchall()
+        receipt_count = conn.execute(
+            "SELECT COUNT(*) FROM relation_edge_effects WHERE effect_key='delta:1:knows:alice:bob'"
+        ).fetchone()[0]
     assert len(rows) == 1
     assert rows[0][2] == "active"
     assert rows[0][3] == 1
     assert sum(tally.new for tally in tallies) == 1
     assert sum(tally.reinforced for tally in tallies) == 0
+    assert receipt_count == 1
+
+
+def test_concurrent_same_effect_reinforces_existing_edge_once(ac_root):
+    with fts.cursor() as conn:
+        edge_id = edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity="Alice",
+            predicate="engaged_with",
+            src_kind="self",
+            dst_kind="person",
+            provenance="inferred",
+            confidence=1.0,
+            status="active",
+        )
+
+    barrier = threading.Barrier(2)
+
+    def reinforce() -> bool:
+        with fts.cursor() as conn:
+            barrier.wait(timeout=5)
+            return edges.reinforce_edge(
+                conn,
+                edge_id=edge_id,
+                observations=1,
+                additive=True,
+                effect_key="delta:2:engaged:self:alice",
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: reinforce(), range(2)))
+
+    with fts.cursor() as conn:
+        observations = conn.execute(
+            "SELECT observations FROM relation_edges WHERE edge_id=?", (edge_id,)
+        ).fetchone()[0]
+        receipts = conn.execute(
+            "SELECT COUNT(*) FROM relation_edge_effects"
+            " WHERE effect_key='delta:2:engaged:self:alice'"
+        ).fetchone()[0]
+    assert sorted(results) == [False, True]
+    assert observations == 2
+    assert receipts == 1
+
+
+def test_effect_recovers_when_seen_edge_closes_before_reinforcement(ac_root) -> None:
+    key = edges.canonical_edge_key("self", "Alice", "engaged_with")
+    with fts.cursor() as conn:
+        old_edge = edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity="Alice",
+            predicate="engaged_with",
+            src_kind="self",
+            dst_kind="person",
+            provenance="inferred",
+            confidence=0.8,
+            status="active",
+        )
+        seen = {key: old_edge}
+        assert edges.close_edge(conn, edge_id=old_edge)
+        tally = rx._Tally()
+        rx._upsert_shadow(
+            conn,
+            seen,
+            tally,
+            src="self",
+            dst="Alice",
+            predicate=edges.Predicate.ENGAGED_WITH,
+            confidence=0.9,
+            quote="new window evidence",
+            label=None,
+            src_kind="self",
+            dst_kind="person",
+            additive=True,
+            status="active",
+            effect_key="delta:2:engaged:self:alice",
+        )
+        open_rows = conn.execute(
+            "SELECT edge_id, observations FROM relation_edges"
+            " WHERE edge_key=? AND valid_to IS NULL",
+            (key,),
+        ).fetchall()
+        receipt = conn.execute(
+            "SELECT edge_id FROM relation_edge_effects WHERE effect_key=?",
+            ("delta:2:engaged:self:alice",),
+        ).fetchone()
+
+    assert tally.new == 1 and tally.reinforced == 0
+    assert len(open_rows) == 1 and open_rows[0][0] != old_edge
+    assert receipt is not None and receipt[0] == open_rows[0][0]
+
+
+def test_non_additive_recovers_when_seen_edge_closes_before_reinforcement(ac_root) -> None:
+    key = edges.canonical_edge_key("self", "Alice", "reports_to")
+    with fts.cursor() as conn:
+        old_edge = edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity="Alice",
+            predicate="reports_to",
+            src_kind="self",
+            dst_kind="person",
+            provenance="inferred",
+            confidence=0.7,
+        )
+        seen = {key: old_edge}
+        assert edges.close_edge(conn, edge_id=old_edge)
+        tally = rx._Tally()
+        rx._upsert_shadow(
+            conn,
+            seen,
+            tally,
+            src="self",
+            dst="Alice",
+            predicate=edges.Predicate.REPORTS_TO,
+            confidence=0.9,
+            quote="new independent evidence",
+            label=None,
+            observations=2,
+            src_kind="self",
+            dst_kind="person",
+        )
+        open_rows = conn.execute(
+            "SELECT edge_id, observations, confidence FROM relation_edges"
+            " WHERE edge_key=? AND valid_to IS NULL",
+            (key,),
+        ).fetchall()
+
+    assert tally.new == 1 and tally.reinforced == 0
+    assert len(open_rows) == 1
+    assert open_rows[0][0] != old_edge
+    assert tuple(open_rows[0][1:]) == (2, 0.9)
+
+
+def test_effect_retry_after_its_interval_closed_is_noop(ac_root) -> None:
+    common = dict(
+        src="self",
+        dst="Alice",
+        predicate=edges.Predicate.ENGAGED_WITH,
+        confidence=0.8,
+        quote="same window evidence",
+        label=None,
+        src_kind="self",
+        dst_kind="person",
+        additive=True,
+        status="active",
+        effect_key="delta:1:engaged:self:alice",
+    )
+    with fts.cursor() as conn:
+        first = rx._Tally()
+        seen: dict[str, str] = {}
+        rx._upsert_shadow(conn, seen, first, **common)
+        edge_id = next(iter(seen.values()))
+        assert edges.close_edge(conn, edge_id=edge_id)
+
+        replay = rx._Tally()
+        rx._upsert_shadow(conn, {}, replay, **common)
+        row_count = conn.execute(
+            "SELECT COUNT(*) FROM relation_edges WHERE edge_key=?",
+            (edges.canonical_edge_key("self", "Alice", "engaged_with"),),
+        ).fetchone()[0]
+        open_count = conn.execute(
+            "SELECT COUNT(*) FROM relation_edges WHERE edge_key=? AND valid_to IS NULL",
+            (edges.canonical_edge_key("self", "Alice", "engaged_with"),),
+        ).fetchone()[0]
+
+    assert first.new == 1
+    assert replay.new == replay.reinforced == 0
+    assert row_count == 1 and open_count == 0
 
 
 def test_new_evidence_reinforces_strength(ac_root):

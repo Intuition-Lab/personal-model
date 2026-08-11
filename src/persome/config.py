@@ -208,8 +208,9 @@ class MemoryDeltaConfig:
     # One LLM reading of each newly flushed session window emits a structured
     # ``memory_delta {owner_alias_candidates, entities, assertions, relations,
     # events}`` persisted to
-    # the ``memory_deltas`` table before deterministic application mints or
-    # reinforces evomem Points and relation Lines.
+    # the ``memory_deltas`` table before deterministic application records
+    # first-sighting candidates, promotes independently repeated Points, and
+    # reinforces relation Lines with per-effect receipts.
     enabled: bool = True
     # Upper bound on session timeline blocks fed to the model.
     max_blocks: int = 120
@@ -746,7 +747,7 @@ max_blocks = 120
 roster_max = 60
 owner_aliases = []          # optional trusted overrides; owner aliases are normally learned from evidence
 min_confidence = 0.5
-apply_enabled = true       # deterministic Point/Line production after persist
+apply_enabled = true       # itemized candidate/Point/Line production after persist
 apply_assertions = true
 cooccurrence_knows = true
 

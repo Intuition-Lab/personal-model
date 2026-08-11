@@ -794,6 +794,291 @@ def test_a_withdrawn_fact_is_not_re_minted_by_the_next_observation(ac_root) -> N
     assert all(point["content"] != text for point in snapshot["points"])
 
 
+def test_a_withdrawn_entity_is_not_re_minted_by_the_next_observation(ac_root) -> None:
+    from persome import config as config_mod
+    from persome.writer import delta_apply
+
+    point_id = _seed_point("Alex")
+    with fts.cursor() as conn:
+        assert apply_model_edit(conn, kind="point", target_id=point_id, op="retire").ok
+        result = delta_apply.apply_delta(
+            conn,
+            config_mod.load(),
+            {"entities": [{"canonical": "Alex", "kind": "person"}]},
+        )
+        snapshot = build_snapshot(conn, redact=False)
+
+    assert result.entities_minted == 0
+    assert result.entities_seen == 1
+    assert all(point["content"] != "Alex" for point in snapshot["points"])
+    with fts.cursor() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM relation_edges").fetchone()[0] == 0
+
+
+def test_retired_entity_stays_suppressed_when_owner_audit_insert_fails(
+    ac_root, monkeypatch
+) -> None:
+    """The candidate decision is an independent owner-authority receipt.
+
+    Point mutation and ``memory_deltas`` audit are intentionally not one SQLite
+    transaction.  If the latter fails, two later sessions must not use the
+    ordinary candidate quorum to resurrect the Point or its attention floor.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from persome import config as config_mod
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.models import MemoryLayer
+    from persome.session import store as session_store
+    from persome.store import memory_deltas, model_candidates
+    from persome.store.memory_delta_items import ClaimedDeltaItem
+    from persome.writer import delta_apply
+
+    point_id = EvoMemory().add_direct(
+        "Alice",
+        layer=MemoryLayer.L5_KNOWLEDGE,
+        file_name="person-alice",
+        tags="entity",
+    )
+    # Keep another live Point in the same entity file.  ``delta_apply`` treats
+    # any live head in that file as an existing entity, so candidate rejection
+    # alone cannot suppress the floor Line; the recovered owner-edit receipt
+    # must remain queryable too.
+    EvoMemory().add_direct(
+        "Alice mentors the Runtime team.",
+        layer=MemoryLayer.L5_KNOWLEDGE,
+        file_name="person-alice",
+        tags="fact",
+    )
+
+    def fail_owner_audit(*_args, **_kwargs):
+        raise sqlite3.OperationalError("synthetic owner-audit failure")
+
+    monkeypatch.setattr(memory_deltas, "insert", fail_owner_audit)
+    monkeypatch.setattr(memory_deltas, "_insert_row", fail_owner_audit)
+    with fts.cursor() as conn:
+        retired = apply_model_edit(conn, kind="point", target_id=point_id, op="retire")
+        candidate = model_candidates.find(
+            conn,
+            candidate_kind=model_candidates.KIND_PERSON,
+            subject="Alice",
+            text="Alice",
+        )
+        owner_audits = conn.execute(
+            "SELECT COUNT(*) FROM memory_deltas WHERE session_id='owner-edit'"
+        ).fetchone()[0]
+
+    assert retired.ok
+    assert candidate is not None
+    assert candidate.status == model_candidates.STATUS_REJECTED
+    assert candidate.decision_source == "owner_explicit"
+    assert owner_audits == 0
+
+    cfg = config_mod.load()
+    entity = {
+        "new_entity": "Alice",
+        "kind": "person",
+        "quote": "Alice",
+        "confidence": 0.9,
+    }
+    base = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
+    for index in (1, 2):
+        start = base + timedelta(hours=index)
+        end = start + timedelta(minutes=5)
+        session_id = f"owner-audit-loss-{index}"
+        with fts.cursor() as conn:
+            session_store.insert(
+                conn,
+                session_store.SessionRow(
+                    id=session_id,
+                    start_time=start,
+                    end_time=end,
+                    status="reduced",
+                ),
+            )
+            applied = delta_apply.apply_delta_item(
+                conn,
+                cfg,
+                {"entities": [entity]},
+                item=ClaimedDeltaItem(
+                    kind="entity",
+                    key="entity:person:alice",
+                    ordinal=0,
+                    payload_hash="synthetic",
+                    payload=entity,
+                    delta_id=index,
+                    token=f"claim-{index}",
+                    attempts=1,
+                ),
+                delta_id=index,
+                session_id=session_id,
+                window_start=start,
+                window_end=end,
+            )
+        assert applied.entities_minted == 0
+        assert applied.floor_edges == 0
+        assert applied.entities_seen == 1
+
+    with fts.cursor() as conn:
+        live = conn.execute(
+            "SELECT COUNT(*) FROM evo_nodes WHERE file_name='person-alice.md' "
+            "AND is_latest=1 AND status='active' AND instr(tags, 'entity') > 0"
+        ).fetchone()[0]
+        candidate = model_candidates.find(
+            conn,
+            candidate_kind=model_candidates.KIND_PERSON,
+            subject="Alice",
+            text="Alice",
+        )
+        relation_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='relation_edges'"
+        ).fetchone()
+
+    assert live == 0
+    assert candidate is not None
+    assert candidate.status == model_candidates.STATUS_REJECTED
+    assert candidate.independent_sessions == 0
+    assert relation_table is None
+
+
+def test_later_owner_promote_overrides_stale_retire_audit(ac_root) -> None:
+    """Append-only retire history must not overrule a newer explicit restore."""
+    from datetime import UTC, datetime, timedelta
+
+    from persome import config as config_mod
+    from persome.evomem.engine import EvoMemory
+    from persome.evomem.models import MemoryLayer
+    from persome.session import store as session_store
+    from persome.store import model_candidates
+    from persome.store.memory_delta_items import ClaimedDeltaItem
+    from persome.writer import delta_apply
+
+    point_id = EvoMemory().add_direct(
+        "Alice",
+        layer=MemoryLayer.L5_KNOWLEDGE,
+        file_name="person-alice",
+        tags="entity",
+    )
+    with fts.cursor() as conn:
+        retired = apply_model_edit(conn, kind="point", target_id=point_id, op="retire")
+        rejected = model_candidates.find(
+            conn,
+            candidate_kind=model_candidates.KIND_PERSON,
+            subject="Alice",
+            text="Alice",
+        )
+        assert retired.ok
+        assert rejected is not None and rejected.status == model_candidates.STATUS_REJECTED
+        restored = model_candidates.record_owner_decision(
+            conn,
+            candidate_kind=model_candidates.KIND_PERSON,
+            subject="Alice",
+            text="Alice",
+            decision=model_candidates.DECISION_PROMOTE,
+            source_receipt="⟨owner-restored-alice:model-candidate⟩",
+            reason="Owner restored this Point.",
+        )
+
+    assert restored is not None and restored.status == model_candidates.STATUS_PROMOTED
+
+    start = datetime(2026, 8, 11, 15, 0, tzinfo=UTC)
+    end = start + timedelta(minutes=5)
+    session_id = "owner-restored-alice"
+    entity = {
+        "new_entity": "Alice",
+        "kind": "person",
+        "quote": "Alice",
+        "confidence": 0.9,
+    }
+    with fts.cursor() as conn:
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id=session_id,
+                start_time=start,
+                end_time=end,
+                status="reduced",
+            ),
+        )
+        applied = delta_apply.apply_delta_item(
+            conn,
+            config_mod.load(),
+            {"entities": [entity]},
+            item=ClaimedDeltaItem(
+                kind="entity",
+                key="entity:person:alice",
+                ordinal=0,
+                payload_hash="synthetic",
+                payload=entity,
+                delta_id=1,
+                token="owner-restore-claim",
+                attempts=1,
+            ),
+            delta_id=1,
+            session_id=session_id,
+            window_start=start,
+            window_end=end,
+        )
+        live = conn.execute(
+            "SELECT COUNT(*) FROM evo_nodes WHERE file_name='person-alice.md' "
+            "AND is_latest=1 AND status='active' AND instr(tags, 'entity') > 0"
+        ).fetchone()[0]
+
+    assert applied.entities_minted == 1
+    assert applied.floor_edges == 1
+    assert live == 1
+
+
+def test_newer_retire_audit_overrides_older_candidate_promote(ac_root, monkeypatch) -> None:
+    """The audit fallback still wins when the candidate write channel failed."""
+    from datetime import UTC, datetime
+
+    from persome.store import memory_deltas, model_candidates
+    from persome.writer import delta_apply
+
+    monkeypatch.setattr(
+        model_candidates,
+        "_now",
+        lambda: "2020-01-01T00:00:00+00:00",
+    )
+    with fts.cursor() as conn:
+        promoted = model_candidates.record_owner_decision(
+            conn,
+            candidate_kind=model_candidates.KIND_PERSON,
+            subject="Alice",
+            text="Alice",
+            decision=model_candidates.DECISION_PROMOTE,
+            source_receipt="⟨owner-promoted-alice:model-candidate⟩",
+        )
+        memory_deltas.insert(
+            conn,
+            session_id="owner-edit",
+            payload={
+                "owner_edit": {
+                    "kind": "point",
+                    "target_id": "point-alice",
+                    "op": "retire",
+                    "prior_text": "Alice",
+                    "new_text": "",
+                    "reason": "",
+                    "new_id": "point-alice",
+                    "file_name": "person-alice.md",
+                }
+            },
+            status="active",
+            apply_status="applied",
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        )
+        withdrew = delta_apply._owner_withdrew(  # noqa: SLF001
+            conn,
+            "person-alice.md",
+            "Alice",
+        )
+
+    assert promoted is not None and promoted.status == model_candidates.STATUS_PROMOTED
+    assert withdrew is True
+
+
 def test_a_differently_worded_observation_still_lands(ac_root) -> None:
     """Withdrawal suppresses the exact claim, not the subject."""
     from persome import config as config_mod

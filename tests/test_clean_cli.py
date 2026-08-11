@@ -43,8 +43,13 @@ def _seed_model() -> None:
             content="Synthetic personal-model fact.",
             tags=["synthetic"],
         )
-        schema_faces.upsert_root(
+        schema_faces.upsert_root_with_receipt(
             conn,
+            receipt=schema_faces.make_input_receipt(
+                producer="root_synthesis",
+                sampled_at=datetime(2026, 7, 10, 8, 0, tzinfo=UTC),
+                input_value={"members": [entry_id], "profile": []},
+            ),
             signature="Synthetic root.",
             members=[entry_id],
             anchors=["self"],
@@ -105,7 +110,24 @@ def test_clean_memory_removes_canonical_model_exports_and_backups(ac_root, monke
         assert conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM evo_nodes").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM schema_faces").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM schema_input_receipts").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 1
+
+
+def test_clean_memory_table_boundary_includes_gator_state() -> None:
+    assert {
+        "memory_delta_items",
+        "memory_delta_window_claims",
+        "model_candidate_evidence",
+        "model_candidate_decisions",
+        "model_candidates",
+        "owner_alias_evidence",
+        "owner_aliases",
+        "event_occurrences",
+        "relation_edge_effects",
+        "schema_input_receipts",
+        "source_imports",
+    } <= set(cli._MODEL_TABLES)
 
 
 def test_clean_all_keeps_only_install_configuration(ac_root, monkeypatch) -> None:
