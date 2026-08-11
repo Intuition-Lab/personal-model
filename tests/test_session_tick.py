@@ -115,7 +115,8 @@ def test_build_manager_wires_reducer_end_to_end(ac_root: Path, monkeypatch) -> N
 
 def test_prune_telemetry_calls_parser_store(ac_root: Path, monkeypatch) -> None:
     monkeypatch.setattr(session_tick.parser_ticks_store, "prune", lambda conn: 7)
-    assert session_tick._prune_telemetry_tables() == {"parser_ticks": 7}
+    monkeypatch.setattr(session_tick.tool_ticks_store, "prune", lambda conn: 3)
+    assert session_tick._prune_telemetry_tables() == {"parser_ticks": 7, "tool_ticks": 3}
 
 
 def test_model_dirty_generation_does_not_clear_newer_evidence(ac_root: Path) -> None:

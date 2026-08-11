@@ -363,6 +363,18 @@ CREATE INDEX ix_cross_domain_probe_age
 
 CREATE INDEX ix_faces_status ON schema_faces(status, level);
 
+-- ---- store/tool_ticks.py ----
+
+CREATE TABLE tool_ticks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,              -- ISO8601 call time (local, with offset)
+    tool TEXT NOT NULL,            -- MCP tool name (e.g. 'search')
+    client TEXT NOT NULL,          -- clientInfo.name best-effort ('' unknown)
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_tool_ticks_ts ON tool_ticks(ts DESC);
+
 -- ---- source_import.py ----
 
 CREATE TABLE source_imports (

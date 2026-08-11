@@ -121,6 +121,13 @@ configured capabilities:
 Capture and BM25 retrieval work without provider credentials. LLM-dependent
 model stages report degradation rather than silently claiming success.
 
+Local usage counting is not egress: each MCP tool call appends one row (tool
+name, timestamp, client name) to the `tool_ticks` table in `index.db`. Rows
+are bounded, pruned daily, and never uploaded. `persome stats show` reads
+them locally; `persome stats export` prints bare daily call counts — no tool
+names, no client names, no content — as JSON the owner may choose to share
+by hand. Nothing transmits it.
+
 ## Local API boundary
 
 - REST and streamable HTTP MCP are restricted to loopback (`127.0.0.1` by default).

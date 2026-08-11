@@ -18,6 +18,7 @@ depending on `[mcp] transport`. Exposes:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -1027,6 +1028,24 @@ def _protect_http_app(app: Any, *, host: str, auth_enabled: bool) -> Any:
     return add_local_api_auth_middleware(app, enabled=auth_enabled)
 
 
+def _record_tool_tick(tool: str, client: str) -> None:
+    """Best-effort local usage tick — one row in ``index.db``, nothing leaves
+    the machine (SECURITY_PRIVACY.md). Never raises: a telemetry failure must
+    not break the tool call it describes."""
+    try:
+        from ..store import tool_ticks
+
+        with fts.cursor() as conn:
+            tool_ticks.record_tick(
+                conn,
+                ts=datetime.now().astimezone().isoformat(timespec="seconds"),
+                tool=tool,
+                client=client,
+            )
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break a call
+        logger.debug("tool tick skipped: %s", exc)
+
+
 def build_server(
     cfg: Config | None = None,
     *,
@@ -1075,7 +1094,26 @@ def build_server(
         validate_bind_host(cfg.mcp.host)
 
     class _ProtectedFastMCP(FastMCP):
-        """FastMCP whose complete HTTP app shares the local bearer boundary."""
+        """FastMCP whose complete HTTP app shares the local bearer boundary.
+
+        Also the single interception point for local tool-call counting: every
+        registered tool dispatches through ``call_tool``, so one override
+        covers the whole surface without touching individual tools.
+        """
+
+        async def call_tool(self, name, arguments):  # type: ignore[no-untyped-def]
+            client = ""
+            try:
+                params = self.get_context().session.client_params
+                if params is not None and params.clientInfo is not None:
+                    client = str(params.clientInfo.name or "")[:64]
+            except Exception:  # noqa: BLE001 — attribution is best-effort
+                client = ""
+            # Local-only usage tick (see SECURITY_PRIVACY.md: no phone-home).
+            # Runs off-loop; _record_tool_tick never raises, so only
+            # cancellation can propagate — and then the call is dying anyway.
+            await asyncio.to_thread(_record_tool_tick, name, client)
+            return await super().call_tool(name, arguments)
 
         def streamable_http_app(self):  # type: ignore[no-untyped-def]
             app = super().streamable_http_app()
