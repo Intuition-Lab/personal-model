@@ -59,12 +59,20 @@ class EntitySource:
         direct = self._direct_events()
         known = {(event.entity_id, event.kind): event.display_name for event in direct}
         mentions = self._event_mentions(known)
-        unique = {event.stable_id: event for event in [*direct, *mentions]}
-        return sorted(
-            unique.values(),
-            key=lambda event: (_time_sort_key(event.occurred_at), event.stable_id),
-            reverse=True,
-        )[: self._limit]
+        # Identity maintenance must run before interactions, regardless of
+        # their relative timestamps.  Keep a per-source budget so a burst of
+        # newer entries cannot evict every durable Point, while a full Point
+        # batch cannot starve entry-backed interaction history either.
+        direct_unique = {event.stable_id: event for event in direct}
+        mention_unique = {event.stable_id: event for event in mentions}
+
+        def sort_key(event: EntityEvent) -> tuple[datetime, str]:
+            return (_time_sort_key(event.occurred_at), event.stable_id)
+
+        return [
+            *sorted(direct_unique.values(), key=sort_key, reverse=True)[: self._limit],
+            *sorted(mention_unique.values(), key=sort_key, reverse=True)[: self._limit],
+        ]
 
     def _direct_events(self) -> list[EntityEvent]:
         try:
@@ -73,12 +81,60 @@ class EntitySource:
                 "FROM evo_nodes WHERE is_latest = 1 AND status = 'active' "
                 "AND (file_name LIKE 'person-%' OR file_name LIKE 'org-%' "
                 "OR file_name LIKE 'project-%') "
+                "AND instr(' ' || COALESCE(tags, '') || ' ', ' person-entity ') = 0 "
+                "AND instr(' ' || COALESCE(tags, '') || ' ', ' person-event ') = 0 "
                 "ORDER BY persome_epoch(COALESCE(occurred_at, memory_at)) DESC "
                 "LIMIT ?",
                 (self._limit,),
             ).fetchall()
         except sqlite3.Error:
             return []
+        # Prefer the explicit entity Point's display body over the filename
+        # slug for every fact in that file. Identity Points need a separate,
+        # time-unbounded lookup: a busy person file can have an old identity
+        # head outside the recent-event LIMIT while still contributing a new
+        # fact. Limit that lookup to files in this batch rather than scanning
+        # every current model node on each enrichment tick.
+        files = sorted({str(row[1] or "") for row in rows if row[1]})
+        try:
+            placeholders = ",".join("?" for _file in files)
+            identity_rows = (
+                self._conn.execute(
+                    "SELECT file_name, content, tags FROM evo_nodes "
+                    "WHERE is_latest = 1 AND status = 'active' "
+                    f"AND file_name IN ({placeholders}) "
+                    "ORDER BY file_name, gmt_created DESC, node_id",
+                    files,
+                ).fetchall()
+                if files
+                else []
+            )
+        except sqlite3.Error:
+            identity_rows = []
+        raw_identity_names: dict[tuple[str, str], dict[str, str]] = {}
+        derived_identity_names: dict[tuple[str, str], dict[str, str]] = {}
+        for row in identity_rows:
+            tags = set(str(row[2] or "").split())
+            typed = _entity_from_file(str(row[0] or ""))
+            content = str(row[1] or "").strip()
+            if typed is None or not content:
+                continue
+            if "entity" in tags:
+                raw_identity_names.setdefault(typed, {}).setdefault(norm_identity(content), content)
+            elif "person-entity" in tags:
+                derived_identity_names.setdefault(typed, {}).setdefault(
+                    norm_identity(content), content
+                )
+
+        displays: dict[tuple[str, str], str] = {}
+        for typed in raw_identity_names.keys() | derived_identity_names.keys():
+            # A raw identity Point is the authoritative display surface.  A
+            # PersonGraph roster head is only a fallback while no raw identity
+            # exists; treating both as peers makes the safe roster-first/raw-
+            # identity-later transition look ambiguous forever.
+            names = raw_identity_names.get(typed) or derived_identity_names.get(typed, {})
+            if len(names) == 1:
+                displays[typed] = next(iter(names.values()))
         out: list[EntityEvent] = []
         for row in rows:
             tags = str(row[6] or "").split()
@@ -96,7 +152,7 @@ class EntitySource:
                 EntityEvent(
                     stable_id=f"entity:point:{node_id}",
                     entity_id=entity_id,
-                    display_name=entity_id,
+                    display_name=displays.get((entity_id, kind), entity_id),
                     kind=kind,
                     occurred_at=str(row[3] or row[4]) if (row[3] or row[4]) else None,
                     summary=summary,
@@ -199,6 +255,8 @@ class MemoryPersonNameSource:
                 occurred_at=_parse_ts(event.occurred_at),
                 confidence=event.confidence,
                 source_id=event.stable_id,
+                source_kind=event.source_kind,
+                source_receipt=event.source_receipt,
             )
             for event in events
             if event.kind == "person"

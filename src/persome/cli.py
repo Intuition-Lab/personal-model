@@ -3780,21 +3780,53 @@ def writer_run() -> None:
         console.print(f"  - {s}")
 
 
+def _require_stopped_for_capture_once():  # type: ignore[no-untyped-def]
+    pid = _read_pid()
+    lock = None
+    if pid is None:
+        try:
+            lock = _acquire_daemon_lock()
+        except RuntimeError:
+            pass
+        else:
+            # Re-check after acquiring the lifetime lock so a just-published
+            # generation cannot be mistaken for a stopped Runtime.
+            pid = _read_pid()
+            if pid is None:
+                return lock
+            lock.close()
+    process = f" (pid {pid})" if pid is not None else ""
+    console.print(
+        f"[red]Refusing to run capture-once while the Runtime is running or starting{process}. "
+        "Run `persome stop` first, then retry the isolated diagnostic.[/red]"
+    )
+    raise typer.Exit(1)
+
+
 @app.command("capture-once")
 def capture_once() -> None:
     """Perform one capture immediately (useful for testing)."""
-    cfg = _init()
-    from .capture import ax_capture, scheduler
+    # This command writes outside the daemon-owned runner. Running both would
+    # leave the daemon's in-memory content head stale even after the direct CLI
+    # invalidates durable receipts, so refuse before config/integrity can write.
+    daemon_lock = _require_stopped_for_capture_once()
+    try:
+        # The held lifetime lock is the integrity exclusion for this diagnostic;
+        # do not ask _init() to open a second lock and misclassify our own owner.
+        cfg = _init(recover_integrity=False)
+        from .capture import ax_capture, scheduler
 
-    provider = ax_capture.create_provider(
-        depth=cfg.capture.ax_depth, timeout=cfg.capture.ax_timeout_seconds
-    )
-    path = scheduler.capture_once(cfg.capture, provider)
-    if path:
-        console.print(f"[green]Wrote {path}[/green]")
-    else:
-        console.print("[red]Capture skipped or failed (check logs).[/red]")
-        raise typer.Exit(1)
+        provider = ax_capture.create_provider(
+            depth=cfg.capture.ax_depth, timeout=cfg.capture.ax_timeout_seconds
+        )
+        path = scheduler.capture_once(cfg.capture, provider)
+        if path:
+            console.print(f"[green]Wrote {path}[/green]")
+        else:
+            console.print("[red]Capture skipped or failed (check logs).[/red]")
+            raise typer.Exit(1)
+    finally:
+        daemon_lock.close()
 
 
 @app.command("rebuild-index")

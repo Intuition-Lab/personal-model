@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from ..evomem import identity as identity_mod
 from ..evomem import relation_extractor as rex
 from ..evomem.engine import EvoMemory
 from ..evomem.models import MemoryLayer
@@ -80,10 +81,19 @@ def _canonical_of(who: dict[str, Any] | None) -> str | None:
 
 def _entity_kind_map(clean: dict) -> dict[str, str]:
     out: dict[str, str] = {}
+    ambiguous: set[str] = set()
     for e in clean.get("entities") or []:
         c = _canonical_of(e)
         if c and e.get("kind") in _KIND_PREFIX:
-            out[c] = e["kind"]
+            key = identity_mod.norm(c)
+            if key in ambiguous:
+                continue
+            previous = out.get(key)
+            if previous is not None and previous != e["kind"]:
+                out.pop(key, None)
+                ambiguous.add(key)
+                continue
+            out[key] = e["kind"]
     return out
 
 
@@ -196,7 +206,7 @@ def _route_assertion_stem(
     conn: sqlite3.Connection, canonical: str, kinds: dict[str, str]
 ) -> str | None:
     slug = _entity_slug(canonical)
-    kind = kinds.get(canonical)
+    kind = kinds.get(identity_mod.norm(canonical))
     if kind in _KIND_PREFIX:
         return f"{_KIND_PREFIX[kind]}-{slug}"
     for prefix in _KIND_PREFIX.values():
@@ -672,7 +682,7 @@ def _endpoint_kind(identity: str, kinds: dict[str, str]) -> str:
         return EntityKind.SELF.value
     if identity.startswith(EVENT_PREFIX):
         return EntityKind.EVENT.value
-    k = kinds.get(identity)
+    k = kinds.get(identity_mod.norm(identity))
     return _KIND_ENUM[k].value if k in _KIND_ENUM else EntityKind.PERSON.value
 
 

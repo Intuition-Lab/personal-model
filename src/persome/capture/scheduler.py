@@ -83,6 +83,11 @@ _active_runner: _CaptureRunner | None = None
 def _set_active_runner(runner: _CaptureRunner | None) -> None:
     global _active_runner
     with _CONTENT_RECEIPT_STATE_LOCK:
+        # Construction loads receipts before publication.  Re-read inside the
+        # publication lock so a direct write interleaved between those two steps
+        # cannot publish a runner with a stale permanent head.
+        if runner is not None:
+            runner._load_content_receipts()
         _active_runner = runner
 
 
@@ -373,6 +378,68 @@ def _build_capture(
     return _finalize_capture(cfg, out, ocr_jpeg_provider=_daemon_ocr_jpeg_provider(cfg))
 
 
+def _reconcile_trigger_surface(
+    out: dict[str, Any],
+    trigger: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Bind a queued event to the surface actually sampled by the worker.
+
+    Watcher events are queued immediately, while ``window_meta`` and AX content
+    are sampled later on the single capture worker. Under backlog the foreground
+    can move from A to C before A's trigger executes. Persisting A beside C's
+    content would also move the session manager back to A. Preserve the source
+    event type on the same stable surface, but downgrade a cross-surface event to
+    a non-actionable refresh and discard its now-stale click details.
+    """
+    if trigger is None:
+        return None
+    stored_trigger = out.get("trigger")
+    sanitized_trigger = stored_trigger if isinstance(stored_trigger, dict) else trigger
+    meta = out.get("window_meta") or {}
+    actual_app = str(meta.get("app_name") or "")
+    actual_bundle = str(meta.get("bundle_id") or "")
+    actual_title = str(meta.get("title") or "")
+    trigger_app = str(trigger.get("app_name") or "")
+    trigger_bundle = str(trigger.get("bundle_id") or "")
+    trigger_title = str(trigger.get("window_title") or "")
+
+    def surface(bundle_id: str, app_name: str) -> tuple[str, str]:
+        if bundle_id:
+            return ("bundle", bundle_id)
+        if app_name:
+            return ("app", app_name)
+        return ("unknown", "")
+
+    source_surface = surface(trigger_bundle, trigger_app)
+    actual_surface = surface(actual_bundle, actual_app)
+    mismatch = (
+        source_surface[0] != "unknown"
+        and actual_surface[0] != "unknown"
+        and source_surface != actual_surface
+    )
+    changed_window = bool(trigger_title and actual_title and trigger_title != actual_title)
+    if mismatch or changed_window:
+        reconciled: dict[str, Any] = {
+            "event_type": "QueuedSurfaceRefresh",
+            "source_event_type": str(sanitized_trigger.get("event_type") or ""),
+        }
+    else:
+        # `_build_capture` has already run the S1 NUL/placeholder sanitizer on
+        # this projection. Never resurrect the raw queue payload here.
+        reconciled = dict(sanitized_trigger)
+
+    # Only overwrite with observed values. An AX provider that cannot identify
+    # the current app should not erase the watcher's last known surface.
+    if actual_app:
+        reconciled["app_name"] = actual_app
+    if actual_bundle:
+        reconciled["bundle_id"] = actual_bundle
+    if actual_title:
+        reconciled["window_title"] = actual_title
+    out["trigger"] = reconciled
+    return reconciled
+
+
 def _ingest_ocr_jpeg_provider(payload: dict[str, Any]) -> Callable[[], bytes | None]:
     """OCR JPEG source for the ingest path: decode the JPEG the Swift app pushed.
 
@@ -493,7 +560,7 @@ def ingest_capture(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
     if runner is not None:
         stem = runner.commit_prebuilt(out)
         return {"id": stem, "deduped": stem is None, "skipped": False}
-    path = _write_capture(out)
+    path = _write_capture_and_invalidate_content_receipts(out)
     return {"id": path.stem, "deduped": False, "skipped": False}
 
 
@@ -677,7 +744,10 @@ def ingest_mobile_event(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
         if runner is not None:
             stem = runner.commit_prebuilt(out, force=True, capture_id=capture_id)
         else:
-            stem = _write_capture(out, capture_id=capture_id).stem
+            stem = _write_capture_and_invalidate_content_receipts(
+                out,
+                capture_id=capture_id,
+            ).stem
         if stem != capture_id:
             raise RuntimeError("mobile capture persistence returned the wrong identity")
         with fts_store.cursor() as conn:
@@ -749,6 +819,65 @@ def _write_capture(out: dict[str, Any], *, capture_id: str | None = None) -> Pat
         thread.start()
 
     return path
+
+
+def _write_capture_and_invalidate_content_receipts(
+    out: dict[str, Any],
+    *,
+    capture_id: str | None = None,
+) -> Path:
+    """Direct-write one capture without leaving an older durable dedup head.
+
+    Production normally commits through ``_CaptureRunner``, which advances the
+    in-memory head and its durable receipt together.  A one-shot/fallback write
+    has no runner-owned head to publish, so keeping an older receipt would make
+    a later restart mistake that older observation for the latest content.
+
+    A private marker is durable before the raw write.  It closes both crash
+    windows around JSON persistence and SQLite invalidation without relying on
+    mutable capture mtimes (screenshot decay legitimately rewrites old JSON).
+    Runner startup consumes the marker only after clearing durable receipts.
+    """
+    marker = paths.capture_content_receipt_invalidation_marker()
+    with _CONTENT_RECEIPT_STATE_LOCK, fts_store.database_activity():
+        paths.atomic_write_private_text(marker, "pending\n")
+        try:
+            path = _write_capture(out, capture_id=capture_id)
+        except BaseException:
+            # The raw write may already have crossed its atomic rename before a
+            # later operation raised. Keep the marker and fail open on reload.
+            runner = _active_runner
+            if runner is not None:
+                runner._last_fingerprint = None
+                runner._recent_fingerprints.clear()
+            raise
+
+        invalidated = False
+        try:
+            with fts_store.cursor() as conn:
+                content_receipt_store.clear(conn)
+            invalidated = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "capture content receipt invalidation failed; durable marker retained: %s",
+                exc,
+            )
+        if invalidated:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError as exc:
+                # A leftover marker only causes another conservative clear on
+                # startup; it can never suppress evidence.
+                logger.warning("capture receipt invalidation marker cleanup failed: %s", exc)
+
+        # The no-runner decision can race daemon startup.  If a runner appeared
+        # while the direct write was in flight, its loaded cache is stale even
+        # when durable invalidation succeeded (and especially when it failed).
+        runner = _active_runner
+        if runner is not None:
+            runner._last_fingerprint = None
+            runner._recent_fingerprints.clear()
+        return path
 
 
 def _index_capture(file_stem: str, out: dict[str, Any]) -> bool:
@@ -851,7 +980,7 @@ def capture_once(
     out = _build_capture(cfg, provider, trigger)
     if out is None:
         return None
-    return _write_capture(out)
+    return _write_capture_and_invalidate_content_receipts(out)
 
 
 class _CaptureRunner:
@@ -916,14 +1045,38 @@ class _CaptureRunner:
             # retaining a head whose backing capture has just been erased.
             self._last_fingerprint = None
             self._recent_fingerprints.clear()
+            marker = paths.capture_content_receipt_invalidation_marker()
+            invalidation_pending = marker.exists()
             try:
                 with fts_store.cursor() as conn:
+                    if invalidation_pending:
+                        content_receipt_store.clear(conn)
                     receipts = content_receipt_store.load_recent(
                         conn,
                         limit=content_receipt_store.RECEIPT_LIMIT,
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("capture content receipt load failed; dedup starts empty: %s", exc)
+                return
+            if invalidation_pending:
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError as exc:
+                    # Retaining the marker repeats a safe clear on next load.
+                    logger.warning("capture receipt invalidation marker cleanup failed: %s", exc)
+
+            if not receipts:
+                return
+            newest = receipts[0]
+            newest_epoch = self._receipt_epoch(newest.committed_at)
+            newest_backing = paths.capture_buffer_dir() / f"{newest.capture_id}.json"
+            # Never promote an older receipt to the permanent head when the true
+            # newest receipt lost its evidence.  A missing/corrupt newest row is
+            # uncertainty about ordering, so the safe policy is a full fail-open.
+            if newest_epoch is None or not newest_backing.is_file():
+                logger.warning(
+                    "newest capture content receipt has no valid backing; dedup starts empty"
+                )
                 return
 
             valid_receipts: list[tuple[content_receipt_store.CaptureContentReceipt, float]] = []
@@ -932,27 +1085,28 @@ class _CaptureRunner:
                 backing_capture = paths.capture_buffer_dir() / f"{receipt.capture_id}.json"
                 if committed_epoch is not None and backing_capture.is_file():
                     valid_receipts.append((receipt, committed_epoch))
-            if not valid_receipts:
-                return
-            self._last_fingerprint = valid_receipts[0][0].fingerprint
+            self._last_fingerprint = newest.fingerprint
+            wall_now = time.time()
+            monotonic_now = time.monotonic()
             for receipt, committed_epoch in reversed(valid_receipts):
-                self._recent_fingerprints[receipt.fingerprint] = committed_epoch
+                wall_age = max(0.0, wall_now - committed_epoch)
+                self._recent_fingerprints[receipt.fingerprint] = monotonic_now - wall_age
                 self._recent_fingerprints.move_to_end(receipt.fingerprint)
 
-    def _duplicate_reason(self, fingerprint: str, *, now: float) -> str | None:
+    def _duplicate_reason(self, fingerprint: str, *, now_monotonic: float) -> str | None:
         if fingerprint == self._last_fingerprint:
             return "head"
         last_committed = self._recent_fingerprints.get(fingerprint)
         if last_committed is None:
             return None
-        age = now - last_committed
+        age = now_monotonic - last_committed
         if 0.0 <= age < self._cfg.same_window_dedup_seconds:
             return "recent"
         return None
 
-    def _remember_success(self, fingerprint: str, *, committed_epoch: float) -> None:
+    def _remember_success(self, fingerprint: str, *, committed_monotonic: float) -> None:
         self._last_fingerprint = fingerprint
-        self._recent_fingerprints[fingerprint] = committed_epoch
+        self._recent_fingerprints[fingerprint] = committed_monotonic
         self._recent_fingerprints.move_to_end(fingerprint)
         while len(self._recent_fingerprints) > content_receipt_store.RECEIPT_LIMIT:
             self._recent_fingerprints.popitem(last=False)
@@ -1023,7 +1177,8 @@ class _CaptureRunner:
                 if out is None:
                     self._publish_receipt(None, capture_gate_reason(self._cfg) or "capture-skipped")
                     return
-                self._commit(out, trigger)
+                committed_trigger = _reconcile_trigger_surface(out, trigger)
+                self._commit(out, committed_trigger)
             except Exception as exc:  # noqa: BLE001
                 logger.error("capture failed: %s", exc, exc_info=True)
 
@@ -1111,7 +1266,7 @@ class _CaptureRunner:
                 if force
                 else self._duplicate_reason(
                     fingerprint,
-                    now=time.time(),
+                    now_monotonic=time.monotonic(),
                 )
             )
             if duplicate_reason is not None:
@@ -1132,7 +1287,11 @@ class _CaptureRunner:
             # Never advance either state before `_write_capture` returns: a full
             # disk/index exception must remain retryable, not become a false dedup.
             committed_epoch = time.time()
-            self._remember_success(fingerprint, committed_epoch=committed_epoch)
+            committed_monotonic = time.monotonic()
+            self._remember_success(
+                fingerprint,
+                committed_monotonic=committed_monotonic,
+            )
             self._record_content_receipt(
                 fingerprint=fingerprint,
                 path=path,
@@ -1140,9 +1299,14 @@ class _CaptureRunner:
             )
         reason = str((out.get("trigger") or {}).get("event_type") or "capture")
         self._publish_receipt(path, reason)
-        if self._pre_capture_hook is not None and trigger is not None:
+        committed_trigger = out.get("trigger")
+        if (
+            self._pre_capture_hook is not None
+            and trigger is not None
+            and isinstance(committed_trigger, dict)
+        ):
             try:
-                self._pre_capture_hook(trigger)
+                self._pre_capture_hook(committed_trigger)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("pre_capture_hook failed: %s", exc)
         return path

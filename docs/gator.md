@@ -23,7 +23,18 @@ capture evidence
   The latest committed head survives daemon restart while its backing raw capture exists, window
   title remains part of exact context identity, and the receipt is never used as a substitute for
   the explicit identity of a mobile event. Raw retention removes the matching receipt; direct
-  maintenance/one-shot writes deliberately fail open instead of minting one.
+  no-runner writes durably invalidate older heads and deliberately fail open instead of minting one.
+  The isolated `capture-once` diagnostic holds the Runtime lifetime lock and cannot race the daemon.
+- Focus transitions prefer the more specific focused-window notification: Activation waits one
+  short trailing interval, Focus replaces it, and Focus followed by Activation remains one capture.
+  A newer cross-surface focus, click, or text signal invalidates every older pending Activation—even
+  if the newer capture is rate-limited—so a delayed trigger cannot label another app's later screen;
+  same-type Focus events still reach content dedup because they can name real windows. Shutdown
+  waits for a capture callback that has already crossed the admission boundary.
+- The capture worker reconciles each queued watcher trigger with the surface actually sampled. A
+  stable-surface or explicit-title mismatch becomes a non-actionable `QueuedSurfaceRefresh`, keeps
+  only the sanitized source event type, discards stale pointer details, and updates the session from
+  the persisted surface rather than the event-time app.
 - Timeline requires sanitized content signal before calling its LLM. Metadata-only windows are
   recorded but are not model evidence.
 - Timeline fallback and explicit-empty outcomes carry a durable `normalization_status`; downstream
@@ -36,6 +47,8 @@ capture evidence
   Historical Points and evolution Lines remain audit-searchable after they occurred.
 - Canonical relation endpoints reuse an unambiguous current entity Point. A context node is created
   only when no safe Point match exists; reserved `self` and ambiguous identities fail closed.
+  Context case/width/whitespace variants share one display node, and duplicate projected strokes
+  render once without deleting their separate audit Lines.
 - A canonical session-window claim is acquired before memory-delta extraction. Timezone-equivalent
   bounds share one key; a lease/token compare-and-swap prevents a stale worker from binding a second
   payload after recovery.
@@ -56,7 +69,19 @@ capture evidence
 - A new entity or assertion is recorded as a candidate on first sighting. It becomes a durable Point
   only after the same canonical candidate appears in two known, distinct sessions. More windows in
   one session add audit evidence but do not satisfy independence; invalid or unknown session context
-  fails closed. Existing Points and explicit owner decisions retain their established authority.
+  fails closed. Repeated same-window entity candidates are coalesced by canonical identity before
+  the immutable item ledger; contradictory active/ended claims drop as a group, and nested
+  assertion/relation/event references share the deterministic winner. Already established Points
+  and explicit owner decisions retain their authority.
+- PersonGraph treats a Point-backed person observation as already durable evidence: it may discover
+  or adopt the roster identity, but it does not copy the Point body into a second `person-event`.
+  If one raw identity Point arrives after one receipt-bearing derived roster head for the same
+  person file, the two are merged through one atomic multi-predecessor supersession without
+  incrementing interaction sightings. Point maintenance runs before entry interactions with a
+  separate bounded budget; the first same-file fact after an entry-created roster supplies one
+  identity bridge without becoming a sighting or copying every later receipt. Durable source events
+  remain idempotent through slug/display-name adoption. Ambiguous raw identities or roster heads,
+  plus unreceipted legacy heads, fail closed and are left for explicit legacy repair.
 - Face, Volume, and Root producers bind canonical input hashes to UTC-day receipts. Re-running the
   same producer/input/day does not add an observation, footprint, promotion vote, Root supersession,
   or duplicate LLM call on the sequential build path. A later UTC day is a new resample.
@@ -88,3 +113,5 @@ the next promotion hardening slice.
 3. An owner-visible dirty-data repair workflow for legacy open-Line collision reports.
 4. Candidate/receipt diagnostics in owner-facing model health surfaces without exposing raw capture
    content.
+5. A batch/indexed PersonGraph identity lookup so large legacy stores do not rescan every current
+   Point for each bounded source event during enrichment.

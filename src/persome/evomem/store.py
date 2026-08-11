@@ -267,39 +267,62 @@ class NodeStore:
     def save_and_supersede(
         self, node: MemoryNode, *, old_id: str, old_valid_until: str | None = None
     ) -> None:
+        self.save_and_supersede_many(
+            node,
+            old_ids=[old_id],
+            old_valid_until=old_valid_until,
+        )
+
+    def save_and_supersede_many(
+        self,
+        node: MemoryNode,
+        *,
+        old_ids: list[str],
+        old_valid_until: str | None = None,
+    ) -> None:
+        """Commit one new head and every predecessor pointer atomically."""
         integrity.ensure_writes_allowed()
         new_id = node.node_id
+        predecessors = list(dict.fromkeys(old_id for old_id in old_ids if old_id))
+        if not predecessors:
+            raise ValueError("save_and_supersede_many: at least one old node is required")
+        if new_id in predecessors:
+            raise ValueError("save_and_supersede_many: a node cannot supersede itself")
         with fts.cursor() as conn:
-            old = conn.execute(
-                "SELECT superseded_by FROM evo_nodes WHERE node_id=? AND user_id=? AND agent_id=?",
-                (old_id, self.user_id, self.agent_id),
-            ).fetchone()
-            if old is None:
-                raise KeyError(f"save_and_supersede: missing old node {old_id!r}")
-
-            old_superseded_by = json.loads(old["superseded_by"] or "[]")
-            if new_id not in old_superseded_by:
-                old_superseded_by.append(new_id)
-
-            if old_id not in node.supersedes:
-                node.supersedes.append(old_id)
-
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             try:
+                placeholders = ",".join("?" for _old_id in predecessors)
+                rows = conn.execute(
+                    "SELECT node_id, superseded_by FROM evo_nodes"
+                    f" WHERE node_id IN ({placeholders}) AND user_id=? AND agent_id=?",
+                    (*predecessors, self.user_id, self.agent_id),
+                ).fetchall()
+                by_id = {str(row["node_id"]): row for row in rows}
+                missing = [old_id for old_id in predecessors if old_id not in by_id]
+                if missing:
+                    raise KeyError(f"save_and_supersede_many: missing old nodes {missing!r}")
+
+                for old_id in predecessors:
+                    if old_id not in node.supersedes:
+                        node.supersedes.append(old_id)
                 self._upsert_node(conn, node)
-                conn.execute(
-                    "UPDATE evo_nodes SET superseded_by=?, status=?, is_latest=0,"
-                    " valid_until=COALESCE(valid_until, ?)"
-                    " WHERE node_id=? AND user_id=? AND agent_id=?",
-                    (
-                        json.dumps(old_superseded_by, ensure_ascii=False),
-                        str(MemoryStatus.SHADOW),
-                        old_valid_until,
-                        old_id,
-                        self.user_id,
-                        self.agent_id,
-                    ),
-                )
+                for old_id in predecessors:
+                    old_superseded_by = json.loads(by_id[old_id]["superseded_by"] or "[]")
+                    if new_id not in old_superseded_by:
+                        old_superseded_by.append(new_id)
+                    conn.execute(
+                        "UPDATE evo_nodes SET superseded_by=?, status=?, is_latest=0,"
+                        " valid_until=COALESCE(valid_until, ?)"
+                        " WHERE node_id=? AND user_id=? AND agent_id=?",
+                        (
+                            json.dumps(old_superseded_by, ensure_ascii=False),
+                            str(MemoryStatus.SHADOW),
+                            old_valid_until,
+                            old_id,
+                            self.user_id,
+                            self.agent_id,
+                        ),
+                    )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")

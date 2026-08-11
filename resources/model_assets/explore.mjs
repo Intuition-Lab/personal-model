@@ -12,6 +12,26 @@ const EXACT_STATE_QUERY_BOOST = 120;
 
 const MODEL_GESTURE_PASSTHROUGH_SELECTOR = ".detail, .line-explorer, .search-panel";
 
+export function modelPollingFingerprint(nextModel, indexHealth = null) {
+  // The snapshot is already a bounded JSON projection. Fingerprint that whole
+  // projection rather than maintaining a second, inevitably incomplete list
+  // of fields consumed by the scene, search, share card, History, and drawer.
+  // The API serializer preserves field order, so a direct stringify avoids a
+  // second recursive copy of a multi-megabyte snapshot on the browser thread.
+  // The volatile response-level `generated_at` is intentionally not an input.
+  const model = { ...(nextModel || {}) };
+  // Both the HTTP envelope and the snapshot model carry a generation clock.
+  // Neither is model state: retaining the inner one would force a full scene
+  // rebuild every cache refresh even when every modeled object is unchanged.
+  delete model.generated_at;
+  return JSON.stringify({
+    model,
+    // `null` is healthy. A degraded note appearing, changing, or clearing must
+    // cross the same refresh boundary as a model edit.
+    index_health: indexHealth || null,
+  });
+}
+
 export function handleSearchShortcut(event, editing, openSearch) {
   const shortcut = (event?.metaKey || event?.ctrlKey)
     && String(event?.key || "").toLowerCase() === "k";
@@ -324,6 +344,7 @@ export function focusKeysForSelection(model, layout, selection) {
   const volumes = new Set((model?.volumes || []).map((item) => item.id));
   const rootId = model?.root?.id;
   const pointForEndpoint = (id) => layout?.endpointPointIds?.get?.(id) || null;
+  const contextForEndpoint = (id) => layout?.endpointContextIds?.get?.(id) || null;
   const kindForId = (id) => {
     if (points.has(id)) return "point";
     if (faces.has(id)) return "face";
@@ -336,7 +357,8 @@ export function focusKeysForSelection(model, layout, selection) {
   };
   const addEndpoint = (id) => {
     const pointId = pointForEndpoint(id);
-    add(pointId ? "point" : kindForId(id), pointId || id);
+    const contextId = contextForEndpoint(id);
+    add(pointId ? "point" : (contextId ? "context" : kindForId(id)), pointId || contextId || id);
   };
   const addLine = (line) => {
     if (!line) return;
@@ -364,7 +386,9 @@ export function focusKeysForSelection(model, layout, selection) {
   if (selection.kind === "point" || selection.kind === "context") {
     (model?.lines || [])
       .filter((line) => [line.source, line.target].some((endpoint) => (
-        endpoint === selection.id || pointForEndpoint(endpoint) === selection.id
+        endpoint === selection.id
+        || pointForEndpoint(endpoint) === selection.id
+        || contextForEndpoint(endpoint) === selection.id
       )))
       .forEach(addLine);
   }

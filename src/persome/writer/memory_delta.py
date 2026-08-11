@@ -68,6 +68,49 @@ def _norm_ended(item: dict) -> bool:
     return item.get("ended") is True
 
 
+def _coalesce_entity_candidates(items: list[dict]) -> tuple[list[dict], int]:
+    """Collapse one window's repeated semantic entity candidates.
+
+    The item ledger intentionally gives an entity one stable key per
+    ``kind + normalized identity``.  LLMs can nevertheless repeat that entity
+    with casing, whitespace, quote, or confidence drift in the same reply.  A
+    deterministic winner keeps that harmless drift from turning the whole
+    window into an immutable-ledger collision.  Conflicting lifecycle claims
+    are not evidence variants, so they fail closed as a group.
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for item in items:
+        canonical = item.get("ref") or item.get("new_entity") or ""
+        key = (str(item.get("kind") or ""), identity_mod.norm(str(canonical)))
+        groups.setdefault(key, []).append(item)
+
+    clean: list[dict] = []
+    dropped = 0
+    for candidates in groups.values():
+        lifecycle = {bool(candidate.get("ended")) for candidate in candidates}
+        if len(lifecycle) != 1:
+            dropped += len(candidates)
+            continue
+
+        def rank(candidate: dict) -> tuple[float, int, str]:
+            try:
+                confidence = float(candidate.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            quote = str(candidate.get("quote") or "")
+            stable = json.dumps(
+                candidate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return (-confidence, -len(quote), stable)
+
+        clean.append(min(candidates, key=rank))
+        dropped += len(candidates) - 1
+    return clean, dropped
+
+
 # Injectable LLM seam (mirrors case_extractor): resolved lazily so the
 # ``fake_llm`` fixture's monkeypatched ``llm_mod.call_llm`` is picked up.
 LlmCallFn = Callable[..., Any]
@@ -298,6 +341,8 @@ def gate_delta(
     clean: dict[str, list[dict]] = {h: [] for h in _HEADS}
     clean["owner_alias_candidates"] = list(owner_candidates or [])
     dropped = 0
+    entity_identity_rewrites: dict[str, dict[str, str]] = {}
+    ambiguous_entity_identities: set[str] = set()
     protected_owner_keys = {
         identity_mod.norm(alias) for alias in (protected_owner_aliases or []) if alias
     }
@@ -315,6 +360,12 @@ def gate_delta(
         unresolved = canonical.get("new_entity")
         if unresolved and identity_mod.norm(unresolved) in protected_owner_keys:
             return None
+        key = identity_mod.norm(canonical.get("ref") or unresolved or "")
+        if key in ambiguous_entity_identities:
+            return None
+        replacement = entity_identity_rewrites.get(key)
+        if replacement is not None:
+            return dict(replacement)
         return canonical
 
     for item in raw.get("entities") or []:
@@ -336,6 +387,28 @@ def gate_delta(
             )
         else:
             dropped += 1
+
+    clean["entities"], entity_duplicates = _coalesce_entity_candidates(clean["entities"])
+    dropped += entity_duplicates
+    entity_kinds: dict[str, str] = {}
+    for entity in clean["entities"]:
+        canonical = str(entity.get("ref") or entity.get("new_entity") or "")
+        key = identity_mod.norm(canonical)
+        kind = str(entity.get("kind") or "")
+        if not key:
+            continue
+        previous_kind = entity_kinds.get(key)
+        if previous_kind is not None and previous_kind != kind:
+            # Identity objects do not carry a kind. If one normalized label is
+            # proposed as two kinds in the same window, nested references are
+            # ambiguous and must fail closed rather than inherit list order.
+            entity_identity_rewrites.pop(key, None)
+            ambiguous_entity_identities.add(key)
+            continue
+        if key not in ambiguous_entity_identities:
+            entity_kinds[key] = kind
+            identity_key = "ref" if entity.get("ref") else "new_entity"
+            entity_identity_rewrites[key] = {identity_key: canonical}
 
     for item in raw.get("assertions") or []:
         subject = ident(item.get("subject")) if isinstance(item, dict) else None

@@ -5,6 +5,7 @@ import {
   focusKeysForSelection,
   handleSearchShortcut,
   lineKnownAt,
+  modelPollingFingerprint,
   pointKnownAt,
   pointSearchMetadata,
   pointVisibleAt,
@@ -15,6 +16,97 @@ import {
   recoverInvalidSceneSelection,
   shouldHandleModelGesture,
 } from "../../resources/model_assets/explore.mjs";
+
+test("poll fingerprint changes for in-place Line presentation edits", () => {
+  const line = {
+    id: "relation-stable-id",
+    kind: "relation",
+    source: "self",
+    target: "acme",
+    predicate: "engaged_with",
+    label: "works with",
+    quote: "Reviewed the proposal",
+    provenance: "observed",
+    confidence: 0.8,
+    observations: 2,
+    polarity: "0",
+    valid_from: "2026-01-01T00:00:00Z",
+    created_at: "2026-01-01T00:00:00Z",
+  };
+  const model = { points: [], lines: [line], faces: [], volumes: [], root: null };
+  const original = modelPollingFingerprint(model);
+
+  for (const [field, value] of [
+    ["status", "shadow"],
+    ["source", "point-owner"],
+    ["target", "other-company"],
+    ["label", "advises"],
+    ["predicate", "advises"],
+    ["polarity", "-"],
+    ["confidence", 0.95],
+    ["observations", 3],
+  ]) {
+    assert.notEqual(
+      modelPollingFingerprint({ ...model, lines: [{ ...line, [field]: value }] }),
+      original,
+      field,
+    );
+  }
+});
+
+test("poll fingerprint changes when index health degrades or recovers", () => {
+  const model = { points: [], lines: [], faces: [], volumes: [], root: null };
+  const healthy = modelPollingFingerprint(model, null);
+  const degraded = modelPollingFingerprint(model, {
+    status: "degraded",
+    note: "capture indexing is failing",
+  });
+
+  assert.notEqual(degraded, healthy);
+  assert.notEqual(
+    modelPollingFingerprint(model, { status: "unknown", note: "report is stale" }),
+    degraded,
+  );
+  assert.equal(modelPollingFingerprint(model, null), healthy);
+});
+
+test("poll fingerprint covers every snapshot field and ignores the generation clock", () => {
+  const point = {
+    id: "point-stable",
+    content: "A current claim",
+    file_name: "person-alex.md",
+    tags: "entity",
+    receipt: "⟨point-stable:person-alex.md⟩",
+  };
+  const root = {
+    id: "root-stable",
+    signature: "Current synthesis",
+    observations: 2,
+    confidence: 0.8,
+    provenance: "observed",
+  };
+  const model = { points: [point], lines: [], faces: [], volumes: [], root };
+  const original = modelPollingFingerprint(model);
+
+  for (const [collection, field, value] of [
+    ["points", "file_name", "person-alex-retyped.md"],
+    ["points", "receipt", "⟨point-stable:person-alex-retyped.md⟩"],
+    ["points", "edit_refusal", "object_not_active"],
+    ["root", "observations", 3],
+    ["root", "confidence", 0.95],
+    ["root", "provenance", "authored"],
+  ]) {
+    const changed = collection === "root"
+      ? { ...model, root: { ...root, [field]: value } }
+      : { ...model, points: [{ ...point, [field]: value }] };
+    assert.notEqual(modelPollingFingerprint(changed), original, `${collection}.${field}`);
+  }
+
+  assert.equal(
+    modelPollingFingerprint({ ...model, generated_at: "2026-08-11T09:00:00Z" }),
+    modelPollingFingerprint({ ...model, generated_at: "2026-08-11T09:00:15Z" }),
+  );
+});
 
 test("keeps an in-progress claim focused when the search chord is pressed", () => {
   let prevented = false;
@@ -472,6 +564,37 @@ test("focuses canonical Line endpoints through their rendered entity Points", ()
   assert.ok(
     focusKeysForSelection(model, layout, { kind: "point", id: "point-a" })
       .has("line:line-entity"),
+  );
+});
+
+test("focuses case variants through their shared context node", () => {
+  const model = {
+    points: [],
+    faces: [],
+    volumes: [],
+    root: null,
+    lines: [
+      { id: "line-upper", source: "self", target: "Acme Labs" },
+      { id: "line-lower", source: "self", target: "acme labs" },
+    ],
+  };
+  const layout = {
+    endpointPointIds: new Map(),
+    endpointContextIds: new Map([
+      ["self", "self"],
+      ["Acme Labs", "Acme Labs"],
+      ["acme labs", "Acme Labs"],
+    ]),
+  };
+
+  assert.deepEqual(
+    focusKeysForSelection(model, layout, { kind: "context", id: "Acme Labs" }),
+    new Set([
+      "context:Acme Labs",
+      "line:line-upper",
+      "line:line-lower",
+      "context:self",
+    ]),
   );
 });
 

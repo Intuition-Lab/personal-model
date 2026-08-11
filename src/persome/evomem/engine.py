@@ -115,6 +115,21 @@ class EvoMemory:
         self._store.save_and_supersede(node, old_id=old_id, old_valid_until=old_valid_until)
         return node.node_id
 
+    def commit_supersede_many(
+        self,
+        node: MemoryNode,
+        *,
+        old_ids: list[str],
+        old_valid_until: str | None = None,
+    ) -> str:
+        node.file_name = _validated_file_name(node.file_name)
+        self._store.save_and_supersede_many(
+            node,
+            old_ids=old_ids,
+            old_valid_until=old_valid_until,
+        )
+        return node.node_id
+
     def commit_retire(self, node_id: str, *, valid_until: str | None = None) -> None:
         self._store.shadow(node_id, valid_until=valid_until)
 

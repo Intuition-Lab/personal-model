@@ -221,9 +221,9 @@ and lifecycle ownership.
 `persome capture-once` is a lower-level developer diagnostic. It constructs a
 new capture provider and scheduler in the calling CLI, so it does not prove the
 daemon's event watcher, lifetime lock, generation, owner, privacy receipt, or
-isolated OCR-worker readiness. It may also race a running capture scheduler.
-Stop Persome before using it to isolate helper output; a successful path is not
-an onboarding or release acceptance result.
+isolated OCR-worker readiness. It refuses to run while the Runtime is running or
+starting; stop Persome before using it to isolate helper output. A successful
+path is not an onboarding or release acceptance result.
 
 The default active-session flush is five minutes. Timeline closure and model
 processing add bounded local work, so the operational target for first useful

@@ -562,6 +562,37 @@ def test_org_nesting_part_of(ac_root):
         )
 
 
+def test_relation_kind_lookup_uses_normalized_entity_identity(ac_root):
+    clean = {
+        "entities": [
+            {"new_entity": "ACME LABS", "kind": "org", "ended": False, "quote": "x"},
+            {"new_entity": "Holding Co", "kind": "org", "ended": False, "quote": "x"},
+        ],
+        "relations": [
+            {
+                "src": {"new_entity": "Acme   Labs"},
+                "dst": {"new_entity": "holding co"},
+                "predicate": "part_of",
+                "polarity": "0",
+                "ended": False,
+                "quote": "Acme Labs is part of Holding Co",
+                "confidence": 0.9,
+            }
+        ],
+        "events": [],
+        "assertions": [],
+    }
+
+    result = _apply(clean)
+
+    assert result.edges_new == 1
+    with fts.cursor() as conn:
+        row = conn.execute(
+            "SELECT src_kind, dst_kind FROM relation_edges WHERE predicate='part_of'"
+        ).fetchone()
+    assert tuple(row) == ("org", "org")
+
+
 def test_classifier_retired_when_apply_enabled(ac_root):
     from datetime import UTC, datetime
     from types import SimpleNamespace

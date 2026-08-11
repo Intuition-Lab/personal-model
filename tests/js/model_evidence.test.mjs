@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   evidenceBreadcrumb,
   evidenceOverview,
+  evidenceRequestPath,
   indexLinePresentations,
   linePresentation,
   modelNodeLabelIndex,
@@ -28,6 +29,18 @@ const currentPoint = {
   status: "active",
 };
 const model = { points: [oldPoint, currentPoint] };
+
+test("adds a historical cutoff to evidence drill-down but keeps Now compatible", () => {
+  const reference = "⟨point-old:user preferences.md⟩";
+  const cutoff = new Date("2026-02-01T10:00:00Z");
+  const historical = new URL(evidenceRequestPath(reference, cutoff), "http://localhost/model/");
+  const now = new URL(evidenceRequestPath(reference), "http://localhost/model/");
+
+  assert.equal(historical.searchParams.get("ref"), reference);
+  assert.equal(historical.searchParams.get("as_of"), "2026-02-01T10:00:00.000Z");
+  assert.equal(now.searchParams.get("ref"), reference);
+  assert.equal(now.searchParams.has("as_of"), false);
+});
 
 test("turns aggregate receipts into human-readable evidence cards", () => {
   const face = {
@@ -181,6 +194,27 @@ test("labels canonical Line endpoints through their rendered entity Point", () =
     source: "self",
     target: "acme labs",
   }, entityModel, labels);
+
+  assert.equal(relation.source, "You");
+  assert.equal(relation.target, "Acme Labs");
+});
+
+test("labels folded context variants with their shared display identity", () => {
+  const labels = modelNodeLabelIndex(
+    { points: [] },
+    new Map(),
+    new Map([
+      ["self", "self"],
+      ["ACME LABS", "Acme Labs"],
+    ]),
+  );
+  const relation = linePresentation({
+    id: "relation-context",
+    kind: "relation",
+    predicate: "engaged_with",
+    source: "self",
+    target: "ACME LABS",
+  }, { points: [] }, labels);
 
   assert.equal(relation.source, "You");
   assert.equal(relation.target, "Acme Labs");

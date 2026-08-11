@@ -27,7 +27,7 @@ runtime schema.
 | POST | `/mobile/events/ingest` | Ingest a paired mobile event; `Idempotency-Key` must equal `event_id`. |
 | GET | `/model` | Open the offline Point/Line/Face/Volume/Root explorer. |
 | GET | `/model/graph` | Read the canonical versioned model snapshot. |
-| GET | `/model/evidence?ref=...` | Resolve a model ID or receipt into direct sources and separately labeled nearby context. |
+| GET | `/model/evidence?ref=...&as_of=...` | Resolve a model ID or receipt into direct sources and separately labeled nearby context, optionally bounded by an ISO 8601 historical cutoff. |
 | GET | `/model/node?id=...` | Resolve a snapshot Point ID or relation endpoint to receipts and its relation tree. |
 | POST | `/model/edit` | Apply one owner correction to a modeled object: rewrite its wording or reject it. |
 
@@ -107,6 +107,16 @@ owner-local graph payload in memory for at most 15 seconds and makes refresh
 single-flight. This bounds repeated snapshot work across polling tabs without
 writing raw graph content to another file. The browser also coalesces overlapping
 polls and turns a request that exceeds 45 seconds into an explicit retry state.
+Its refresh identity includes every displayed Line field and the compact
+`index_health` note, so an in-place relation correction or health transition
+cannot be mistaken for an unchanged graph.
+
+The viewer omits `as_of` at **Now**. During time travel it sends the selected
+cutoff on every nested evidence drill-down. The resolver then omits a
+`next_version` until that successor's effective start and excludes nearby
+captures after the cutoff; a successor whose start cannot be established is
+hidden rather than exposed early. This bounds server-returned evidence instead
+of relying only on cards already filtered in the browser.
 
 ## Security boundary
 

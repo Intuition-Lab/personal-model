@@ -127,11 +127,18 @@ other snapshot-retained inactive Points stay in local search, History, and evide
 are not drawn beside the current head; archived and unlinked retired/withdrawn records remain in
 the durable store rather than the live snapshot. A relation endpoint that names an unambiguous
 current entity Point reuses that Point's position; the viewer creates a context node only when no
-such Point exists.
+such Point exists. Context identities fold NFKC, whitespace, and case variants for placement. If
+legacy Lines then resolve to the same endpoints, predicate, and polarity, the constellation draws a
+single stroke while retaining every original Line in local search and evidence detail. The visible
+representative is the strongest individual Line by observations, confidence, and evidence
+completeness; observations are never summed across legacy variants.
 
 Search is a local view over current objects plus audit history that already existed at the selected
 model-history cutoff. It never reveals a successor before its effective start (`valid_from`, then
-`created_at`, then `occurred_at`). It ranks
+`created_at`, then `occurred_at`). Evidence drill-down carries that cutoff to the Runtime as
+`as_of`; the response excludes future `next_version` links and time-adjacent captures after the
+cutoff, including nested drill-downs. Moving the cutoff closes any open detail/evidence drawer and
+invalidates its in-flight request before rebuilding the slice. **Now** keeps the unbounded evidence response. It ranks
 human-readable text from the already-loaded snapshot; it does not call another service, persist
 queries, or expand the canonical model. Choosing a result opens the same detail surface as selecting
 its rendered object. Point heads that are active at the selected cutoff rank ahead of shadow and

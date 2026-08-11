@@ -507,7 +507,14 @@ class TestViewPage:
         assert b"controller.abort()" in viewer.body
         assert b'retry.textContent = "Retry"' in viewer.body
         assert b"fetch(`./node" in viewer.body
-        assert b"fetch(`./evidence?ref=" in viewer.body
+        assert b"evidenceRequestPath(reference, evidenceCutoff)" in viewer.body
+        assert b"function rebuildAtSelectedCutoff()" in viewer.body
+        assert b"clearSelection(false);" in viewer.body
+        assert viewer.body.count(b"rebuildAtSelectedCutoff();") == 3
+        assert b"request !== evidenceRequest" in viewer.body
+        assert b"livePointers.size || editingItem || editInFlight" in viewer.body
+        assert b"payload.generated_at === modelGeneratedAt" in viewer.body
+        assert b'params.set("as_of", cutoff.toISOString())' in evidence.body
         assert b"Direct evidence" in viewer.body
         assert b"Nearby context" in viewer.body
         assert b"Technical details" in viewer.body
@@ -678,6 +685,21 @@ class TestViewPage:
 
 
 class TestEvidenceResolverRoute:
+    def test_historical_cutoff_is_forwarded_to_the_resolver(self, ac_root, monkeypatch):
+        from persome import evidence as evidence_mod
+
+        cutoff = datetime(2026, 2, 1, 10, 0, tzinfo=UTC)
+        observed: dict[str, object] = {}
+
+        def resolve(_conn, reference, *, as_of=None):  # type: ignore[no-untyped-def]
+            observed.update(reference=reference, as_of=as_of)
+            return {"status": "missing"}
+
+        monkeypatch.setattr(evidence_mod, "resolve_evidence", resolve)
+
+        assert routes.model_evidence(ref="point-old", as_of=cutoff) == {"status": "missing"}
+        assert observed == {"reference": "point-old", "as_of": cutoff}
+
     def test_point_receipt_resolves_through_unified_endpoint(self, ac_root):
         _save_point(
             node_id="point-runtime",

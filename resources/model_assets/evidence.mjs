@@ -38,6 +38,14 @@ export function relationLabel(relation) {
   return labels[relation] || compactText(String(relation || "Evidence").replaceAll("_", " "));
 }
 
+export function evidenceRequestPath(reference, cutoff = null) {
+  const params = new URLSearchParams({ ref: String(reference || "") });
+  if (cutoff instanceof Date && Number.isFinite(cutoff.getTime())) {
+    params.set("as_of", cutoff.toISOString());
+  }
+  return `./evidence?${params.toString()}`;
+}
+
 export function receiptIndex(model, cutoff = null) {
   const byReference = new Map();
   (model?.points || []).forEach((point) => {
@@ -143,7 +151,7 @@ function modelNodeDisplayLabel(node, fallback) {
   );
 }
 
-export function modelNodeLabelIndex(model, endpointPointIds = null) {
+export function modelNodeLabelIndex(model, endpointPointIds = null, endpointContextIds = null) {
   const labels = new Map([["self", "You"]]);
   modelNodeCandidates(model).forEach(([, nodes, fallback]) => {
     nodes.forEach((node) => {
@@ -154,6 +162,10 @@ export function modelNodeLabelIndex(model, endpointPointIds = null) {
   });
   endpointPointIds?.forEach?.((pointId, endpoint) => {
     const label = labels.get(pointId);
+    if (endpoint && label && !labels.has(endpoint)) labels.set(endpoint, label);
+  });
+  endpointContextIds?.forEach?.((contextId, endpoint) => {
+    const label = contextId === "self" ? "You" : contextId;
     if (endpoint && label && !labels.has(endpoint)) labels.set(endpoint, label);
   });
   return labels;

@@ -1396,6 +1396,263 @@ def test_gate_canonicalizes_honorific_ref_through_the_funnel(ac_root) -> None:
     assert "new_entity" not in clean["entities"][0]
 
 
+def test_gate_coalesces_divergent_same_window_entity_evidence(ac_root) -> None:
+    from persome.evomem import identity as identity_mod
+
+    session_text = "Acme Labs confirmed the review; ACME   LABS signed the final report"
+    raw = {
+        "entities": [
+            {
+                "new_entity": "Acme Labs",
+                "kind": "org",
+                "quote": "Acme Labs confirmed the review",
+                "confidence": 0.81,
+            },
+            {
+                "new_entity": "ACME   LABS",
+                "kind": "org",
+                "quote": "ACME   LABS signed the final report",
+                "confidence": 0.92,
+            },
+        ],
+        "assertions": [],
+        "relations": [],
+        "events": [],
+    }
+
+    clean, dropped = delta_mod.gate_delta(
+        raw,
+        roster=identity_mod.Roster.build([]),
+        session_text=session_text,
+        min_confidence=0.5,
+        cooccurrence=False,
+    )
+
+    assert dropped == 1
+    assert clean["entities"] == [
+        {
+            "new_entity": "ACME   LABS",
+            "kind": "org",
+            "quote": "ACME   LABS signed the final report",
+            "confidence": 0.92,
+            "ended": False,
+        }
+    ]
+    assert len(items_store.build_items(clean)) == 1
+
+
+def test_gate_drops_conflicting_entity_lifecycle_claims(ac_root) -> None:
+    from persome.evomem import identity as identity_mod
+
+    quote = "Acme Labs remains part of the launch while acme labs engagement ended"
+    raw = {
+        "entities": [
+            {
+                "new_entity": "Acme Labs",
+                "kind": "org",
+                "quote": quote,
+                "confidence": 0.9,
+                "ended": False,
+            },
+            {
+                "new_entity": "acme labs",
+                "kind": "org",
+                "quote": quote,
+                "confidence": 0.9,
+                "ended": True,
+            },
+        ],
+        "assertions": [],
+        "relations": [],
+        "events": [],
+    }
+
+    clean, dropped = delta_mod.gate_delta(
+        raw,
+        roster=identity_mod.Roster.build([]),
+        session_text=quote,
+        min_confidence=0.5,
+        cooccurrence=False,
+    )
+
+    assert clean["entities"] == []
+    assert dropped == 2
+
+
+def test_gate_rewrites_nested_identity_refs_to_entity_winner(ac_root) -> None:
+    from persome.evomem import identity as identity_mod
+
+    session_text = (
+        "Acme Labs confirmed the review. ACME LABS signed the report. "
+        "Holding Co owns Acme Labs. Acme Labs remains active."
+    )
+    raw = {
+        "entities": [
+            {
+                "new_entity": "Acme Labs",
+                "kind": "org",
+                "quote": "Acme Labs confirmed the review",
+                "confidence": 0.81,
+            },
+            {
+                "new_entity": "ACME LABS",
+                "kind": "org",
+                "quote": "ACME LABS signed the report",
+                "confidence": 0.92,
+            },
+            {
+                "new_entity": "Holding Co",
+                "kind": "org",
+                "quote": "Holding Co owns Acme Labs",
+                "confidence": 0.9,
+            },
+        ],
+        "assertions": [
+            {
+                "subject": {"new_entity": "Acme Labs"},
+                "text": "remains active",
+                "quote": "Acme Labs remains active",
+                "confidence": 0.9,
+            }
+        ],
+        "relations": [
+            {
+                "src": {"new_entity": "Acme Labs"},
+                "dst": {"new_entity": "Holding Co"},
+                "predicate": "part_of",
+                "quote": "Holding Co owns Acme Labs",
+                "confidence": 0.9,
+            }
+        ],
+        "events": [
+            {
+                "title": "Review signed",
+                "participants": [{"new_entity": "Acme Labs"}],
+                "quote": "ACME LABS signed the report",
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    clean, dropped = delta_mod.gate_delta(
+        raw,
+        roster=identity_mod.Roster.build([]),
+        session_text=session_text,
+        min_confidence=0.5,
+        cooccurrence=False,
+    )
+
+    assert dropped == 1
+    assert clean["assertions"][0]["subject"] == {"new_entity": "ACME LABS"}
+    assert clean["relations"][0]["src"] == {"new_entity": "ACME LABS"}
+    assert clean["events"][0]["participants"] == [{"new_entity": "ACME LABS"}]
+
+
+def test_gate_drops_nested_refs_when_one_identity_has_ambiguous_kinds(ac_root) -> None:
+    from persome.evomem import identity as identity_mod
+
+    quote = "Jordan joined the review and Jordan remains active"
+    raw = {
+        "entities": [
+            {
+                "new_entity": "Jordan",
+                "kind": "person",
+                "quote": "Jordan joined the review",
+                "confidence": 0.9,
+            },
+            {
+                "new_entity": "Jordan",
+                "kind": "org",
+                "quote": "Jordan joined the review",
+                "confidence": 0.9,
+            },
+        ],
+        "assertions": [
+            {
+                "subject": {"new_entity": "Jordan"},
+                "text": "remains active",
+                "quote": quote,
+                "confidence": 0.9,
+            }
+        ],
+        "relations": [
+            {
+                "src": {"ref": "self"},
+                "dst": {"new_entity": "Jordan"},
+                "predicate": "engaged_with",
+                "quote": quote,
+                "confidence": 0.9,
+            }
+        ],
+        "events": [
+            {
+                "title": "Review joined",
+                "participants": [{"new_entity": "Jordan"}],
+                "quote": quote,
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    clean, dropped = delta_mod.gate_delta(
+        raw,
+        roster=identity_mod.Roster.build([]),
+        session_text=quote,
+        min_confidence=0.5,
+        cooccurrence=False,
+    )
+
+    assert len(clean["entities"]) == 2
+    assert clean["assertions"] == []
+    assert clean["relations"] == []
+    assert clean["events"] == []
+    assert dropped == 3
+
+
+def test_window_persists_one_item_for_divergent_duplicate_entity(ac_root, fake_llm) -> None:
+    entry = "[Feishu] Acme Labs confirmed the review; ACME LABS signed the final report"
+    start, end = _seed_session_blocks([entry])
+    fake_llm.set_default(
+        delta_mod.STAGE,
+        _payload(
+            entities=[
+                {
+                    "new_entity": "Acme Labs",
+                    "kind": "org",
+                    "quote": "Acme Labs confirmed the review",
+                    "confidence": 0.81,
+                },
+                {
+                    "new_entity": "ACME LABS",
+                    "kind": "org",
+                    "quote": "ACME LABS signed the final report",
+                    "confidence": 0.92,
+                },
+            ],
+            assertions=[],
+        ),
+    )
+
+    result = delta_mod.run_after_session(
+        _cfg(),
+        session_id="s-divergent-entity",
+        start_time=start,
+        end_time=end,
+    )
+
+    assert result.written is True
+    assert result.counts["entities"] == 1
+    assert result.dropped == 1
+    with fts.cursor() as conn:
+        items = conn.execute(
+            "SELECT item_kind, payload FROM memory_delta_items WHERE delta_id=?",
+            (result.delta_id,),
+        ).fetchall()
+    assert len(items) == 1
+    assert items[0]["item_kind"] == "entity"
+    assert json.loads(items[0]["payload"])["new_entity"] == "ACME LABS"
+
+
 def test_gate_adds_deterministic_cooccurrence_knows(ac_root) -> None:
     from persome.evomem import identity as identity_mod
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  coalesceProjectedLines,
   computeClusterLayout,
   layoutMath,
   pickScreenTarget,
@@ -195,6 +196,144 @@ test("does not guess when multiple live entity Points claim the same identity", 
 
   assert.equal(layout.endpointPointIds.has("Alex"), false);
   assert.equal(layout.contextIds.includes("Alex"), true);
+});
+
+test("folds case and width variants into one context node without merging Lines", () => {
+  const layout = computeClusterLayout({
+    points: [],
+    lines: [
+      { id: "relation-upper", kind: "relation", source: "self", target: "Acme Labs" },
+      { id: "relation-lower", kind: "relation", source: "SELF", target: "acme labs" },
+    ],
+    faces: [],
+    volumes: [],
+    root: null,
+  });
+
+  assert.deepEqual(layout.contextIds, ["Acme Labs", "self"]);
+  assert.equal(layout.endpointContextIds.get("Acme Labs"), "Acme Labs");
+  assert.equal(layout.endpointContextIds.get("acme labs"), "Acme Labs");
+  assert.equal(layout.endpointContextIds.get("self"), "self");
+  assert.equal(layout.endpointContextIds.get("SELF"), "self");
+  assert.equal(layout.positions.has("acme labs"), false);
+  assert.equal(layout.diagnostics.contextNodes, 2);
+});
+
+test("renders one projected Line while retaining every legacy variant for audit", () => {
+  const lines = [
+    {
+      id: "relation-upper",
+      kind: "relation",
+      predicate: "engaged_with",
+      source: "self",
+      target: "Acme Labs",
+    },
+    {
+      id: "relation-lower",
+      kind: "relation",
+      predicate: "engaged_with",
+      source: "SELF",
+      target: "acme labs",
+    },
+    {
+      id: "relation-opposite",
+      kind: "relation",
+      predicate: "engaged_with",
+      polarity: "-",
+      source: "self",
+      target: "acme labs",
+    },
+    { id: "evolution", kind: "evolution", source: "old", target: "new" },
+  ];
+  const layout = computeClusterLayout({
+    points: [],
+    lines,
+    faces: [],
+    volumes: [],
+    root: null,
+  });
+
+  const projection = coalesceProjectedLines(lines, layout);
+
+  assert.deepEqual(
+    projection.lines.map((line) => line.id),
+    ["evolution", "relation-lower", "relation-opposite"],
+  );
+  assert.deepEqual(
+    projection.membersByRepresentative.get("relation-lower"),
+    ["relation-lower", "relation-upper"],
+  );
+});
+
+test("renders a symmetric knows relationship once in either stored direction", () => {
+  const lines = [
+    {
+      id: "knows-forward",
+      kind: "relation",
+      predicate: "knows",
+      source: "Alice",
+      target: "Bob",
+    },
+    {
+      id: "knows-reverse",
+      kind: "relation",
+      predicate: "knows",
+      source: "bob",
+      target: "alice",
+    },
+  ];
+  const layout = computeClusterLayout({
+    points: [],
+    lines,
+    faces: [],
+    volumes: [],
+    root: null,
+  });
+
+  const projection = coalesceProjectedLines(lines, layout);
+
+  assert.equal(projection.lines.length, 1);
+  assert.deepEqual(
+    projection.membersByRepresentative.get(projection.lines[0].id),
+    ["knows-forward", "knows-reverse"],
+  );
+});
+
+test("uses the strongest projected Line as the visible representative", () => {
+  const lines = [
+    {
+      id: "relation-early-weak",
+      kind: "relation",
+      predicate: "engaged_with",
+      source: "self",
+      target: "Acme",
+      observations: 1,
+      confidence: 0.6,
+      created_at: "2026-01-01T00:00:00Z",
+    },
+    {
+      id: "relation-later-strong",
+      kind: "relation",
+      predicate: "engaged_with",
+      source: "SELF",
+      target: "acme",
+      observations: 4,
+      confidence: 0.9,
+      quote: "A grounded observation",
+      created_at: "2026-02-01T00:00:00Z",
+    },
+  ];
+  const layout = computeClusterLayout({
+    points: [], lines, faces: [], volumes: [], root: null,
+  });
+
+  const projection = coalesceProjectedLines(lines, layout);
+
+  assert.deepEqual(projection.lines.map((line) => line.id), ["relation-later-strong"]);
+  assert.deepEqual(
+    projection.membersByRepresentative.get("relation-later-strong"),
+    ["relation-early-weak", "relation-later-strong"],
+  );
 });
 
 test("keeps self and non-entity labels as context endpoints", () => {

@@ -99,7 +99,9 @@ file_name, tags, confidence, conflicted, receipt
 for audit and time travel. The snapshot retains both, while the default constellation renders only
 the chain head valid at its selected cutoff. Historical versions remain available through cutoff-
 bounded search, History, receipts, and evolution Lines rather than appearing beside the current
-Point as another live sphere.
+Point as another live sphere. Historical evidence requests carry the same `as_of` boundary, so
+future successors and later nearby captures are not returned during drill-down; **Now** remains
+unbounded.
 
 The memory owner is the reserved identity `self`, not a person Point. Names and
 handles learned from quoted owner-identity evidence resolve to `self`; if an
@@ -121,7 +123,9 @@ Lines have two forms:
 
 Relation endpoints retain canonical identity strings in the public contract. The viewer resolves an
 unambiguous canonical endpoint to the current entity Point for placement and creates a context node
-only when no safe match exists; it does not rewrite the Line or mutate snapshot IDs.
+only when no safe match exists. Case, width, and whitespace variants share one projected context
+node, and semantically identical projected Lines render once while every original Line remains in
+local search and evidence audit. The projection does not rewrite the Line or mutate snapshot IDs.
 
 Activity-derived relation Lines carry the atomic source triplet
 `source_kind`, `source_id`, and `source_receipt`. New activity identities use

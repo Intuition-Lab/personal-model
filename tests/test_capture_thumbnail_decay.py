@@ -11,8 +11,10 @@ from pathlib import Path
 
 from PIL import Image
 
+from persome import paths
 from persome.capture import scheduler as scheduler_mod
 from persome.capture import screenshot_crypto
+from persome.config import load as load_config
 
 HOUR = 3600
 
@@ -83,6 +85,44 @@ class TestThumbnailTier:
         # the downscaled payload is a decodable JPEG of the recorded size
         img = Image.open(io.BytesIO(base64.b64decode(shot["image_base64"])))
         assert img.size == (shot["width"], shot["height"])
+
+    def test_thumbnail_rewrite_does_not_invalidate_content_head(self, ac_root):
+        out = _capture(ts="2026-07-01T10:00:00", b64=_jpeg_b64())
+        runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+        capture_id = runner.commit_prebuilt(out)
+        assert capture_id is not None
+        path = paths.capture_buffer_dir() / f"{capture_id}.json"
+        timestamp = time.time() - 8 * HOUR
+        os.utime(path, (timestamp, timestamp))
+        scheduler_mod._set_active_runner(runner)
+        try:
+            assert _cleanup()["thumbnailed"] == 1
+            assert runner.commit_prebuilt({**out, "timestamp": "2026-07-01T10:00:01"}) is None
+        finally:
+            scheduler_mod._set_active_runner(None)
+
+    def test_head_survives_pixel_decay_then_reopens_after_raw_deletion(self, ac_root):
+        out = _capture(ts="2026-07-01T10:00:00", b64=_jpeg_b64())
+        runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+        capture_id = runner.commit_prebuilt(out)
+        assert capture_id is not None
+        path = paths.capture_buffer_dir() / f"{capture_id}.json"
+        scheduler_mod._set_active_runner(runner)
+        try:
+            os.utime(path, (time.time() - 8 * HOUR,) * 2)
+            assert _cleanup()["thumbnailed"] == 1
+            assert runner.commit_prebuilt({**out, "timestamp": "2026-07-01T10:00:01"}) is None
+
+            os.utime(path, (time.time() - 30 * HOUR,) * 2)
+            assert _cleanup()["stripped"] == 1
+            assert runner.commit_prebuilt({**out, "timestamp": "2026-07-01T10:00:02"}) is None
+
+            os.utime(path, (time.time() - 200 * HOUR,) * 2)
+            assert _cleanup()["deleted"] == 1
+            assert not path.exists()
+            assert runner.commit_prebuilt({**out, "timestamp": "2026-07-01T10:00:03"}) is not None
+        finally:
+            scheduler_mod._set_active_runner(None)
 
     def test_young_capture_untouched(self, ac_root):
         p = _write_aged(_capture(ts="2026-07-01T10:00:00"), hours_old=2)

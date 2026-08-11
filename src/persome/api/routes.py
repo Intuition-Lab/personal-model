@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
@@ -940,6 +940,10 @@ def model_edit(body: ModelEditBody) -> ApiResponse:
 @router.get("/model/evidence", tags=["model"])
 def model_evidence(
     ref: str = Query(..., min_length=1, max_length=1024),
+    as_of: Annotated[
+        datetime | None,
+        Query(description="Historical cutoff for version history and nearby context."),
+    ] = None,
 ) -> dict[str, Any]:
     """Resolve one model receipt or object id into its evidence and nearby context.
 
@@ -948,13 +952,14 @@ def model_evidence(
     provenance. ``label`` is the human-readable display title; Point version
     links are returned separately in ``history``. Unknown or expired references
     fail open with ``status=missing`` so a historical receipt remains inspectable
-    even after raw retention ends.
+    even after raw retention ends. When ``as_of`` is present, future successor
+    links and nearby captures after that cutoff are omitted.
     """
     from ..evidence import resolve_evidence
     from ..store import fts as fts_store
 
     with fts_store.canonical_read_cursor() as conn:
-        return resolve_evidence(conn, ref)
+        return resolve_evidence(conn, ref, as_of=as_of)
 
 
 @router.get("/model/node", tags=["model"])

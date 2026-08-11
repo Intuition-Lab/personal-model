@@ -1,7 +1,10 @@
+import sqlite3
+
 import pytest
 
 from persome.evomem.models import MemoryLayer, MemoryNode, MemoryStatus
 from persome.evomem.store import NodeStore
+from persome.store import fts
 
 
 @pytest.fixture
@@ -66,6 +69,47 @@ def test_save_and_supersede_missing_old_raises(store):
     new = MemoryNode(node_id="b", content="\u559d\u8336", layer=MemoryLayer.L2_FACT)
     with pytest.raises(KeyError):
         store.save_and_supersede(new, old_id="does-not-exist")
+
+
+def test_save_and_supersede_many_links_every_predecessor_atomically(store):
+    for node_id in ("a", "b"):
+        store.save(MemoryNode(node_id=node_id, content=node_id, layer=MemoryLayer.L2_FACT))
+    new = MemoryNode(node_id="c", content="merged", layer=MemoryLayer.L2_FACT)
+
+    store.save_and_supersede_many(new, old_ids=["a", "b"])
+
+    assert store.get("c").supersedes == ["a", "b"]
+    for node_id in ("a", "b"):
+        old = store.get(node_id)
+        assert old.status is MemoryStatus.SHADOW and old.is_latest is False
+        assert old.superseded_by == ["c"]
+    assert [node.node_id for node in store.all_latest()] == ["c"]
+
+
+def test_save_and_supersede_many_rolls_back_every_pointer_on_second_update_failure(store):
+    for node_id in ("a", "b"):
+        store.save(MemoryNode(node_id=node_id, content=node_id, layer=MemoryLayer.L2_FACT))
+    with fts.cursor() as conn:
+        conn.execute(
+            "CREATE TRIGGER fail_second_predecessor BEFORE UPDATE ON evo_nodes "
+            "WHEN OLD.node_id='b' AND NEW.is_latest=0 "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic second predecessor failure'); END"
+        )
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic second predecessor failure"):
+            store.save_and_supersede_many(
+                MemoryNode(node_id="c", content="merged", layer=MemoryLayer.L2_FACT),
+                old_ids=["a", "b"],
+            )
+    finally:
+        with fts.cursor() as conn:
+            conn.execute("DROP TRIGGER fail_second_predecessor")
+
+    assert store.get("c") is None
+    for node_id in ("a", "b"):
+        old = store.get(node_id)
+        assert old.status is MemoryStatus.ACTIVE and old.is_latest is True
+        assert old.superseded_by == []
 
 
 def test_save_and_shadow_single_active_head_no_chain_link(store):

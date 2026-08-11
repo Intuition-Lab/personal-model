@@ -64,7 +64,12 @@ new timeline window + structured focus evidence
 Every proposed item must quote session evidence. Entity references must resolve
 through the identity roster or appear explicitly in the session. Relations use
 a closed predicate set. Low-confidence or unsupported items are dropped and
-counted.
+counted. Repeated entity candidates inside one reply are grouped by normalized
+kind and identity before the immutable item ledger. The strongest quoted
+variant wins deterministically; conflicting active/ended claims fail closed as
+a whole instead of making the persisted window permanently unseedable. Nested
+assertion, relation, and event references are rewritten to that same winner;
+endpoint kind lookup uses the same normalized identity defensively on replay.
 
 Before this gate, timeline provenance is a hard Gator boundary. Memory delta reads only
 shape-validated `llm`, trusted `imported`, or backward-compatible `legacy` blocks. `metadata_only`, `llm_empty`,
@@ -84,6 +89,15 @@ PersonGraph quarantine; two independent sessions promote it to an active alias
 of `self`. A quoted explicit
 first-person identity statement may promote immediately. Promotion retires an
 already-minted duplicate person projection without deleting its audit history.
+
+PersonGraph does not copy Point-backed person facts into additional
+`person-event` Points. A unique matching raw identity Point can become the
+`person-entity` head through an atomic, auditable supersession; later Point facts remain
+their own receipt-bearing evidence and do not increment sightings. Point identity maintenance and
+entry interactions use separate bounded batches, with eligible Points selected before derived rows
+and applied first so entry recency cannot evict the identity bridge. Reducer entry events still
+populate the person timeline, and a stable source event stays deduplicated through a
+slug-to-display-name adoption.
 
 Configured `memory_delta.owner_aliases` remain a trusted override, but ordinary
 operation does not require users to discover or fill the setting themselves.
