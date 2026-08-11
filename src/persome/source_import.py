@@ -250,7 +250,15 @@ def import_folder(root: Path, *, source_type: str = "folder") -> ImportResult:
                 continue
 
             modified = datetime.fromtimestamp(modified_ns / 1_000_000_000).astimezone()
-            latest = min(modified, datetime.now().astimezone()).replace(second=0)
+            observed_now = datetime.now().astimezone()
+            # Imported sessions are already ended. Anchor their final window
+            # to the latest fully elapsed minute before both the source mtime
+            # and our observation clock. The hash-derived microsecond below
+            # must never push either boundary into the future.
+            latest = min(modified, observed_now).replace(
+                second=0,
+                microsecond=0,
+            ) - timedelta(minutes=1)
             if len(created_sessions) + len(parts) > _MAX_IMPORT_SESSIONS:
                 raise ImportLimitError(
                     f"source exceeds the {_MAX_IMPORT_SESSIONS:,}-session import limit; "

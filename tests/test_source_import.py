@@ -264,9 +264,11 @@ def test_imported_session_windows_never_drift_into_the_future(
     result = source_import.import_folder(vault)
 
     with fts.cursor() as conn:
-        starts = [
-            session_store.get_by_id(conn, session_id).start_time
-            for session_id in result.session_ids
-        ]
+        sessions = [session_store.get_by_id(conn, session_id) for session_id in result.session_ids]
+    assert all(session is not None for session in sessions)
+    starts = [session.start_time for session in sessions if session is not None]
+    ends = [session.end_time for session in sessions if session is not None]
+    observed_after = source_import.datetime.now().astimezone()
     assert starts == sorted(starts)
-    assert starts[-1] <= source_import.datetime.now().astimezone()
+    assert starts[-1] <= observed_after
+    assert ends[-1] <= observed_after
