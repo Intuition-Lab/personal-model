@@ -11,6 +11,7 @@ from pathlib import Path
 
 from persome import paths
 from persome.capture import scheduler as scheduler_mod
+from persome.config import load as load_config
 from persome.store import fts
 
 
@@ -282,6 +283,99 @@ def test_cleanup_eviction_also_drops_fts(ac_root: Path) -> None:
     assert written[-1].stem in remaining
 
 
+def test_time_retention_removes_head_receipt_and_readmits_same_content(
+    ac_root: Path,
+) -> None:
+    runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+    scheduler_mod._set_active_runner(runner)
+    try:
+        first = _capture_dict(
+            ts="2026-08-10T00:00:00+00:00",
+            app="Cursor",
+            title="static.py",
+            value="unchanged",
+            text="unchanged",
+        )
+        first_id = runner.commit_prebuilt(first)
+        assert first_id is not None
+        first_path = paths.capture_buffer_dir() / f"{first_id}.json"
+        old = time.time() - 2 * 3600
+        os.utime(first_path, (old, old))
+
+        stats = scheduler_mod.cleanup_buffer(retention_hours=1)
+
+        assert stats["deleted"] == 1
+        assert not first_path.exists()
+        with fts.cursor() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+
+        second = {**first, "timestamp": "2026-08-11T00:00:00+00:00"}
+        assert runner.commit_prebuilt(second) is not None
+        assert len(list(paths.capture_buffer_dir().glob("*.json"))) == 1
+    finally:
+        scheduler_mod._set_active_runner(None)
+
+
+def test_hard_cap_eviction_removes_head_receipt_and_readmits_same_content(
+    ac_root: Path,
+) -> None:
+    runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+    scheduler_mod._set_active_runner(runner)
+    try:
+        large = "x" * 1_100_000
+        first = _capture_dict(
+            ts="2026-08-10T00:00:00+00:00",
+            app="Cursor",
+            title="large.py",
+            value=large,
+            text=large,
+        )
+        first_id = runner.commit_prebuilt(first)
+        assert first_id is not None
+
+        stats = scheduler_mod.cleanup_buffer(retention_hours=24 * 365, max_mb=1)
+
+        assert stats["evicted"] == 1
+        assert list(paths.capture_buffer_dir().glob("*.json")) == []
+        with fts.cursor() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+
+        second = {**first, "timestamp": "2026-08-11T00:00:00+00:00"}
+        assert runner.commit_prebuilt(second) is not None
+        assert len(list(paths.capture_buffer_dir().glob("*.json"))) == 1
+    finally:
+        scheduler_mod._set_active_runner(None)
+
+
+def test_missing_file_reconciliation_removes_legacy_stale_receipt(
+    ac_root: Path,
+) -> None:
+    runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+    scheduler_mod._set_active_runner(runner)
+    try:
+        first = _capture_dict(
+            ts="2026-08-10T00:00:00+00:00",
+            app="Cursor",
+            title="missing.py",
+            value="missing",
+            text="missing",
+        )
+        first_id = runner.commit_prebuilt(first)
+        assert first_id is not None
+        (paths.capture_buffer_dir() / f"{first_id}.json").unlink()
+
+        stats = scheduler_mod.cleanup_buffer(retention_hours=24 * 365)
+
+        assert stats == {"deleted": 0, "stripped": 0, "thumbnailed": 0, "evicted": 0}
+        with fts.cursor() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+        second = {**first, "timestamp": "2026-08-11T00:00:00+00:00"}
+        assert runner.commit_prebuilt(second) is not None
+    finally:
+        scheduler_mod._set_active_runner(None)
+
+
 def test_hard_cap_continues_after_unlink_failure(ac_root: Path, monkeypatch) -> None:
     written: list[Path] = []
     for i in range(3):
@@ -370,8 +464,19 @@ def test_prune_does_not_delete_row_inserted_after_candidate_snapshot(
             return [("old",)]
 
     class _Conn:
-        def execute(self, sql: str):  # type: ignore[no-untyped-def]
-            return _Rows() if sql == "SELECT id FROM captures" else self
+        def execute(self, sql: str, _params=()):  # type: ignore[no-untyped-def]
+            if sql == "SELECT id FROM captures":
+                return _Rows()
+            if sql == "SELECT DISTINCT capture_id FROM capture_content_receipts":
+                return type(
+                    "_ReceiptRows",
+                    (),
+                    {
+                        "fetchall": lambda self: [],
+                        "__iter__": lambda self: iter(()),
+                    },
+                )()
+            return self
 
     @contextmanager
     def fake_cursor():  # type: ignore[no-untyped-def]

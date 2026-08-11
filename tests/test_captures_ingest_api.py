@@ -16,6 +16,7 @@ capture loop. These tests pin the contract:
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 
 import pytest
@@ -96,6 +97,26 @@ def _payload(*, with_screenshot: bool = False) -> tuple[dict, dict]:
     if with_screenshot:
         payload["screenshot"] = cap.get("screenshot")
     return cap, payload
+
+
+def _prebuilt_capture(*, timestamp: str, text: str, title: str = "Dynamic title") -> dict:
+    return {
+        "timestamp": timestamp,
+        "schema_version": 2,
+        "trigger": {"event_type": "AXFocusedWindowChanged"},
+        "window_meta": {
+            "app_name": "Synthetic Editor",
+            "title": title,
+            "bundle_id": "com.example.editor",
+        },
+        "focused_element": {
+            "role": "AXTextArea",
+            "value": text,
+            "is_editable": True,
+        },
+        "visible_text": text,
+        "url": "",
+    }
 
 
 def test_ingest_writes_and_enriches_byte_compatibly(ac_root) -> None:
@@ -245,6 +266,8 @@ def test_commit_prebuilt_propagates_write_error_not_dedup(ac_root, monkeypatch) 
     capture_cfg.pause_on_lock = False
     runner = scheduler._CaptureRunner(capture_cfg, provider=None)
 
+    real_write = scheduler._write_capture
+
     def boom(_out):
         raise OSError("disk full")
 
@@ -253,3 +276,192 @@ def test_commit_prebuilt_propagates_write_error_not_dedup(ac_root, monkeypatch) 
     assert out is not None
     with pytest.raises(OSError):
         runner.commit_prebuilt(out)
+
+    # A failed write must not move the in-memory head or mint a durable receipt.
+    monkeypatch.setattr(scheduler, "_write_capture", real_write)
+    assert runner.commit_prebuilt(out)
+    with scheduler.fts_store.cursor() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 1
+
+
+def test_v2_fingerprint_keeps_distinct_title_context_with_semantic_content() -> None:
+    from persome.capture import scheduler
+
+    first = _prebuilt_capture(
+        timestamp="2026-08-11T00:00:00+00:00",
+        text="same semantic content",
+        title="Build 1%",
+    )
+    second = _prebuilt_capture(
+        timestamp="2026-08-11T00:00:01+00:00",
+        text="same semantic content",
+        title="Build 99%",
+    )
+
+    assert scheduler._content_fingerprint(first).startswith("v2:")
+    assert scheduler._content_fingerprint(first) != scheduler._content_fingerprint(second)
+
+
+def test_v2_fingerprint_keeps_distinct_title_context_for_opaque_capture() -> None:
+    from persome.capture import scheduler
+
+    first = _prebuilt_capture(
+        timestamp="2026-08-11T00:00:00+00:00",
+        text="",
+        title="Opaque window A",
+    )
+    second = _prebuilt_capture(
+        timestamp="2026-08-11T00:00:01+00:00",
+        text="",
+        title="Opaque window B",
+    )
+
+    assert scheduler._content_fingerprint(first) != scheduler._content_fingerprint(second)
+
+
+def test_runner_dedups_recent_a_b_a_without_refreshing_skip(
+    ac_root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from persome.capture import scheduler
+
+    now = [100.0]
+    monkeypatch.setattr(scheduler.time, "time", lambda: now[0])
+    cfg = load_config().capture
+    cfg.same_window_dedup_seconds = 5.0
+    runner = scheduler._CaptureRunner(cfg, provider=None)
+
+    a1 = _prebuilt_capture(timestamp="2026-08-11T00:00:00+00:00", text="state A")
+    b = _prebuilt_capture(timestamp="2026-08-11T00:00:01+00:00", text="state B")
+    a2 = _prebuilt_capture(timestamp="2026-08-11T00:00:02+00:00", text="state A")
+    a3 = _prebuilt_capture(timestamp="2026-08-11T00:00:03+00:00", text="state A")
+
+    assert runner.commit_prebuilt(a1)
+    now[0] = 101.0
+    assert runner.commit_prebuilt(b)
+    now[0] = 104.9
+    assert runner.commit_prebuilt(a2) is None
+    # The skipped A did not refresh its receipt; five seconds is measured from
+    # the successful A at t=100, so it is admitted immediately after t=105.
+    now[0] = 105.1
+    assert runner.commit_prebuilt(a3)
+    assert len(list(paths.capture_buffer_dir().glob("*.json"))) == 3
+
+
+def test_runner_uses_configured_recent_content_horizon(
+    ac_root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from persome.capture import scheduler
+
+    now = [100.0]
+    monkeypatch.setattr(scheduler.time, "time", lambda: now[0])
+    cfg = load_config().capture
+    cfg.same_window_dedup_seconds = 1.5
+    runner = scheduler._CaptureRunner(cfg, provider=None)
+
+    assert runner.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:00+00:00", text="state A")
+    )
+    now[0] = 100.5
+    assert runner.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:01+00:00", text="state B")
+    )
+    now[0] = 101.6
+    assert runner.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:02+00:00", text="state A")
+    )
+
+
+def test_runner_restores_retained_head_across_restart(ac_root) -> None:
+    from persome.capture import scheduler
+
+    cfg = load_config().capture
+    first = scheduler._CaptureRunner(cfg, provider=None)
+    assert first.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:00+00:00", text="static state")
+    )
+
+    restarted = scheduler._CaptureRunner(cfg, provider=None)
+    assert (
+        restarted.commit_prebuilt(
+            _prebuilt_capture(timestamp="2026-08-12T00:00:00+00:00", text="static state")
+        )
+        is None
+    )
+    assert len(list(paths.capture_buffer_dir().glob("*.json"))) == 1
+
+
+def test_receipt_failure_keeps_in_process_head_but_fails_open_after_restart(
+    ac_root, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from persome.capture import scheduler
+
+    def receipt_failure(*_args, **_kwargs):
+        raise OSError("receipt database unavailable")
+
+    monkeypatch.setattr(scheduler.content_receipt_store, "record_success", receipt_failure)
+    cfg = load_config().capture
+    runner = scheduler._CaptureRunner(cfg, provider=None)
+    assert runner.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:00+00:00", text="static state")
+    )
+    assert (
+        runner.commit_prebuilt(
+            _prebuilt_capture(timestamp="2026-08-11T00:00:01+00:00", text="static state")
+        )
+        is None
+    )
+
+    restarted = scheduler._CaptureRunner(cfg, provider=None)
+    assert restarted.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:02+00:00", text="static state")
+    )
+    assert len(list(paths.capture_buffer_dir().glob("*.json"))) == 2
+
+
+def test_force_success_becomes_content_head(ac_root) -> None:
+    from persome.capture import scheduler
+
+    runner = scheduler._CaptureRunner(load_config().capture, provider=None)
+    assert runner.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:00+00:00", text="state A")
+    )
+    assert runner.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:01+00:00", text="state B")
+    )
+    assert runner.commit_prebuilt(
+        _prebuilt_capture(timestamp="2026-08-11T00:00:02+00:00", text="state A"),
+        force=True,
+    )
+    assert (
+        runner.commit_prebuilt(
+            _prebuilt_capture(timestamp="2026-08-11T00:00:03+00:00", text="state A")
+        )
+        is None
+    )
+
+
+def test_runner_capture_and_receipt_share_maintenance_boundary(ac_root) -> None:
+    from persome.capture import scheduler
+
+    runner = scheduler._CaptureRunner(load_config().capture, provider=None)
+    started = threading.Event()
+    finished = threading.Event()
+
+    def commit() -> None:
+        started.set()
+        runner.commit_prebuilt(
+            _prebuilt_capture(timestamp="2026-08-11T00:00:00+00:00", text="atomic state")
+        )
+        finished.set()
+
+    with scheduler.fts_store.exclusive_database_maintenance():
+        worker = threading.Thread(target=commit)
+        worker.start()
+        assert started.wait(1)
+        assert not finished.wait(0.1)
+
+    worker.join(timeout=5)
+    assert finished.is_set()
+    with scheduler.fts_store.cursor() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 1

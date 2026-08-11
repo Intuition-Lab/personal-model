@@ -53,7 +53,7 @@ _PRIVATE_SQLITE_FILE_MODE = 0o600
 # independent from PRAGMA user_version, which already tracks the secure-FTS
 # migration. Clients require an exact match: an older binary must not assume a
 # future schema is backward compatible.
-_RUNTIME_SCHEMA_REVISION = "2026-08-11.3"
+_RUNTIME_SCHEMA_REVISION = "2026-08-11.4"
 _RUNTIME_SCHEMA_REVISION_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\.(\d+)$")
 _ENTRIES_FTS_OBJECTS = (
     "entries",
