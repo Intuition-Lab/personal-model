@@ -87,6 +87,11 @@ class DeltaResult:
     skipped_reason: str = ""
 
 
+def window_block_limit(cfg: Any) -> int:
+    """Bound one prompt while reserving one read slot to detect overflow."""
+    return max(1, min(int(getattr(cfg.memory_delta, "max_blocks", 120)), 199))
+
+
 def _safe_json(text: str) -> dict:
     """Parse the LLM reply into a dict; tolerate ```json fences and junk."""
     text = (text or "").strip()
@@ -146,6 +151,8 @@ def _render_blocks(blocks: list[tl_store.TimelineBlock]) -> str:
     """
     parts: list[str] = []
     for b in blocks:
+        if not b.eligible_for_modeling:
+            continue
         raw_entries = list(b.entries or [])
         entries = [entry for entry in raw_entries if not _is_local_model_output(entry)]
         if not entries:
@@ -419,13 +426,14 @@ def run_after_session(
         result.skipped_reason = "no_window"
         return result
 
-    max_blocks = int(getattr(cfg.memory_delta, "max_blocks", 120))
+    max_blocks = window_block_limit(cfg)
     try:
         with fts.cursor() as conn:
-            # newest-first + limit gives the window's most recent max_blocks;
-            # reversed back to chronological order for the event log.
-            blocks = list(
-                reversed(tl_store.query_range(conn, start_time, end_time, limit=max_blocks))
+            blocks = tl_store.query_range_oldest(
+                conn,
+                start_time,
+                end_time,
+                limit=max_blocks + 1,
             )
     except Exception:  # noqa: BLE001 — fail-open, never disturb the writer chain
         logger.warning("memory_delta %s: block read failed", session_id, exc_info=True)
@@ -433,6 +441,15 @@ def run_after_session(
         return result
     if not blocks:
         result.skipped_reason = "no_blocks"
+        return result
+    if len(blocks) > max_blocks:
+        # The shared agent splits long recovery ranges before calling us. A
+        # direct caller must not let a truncated prompt claim the full window.
+        result.skipped_reason = "window_too_large"
+        return result
+
+    if not any(block.eligible_for_modeling for block in blocks):
+        result.skipped_reason = "no_eligible_evidence"
         return result
 
     roster_entries = _load_roster(cfg)

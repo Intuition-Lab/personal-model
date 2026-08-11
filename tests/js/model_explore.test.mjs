@@ -4,7 +4,10 @@ import test from "node:test";
 import {
   focusKeysForSelection,
   handleSearchShortcut,
+  lineKnownAt,
+  pointKnownAt,
   pointSearchMetadata,
+  pointVisibleAt,
   pointerUpOutcome,
   prepareSearchEntries,
   rankSearchEntries,
@@ -38,6 +41,105 @@ test("keeps an in-progress claim focused when the search chord is pressed", () =
   assert.equal(handleSearchShortcut(event, false, () => { opened = true; }), true);
   assert.equal(prevented, true);
   assert.equal(opened, true);
+});
+
+test("renders only the Point chain head valid at the selected time", () => {
+  const predecessor = {
+    id: "old",
+    is_latest: false,
+    status: "shadow",
+    valid_from: "2026-01-01T00:00:00Z",
+    valid_until: "2026-03-01T00:00:00Z",
+  };
+  const successor = {
+    id: "new",
+    is_latest: true,
+    status: "active",
+    valid_from: "2026-03-01T00:00:00Z",
+    valid_until: null,
+  };
+
+  assert.equal(pointVisibleAt(predecessor, new Date("2026-02-01T00:00:00Z")), true);
+  assert.equal(pointVisibleAt(successor, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(pointVisibleAt(predecessor, new Date("2026-04-01T00:00:00Z")), false);
+  assert.equal(pointVisibleAt(successor, new Date("2026-04-01T00:00:00Z")), true);
+  assert.equal(pointVisibleAt({ ...successor, status: "shadow" }, new Date("2026-04-01T00:00:00Z")), false);
+  assert.equal(pointKnownAt(successor, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(pointKnownAt(successor, new Date("2026-03-01T00:00:00Z")), true);
+  assert.deepEqual(
+    pointSearchMetadata(successor, new Date("2026-02-01T00:00:00Z")),
+    {
+      state: "future",
+      subtitle: "Modeled observation · not yet valid at this date",
+      aliases: ["future", "not yet valid"],
+      weightAdjustment: -56,
+    },
+  );
+  const model = {
+    points: [predecessor, successor],
+  };
+  const evolution = { kind: "evolution", source: "old", target: "new" };
+  assert.equal(lineKnownAt(evolution, model, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(lineKnownAt(evolution, model, new Date("2026-03-01T00:00:00Z")), true);
+});
+
+test("uses creation time when older Points do not carry valid_from", () => {
+  const point = {
+    id: "created-later",
+    is_latest: true,
+    status: "active",
+    created_at: "2026-03-01T00:00:00Z",
+  };
+
+  assert.equal(pointVisibleAt(point, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(pointKnownAt(point, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(
+    pointSearchMetadata(point, new Date("2026-02-01T00:00:00Z")).state,
+    "future",
+  );
+  assert.equal(pointVisibleAt(point, new Date("2026-03-01T00:00:00Z")), true);
+
+  const occurredOnly = { ...point, created_at: "", occurred_at: "2026-04-01T00:00:00Z" };
+  assert.equal(pointKnownAt(occurredOnly, new Date("2026-03-01T00:00:00Z")), false);
+  assert.equal(pointKnownAt(occurredOnly, new Date("2026-04-01T00:00:00Z")), true);
+});
+
+test("infers a predecessor end from its successor when valid_until is absent", () => {
+  const predecessor = {
+    id: "entity-old",
+    is_latest: false,
+    status: "shadow",
+    created_at: "2026-01-01T00:00:00Z",
+    superseded_by: ["entity-new"],
+  };
+  const successor = {
+    id: "entity-new",
+    is_latest: true,
+    status: "active",
+    created_at: "2026-03-01T00:00:00Z",
+    supersedes: ["entity-old"],
+  };
+  const pointById = new Map([
+    [predecessor.id, predecessor],
+    [successor.id, successor],
+  ]);
+
+  assert.equal(
+    pointVisibleAt(predecessor, new Date("2026-02-01T00:00:00Z"), pointById),
+    true,
+  );
+  assert.equal(
+    pointVisibleAt(successor, new Date("2026-02-01T00:00:00Z"), pointById),
+    false,
+  );
+  assert.equal(
+    pointVisibleAt(predecessor, new Date("2026-03-01T00:00:00Z"), pointById),
+    false,
+  );
+  assert.equal(
+    pointVisibleAt(successor, new Date("2026-03-01T00:00:00Z"), pointById),
+    true,
+  );
 });
 
 test("preserves ordinary panel scrolling but captures pinch everywhere", () => {
@@ -351,6 +453,26 @@ test("focuses a Point's semantic cluster and directly connected relations", () =
     "face:face-work",
   ]));
   assert.equal(focus.has("point:point-c"), false);
+});
+
+test("focuses canonical Line endpoints through their rendered entity Points", () => {
+  const model = {
+    ...modelFixture(),
+    lines: [{ id: "line-entity", source: "self", target: "Acme" }],
+  };
+  const layout = {
+    ...layoutFixture(),
+    endpointPointIds: new Map([["Acme", "point-a"]]),
+  };
+
+  assert.deepEqual(
+    focusKeysForSelection(model, layout, { kind: "line", id: "line-entity" }),
+    new Set(["line:line-entity", "context:self", "point:point-a"]),
+  );
+  assert.ok(
+    focusKeysForSelection(model, layout, { kind: "point", id: "point-a" })
+      .has("line:line-entity"),
+  );
 });
 
 test("focuses only the adjacent hierarchy shell for high-level selections", () => {

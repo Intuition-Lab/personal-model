@@ -1,3 +1,5 @@
+import { pointKnownAt } from "./explore.mjs";
+
 function compactText(value, fallback = "Evidence", limit = 140) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   return (text || fallback).slice(0, limit);
@@ -36,9 +38,10 @@ export function relationLabel(relation) {
   return labels[relation] || compactText(String(relation || "Evidence").replaceAll("_", " "));
 }
 
-export function receiptIndex(model) {
+export function receiptIndex(model, cutoff = null) {
   const byReference = new Map();
   (model?.points || []).forEach((point) => {
+    if (cutoff && !pointKnownAt(point, cutoff)) return;
     if (!point.receipt) return;
     byReference.set(point.receipt, {
       id: point.id,
@@ -53,19 +56,24 @@ export function receiptIndex(model) {
   return byReference;
 }
 
-export function nodeEvidenceCards(item, model) {
+export function nodeEvidenceCards(item, model, cutoff = null) {
   const references = [
     item?.receipt,
     item?.source_evidence?.receipt,
     ...(item?.member_receipts || []),
     ...(item?.source_receipts || []),
   ].filter(Boolean);
-  const index = receiptIndex(model);
-  return [...new Set(references)].map((reference) => {
+  const index = receiptIndex(model, cutoff);
+  const fullIndex = cutoff ? receiptIndex(model) : index;
+  return [...new Set(references)].flatMap((reference) => {
     const known = index.get(reference);
-    if (known) return known;
+    if (known) return [known];
+    // The receipt belongs to a Point that exists only after the historical
+    // cutoff.  Omitting the card also prevents a generic fallback from
+    // revealing its ID or making its evidence endpoint drillable early.
+    if (cutoff && fullIndex.has(reference)) return [];
     const parsed = parseReceipt(reference);
-    return {
+    return [{
       id: parsed.id,
       kind: "receipt",
       reference,
@@ -73,12 +81,13 @@ export function nodeEvidenceCards(item, model) {
       label: humanizePath(parsed.path) || "Recorded evidence",
       timestamp: null,
       status: null,
-    };
+    }];
   });
 }
 
-export function nodeHistoryCards(item, model) {
+export function nodeHistoryCards(item, model, cutoff = null) {
   const byId = new Map((model?.points || []).map((point) => [point.id, point]));
+  const knownAtCutoff = (point) => !cutoff || pointKnownAt(point, cutoff);
   const links = [];
   [
     ["previous_version", item?.supersedes || []],
@@ -86,6 +95,7 @@ export function nodeHistoryCards(item, model) {
   ].forEach(([relation, ids]) => {
     ids.forEach((id) => {
       const point = byId.get(id);
+      if (point && !knownAtCutoff(point)) return;
       links.push({
         id,
         kind: "point",
@@ -100,8 +110,8 @@ export function nodeHistoryCards(item, model) {
   return links;
 }
 
-export function evidenceOverview(kind, item, model) {
-  const cards = nodeEvidenceCards(item, model);
+export function evidenceOverview(kind, item, model, cutoff = null) {
+  const cards = nodeEvidenceCards(item, model, cutoff);
   const noun = cards.length === 1 ? "source observation" : "source observations";
   return {
     title: cards.length ? `${cards.length} ${noun}` : "No direct evidence receipts",
@@ -133,7 +143,7 @@ function modelNodeDisplayLabel(node, fallback) {
   );
 }
 
-export function modelNodeLabelIndex(model) {
+export function modelNodeLabelIndex(model, endpointPointIds = null) {
   const labels = new Map([["self", "You"]]);
   modelNodeCandidates(model).forEach(([, nodes, fallback]) => {
     nodes.forEach((node) => {
@@ -141,6 +151,10 @@ export function modelNodeLabelIndex(model) {
         labels.set(node.id, modelNodeDisplayLabel(node, fallback));
       }
     });
+  });
+  endpointPointIds?.forEach?.((pointId, endpoint) => {
+    const label = labels.get(pointId);
+    if (endpoint && label && !labels.has(endpoint)) labels.set(endpoint, label);
   });
   return labels;
 }

@@ -1199,6 +1199,7 @@ def test_current_context_shape(ac_root: Path) -> None:
                 entries=["[Cursor] editing main.py"],
                 apps_used=["Cursor"],
                 capture_count=2,
+                normalization_status="legacy",
             ),
         )
         timeline_store.insert(
@@ -1209,6 +1210,18 @@ def test_current_context_shape(ac_root: Path) -> None:
                 entries=["[Safari] reading docs"],
                 apps_used=["Safari"],
                 capture_count=1,
+                normalization_status="legacy",
+            ),
+        )
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=datetime(2026, 4, 22, 14, 2, tzinfo=tz),
+                end_time=datetime(2026, 4, 22, 14, 3, tzinfo=tz),
+                entries=["[Mail] active, involving —"],
+                apps_used=["Mail"],
+                capture_count=1,
+                normalization_status="metadata_only",
             ),
         )
 
@@ -1236,6 +1249,10 @@ def test_current_context_shape(ac_root: Path) -> None:
     # Timeline blocks present and ordered chronologically.
     assert len(ctx["recent_timeline_blocks"]) == 2
     assert ctx["recent_timeline_blocks"][0]["entries"] == ["[Cursor] editing main.py"]
+    assert [block["normalization_status"] for block in ctx["recent_timeline_blocks"]] == [
+        "legacy",
+        "legacy",
+    ]
 
 
 def test_current_context_app_filter(ac_root: Path) -> None:

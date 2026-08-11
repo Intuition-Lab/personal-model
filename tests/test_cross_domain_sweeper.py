@@ -108,6 +108,7 @@ def test_behavior_signature_traces_occurred_at(ac_root):
                 capture_count=3,
                 id="blk-1",
                 created_at=t,
+                normalization_status="legacy",
             ),
         )
         entries_mod.create_file(conn, name="project-a.md", description="d", tags=["t"])

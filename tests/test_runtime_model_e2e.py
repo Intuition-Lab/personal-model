@@ -128,6 +128,25 @@ def test_fresh_root_ingest_build_export_contract(ac_root, monkeypatch, fake_llm)
         routes_mod.set_config(None)
 
     monkeypatch.setattr(timeline_tick, "_now", lambda: datetime(2026, 7, 10, 9, 3, tzinfo=TZ))
+    fake_llm.add_script(
+        "timeline",
+        [
+            _response(
+                payload={
+                    "entries": [
+                        "[Synthetic Editor] documented the local-first runtime and auditable model build."
+                    ]
+                }
+            ),
+            _response(
+                payload={
+                    "entries": [
+                        "[Synthetic Editor] connected Point, Line, Face, Volume, and Root to reproducible artifacts."
+                    ]
+                }
+            ),
+        ],
+    )
     assert timeline_tick.tick_now(cfg) == 2
 
     fake_llm.add_script("classifier", _classifier_script())

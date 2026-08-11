@@ -133,6 +133,8 @@ def test_import_folder_is_read_only_private_and_idempotent(ac_root: Path, tmp_pa
         assert session.status == "ended"
         blocks = timeline_store.query_range(conn, session.start_time, session.end_time, limit=10)
     assert len(blocks) == 1
+    assert blocks[0].normalization_status == "imported"
+    assert blocks[0].eligible_for_modeling is True
     assert "Work/plan.md" in blocks[0].focus_excerpt
     assert original in blocks[0].focus_excerpt
     assert "private config" not in blocks[0].focus_excerpt

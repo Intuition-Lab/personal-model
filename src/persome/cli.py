@@ -3423,7 +3423,7 @@ def timeline_list(
         console.print(
             f"[bold]{b.start_time.strftime('%Y-%m-%d %H:%M')}"
             f"–{b.end_time.strftime('%H:%M')}[/bold] "
-            f"({b.capture_count} captures, apps: {apps})"
+            f"({b.capture_count} captures, quality: {b.normalization_status}, apps: {apps})"
         )
         for e in b.entries:
             console.print(f"  - {e}")

@@ -69,7 +69,7 @@ Example stdio client configuration:
 
 | Tool | Purpose |
 |---|---|
-| `current_context` | Return recent capture headlines, full text, and timeline blocks. |
+| `current_context` | Return recent capture headlines/full text and model-eligible timeline blocks; each block includes `normalization_status`. |
 | `search_captures` | Search the local capture index. |
 | `read_recent_capture` | Read an exact returned `file_stem` or nearest recent capture, with screenshot opt-in. |
 | `attention_trajectory` | Read the derived attention path used by state formation. |

@@ -63,7 +63,19 @@ Explicit rules (see the prompt for the full list):
 - **Authorship guard.** Typing into a search box / address bar is not chat participation.
 - **De-duplication.** Collapse consecutive identical passive reads; keep the longest version of an in-progress draft.
 
-On any failure (JSON parse, LLM timeout, empty), the code falls back to a heuristic entry built from `window_meta.app_name` counts. Never silently drops a window.
+Every stored block records `normalization_status`. Sanitized visible/focused/OCR or structured
+conversation content is required before the timeline LLM is called; app, title, bundle, URL, role,
+and trigger metadata alone produce a `metadata_only` block with no entries. A valid explicit
+`entries=[]` remains empty (`llm_empty`). JSON/contract errors and provider failures may retain a
+coarse heuristic breadcrumb for local debugging (`llm_malformed` / `llm_failed`), but those blocks
+are barred from reducer, memory-delta, case, and structural-model evidence. The window is still
+stored and its session/model watermarks still advance, so strict filtering cannot wedge replay.
+
+Only `llm`, trusted `imported`, and pre-migration `legacy` blocks are eligible for modeling. A new
+in-process block whose producer omits provenance defaults to `unknown` and fails closed; the DB
+default remains `legacy` solely so pre-column rows preserve their historical behavior. The
+`legacy` compatibility state avoids pretending the Runtime can reconstruct provenance that older
+rows never stored.
 
 ## Schema
 
@@ -84,13 +96,15 @@ CREATE TABLE timeline_blocks (
   attention_surface TEXT NOT NULL DEFAULT '',
   attention_confidence REAL NOT NULL DEFAULT 0.0,
   attention_rung TEXT NOT NULL DEFAULT '',
+  normalization_status TEXT NOT NULL DEFAULT 'legacy',
   UNIQUE(start_time, end_time)
 );
 ```
 
 Stored in the same `index.db` as the FTS tables. It is not FTS-indexed; reducer,
 memory-delta, case, and attention stages query it by time range. Structured
-focus and raw excerpts preserve evidence that the normalized entry may omit.
+focus and bounded raw excerpts preserve evidence that the normalized entry may omit; they do not
+override an ineligible normalization status.
 
 ## CLI
 
@@ -111,11 +125,11 @@ SELECT * FROM timeline_blocks
  ORDER BY start_time ASC
 ```
 
-Where `:start_bound` is `flush_end` (or `session.start` on the first flush) and `:end_bound` is `now` (flush) or `session.end` (terminal). All overlapping blocks are fed to the reducer LLM along with the window's wall-clock range. Earlier entries from the same daily file are deliberately not included: `flush_end` already prevents overlap, while replaying old task bodies biases later same-day summaries toward stale work. The reducer emits per-window-range sub_tasks like `[13:25-13:30, Cursor] edited tick.py; "fixed _stem_to_dt for negative offsets"; involving persome/timeline/aggregator.py`.
+Where `:start_bound` is `flush_end` (or `session.start` on the first flush) and `:end_bound` is `now` (flush) or `session.end` (terminal). All overlapping blocks advance the reducer watermark, but only model-eligible blocks are fed to the reducer LLM. Earlier entries from the same daily file are deliberately not included: `flush_end` already prevents overlap, while replaying old task bodies biases later same-day summaries toward stale work. The reducer emits per-window-range sub_tasks like `[13:25-13:30, Cursor] edited tick.py; "fixed _stem_to_dt for negative offsets"; involving persome/timeline/aggregator.py`.
 
 ## Tuning
 
-- Timeline runs every 60s even with no captures; the LLM call is skipped when the window has zero events.
+- Timeline runs every 60s even with no captures; the LLM call is skipped when the window has zero events or only metadata-level events.
 - If your `timeline` model is slow (>30s per call), that's your bottleneck — consider a faster model for this stage. Since the prompt is now bigger (1-min window but more verbatim content), a mid-tier model may be worth it; a too-weak model will start summarizing instead of normalizing.
 - `window_minutes` can be tuned but changing it doesn't migrate existing blocks. A larger window cuts LLM calls per hour but risks the model over-summarizing a crowded window; a smaller window costs more calls but keeps fidelity high.
 - Drop all timeline data with `persome clean timeline`. The aggregator will re-produce blocks from whatever captures are still in the buffer on the next tick.

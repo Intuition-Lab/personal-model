@@ -558,7 +558,10 @@ class TestViewPage:
         assert b"loadConstellationBundle" in viewer.body
         assert b"graphPayload.generated_at === share.generatedAt" in viewer.body
         assert b"fetchModelGraph()" in viewer.body
-        assert b"drawConstellationCard(context, renderer.domElement, shareModel)" in viewer.body
+        assert (
+            b"drawConstellationCard(context, renderer.domElement, renderedShareModel)"
+            in viewer.body
+        )
         assert b"drawConstellationCard(context, renderer.domElement, model)" not in viewer.body
         assert b"private source content" in share.body
         assert b"Built locally with Persome \xc2\xb7 Build yours" in share.body
@@ -632,7 +635,7 @@ class TestViewPage:
         assert 'id="line-select"' in page
         assert 'lineSelectEl.addEventListener("change"' in viewer
         assert "placeholder.disabled = lines.length > 0" in viewer
-        assert "indexLinePresentations(renderedLineItems, sceneModel, sceneNodeLabels)" in viewer
+        assert "indexLinePresentations(searchLines, searchModel, searchNodeLabels)" in viewer
         assert "linePresentations.get(line.id)?.option" in viewer
         assert 'appendMeta("Predicate", lineDetail?.predicate)' in viewer
         assert 'appendMeta("From", lineDetail?.source)' in viewer

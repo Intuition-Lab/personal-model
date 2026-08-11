@@ -32,6 +32,7 @@ def _seed_blocks(start: datetime) -> list[timeline_store.TimelineBlock]:
                 entries=[f"[Cursor] edited file_{i}.py, involving nothing"],
                 apps_used=["Cursor"],
                 capture_count=6,
+                normalization_status="legacy",
             )
             timeline_store.insert(conn, b)
             bs.append(b)
@@ -74,14 +75,16 @@ def test_reducer_fixture_happy_path(ac_root: Path, fake_llm, load_llm_fixture) -
     assert "[10:00-10:05, Cursor]" in md
 
 
-def test_reducer_fixture_malformed_keys_falls_back_to_heuristic(
+def test_reducer_fixture_malformed_keys_is_consumed_without_heuristic(
     ac_root: Path,
     fake_llm,
     load_llm_fixture,
 ) -> None:
-    """A fixture with wrong keys (valid JSON, wrong schema) → heuristic sub_tasks
-    but the reducer still marks the session as succeeded because the JSON
-    itself parsed successfully.
+    """Valid JSON with the wrong schema is consumed without inventing facts.
+
+    The reducer may retry transport/parse failures, but an empty validated
+    result is a successful no-op.  Generic heuristic prose is intentionally
+    not promoted into the event memory path.
     """
     start = datetime(2026, 4, 21, 11, 0, tzinfo=_TZ)
     end = start + timedelta(minutes=15)
@@ -108,11 +111,11 @@ def test_reducer_fixture_malformed_keys_falls_back_to_heuristic(
         end_time=end,
     )
 
-    # Valid JSON with wrong keys → heuristic fallback, but succeeded=True
-    # because the JSON parse itself did not fail.
     assert result.succeeded is True
-    assert result.written is True
-    assert "active during the session" in result.sub_tasks[0]
+    assert result.written is False
+    assert result.consumed is True
+    assert result.sub_tasks == []
+    assert result.path == ""
 
 
 def test_reducer_fixture_invalid_json_schedules_retry(

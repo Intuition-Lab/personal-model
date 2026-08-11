@@ -65,6 +65,16 @@ through the identity roster or appear explicitly in the session. Relations use
 a closed predicate set. Low-confidence or unsupported items are dropped and
 counted.
 
+Before this gate, timeline provenance is a hard Gator boundary. Memory delta reads only
+shape-validated `llm`, trusted `imported`, or backward-compatible `legacy` blocks. `metadata_only`, `llm_empty`,
+`llm_malformed`, and `llm_failed` windows are consumed without an extraction call or geometry
+write; `sessions.delta_end` still advances. Reducer fallback wording therefore cannot become a
+Point or Line merely because it is non-empty.
+
+`llm` is an admission/provenance class, not proof that every normalized clause is independently
+grounded. Per-entry source receipts and locally verified evidence spans remain a planned hardening
+step; downstream quote checks must not treat this label alone as factual verification.
+
 The roster always includes the reserved `self` endpoint. The same LLM pass may
 propose `owner_alias_candidates` only when quoted session evidence identifies a
 proper name or handle as an explicit self-identification or owned account. One
@@ -89,8 +99,9 @@ per-identity fan-out cap.
 Persist-before-apply is deliberate. `apply_status` is `pending`, `applied`, or
 `failed`; a retry reuses the stored window payload and only resumes apply.
 `sessions.delta_end` advances only after success, keeping cost and
-relation-observation counts idempotent. Terminal finalization processes only
-the remaining tail.
+relation-observation counts idempotent. Long recovery ranges are processed oldest-first in bounded
+`max_blocks` slices; a direct oversized call fails closed instead of silently claiming a truncated
+window. Terminal finalization processes only the remaining tail.
 
 When `apply_enabled=false`, the delta remains an audit artifact and the legacy
 classifier regains the terminal durable-fact role. This is a compatibility and

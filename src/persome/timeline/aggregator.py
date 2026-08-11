@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from datetime import datetime, tzinfo
 from pathlib import Path
 
@@ -52,6 +53,12 @@ _PER_CAPTURE_TEXT_LIMIT = 4000
 # 30+ captures, keep the newest ones. Later events are more recent and
 # tend to be more informative.
 _MAX_EVENTS_PER_WINDOW = 30
+
+_GENERIC_ACTIVITY_RE = re.compile(
+    r"^\[[^\]]+\]\s+(?:active|worked in window(?:\s+'[^']*')?)"
+    r"(?:,\s*)?(?:involving\s*:?\s*—)?[.!]?\s*$",
+    re.IGNORECASE,
+)
 
 # Terminal emulators that scroll oldest-to-newest: the most recent content
 # is at the bottom, so tail-truncation gives better intent signal than
@@ -142,6 +149,80 @@ def _focus_excerpt(parsed: list[tuple[Path, dict]]) -> str:
         if vt:
             return vt[:_FOCUS_EXCERPT_CHARS]
     return ""
+
+
+def _has_model_signal(
+    parsed: list[tuple[Path, dict]],
+    *,
+    events_text: str,
+    focus_structured: str,
+) -> bool:
+    """Require content, not app/window metadata, before timeline modeling.
+
+    S1 and historical AX renders include Markdown app/window chrome even when
+    sanitisation removed every content node.  Inspect the underlying render so
+    that those headings do not become evidence merely because
+    ``_format_events`` prefixed them with ``|``.  Successful OCR backfill,
+    structured parser output, and a non-placeholder editable value remain the
+    other grounded content paths.  Window titles, URLs, roles, and trigger
+    names remain useful local metadata but cannot on their own mint durable
+    geometry.
+    """
+    if focus_structured.strip():
+        return True
+    for _path, data in parsed:
+        visible_text = data.get("visible_text")
+        if visible_text is None:
+            ax = data.get("ax_tree")
+            visible_text = ax_tree_to_markdown(ax) if ax else ""
+        content_lines = []
+        for raw_line in str(visible_text).splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if re.fullmatch(r"#{2,3}\s+.+", line):
+                continue
+            if re.fullmatch(r"_[^_\n]+_", line):
+                continue
+            if line.startswith("[chrome folded:"):
+                continue
+            content_lines.append(line)
+        if content_lines:
+            return True
+
+        focused = data.get("focused_element") or {}
+        value = str(focused.get("value") or "").strip()
+        if not focused.get("is_editable") or not value:
+            continue
+        placeholders = {candidate.strip() for candidate in s1_parser.ocr_placeholder_values(data)}
+        if value not in placeholders:
+            return True
+
+    # OCR is stored outside the capture JSON.  Its sanitised text is therefore
+    # visible only in the formatted event stream, not in ``visible_text``.
+    if any(data.get("ocr_submitted") for _path, data in parsed):
+        return bool(re.search(r"(?m)^\|\s", events_text))
+    return False
+
+
+def _validated_entries(raw_entries: object) -> list[str] | None:
+    """Return conservative, exact-deduplicated entries or ``None`` on bad shape."""
+    if not isinstance(raw_entries, list):
+        return None
+    entries: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_entries:
+        if not isinstance(raw, str):
+            return None
+        text = raw.strip()
+        if not text or _GENERIC_ACTIVITY_RE.fullmatch(text):
+            continue
+        key = " ".join(unicodedata.normalize("NFKC", text).split()).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(text)
+    return entries
 
 
 def _focus_structured_with_outcome(
@@ -541,6 +622,14 @@ def produce_block_for_window(
         locus_enabled=cfg.timeline.attention_locus_enabled,
         display_tz=start.tzinfo,
     )
+    focus_structured, parser_bundle, parser_outcome, _parser_miss_reason = (
+        _focus_structured_with_outcome(parsed)
+    )
+    has_model_signal = _has_model_signal(
+        parsed,
+        events_text=events_text,
+        focus_structured=focus_structured,
+    )
     # Use len(parsed) — capture_count must match what the LLM actually sees
     # and what _heuristic_entries can group; len(capture_files) overcounts
     # whenever _load_captures drops a corrupt or non-dict file.
@@ -575,53 +664,63 @@ def produce_block_for_window(
     entries: list[str] = []
     skill_hints: list[dict] = []
     action_trace: list[dict] = []
-    try:
-        resp = llm_mod.call_llm(
-            cfg,
-            "timeline",
-            messages=[
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": system_text,
-                            "cache_control": {"type": "ephemeral"},
-                        }
-                    ],
-                },
-                {"role": "user", "content": user_text},
-            ],
-            json_mode=True,
-        )
-        text = llm_mod.extract_text(resp).strip()
-        data = json.loads(text) if text else {}
-        if isinstance(data, dict):
-            raw_entries = data.get("entries")
-            if isinstance(raw_entries, list):
-                entries = [str(e).strip() for e in raw_entries if str(e).strip()]
-            raw_skills = data.get("skill_hints")
-            if isinstance(raw_skills, list) and skill_paths:
-                for raw in raw_skills:
-                    validated_skill = _validate_skill_hint(raw, skill_paths=skill_paths)
-                    if validated_skill is not None:
-                        skill_hints.append(validated_skill)
-                    else:
-                        logger.debug("timeline: dropped malformed skill hint: %r", raw)
-            raw_trace = data.get("action_trace")
-            if isinstance(raw_trace, list):
-                action_trace = [r for r in raw_trace if isinstance(r, dict)]
-    except json.JSONDecodeError as exc:
-        logger.warning("timeline: malformed JSON from LLM: %s", exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("timeline: LLM call failed: %s", exc)
+    normalization_status = "metadata_only"
+    if has_model_signal:
+        normalization_status = "llm_failed"
+        try:
+            resp = llm_mod.call_llm(
+                cfg,
+                "timeline",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": system_text,
+                                "cache_control": {"type": "ephemeral"},
+                            }
+                        ],
+                    },
+                    {"role": "user", "content": user_text},
+                ],
+                json_mode=True,
+            )
+            text = llm_mod.extract_text(resp).strip()
+            data = json.loads(text) if text else None
+            if isinstance(data, dict):
+                validated_entries = _validated_entries(data.get("entries"))
+                if validated_entries is not None:
+                    entries = validated_entries
+                    normalization_status = "llm" if entries else "llm_empty"
+                    raw_skills = data.get("skill_hints")
+                    if isinstance(raw_skills, list) and skill_paths:
+                        for raw in raw_skills:
+                            validated_skill = _validate_skill_hint(raw, skill_paths=skill_paths)
+                            if validated_skill is not None:
+                                skill_hints.append(validated_skill)
+                            else:
+                                logger.debug("timeline: dropped malformed skill hint: %r", raw)
+                    raw_trace = data.get("action_trace")
+                    if isinstance(raw_trace, list):
+                        action_trace = [r for r in raw_trace if isinstance(r, dict)]
+                else:
+                    normalization_status = "llm_malformed"
+            else:
+                normalization_status = "llm_malformed"
+        except json.JSONDecodeError as exc:
+            normalization_status = "llm_malformed"
+            logger.warning("timeline: malformed JSON from LLM: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            normalization_status = "llm_failed"
+            logger.warning("timeline: LLM call failed: %s", exc)
 
-    if not entries:
+    if normalization_status in {"llm_malformed", "llm_failed"}:
+        # Retain a coarse operator-facing breadcrumb, but the block's explicit
+        # status keeps this text out of every durable modeling consumer.
         entries = _heuristic_entries(parsed)
-
-    focus_structured, parser_bundle, parser_outcome, _parser_miss_reason = (
-        _focus_structured_with_outcome(parsed)
-    )
+    if normalization_status != "llm":
+        skill_hints = []
     block = store.TimelineBlock(
         start_time=start,
         end_time=end,
@@ -636,6 +735,7 @@ def produce_block_for_window(
         attention_surface=(block_locus.surface if block_locus else ""),
         attention_confidence=(block_locus.confidence if block_locus else 0.0),
         attention_rung=(block_locus.rung if block_locus else ""),
+        normalization_status=normalization_status,
     )
     with fts_store.cursor() as conn:
         store.insert(conn, block)
@@ -665,7 +765,7 @@ def produce_block_for_window(
         len(action_trace),
         ", ".join(apps_used),
     )
-    if skill_hints:
+    if skill_hints and block.eligible_for_modeling:
         _echo_skill_hints(block, skill_hints)
     return block
 

@@ -99,6 +99,26 @@ def test_event_mentions_keep_only_person_specific_lines(ac_root) -> None:
     assert "investment" not in mention.summary
 
 
+def test_entity_source_excludes_heuristic_event_mentions(ac_root) -> None:
+    _seed_person_memory()
+    with fts.cursor() as conn:
+        entries_store.create_file(
+            conn,
+            name="event-2026-07-10.md",
+            description="Synthetic reducer fallback",
+            tags=["event"],
+        )
+        entries_store.append_entry(
+            conn,
+            name="event-2026-07-10.md",
+            content="Worked in a window with Alex, involving —",
+            tags=["session", "heuristic"],
+        )
+        events = EntitySource(conn).events()
+
+    assert all(event.source_kind != "entry" for event in events)
+
+
 def test_memory_person_source_filters_configured_owner_alias(ac_root) -> None:
     node_id = "point-person-owner"
     NodeStore().save(
