@@ -468,6 +468,73 @@ def maybe_promote(
     return False
 
 
+def supersede_signature(
+    conn: sqlite3.Connection,
+    *,
+    old_signature: str,
+    new_signature: str = "",
+) -> list[str]:
+    """Apply a supervised correction to active geometry carrying a schema signature.
+
+    ``schema-*.md`` and ``schema_faces`` are projections of the same modeled
+    object. When the correction workflow must update a schema directly (because
+    its source fact projection is unavailable), leaving the old Face or Volume
+    active would keep feeding the retired belief into recall and Root synthesis.
+    Close every exact normalized match and, when a corrected signature is
+    supplied, carry its evidence footprint into a fresh active successor.
+    """
+    ensure_schema(conn)
+    old_norm = _norm_sig(old_signature)
+    new_clean = (new_signature or "").strip()
+    if not old_norm or old_norm == _norm_sig(new_clean):
+        return []
+
+    conn.row_factory = sqlite3.Row
+    rows = [
+        row
+        for row in conn.execute(
+            "SELECT * FROM schema_faces WHERE status = ? AND valid_to IS NULL AND level IN (1, 2)",
+            (MemoryStatus.ACTIVE.value,),
+        )
+        if _norm_sig(str(row["signature"])) == old_norm
+    ]
+    changed: list[str] = []
+    for row in rows:
+        now = _now()
+        old_id = str(row["face_id"])
+        conn.execute(
+            "UPDATE schema_faces SET valid_to = ?, status = ? WHERE face_id = ?",
+            (now, MemoryStatus.SUPERSEDED.value, old_id),
+        )
+        changed.append(old_id)
+        if not new_clean:
+            continue
+        new_id = "face-" + hashlib.sha1((now + old_id + new_clean).encode()).hexdigest()[:12]
+        conn.execute(
+            "INSERT INTO schema_faces (face_id, level, parent_face, signature, members,"
+            " footprints, provenance, observations, confidence, status, valid_from,"
+            " valid_to, created_at, anchors)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            (
+                new_id,
+                int(row["level"]),
+                row["parent_face"],
+                new_clean,
+                row["members"],
+                row["footprints"],
+                row["provenance"],
+                int(row["observations"]) + 1,
+                float(row["confidence"]),
+                MemoryStatus.ACTIVE.value,
+                now,
+                now,
+                row["anchors"],
+            ),
+        )
+        changed.append(new_id)
+    return changed
+
+
 def resident_faces(conn: sqlite3.Connection, *, top_k: int = 5) -> list[sqlite3.Row]:
     """The §3.1 residency selection: ACTIVE (= promoted, both-provenance) faces,
     strongest first, capped — the O(1) tower-top block the system prompt holds.

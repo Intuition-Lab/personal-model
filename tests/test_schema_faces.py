@@ -192,6 +192,62 @@ class TestStabilityGateAndPromotion:
         assert faces.maybe_promote(conn, "face-nope") is False
 
 
+class TestSupervisedCorrection:
+    def test_supersede_signature_replaces_active_geometry_and_keeps_footprint(self, conn):
+        old_id = faces.record_face(
+            conn,
+            source="mined",
+            signature="Valse builds coding-agent management",
+            members=MEMBERS,
+            confidence=0.9,
+            level=2,
+        )
+        faces.record_face(
+            conn,
+            source="emergent",
+            signature="Valse builds coding-agent management",
+            members=MEMBERS,
+            confidence=0.9,
+            level=2,
+        )
+        assert faces.maybe_promote(conn, old_id)
+
+        changed = faces.supersede_signature(
+            conn,
+            old_signature="  valse builds coding-agent management ",
+            new_signature="Valse helps individuals restore continuous personal state",
+        )
+
+        assert changed[0] == old_id
+        new_id = changed[1]
+        old = _row(conn, old_id)
+        new = _row(conn, new_id)
+        assert old["status"] == "superseded" and old["valid_to"] is not None
+        assert new["status"] == "active" and new["valid_to"] is None
+        assert new["signature"] == "Valse helps individuals restore continuous personal state"
+        assert new["members"] == old["members"]
+        assert new["footprints"] == old["footprints"]
+        assert new["observations"] == old["observations"] + 1
+
+    def test_supersede_signature_can_retire_without_replacement(self, conn):
+        old_id = faces.record_face(
+            conn,
+            source="mined",
+            signature="obsolete claim",
+            members=MEMBERS,
+        )
+        conn.execute(
+            "UPDATE schema_faces SET status = 'active' WHERE face_id = ?",
+            (old_id,),
+        )
+
+        assert faces.supersede_signature(
+            conn,
+            old_signature="obsolete claim",
+        ) == [old_id]
+        assert _row(conn, old_id)["status"] == "superseded"
+
+
 class TestResidency:
     def _promoted(self, conn, sig, members, obs_extra=0):
         fid = faces.record_face(conn, source="mined", signature=sig, members=members)

@@ -84,7 +84,7 @@ of returning partial results.
 | Tool | Purpose |
 |---|---|
 | `remember` | Append a user-requested, auditable memory. |
-| `correct_memory` | Supersede or revoke memory while preserving provenance. |
+| `correct_memory` | Supersede or revoke memory while preserving provenance; returns separate `applied` and `errors` lists and reports `ok` only after the planned writes and immediate model refresh succeed. |
 
 The server exposes no computer-use, meeting, notification, product dashboard,
 or task-lifecycle tools.

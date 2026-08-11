@@ -1197,7 +1197,13 @@ def build_server(
             res = correct_mod.update_memory(cfg, conn, correction, source="agent")
         model_snapshot_cache.clear()
         return json.dumps(
-            {"kind": res.kind, "applied": res.applied, "reason": res.reason, "ok": res.ok},
+            {
+                "kind": res.kind,
+                "applied": res.applied,
+                "errors": getattr(res, "errors", []),
+                "reason": res.reason,
+                "ok": res.ok,
+            },
             ensure_ascii=False,
         )
 

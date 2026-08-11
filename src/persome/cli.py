@@ -1795,6 +1795,8 @@ def correct_cmd(
     typer.echo(f"correct: {res.kind}  ok={res.ok}")
     for a in res.applied:
         typer.echo(f"  - {a}")
+    for error in getattr(res, "errors", []):
+        typer.echo(f"  ! {error}", err=True)
     if res.reason:
         typer.echo(f"  reason: {res.reason}")
     if not res.ok and not dry_run and res.kind == "noop":
