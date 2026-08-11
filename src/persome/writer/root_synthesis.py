@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,9 @@ _PROFILE_FILES = ("schema-user-profile.md", "user-profile.md", "user-preferences
 @dataclass(frozen=True)
 class RootResult:
     face_id: str | None
-    reason: str  # written | skip_empty_input | skip_empty_output | skip_hallucination | disabled | error
+    reason: (
+        str  # written | skip_duplicate_input | skip_empty_* | skip_hallucination | disabled | error
+    )
 
 
 def estimate_tokens(text: str) -> int:
@@ -185,6 +188,7 @@ def synthesize_root(
     llm_call: Callable[[list[dict]], Any] | None = None,
     budget: int | None = None,
     roster: Any | None = None,
+    sampled_at: datetime | None = None,
 ) -> RootResult:
     """Gather → LLM → gates → upsert_root born-active. Injectable ``llm_call``/``roster``
     for tests. Returns a RootResult; NEVER raises (fail-open is the tick's contract, but we
@@ -211,6 +215,19 @@ def synthesize_root(
         profile = _profile_facts(cfg)
         if not bodies and not profile:  # gate 1: nothing to compress → keep prior root
             return RootResult(None, "skip_empty_input")
+
+        receipt = schema_faces.make_input_receipt(
+            producer="root_synthesis",
+            sampled_at=sampled_at or datetime.now(UTC),
+            input_value={
+                "budget": budget,
+                "volumes": [(b["face_id"], b["signature"]) for b in bodies],
+                "faces": [(f["face_id"], f["signature"]) for f in faces],
+                "profile": profile,
+            },
+        )
+        if prior_id := schema_faces.receipt_object(conn, receipt):
+            return RootResult(prior_id, "skip_duplicate_input")
 
         roster = roster if roster is not None else identity.load_roster(cfg)
         input_text = "\n".join(
@@ -249,24 +266,36 @@ def synthesize_root(
         if decided is not None:
             return RootResult(str(decided["face_id"]), "skip_authored")
 
-        face_id = schema_faces.upsert_root(
-            conn, signature=apex, members=members, anchors=anchors, confidence=1.0
+        root_record = schema_faces.upsert_root_with_receipt(
+            conn,
+            receipt=receipt,
+            signature=apex,
+            members=members,
+            anchors=anchors,
+            confidence=1.0,
         )
+        if not root_record.recorded:
+            return RootResult(root_record.face_id, "skip_duplicate_input")
         logger.info(
             "root_synthesis: wrote root %s (%d tok, %d volumes, %d anchors)",
-            face_id,
+            root_record.face_id,
             estimate_tokens(apex),
             len(members),
             len(anchors),
         )
-        return RootResult(face_id, "written")
+        return RootResult(root_record.face_id, "written")
     except Exception:  # noqa: BLE001 — fail-open; a bad synthesis never kills the tick
         logger.exception("root_synthesis failed")
         return RootResult(None, "error")
 
 
-def run_root_synthesis(cfg: Any, conn: sqlite3.Connection) -> RootResult:
+def run_root_synthesis(
+    cfg: Any,
+    conn: sqlite3.Connection,
+    *,
+    sampled_at: datetime | None = None,
+) -> RootResult:
     """Tick entry: gated on ``[schema] root_synthesis_enabled`` (default ON). Fail-open."""
     if not getattr(cfg.schema, "root_synthesis_enabled", True):
         return RootResult(None, "disabled")
-    return synthesize_root(cfg, conn)
+    return synthesize_root(cfg, conn, sampled_at=sampled_at)

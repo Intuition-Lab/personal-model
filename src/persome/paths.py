@@ -60,6 +60,11 @@ def mobile_event_ingest_lock() -> Path:
     return root() / "mobile-event-ingest.lock"
 
 
+def capture_content_receipt_invalidation_marker() -> Path:
+    """Crash-safe intent that invalidates an older capture-content head."""
+    return root() / ".capture-content-receipts.invalidated"
+
+
 def model_build_manifest() -> Path:
     return root() / "model-build.json"
 

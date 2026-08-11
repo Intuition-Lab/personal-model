@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -253,28 +254,20 @@ def _kind_of(identity: str) -> EntityKind:
     return EntityKind.PERSON
 
 
-def _edge_key(src: str, dst: str, predicate_value: str) -> tuple[str, str, str]:
-    """Dedup key. Undirected predicates (``knows``) canonicalize endpoint order so
-    (A,B,knows) and (B,A,knows) are the same edge (#436)."""
-    from ..model.activity_source import normalize_activity_identity
-
-    src = normalize_activity_identity(src)
-    dst = normalize_activity_identity(dst)
-    if predicate_value == Predicate.KNOWS.value:
-        a, b = sorted((src, dst))
-        return (a, b, predicate_value)
-    return (src, dst, predicate_value)
+def _edge_key(src: str, dst: str, predicate_value: str) -> str:
+    """Compatibility wrapper around the store's canonical logical identity."""
+    return edges_store.canonical_edge_key(src, dst, predicate_value)
 
 
-def _open_edges(conn) -> dict[tuple[str, str, str], str]:
+def _open_edges(conn) -> dict[str, str]:
     """Existing open (valid_to IS NULL), non-retired edges: key → edge_id (for reinforcement)."""
     edges_store.ensure_schema(conn)
     conn.row_factory = None
     rows = conn.execute(
-        "SELECT src_identity, dst_identity, predicate, edge_id FROM relation_edges "
+        "SELECT edge_key, edge_id FROM relation_edges "
         "WHERE valid_to IS NULL AND status IN ('shadow','active')"
     ).fetchall()
-    return {_edge_key(r[0], r[1], r[2]): r[3] for r in rows}
+    return {str(r[0]): str(r[1]) for r in rows}
 
 
 @dataclass
@@ -285,7 +278,7 @@ class _Tally:
 
 def _upsert_shadow(
     conn,
-    seen: dict[tuple[str, str, str], str],
+    seen: dict[str, str],
     tally: _Tally,
     *,
     src: str,
@@ -305,6 +298,7 @@ def _upsert_shadow(
     source_id: str | None = None,
     source_receipt: str | None = None,
     status: str = "shadow",
+    effect_key: str | None = None,
 ) -> None:
     """New evidence adds an edge; existing open edge ratchets its strength.
 
@@ -313,49 +307,118 @@ def _upsert_shadow(
     Endpoint legality is enforced by ``add_edge`` (raises for an illegal pair) — the
     caller treats a raise as "not a P0 relation" and drops it. Extractors use the
     default shadow status; deterministic observed floor edges may request active.
+
+    The database is the final arbiter when two connections race to create the
+    same canonical edge. A loser reuses the winning row. MAX reinforcement is
+    safe to replay. For additive writes, pass a relation-specific ``effect_key``:
+    initial creation records it atomically, and reinforcement increments only
+    if that receipt is new. Legacy additive callers without a key retain the
+    conservative creation-race behavior and at-least-once reinforcement.
     """
+    if effect_key is not None and not additive:
+        raise ValueError("relation_extractor: effect_key requires additive=True")
     key = _edge_key(src, dst, predicate.value)
-    eid = seen.get(key)
-    if eid is not None:
-        if edges_store.reinforce_edge(
-            conn, edge_id=eid, observations=observations, confidence=confidence, additive=additive
-        ):
-            tally.reinforced += 1
-        if status == "active":
-            conn.execute(
-                "UPDATE relation_edges SET status='active' WHERE edge_id=? AND status='shadow'",
-                (eid,),
-            )
-        return
-    new_id = edges_store.add_edge(
+    # A receipt survives the physical edge interval. Check it before looking
+    # for an open row so a crash retry after close is a successful no-op rather
+    # than an attempt to manufacture a replacement Line.
+    if effect_key is not None and edges_store.effect_already_applied(
         conn,
-        src_identity=src,
-        dst_identity=dst,
-        predicate=predicate,
-        src_kind=src_kind or _kind_of(src),
-        dst_kind=dst_kind or _kind_of(dst),
-        provenance=provenance,
-        confidence=confidence,
-        label=label,
-        quote=(quote or "")[:_QUOTE_MAX] or None,
-        observations=observations,
-        valid_from=valid_from,
-        polarity=polarity,
-        source_kind=source_kind,
-        source_id=source_id,
-        source_receipt=source_receipt,
-        status=status,
-    )
-    seen[key] = new_id
-    tally.new += 1
+        effect_key=effect_key,
+        edge_key=key,
+    ):
+        return
+
+    # A ``seen`` snapshot can race with a close on another connection. Bounded
+    # retries re-resolve the canonical open row; an effect-keyed item only
+    # returns success after its receipt exists or a new edge owns it.
+    for _attempt in range(3):
+        eid = seen.get(key) or edges_store.find_open_edge(conn, edge_key=key)
+        if eid is not None:
+            changed = edges_store.reinforce_edge(
+                conn,
+                edge_id=eid,
+                observations=observations,
+                confidence=confidence,
+                additive=additive,
+                effect_key=effect_key,
+            )
+            if effect_key is not None and not edges_store.effect_already_applied(
+                conn,
+                effect_key=effect_key,
+                edge_key=key,
+            ):
+                # The edge closed after the caller took its snapshot, so no
+                # receipt or mutation was committed. Resolve/create again.
+                seen.pop(key, None)
+                continue
+            if not changed and effect_key is None:
+                # MAX/legacy-additive writes have no receipt to distinguish a
+                # genuine open-edge no-op from a stale snapshot. Re-resolve the
+                # canonical row: only the same still-open edge may complete as
+                # a no-op; a close or replacement must retry against current
+                # state so a one-shot semantic relation is not silently lost.
+                current = edges_store.find_open_edge(conn, edge_key=key)
+                if current != eid:
+                    if current is None:
+                        seen.pop(key, None)
+                    else:
+                        seen[key] = current
+                    continue
+            if changed:
+                tally.reinforced += 1
+            if status == "active":
+                conn.execute(
+                    "UPDATE relation_edges SET status='active'"
+                    " WHERE edge_id=? AND status='shadow' AND valid_to IS NULL",
+                    (eid,),
+                )
+            return
+        try:
+            new_id = edges_store.add_edge(
+                conn,
+                src_identity=src,
+                dst_identity=dst,
+                predicate=predicate,
+                src_kind=src_kind or _kind_of(src),
+                dst_kind=dst_kind or _kind_of(dst),
+                provenance=provenance,
+                confidence=confidence,
+                label=label,
+                quote=(quote or "")[:_QUOTE_MAX] or None,
+                observations=observations,
+                valid_from=valid_from,
+                polarity=polarity,
+                source_kind=source_kind,
+                source_id=source_id,
+                source_receipt=source_receipt,
+                status=status,
+                effect_key=effect_key if additive else None,
+            )
+        except sqlite3.IntegrityError:
+            # The canonical edge or the effect receipt may have won on another
+            # connection. A matching durable receipt completes this retry even
+            # when the winning physical edge has since closed.
+            if effect_key is not None and edges_store.effect_already_applied(
+                conn,
+                effect_key=effect_key,
+                edge_key=key,
+            ):
+                return
+            winner = edges_store.find_open_edge(conn, edge_key=key)
+            if winner is None:
+                raise
+            seen[key] = winner
+            continue
+        seen[key] = new_id
+        tally.new += 1
+        return
+    raise RuntimeError("relation_extractor: canonical edge changed repeatedly during apply")
 
 
 # ── the passes ────────────────────────────────────────────────────────────────
 
 
-def _deterministic_pass(
-    conn, people: _People, seen: dict[tuple[str, str, str], str], tally: _Tally
-) -> None:
+def _deterministic_pass(conn, people: _People, seen: dict[str, str], tally: _Tally) -> None:
     """SELF↔person + co-occurring person↔person ``knows`` from consolidated entities.
 
     strength(observations) comes FROM the evidence: sightings for SELF↔person, shared
@@ -405,7 +468,7 @@ def _deterministic_pass(
             continue  # illegal endpoints for P0 → drop (#435)
 
 
-def _project_pass(conn, seen: dict[tuple[str, str, str], str], tally: _Tally) -> None:
+def _project_pass(conn, seen: dict[str, str], tally: _Tally) -> None:
     """SELF→PROJECT ``participates_in`` (works_on) — the §1.3 legal cell whose
     evidence is the project memory file itself: every durable fact under
     ``project-X.md`` exists because the classifier attributed the USER's own
@@ -454,9 +517,7 @@ def _project_pass(conn, seen: dict[tuple[str, str, str], str], tally: _Tally) ->
             continue
 
 
-def _activity_pass(
-    conn, activities: list[_Activity], seen: dict[tuple[str, str, str], str], tally: _Tally
-) -> None:
+def _activity_pass(conn, activities: list[_Activity], seen: dict[str, str], tally: _Tally) -> None:
     """Sourced past activities → EVENT points via ``participates_in`` edges.
 
     Each activity is one evidence item; a re-scan is a no-op because its source
@@ -560,7 +621,7 @@ def _llm_pass(
     cfg: Any,
     conn,
     people: _People,
-    seen: dict[tuple[str, str, str], str],
+    seen: dict[str, str],
     tally: _Tally,
     llm_call: LlmCallFn,
 ) -> int:

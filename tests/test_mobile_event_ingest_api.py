@@ -36,6 +36,26 @@ def _event() -> dict:
     }
 
 
+def _prebuilt_capture(*, timestamp: str, text: str) -> dict:
+    return {
+        "timestamp": timestamp,
+        "schema_version": 2,
+        "trigger": {"event_type": "AXFocusedWindowChanged"},
+        "window_meta": {
+            "app_name": "Synthetic Editor",
+            "title": "Stable window",
+            "bundle_id": "com.example.editor",
+        },
+        "focused_element": {
+            "role": "AXTextArea",
+            "value": text,
+            "is_editable": True,
+        },
+        "visible_text": text,
+        "url": "",
+    }
+
+
 def _ingest(client: TestClient, payload: dict, *, key: str | None = None):
     return client.post(
         "/mobile/events/ingest",
@@ -124,6 +144,27 @@ def test_mobile_event_retry_is_runtime_idempotent(ac_root) -> None:
     assert first.json()["data"]["deduped"] is False
     assert second.json()["data"]["deduped"] is True
     assert len(list(paths.capture_buffer_dir().glob("*.json"))) == 1
+
+
+def test_mobile_fallback_invalidates_stale_head_before_restart(ac_root) -> None:
+    from persome.capture import scheduler
+
+    cfg = load_config()
+    cfg.capture.pause_on_lock = False
+    stale = _prebuilt_capture(
+        timestamp="2026-08-11T00:00:00+00:00",
+        text="receipted state A",
+    )
+    first = scheduler._CaptureRunner(cfg.capture, provider=None)
+    assert first.commit_prebuilt(stale)
+
+    result = scheduler.ingest_mobile_event(cfg, _event())
+
+    assert result["id"]
+    with scheduler.fts_store.cursor() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+    restarted = scheduler._CaptureRunner(cfg.capture, provider=None)
+    assert restarted.commit_prebuilt({**stale, "timestamp": "2026-08-11T00:00:01+00:00"})
 
 
 def test_mobile_event_retry_recovers_crash_after_capture_write(

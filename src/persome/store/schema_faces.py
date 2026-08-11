@@ -33,8 +33,10 @@ import hashlib
 import json
 import sqlite3
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from ..evomem.models import MemoryStatus
 from ..logger import get
@@ -82,6 +84,17 @@ CREATE TABLE IF NOT EXISTS cross_domain_probe_state (
 );
 CREATE INDEX IF NOT EXISTS ix_cross_domain_probe_age
     ON cross_domain_probe_state(last_probed_at, pair_key);
+CREATE TABLE IF NOT EXISTS schema_input_receipts (
+    producer    TEXT NOT NULL,
+    sample_day TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    level       INTEGER NOT NULL,
+    object_id   TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (producer, sample_day, input_hash)
+);
+CREATE INDEX IF NOT EXISTS ix_schema_input_receipts_object
+    ON schema_input_receipts(object_id, level);
 """
 
 
@@ -110,6 +123,184 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+@dataclass(frozen=True)
+class InputReceipt:
+    """Identity of one independent structural-model input sample."""
+
+    producer: str
+    sample_day: str
+    input_hash: str
+
+
+@dataclass(frozen=True)
+class ReceiptRecord:
+    """Result of applying an input receipt to one structural object."""
+
+    face_id: str
+    recorded: bool
+
+
+def _canonical_input(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _canonical_input(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_input(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        items = [_canonical_input(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False))
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.astimezone()
+        return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    if isinstance(value, str):
+        return " ".join(unicodedata.normalize("NFKC", value).strip().split())
+    return value
+
+
+def canonical_input_hash(value: Any) -> str:
+    """Hash canonical JSON so mapping/set order and text form do not mint samples."""
+    encoded = json.dumps(
+        _canonical_input(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def make_input_receipt(
+    *, producer: str, input_value: Any, sampled_at: datetime | None = None
+) -> InputReceipt:
+    """Build a receipt keyed by producer, UTC calendar day, and canonical input."""
+    name = str(producer or "").strip()
+    if not name:
+        raise ValueError("schema input receipt requires a producer")
+    sample = sampled_at or datetime.now(UTC)
+    if sample.tzinfo is None:
+        sample = sample.astimezone()
+    return InputReceipt(
+        producer=name,
+        sample_day=sample.astimezone(UTC).date().isoformat(),
+        input_hash=canonical_input_hash(input_value),
+    )
+
+
+def receipt_object(conn: sqlite3.Connection, receipt: InputReceipt) -> str | None:
+    """Return the object already bound to a completed receipt, if any."""
+    ensure_schema(conn)
+    row = conn.execute(
+        "SELECT object_id, level FROM schema_input_receipts"
+        " WHERE producer=? AND sample_day=? AND input_hash=?",
+        (receipt.producer, receipt.sample_day, receipt.input_hash),
+    ).fetchone()
+    if row is None:
+        return None
+    object_id = str(row[0] or "")
+    face = (
+        conn.execute("SELECT level FROM schema_faces WHERE face_id=?", (object_id,)).fetchone()
+        if object_id
+        else None
+    )
+    if face is not None:
+        if int(face[0]) != int(row[1]):
+            raise RuntimeError("schema input receipt level disagrees with its bound object")
+        return object_id
+    # A geometry invalidation or an older clean path may have removed the
+    # object without its newly introduced receipt. Self-heal that orphan so a
+    # same-day rebuild can recreate truthful geometry instead of returning a
+    # stale ID forever.
+    conn.execute(
+        "DELETE FROM schema_input_receipts"
+        " WHERE producer=? AND sample_day=? AND input_hash=? AND object_id=?",
+        (receipt.producer, receipt.sample_day, receipt.input_hash, object_id),
+    )
+    return None
+
+
+def _apply_receipt(
+    conn: sqlite3.Connection,
+    receipt: InputReceipt,
+    *,
+    level: int,
+    writer: Callable[[], str],
+) -> ReceiptRecord:
+    """Atomically reserve, write, and bind one structural input receipt."""
+    ensure_schema(conn)
+    conn.execute("SAVEPOINT schema_input_receipt")
+    try:
+        inserted = conn.execute(
+            "INSERT INTO schema_input_receipts"
+            " (producer, sample_day, input_hash, level, object_id, created_at)"
+            " VALUES (?, ?, ?, ?, '', ?)"
+            " ON CONFLICT(producer, sample_day, input_hash) DO NOTHING",
+            (
+                receipt.producer,
+                receipt.sample_day,
+                receipt.input_hash,
+                level,
+                _now(),
+            ),
+        )
+        if inserted.rowcount != 1:
+            row = conn.execute(
+                "SELECT object_id, level FROM schema_input_receipts"
+                " WHERE producer=? AND sample_day=? AND input_hash=?",
+                (receipt.producer, receipt.sample_day, receipt.input_hash),
+            ).fetchone()
+            existing = str(row[0]) if row is not None else ""
+            receipt_level = int(row[1]) if row is not None else -1
+            if receipt_level != level:
+                raise RuntimeError("schema input receipt was reused for a different geometry level")
+            bound = (
+                conn.execute(
+                    "SELECT level FROM schema_faces WHERE face_id=?", (existing,)
+                ).fetchone()
+                if existing
+                else None
+            )
+            if bound is not None:
+                if int(bound[0]) != level:
+                    raise RuntimeError("schema input receipt level disagrees with its bound object")
+                conn.execute("RELEASE schema_input_receipt")
+                return ReceiptRecord(existing, recorded=False)
+            removed = conn.execute(
+                "DELETE FROM schema_input_receipts"
+                " WHERE producer=? AND sample_day=? AND input_hash=? AND object_id=?",
+                (receipt.producer, receipt.sample_day, receipt.input_hash, existing),
+            )
+            if removed.rowcount != 1:
+                raise RuntimeError("schema input receipt changed during orphan recovery")
+            inserted = conn.execute(
+                "INSERT INTO schema_input_receipts"
+                " (producer, sample_day, input_hash, level, object_id, created_at)"
+                " VALUES (?, ?, ?, ?, '', ?)",
+                (
+                    receipt.producer,
+                    receipt.sample_day,
+                    receipt.input_hash,
+                    level,
+                    _now(),
+                ),
+            )
+            if inserted.rowcount != 1:
+                raise RuntimeError("schema input receipt could not be reclaimed")
+
+        face_id = writer()
+        bound = conn.execute(
+            "UPDATE schema_input_receipts SET object_id=?"
+            " WHERE producer=? AND sample_day=? AND input_hash=? AND object_id=''",
+            (face_id, receipt.producer, receipt.sample_day, receipt.input_hash),
+        )
+        if bound.rowcount != 1:
+            raise RuntimeError("schema input receipt changed before object binding")
+        conn.execute("RELEASE schema_input_receipt")
+        return ReceiptRecord(face_id, recorded=True)
+    except Exception:
+        conn.execute("ROLLBACK TO schema_input_receipt")
+        conn.execute("RELEASE schema_input_receipt")
+        raise
 
 
 def _norm_sig(signature: str) -> str:
@@ -247,6 +438,62 @@ def record_face(
     parent_face: str | None = None,
     anchors: list[str] | None = None,
 ) -> str:
+    """Legacy-compatible unreceipted Face/Volume contribution."""
+    ensure_schema(conn)
+    return _record_face(
+        conn,
+        source=source,
+        signature=signature,
+        members=members,
+        confidence=confidence,
+        level=level,
+        parent_face=parent_face,
+        anchors=anchors,
+    )
+
+
+def record_face_with_receipt(
+    conn: sqlite3.Connection,
+    *,
+    receipt: InputReceipt,
+    source: str,
+    signature: str,
+    members: Iterable[str],
+    confidence: float = 0.5,
+    level: int = 1,
+    parent_face: str | None = None,
+    anchors: list[str] | None = None,
+) -> ReceiptRecord:
+    """Record a Face/Volume only once for this producer/day/input sample."""
+    member_values = tuple(members)
+    return _apply_receipt(
+        conn,
+        receipt,
+        level=level,
+        writer=lambda: _record_face(
+            conn,
+            source=source,
+            signature=signature,
+            members=member_values,
+            confidence=confidence,
+            level=level,
+            parent_face=parent_face,
+            anchors=anchors,
+        ),
+    )
+
+
+def _record_face(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    signature: str,
+    members: Iterable[str],
+    confidence: float = 0.5,
+    level: int = 1,
+    parent_face: str | None = None,
+    anchors: list[str] | None = None,
+) -> str:
     """One extractor's contribution lands on the ONE unified object.
 
     ``source`` ∈ {mined, emergent}. New face → born shadow with that
@@ -264,7 +511,6 @@ def record_face(
     empty or foreign-keyed snapshot.
     """
     assert source in (PROVENANCE_MINED, PROVENANCE_EMERGENT)
-    ensure_schema(conn)
     member_set = {str(m) for m in members if str(m).strip()}
     anchor_set = {str(a) for a in (anchors or []) if str(a).strip()}
     now = _now()
@@ -536,6 +782,51 @@ def upsert_root(
     anchors: Iterable[str] | None = None,
     confidence: float = 1.0,
 ) -> str:
+    """Legacy-compatible unreceipted Root supersede."""
+    ensure_schema(conn)
+    return _upsert_root(
+        conn,
+        signature=signature,
+        members=members,
+        anchors=anchors,
+        confidence=confidence,
+    )
+
+
+def upsert_root_with_receipt(
+    conn: sqlite3.Connection,
+    *,
+    receipt: InputReceipt,
+    signature: str,
+    members: Iterable[str],
+    anchors: Iterable[str] | None = None,
+    confidence: float = 1.0,
+) -> ReceiptRecord:
+    """Supersede Root once for one producer/day/canonical-input receipt."""
+    member_values = tuple(members)
+    anchor_values = tuple(anchors or ())
+    return _apply_receipt(
+        conn,
+        receipt,
+        level=ROOT_LEVEL,
+        writer=lambda: _upsert_root(
+            conn,
+            signature=signature,
+            members=member_values,
+            anchors=anchor_values,
+            confidence=confidence,
+        ),
+    )
+
+
+def _upsert_root(
+    conn: sqlite3.Connection,
+    *,
+    signature: str,
+    members: Iterable[str],
+    anchors: Iterable[str] | None = None,
+    confidence: float = 1.0,
+) -> str:
     """Write a fresh root as the SINGLETON level-3 apex, chain-superseding any prior
     live root (close its validity + mark superseded; the new row is born ACTIVE per
     the default-ON ruling). ``signature`` = the synthesized apex narrative (the caller
@@ -543,7 +834,6 @@ def upsert_root(
     ``anchors`` are entity handles named by the narrative for progressive disclosure.
     Returns the new root's face_id. observations carries forward (+1 = one more nightly
     resample of "this is the apex")."""
-    ensure_schema(conn)
     now = _now()
     prior = conn.execute(
         "SELECT observations FROM schema_faces WHERE level = ? AND valid_to IS NULL",

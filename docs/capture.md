@@ -105,15 +105,19 @@ Four time-based knobs throttle the event firehose (`capture/event_dispatcher.py`
 | Knob | Default | What it does |
 |---|---|---|
 | `debounce_seconds` | 3.0 | `AXValueChanged` events within this window collapse — only the last triggers a capture. Prevents one-capture-per-keystroke during typing. |
-| `dedup_interval_seconds` | 1.0 | Same `(event_type, app)` pair within this window is dropped outright. |
-| `min_capture_gap_seconds` | 2.0 | Hard floor between consecutive `capture_once` calls, regardless of event reason. |
-| `same_window_dedup_seconds` | 5.0 | Non-focus-change events in the same `(bundle_id, title)` pair collapse within this window. Focus changes always bypass it. |
+| `dedup_interval_seconds` | 1.0 | Repeated non-focus events on one surface are dropped. `AXApplicationActivated` waits for this short trailing window and is replaced by a more-specific `AXFocusedWindowChanged`; Focus first is immediate and its later Activation is dropped. Only the latest surface transition may retain a pending Activation. Any newer cross-surface focus/click/text signal invalidates an older pending Activation even if rate limiting rejects the newer capture, because an older trigger cannot safely label content sampled after the foreground surface changed. Repeated same-type Focus notifications continue to the content gate because they may be different real windows. |
+| `min_capture_gap_seconds` | 2.0 | Hard floor between consecutive non-focus captures. Focus transitions bypass it. |
+| `same_window_dedup_seconds` | 5.0 | Non-focus-change events on the same surface (`bundle_id`, falling back to `app_name`) collapse within this window. Dynamic titles are not surface identities; focus changes always bypass it. |
 
 Tune these if you see `capture.log` flooded; the defaults produce a few hundred captures per work-day, comfortably under the buffer retention.
 
-### Content dedup (no time window)
+### Content dedup (durable head + bounded recent window)
 
-On top of the time-based knobs, the scheduler compares each built capture against the previous one by a content fingerprint (`hash(bundle + title + focused_element.value + visible_text + url)`, in `capture/scheduler.py`). If the fingerprint matches, the capture is **not** written and the session manager's `pre_capture_hook` is **not** fired.
+On top of the time-based knobs, the live capture runner compares each built capture against recently committed capture-content receipts. Its versioned fingerprint includes the stable surface (`bundle_id`, falling back to `app_name`), window title, focused role/value, visible text, URL, and any explicit mobile device/event identity. Title remains part of the exact context identity because two windows or channels can expose the same empty-state text; short dynamic-title bursts are handled by the title-independent surface gates above. Timestamp, trigger metadata, screenshots, and raw AX geometry are excluded.
+
+Watcher events enter a bounded queue before AX and `window_meta` are sampled. Before commit, the worker therefore rebinds the trigger's app, bundle, and title to the surface it actually observed. If the stable surface or an explicit non-empty window title changed while the event waited, the trigger becomes `QueuedSurfaceRefresh`, retains only its sanitized source event type, and drops stale click details; the session hook receives that same reconciled trigger. This preserves current content without attributing an action or app switch to the wrong window under backlog.
+
+The latest successfully written fingerprint remains a duplicate with no time limit while its backing raw capture exists, including across daemon restart. An older non-head fingerprint is suppressed only within `same_window_dedup_seconds` (five seconds by default), catching burst noise such as A → B → A without erasing a later genuine revisit; the live horizon uses a monotonic clock. The bounded receipt history is advanced only after capture persistence succeeds. Raw-retention deletion or hard-cap eviction removes the matching receipt in the same SQLite transaction as its capture projection and reloads the live runner's head, so an identical current frame can be observed again after its old evidence ages out. A no-runner direct write does not invent a new head: it durably marks and clears prior receipts, and a runner reload consumes any crash-stranded marker fail-open. `persome capture-once` holds the Runtime lifetime lock and refuses to race a running daemon. A duplicate is **not** written and the session manager's `pre_capture_hook` is **not** fired. Mobile observations still use their explicit `(device.id, event_id)` as the authoritative exactly-once identity; a forced mobile write merely becomes the runner's new content head.
 
 This catches the case the time knobs can't: a screen that doesn't change (lock screen overnight, a paused video, an idle IDE) keeps generating AX events with the same content indefinitely. Without content-dedup those would both fill the buffer and keep the current session from ever idling out. Timestamps, triggers, and screenshots are excluded from the fingerprint so only meaningful changes count.
 
@@ -257,6 +261,15 @@ To wipe manually:
 persome clean captures
 ```
 
+This removes buffered JSON, the `captures`/`captures_fts` projection, and the
+durable content-dedup receipts. The same tables are securely scrubbed from
+retained snapshots and integrity-quarantine database copies so a later recovery
+cannot restore the deleted capture state. Timeline and personal-model state are
+separate deletion scopes. Both exact and `--merge` forms of
+`persome rebuild-captures-index` also clear the receipt history. Neither raw
+buffer replay nor an older snapshot can reconstruct original commit order, so
+the next observation passes fail-open instead of trusting a stale head.
+
 ## Search index — `captures_fts`
 
 Every successful capture write is also indexed into an FTS5 virtual table (`captures_fts`, backed by a `captures` content table — see `src/persome/store/fts.py`). This is what powers the MCP `search_captures` and `current_context` tools, which let LLM clients reach the raw screen content directly without having to scan JSON files on disk.
@@ -266,9 +279,10 @@ Every successful capture write is also indexed into an FTS5 virtual table (`capt
 | Event | Effect on index |
 |---|---|
 | `_write_capture` (write-through) | Upsert one row into `captures` (`INSERT OR REPLACE` on the file stem). Triggers keep `captures_fts` in sync. |
-| `cleanup_buffer` time-based delete | FTS deletion is attempted before each JSON deletion; filesystem erasure remains authoritative if SQLite is temporarily unavailable, and the final reconciliation removes stale searchable rows after recovery. |
+| `cleanup_buffer` time-based delete | FTS and matching content-receipt deletion are attempted in one transaction before each JSON deletion; filesystem erasure remains authoritative if SQLite is temporarily unavailable, and final reconciliation removes stale searchable/receipt rows after recovery. The live receipt cache fails open until reconciliation is trustworthy. |
 | `cleanup_buffer` size-based eviction | Same, including hard-cap eviction of unabsorbed files when necessary and continued eviction after one unlink failure. |
 | Screenshot strip | **Untouched.** Strip only removes the base64 image; the indexed text (`visible_text`, `focused_value`, `window_title`, `app_name`, `url`) is unchanged. |
+| `persome clean captures` | Securely delete capture files, indexed rows, and content-dedup receipts from the live store, retained snapshots, and integrity-quarantine copies. |
 | `persome rebuild-captures-index` | Offline maintenance: run `persome stop` first. The command then holds the exclusive database gate while it atomically clears stale rows and indexes every surviving `~/.persome/capture-buffer/*.json` in one rollback-safe transaction. Use `--merge` after snapshot recovery to preserve older rows whose JSON aged out, then run `persome start`. |
 
 **Indexed columns.** Only the searchable text is in FTS: `app_name`, `window_title`, `focused_value`, `visible_text`, `url`. Filterable metadata (timestamp, bundle_id, focused_role) lives on the `captures` table for `WHERE`-clause filtering. Screenshots are deliberately not duplicated — the JSON file on disk stays the authoritative copy of the raw image bytes.
@@ -330,5 +344,6 @@ the calling CLI, writes one immediate capture, and can confirm the one-shot
 helper returns useful AX content. It does **not** run through the active daemon's
 capture runner, prove the event watcher, bind a Runtime generation or lifecycle
 owner, validate a privacy/mode receipt, or wait for the daemon-owned OCR worker.
-It may race the running scheduler, so stop Persome before using it to isolate a
-helper problem. Use `persome onboard` for onboarding, update, and release proof.
+It refuses to run while the Runtime PID or lifetime lock says the daemon is
+running or starting; use `persome stop` before isolating a helper problem. Use
+`persome onboard` for onboarding, update, and release proof.

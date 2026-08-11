@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from ..config import Config
@@ -360,6 +361,7 @@ def mine_bundles_and_write(
     min_facts: int = _DEFAULT_MIN_FACTS,
     stable_threshold: float = _DEFAULT_STABLE_THRESHOLD,
     llm_call: Callable[[list[dict]], Any] | None = None,
+    sampled_at: datetime | None = None,
 ) -> SchemaRunResult:
     """Feed each fact bundle to the miner and persist the resulting schemas.
 
@@ -371,10 +373,28 @@ def mine_bundles_and_write(
     """
     miner = SchemaMiner(llm_call=llm_call if llm_call is not None else _build_llm_call(cfg))
     run = SchemaRunResult()
+    sample_time = sampled_at or datetime.now(UTC)
 
     for bundle in fact_bundles:
         if len(bundle.facts) < min_facts:
             run.skipped_small += 1
+            continue
+        # The receipt identity depends only on the sampled fact bundle, so it is
+        # available before the non-deterministic/expensive miner call.  A completed
+        # same-day receipt means this exact production input already landed; do not
+        # spend another LLM call or supersede the Markdown projection with a second
+        # answer while leaving the canonical Face unchanged.  The atomic
+        # ``record_face_with_receipt`` check below remains the write-time backstop.
+        member_keys = sorted(schema_faces.member_key(f) for f in bundle.facts)
+        receipt = schema_faces.make_input_receipt(
+            producer="schema_miner",
+            sampled_at=sample_time,
+            input_value={
+                "source_path": bundle.source_path,
+                "members": member_keys,
+            },
+        )
+        if schema_faces.receipt_object(conn, receipt) is not None:
             continue
         try:
             result = miner.mine_schema(bundle.facts)
@@ -397,17 +417,19 @@ def mine_bundles_and_write(
             # central proposition; the fact bundle is the footprint). Shadow-only
             # SQLite write, fail-open: a faces failure never blocks the mine.
             try:
-                face_id = schema_faces.record_face(
+                recorded = schema_faces.record_face_with_receipt(
                     conn,
+                    receipt=receipt,
                     source=schema_faces.PROVENANCE_MINED,
                     signature=result.central_proposition,
-                    members=[schema_faces.member_key(f) for f in bundle.facts],
+                    members=member_keys,
                     confidence=result.confidence,
                     anchors=_face_anchors(
                         cfg, bundle.source_path, result.central_proposition, bundle.facts
                     ),
                 )
-                schema_faces.maybe_promote(conn, face_id)
+                if recorded.recorded:
+                    schema_faces.maybe_promote(conn, recorded.face_id)
             except Exception:
                 logger.exception("schema_faces record failed for %s", bundle.source_path)
     return run
@@ -420,6 +442,7 @@ def mine_schemas_for_user(
     min_facts: int = _DEFAULT_MIN_FACTS,
     stable_threshold: float = _DEFAULT_STABLE_THRESHOLD,
     llm_call: Callable[[list[dict]], Any] | None = None,
+    sampled_at: datetime | None = None,
 ) -> SchemaRunResult:
     """Top-level, testable entry point: collect fact bundles, mine, and land them.
 
@@ -439,4 +462,5 @@ def mine_schemas_for_user(
         min_facts=min_facts,
         stable_threshold=stable_threshold,
         llm_call=llm_call,
+        sampled_at=sampled_at,
     )

@@ -67,7 +67,7 @@ Example client configuration:
 
 | Tool | Purpose |
 |---|---|
-| `current_context` | Read recent capture headlines, text, and timeline blocks. |
+| `current_context` | Read recent capture headlines/text and model-eligible timeline blocks; each block includes `normalization_status`. |
 | `search_captures` | Search the local capture index. |
 | `read_recent_capture` | Read an exact `file_stem` or nearby capture; screenshot inclusion is opt-in. |
 | `attention_trajectory` | Read the attention path used during state formation. |

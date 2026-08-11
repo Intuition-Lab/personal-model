@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from persome.evomem.engine import EvoMemory
-from persome.evomem.models import MemoryLayer, MemoryStatus
+from persome.evomem.models import MemoryLayer, MemoryNode, MemoryStatus
 from persome.evomem.person_graph import PersonEvent, PersonGraph
 from persome.evomem.reconciler import Reconciler
 from persome.store import fts
@@ -84,6 +85,453 @@ def test_events_and_entities_are_evo_nodes_via_public_entrance(ac_root):
     assert entities[0].status is MemoryStatus.ACTIVE
     assert entities[0].file_name == "person-\u5f20\u4e09.md"
     assert len(evcount) == 1
+
+    with fts.cursor() as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM evo_nodes WHERE tags = 'person-entity'").fetchone()[
+                0
+            ]
+            == 1
+        )
+
+
+def test_point_backed_identity_is_adopted_without_copying_an_event(ac_root):
+    mem = _mem()
+    source = MemoryNode(
+        node_id="raw-alex-identity",
+        content="Alex Chen",
+        layer=MemoryLayer.L5_KNOWLEDGE,
+        file_name="person-alex-chen.md",
+        tags="entity",
+    )
+    mem.commit_node(source)
+    graph = PersonGraph(mem, cfg=_on(), name_source=_StaticSource([]))
+
+    graph.record(
+        PersonEvent(
+            name="Alex Chen",
+            summary="Alex Chen",
+            source_id="entity:point:raw-alex-identity",
+            source_kind="point",
+            source_receipt="⟨raw-alex-identity:person-alex-chen.md⟩",
+        )
+    )
+
+    prior = mem.store.get("raw-alex-identity")
+    assert prior is not None
+    assert prior.is_latest is False
+    assert prior.status is MemoryStatus.SHADOW
+    heads = mem.store.all_latest()
+    entities = [node for node in heads if "person-entity" in node.tags.split()]
+    assert len(entities) == 1
+    assert entities[0].supersedes == ["raw-alex-identity"]
+    assert json.loads(entities[0].schema_summary or "{}")["source_receipts"] == [
+        "⟨raw-alex-identity:person-alex-chen.md⟩"
+    ]
+    assert [node for node in heads if "person-event" in node.tags.split()] == []
+
+    before = entities[0].node_id
+    graph.record(
+        PersonEvent(
+            name="Alex Chen",
+            summary="Alex reviews architecture decisions.",
+            source_id="entity:point:raw-alex-fact",
+            source_kind="point",
+            source_receipt="⟨raw-alex-fact:person-alex-chen.md⟩",
+        )
+    )
+    assert graph.list_persons()[0].node_id == before
+    assert graph.list_persons()[0].sightings == 1
+    assert graph.person_timeline("Alex Chen") == []
+
+
+def test_late_raw_identity_merges_unique_slug_roster_without_event_copy(ac_root):
+    mem = _mem()
+    fact = MemoryNode(
+        node_id="raw-alex-fact",
+        content="Alex reviews architecture decisions.",
+        layer=MemoryLayer.L2_FACT,
+        file_name="person-alex-chen.md",
+        tags="fact",
+    )
+    mem.commit_node(fact)
+    graph = PersonGraph(mem, cfg=_on(), name_source=_StaticSource([]))
+
+    assert (
+        graph.record(
+            PersonEvent(
+                name="alex-chen",
+                summary=fact.content,
+                source_id="entity:point:raw-alex-fact",
+                source_kind="point",
+                source_receipt="⟨raw-alex-fact:person-alex-chen.md⟩",
+            )
+        )
+        == "alex-chen"
+    )
+    old_roster = graph.list_persons()[0]
+
+    identity = MemoryNode(
+        node_id="raw-alex-identity-late",
+        content="Alex Chen",
+        layer=MemoryLayer.L5_KNOWLEDGE,
+        file_name="person-alex-chen.md",
+        tags="entity",
+    )
+    mem.commit_node(identity)
+    assert (
+        graph.record(
+            PersonEvent(
+                name="Alex Chen",
+                summary="Alex Chen",
+                source_id="entity:point:raw-alex-identity-late",
+                source_kind="point",
+                source_receipt="⟨raw-alex-identity-late:person-alex-chen.md⟩",
+            )
+        )
+        == "Alex Chen"
+    )
+
+    heads = mem.store.all_latest()
+    entities = [node for node in heads if "person-entity" in node.tags.split()]
+    assert len(entities) == 1
+    adopted = entities[0]
+    assert adopted.content == "Alex Chen"
+    assert adopted.supersedes == [old_roster.node_id, identity.node_id]
+    assert mem.store.get(old_roster.node_id).superseded_by == [adopted.node_id]  # type: ignore[union-attr]
+    assert mem.store.get(identity.node_id).superseded_by == [adopted.node_id]  # type: ignore[union-attr]
+    assert json.loads(adopted.schema_summary or "{}") == {
+        "canonical": "Alex Chen",
+        "aliases": ["Alex Chen", "alex-chen"],
+        "category": None,
+        "sightings": 1,
+        "source_receipts": [
+            "⟨raw-alex-fact:person-alex-chen.md⟩",
+            "⟨raw-alex-identity-late:person-alex-chen.md⟩",
+        ],
+    }
+    assert graph.person_timeline("Alex Chen") == []
+
+
+def test_late_raw_identity_leaves_ambiguous_roster_heads_untouched(ac_root):
+    mem = _mem()
+    graph = PersonGraph(mem, cfg=_on(), name_source=_StaticSource([]))
+    graph.record(
+        PersonEvent(
+            name="alex-chen",
+            source_kind="point",
+            source_receipt="⟨raw-alex-fact:person-alex-chen.md⟩",
+        )
+    )
+    mem.commit_node(
+        MemoryNode(
+            node_id="legacy-person-head",
+            content="Legacy Alex",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-alex-chen.md",
+            tags="person-entity",
+            schema_summary=json.dumps(
+                {"canonical": "Legacy Alex", "aliases": ["Legacy Alex"], "sightings": 1}
+            ),
+        )
+    )
+    identity = MemoryNode(
+        node_id="raw-alex-identity",
+        content="Alex Chen",
+        layer=MemoryLayer.L5_KNOWLEDGE,
+        file_name="person-alex-chen.md",
+        tags="entity",
+    )
+    mem.commit_node(identity)
+    before = {node.node_id for node in mem.store.all_latest()}
+
+    assert (
+        graph.record(
+            PersonEvent(
+                name="Alex Chen",
+                source_id="entity:point:raw-alex-identity",
+                source_kind="point",
+                source_receipt="⟨raw-alex-identity:person-alex-chen.md⟩",
+            )
+        )
+        is None
+    )
+    assert {node.node_id for node in mem.store.all_latest()} == before
+    assert graph.person_timeline("Alex Chen") == []
+
+
+def test_late_raw_identity_leaves_duplicate_raw_heads_untouched(ac_root):
+    mem = _mem()
+    graph = PersonGraph(mem, cfg=_on(), name_source=_StaticSource([]))
+    graph.record(PersonEvent(name="alex-chen", source_kind="point"))
+    for node_id in ("raw-alex-identity-a", "raw-alex-identity-b"):
+        mem.commit_node(
+            MemoryNode(
+                node_id=node_id,
+                content="Alex Chen",
+                layer=MemoryLayer.L5_KNOWLEDGE,
+                file_name="person-alex-chen.md",
+                tags="entity",
+            )
+        )
+    before = {node.node_id for node in mem.store.all_latest()}
+
+    assert (
+        graph.record(
+            PersonEvent(
+                name="Alex Chen",
+                source_id="entity:point:raw-alex-identity-a",
+                source_kind="point",
+            )
+        )
+        is None
+    )
+    assert {node.node_id for node in mem.store.all_latest()} == before
+
+
+def test_late_raw_identity_does_not_auto_merge_legacy_unreceipted_head(ac_root):
+    mem = _mem()
+    mem.commit_node(
+        MemoryNode(
+            node_id="legacy-person-head",
+            content="alex-chen",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-alex-chen.md",
+            tags="person-entity",
+            schema_summary=json.dumps(
+                {"canonical": "alex-chen", "aliases": ["alex-chen"], "sightings": 1}
+            ),
+        )
+    )
+    fact = MemoryNode(
+        node_id="raw-alex-fact",
+        content="Alex reviews architecture decisions.",
+        layer=MemoryLayer.L2_FACT,
+        file_name="person-alex-chen.md",
+        tags="fact",
+    )
+    mem.commit_node(fact)
+    graph = PersonGraph(mem, cfg=_on(), name_source=_StaticSource([]))
+    legacy_before = graph.list_persons()[0]
+    assert (
+        graph.record(
+            PersonEvent(
+                name="alex-chen",
+                source_id="entity:point:raw-alex-fact",
+                source_kind="point",
+                source_receipt="⟨raw-alex-fact:person-alex-chen.md⟩",
+            )
+        )
+        == "alex-chen"
+    )
+    assert graph.list_persons()[0].node_id == legacy_before.node_id
+    assert graph.list_persons()[0].source_receipts == []
+
+    mem.commit_node(
+        MemoryNode(
+            node_id="raw-alex-identity",
+            content="Alex Chen",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-alex-chen.md",
+            tags="entity",
+        )
+    )
+    before = {node.node_id for node in mem.store.all_latest()}
+
+    assert (
+        graph.record(
+            PersonEvent(
+                name="Alex Chen",
+                source_id="entity:point:raw-alex-identity",
+                source_kind="point",
+                source_receipt="⟨raw-alex-identity:person-alex-chen.md⟩",
+            )
+        )
+        is None
+    )
+    assert {node.node_id for node in mem.store.all_latest()} == before
+
+
+def test_late_raw_identity_does_not_merge_unrelated_receipted_roster(ac_root):
+    mem = _mem()
+    mem.commit_node(
+        MemoryNode(
+            node_id="wrong-person-head",
+            content="Wrong Person",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-alex-chen.md",
+            tags="person-entity",
+            schema_summary=json.dumps(
+                {
+                    "canonical": "Wrong Person",
+                    "aliases": ["Wrong Person"],
+                    "sightings": 1,
+                    "source_receipts": ["⟨wrong-fact:person-alex-chen.md⟩"],
+                }
+            ),
+        )
+    )
+    mem.commit_node(
+        MemoryNode(
+            node_id="raw-alex-identity",
+            content="Alex Chen",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-alex-chen.md",
+            tags="entity",
+        )
+    )
+    graph = PersonGraph(mem, cfg=_on(), name_source=_StaticSource([]))
+    before = {node.node_id for node in mem.store.all_latest()}
+
+    assert (
+        graph.record(
+            PersonEvent(
+                name="Alex Chen",
+                source_id="entity:point:raw-alex-identity",
+                source_kind="point",
+                source_receipt="⟨raw-alex-identity:person-alex-chen.md⟩",
+            )
+        )
+        is None
+    )
+    assert {node.node_id for node in mem.store.all_latest()} == before
+
+
+def test_entry_first_fact_receipt_allows_late_identity_without_duplicate_event(ac_root):
+    mem = _mem()
+    fact = MemoryNode(
+        node_id="raw-alex-fact",
+        content="Alex reviews architecture decisions.",
+        layer=MemoryLayer.L2_FACT,
+        file_name="person-alex-chen.md",
+        tags="fact",
+    )
+    mem.commit_node(fact)
+    graph = PersonGraph(mem, cfg=_on(), name_source=_StaticSource([]))
+    entry = PersonEvent(
+        name="alex-chen",
+        summary="Reviewed the runtime architecture with alex-chen.",
+        source_id="entity:entry:77:person:alex-chen",
+        source_kind="entry",
+        source_receipt="⟨77:event-2026-07-10.md⟩",
+    )
+
+    assert graph.record(entry) == "alex-chen"
+    assert (
+        graph.record(
+            PersonEvent(
+                name="alex-chen",
+                summary=fact.content,
+                source_id="entity:point:raw-alex-fact",
+                source_kind="point",
+                source_receipt="⟨raw-alex-fact:person-alex-chen.md⟩",
+            )
+        )
+        == "alex-chen"
+    )
+    assert graph.list_persons()[0].source_receipts == [
+        "⟨77:event-2026-07-10.md⟩",
+        "⟨raw-alex-fact:person-alex-chen.md⟩",
+    ]
+    bridged_roster_id = graph.list_persons()[0].node_id
+    another_fact = MemoryNode(
+        node_id="raw-alex-fact-2",
+        content="Alex reviews another architecture decision.",
+        layer=MemoryLayer.L2_FACT,
+        file_name="person-alex-chen.md",
+        tags="fact",
+    )
+    mem.commit_node(another_fact)
+    graph.record(
+        PersonEvent(
+            name="alex-chen",
+            summary=another_fact.content,
+            source_id="entity:point:raw-alex-fact-2",
+            source_kind="point",
+            source_receipt="⟨raw-alex-fact-2:person-alex-chen.md⟩",
+        )
+    )
+    assert graph.list_persons()[0].node_id == bridged_roster_id
+    assert "⟨raw-alex-fact-2:person-alex-chen.md⟩" not in graph.list_persons()[0].source_receipts
+
+    mem.commit_node(
+        MemoryNode(
+            node_id="raw-alex-identity",
+            content="Alex Chen",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-alex-chen.md",
+            tags="entity",
+        )
+    )
+    replay = PersonEvent(
+        name="Alex Chen",
+        summary=entry.summary,
+        source_id=entry.source_id,
+        source_kind="entry",
+        source_receipt=entry.source_receipt,
+    )
+
+    assert graph.record(replay) == "Alex Chen"
+    people = graph.list_persons()
+    assert [(person.canonical, person.sightings) for person in people] == [("Alex Chen", 1)]
+    events = [
+        node for node in mem.store.all_latest() if "person-event" in (node.tags or "").split()
+    ]
+    assert len(events) == 1
+    assert json.loads(events[0].schema_summary or "{}")["source_id"] == entry.source_id
+
+
+def test_source_event_dedup_survives_slug_to_display_canonical_transition(ac_root):
+    mem = _mem()
+    graph = PersonGraph(mem, cfg=_on(), name_source=_StaticSource([]))
+    graph.record(
+        PersonEvent(
+            name="alex-chen",
+            source_kind="point",
+            source_receipt="⟨raw-alex-fact:person-alex-chen.md⟩",
+        )
+    )
+    entry = PersonEvent(
+        name="alex-chen",
+        summary="Reviewed the runtime architecture with alex-chen.",
+        source_id="entity:entry:77:person:alex-chen",
+        source_kind="entry",
+    )
+    graph.record(entry)
+    mem.commit_node(
+        MemoryNode(
+            node_id="raw-alex-identity",
+            content="Alex Chen",
+            layer=MemoryLayer.L5_KNOWLEDGE,
+            file_name="person-alex-chen.md",
+            tags="entity",
+        )
+    )
+    graph.record(
+        PersonEvent(
+            name="Alex Chen",
+            source_id="entity:point:raw-alex-identity",
+            source_kind="point",
+            source_receipt="⟨raw-alex-identity:person-alex-chen.md⟩",
+        )
+    )
+    before = graph.list_persons()[0]
+
+    assert (
+        graph.record(
+            PersonEvent(
+                name="Alex Chen",
+                summary=entry.summary,
+                source_id=entry.source_id,
+                source_kind="entry",
+            )
+        )
+        == "Alex Chen"
+    )
+    after = graph.list_persons()[0]
+    assert after.node_id == before.node_id
+    assert after.sightings == 2
+    assert len(graph.person_timeline("Alex Chen")) == 1
 
 
 def test_aliases_merge_into_one_entity(ac_root):

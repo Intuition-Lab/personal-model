@@ -115,6 +115,33 @@ test("keeps aggregate constellation counts separate from private source data", (
   );
 });
 
+test("keeps explicit rendered zero counts instead of falling back to snapshot arrays", () => {
+  assert.deepEqual(
+    shareStats({
+      stats: {
+        points: 0,
+        evolution_lines: 0,
+        relation_lines: 0,
+        faces: 0,
+        volumes: 0,
+        roots: 0,
+      },
+      points: [{}],
+      lines: [{}],
+      faces: [{}],
+      volumes: [{}],
+      root: {},
+    }),
+    [
+      ["POINTS", 0],
+      ["LINES", 0],
+      ["FACES", 0],
+      ["VOLUMES", 0],
+      ["ROOT", 0],
+    ],
+  );
+});
+
 test("selects a bounded constellation narrative and highest-level patterns", () => {
   const narrative = shareNarrative({
     root: {

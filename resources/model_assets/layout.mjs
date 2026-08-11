@@ -294,6 +294,34 @@ function sourceFamily(point) {
   return parts[0] || "unmodeled";
 }
 
+function identityKey(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function entityPointIndex(points) {
+  const index = new Map();
+  const ambiguous = new Set();
+  stableItems(points).forEach((point) => {
+    const tags = new Set(String(point.tags || "").split(/\s+/).filter(Boolean));
+    const isEntity = tags.has("entity") || tags.has("person-entity");
+    const key = isEntity ? identityKey(point.content) : "";
+    if (!key || key === "self" || ambiguous.has(key)) return;
+    if (index.has(key)) {
+      // A duplicated live entity is a storage-quality problem. Do not pick an
+      // arbitrary Point and silently attach every Line to the wrong head.
+      index.delete(key);
+      ambiguous.add(key);
+      return;
+    }
+    index.set(key, point.id);
+  });
+  return index;
+}
+
 function placePointClouds(points, pointClusterById, positions, sourceOrbitRadius) {
   const groups = new Map();
   points.forEach((point) => {
@@ -325,20 +353,98 @@ function placePointClouds(points, pointClusterById, positions, sourceOrbitRadius
   return groups;
 }
 
-function placeContextNodes(lines, pointIds, positions, hasRoot) {
-  const ids = new Set();
+function placeContextNodes(lines, pointIds, positions, hasRoot, entityPoints) {
+  const groups = new Map();
+  const endpointPointIds = new Map();
   lines.filter((line) => line.kind === "relation").forEach((line) => {
-    if (!pointIds.has(line.source)) ids.add(line.source);
-    if (!pointIds.has(line.target)) ids.add(line.target);
+    [line.source, line.target].forEach((endpoint) => {
+      if (!endpoint || pointIds.has(endpoint)) return;
+      const pointId = entityPoints.get(identityKey(endpoint));
+      const pointPosition = pointId ? positions.get(pointId) : null;
+      if (pointId && pointPosition) {
+        // Relation endpoints intentionally use stable canonical identities,
+        // while Points use immutable node IDs. Alias the endpoint to the
+        // existing entity Point instead of drawing a second context node.
+        endpointPointIds.set(endpoint, pointId);
+      } else {
+        const key = identityKey(endpoint);
+        if (!key) return;
+        if (!groups.has(key)) groups.set(key, new Set());
+        groups.get(key).add(endpoint);
+      }
+    });
   });
-  const contextIds = [...ids].filter(Boolean).sort();
-  contextIds.forEach((id) => {
+  const contextIds = [];
+  const endpointContextIds = new Map();
+  [...groups.entries()].sort(([left], [right]) => left.localeCompare(right)).forEach(([key, endpoints]) => {
+    const variants = [...endpoints].sort();
+    const id = key === "self" ? "self" : variants[0];
+    contextIds.push(id);
+    variants.forEach((endpoint) => endpointContextIds.set(endpoint, id));
     const radius = hasRoot
-      ? 1.1 + stableHash(`context:${id}:radius`) * 0.5
-      : 0.72 + stableHash(`context:${id}:radius`) * 0.68;
-    positions.set(id, scale(unitVector(`context:${id}`), radius));
+      ? 1.1 + stableHash(`context:${key}:radius`) * 0.5
+      : 0.72 + stableHash(`context:${key}:radius`) * 0.68;
+    positions.set(id, scale(unitVector(`context:${key}`), radius));
   });
-  return contextIds;
+  return { contextIds, endpointPointIds, endpointContextIds };
+}
+
+function projectedEndpointId(layout, endpoint) {
+  return layout?.endpointPointIds?.get?.(endpoint)
+    || layout?.endpointContextIds?.get?.(endpoint)
+    || endpoint;
+}
+
+export function coalesceProjectedLines(lines, layout) {
+  const rendered = [];
+  const membersByRepresentative = new Map();
+  const groups = new Map();
+  stableItems(lines || []).forEach((line) => {
+    if (line.kind !== "relation") {
+      rendered.push(line);
+      membersByRepresentative.set(line.id, [line.id]);
+      return;
+    }
+    let source = projectedEndpointId(layout, line.source);
+    let target = projectedEndpointId(layout, line.target);
+    if (line.predicate === "knows" && String(source).localeCompare(String(target)) > 0) {
+      [source, target] = [target, source];
+    }
+    const key = JSON.stringify([
+      line.kind,
+      line.predicate || "",
+      line.polarity || "0",
+      source || "",
+      target || "",
+    ]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(line);
+  });
+
+  const evidenceStrength = (line) => [
+    line.quote,
+    line.label,
+    line.receipt,
+    line.source_evidence,
+    line.provenance,
+    ...(line.source_receipts || []),
+    ...(line.member_receipts || []),
+  ].filter(Boolean).length;
+  groups.forEach((members) => {
+    const stable = stableItems(members);
+    const representative = [...stable].sort((left, right) => {
+      const byObservations = Number(right.observations || 0) - Number(left.observations || 0);
+      if (byObservations) return byObservations;
+      const byConfidence = Number(right.confidence || 0) - Number(left.confidence || 0);
+      if (byConfidence) return byConfidence;
+      const byEvidence = evidenceStrength(right) - evidenceStrength(left);
+      if (byEvidence) return byEvidence;
+      return stable.indexOf(left) - stable.indexOf(right);
+    })[0];
+    rendered.push(representative);
+    membersByRepresentative.set(representative.id, stable.map((line) => line.id));
+  });
+  return { lines: rendered, membersByRepresentative };
 }
 
 function averageRadius(ids, positions) {
@@ -391,7 +497,9 @@ export function computeClusterLayout(model) {
   const sourceOrbitRadius = faces.length ? 7.2 : (volumes.length || root ? 4.2 : 1.2);
   const groups = placePointClouds(points, assignments.pointClusterById, positions, sourceOrbitRadius);
   const pointIds = new Set(points.map((point) => point.id));
-  const contextIds = placeContextNodes(lines, pointIds, positions, Boolean(root));
+  const entityPoints = entityPointIndex(points);
+  const context = placeContextNodes(lines, pointIds, positions, Boolean(root), entityPoints);
+  const { contextIds, endpointPointIds, endpointContextIds } = context;
 
   const volumeIds = new Set(volumes.map((volume) => volume.id));
   const rootVolumeIds = root?.members?.filter((id) => volumeIds.has(id)) || [];
@@ -415,9 +523,11 @@ export function computeClusterLayout(model) {
     pointClusterById: assignments.pointClusterById,
     directPointIds: assignments.directPointIds,
     contextIds,
+    endpointPointIds,
+    endpointContextIds,
     pointRadius,
     diagnostics: {
-      version: "hierarchical-cluster-v1",
+      version: "hierarchical-cluster-v2",
       rootAtCenter: !root || magnitude(positions.get(root.id) || [0, 0, 0]) < 0.000001,
       clusters: groups.size,
       directPoints: assignments.directPointIds.size,
@@ -427,6 +537,8 @@ export function computeClusterLayout(model) {
       maxFacesPerVolume: Math.max(0, ...primaryVolumeLoads.values()),
       faceMembershipEdges: [...facePointIds.values()].reduce((sum, ids) => sum + ids.length, 0),
       volumeMembershipEdges: [...volumeFaceIds.values()].reduce((sum, ids) => sum + ids.length, 0),
+      resolvedEntityEndpoints: endpointPointIds.size,
+      contextNodes: contextIds.length,
       averageRadius: {
         volumes: averageRadius(volumes.map((volume) => volume.id), positions),
         faces: averageRadius(faces.map((face) => face.id), positions),

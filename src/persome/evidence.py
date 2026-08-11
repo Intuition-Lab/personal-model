@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -170,16 +171,64 @@ def _reference_label(conn: sqlite3.Connection, reference: str) -> str:
     return _humanize_path(path_hint) or identifier
 
 
-def _nearby_capture_links(conn: sqlite3.Connection, timestamp: str | None) -> list[dict[str, Any]]:
+def _normalise_as_of(value: datetime | str | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.astimezone(UTC)
+
+
+def _at_or_before(value: Any, as_of: datetime) -> bool:
+    parsed = _normalise_as_of(str(value)) if value else None
+    return parsed is not None and parsed <= as_of
+
+
+def _evo_node_known_at(conn: sqlite3.Connection, node_id: str, as_of: datetime) -> bool:
+    """Fail closed unless a successor's effective start is known by ``as_of``."""
+    try:
+        row = conn.execute(
+            "SELECT valid_from, gmt_created, occurred_at FROM evo_nodes WHERE node_id=?"
+            " ORDER BY is_latest DESC LIMIT 1",
+            (node_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    # Matches the public viewer contract: validity first, then transaction
+    # creation, then occurrence as the final legacy fallback.
+    effective_start = next((value for value in row if _normalise_as_of(value) is not None), None)
+    return effective_start is not None and _at_or_before(effective_start, as_of)
+
+
+def _nearby_capture_links(
+    conn: sqlite3.Connection,
+    timestamp: str | None,
+    *,
+    as_of: datetime | None = None,
+) -> list[dict[str, Any]]:
     if not timestamp or not _table_exists(conn, "captures"):
         return []
     try:
-        rows = conn.execute(
+        query = (
             "SELECT id, timestamp, app_name, window_title FROM captures"
             " WHERE abs(persome_epoch(timestamp) - persome_epoch(?)) <= ?"
-            " ORDER BY abs(persome_epoch(timestamp) - persome_epoch(?)) LIMIT ?",
-            (timestamp, _NEARBY_CAPTURE_SECONDS, timestamp, _NEARBY_CAPTURE_LIMIT),
-        ).fetchall()
+        )
+        params: list[Any] = [timestamp, _NEARBY_CAPTURE_SECONDS]
+        if as_of is not None:
+            query += " AND persome_epoch(timestamp) <= persome_epoch(?)"
+            params.append(as_of.isoformat())
+        query += " ORDER BY abs(persome_epoch(timestamp) - persome_epoch(?)) LIMIT ?"
+        params.extend((timestamp, _NEARBY_CAPTURE_LIMIT))
+        rows = conn.execute(query, params).fetchall()
     except sqlite3.Error:
         return []
     return [
@@ -200,6 +249,7 @@ def _resolve_entry(
     original: str,
     identifier: str,
     receipt: str | None,
+    as_of: datetime | None,
 ) -> dict[str, Any] | None:
     if not _table_exists(conn, "entries"):
         return None
@@ -257,7 +307,7 @@ def _resolve_entry(
         timestamp=timestamp,
         path=path,
         metadata=metadata,
-        context=_nearby_capture_links(conn, context_timestamp),
+        context=_nearby_capture_links(conn, context_timestamp, as_of=as_of),
     )
 
 
@@ -267,6 +317,7 @@ def _resolve_evo_node(
     original: str,
     identifier: str,
     receipt: str | None,
+    as_of: datetime | None,
 ) -> dict[str, Any] | None:
     if not _table_exists(conn, "evo_nodes"):
         return None
@@ -308,6 +359,12 @@ def _resolve_evo_node(
         ("next_version", _json_list(row[17])),
     ):
         for related_id in related_ids:
+            if (
+                relation == "next_version"
+                and as_of is not None
+                and not _evo_node_known_at(conn, related_id, as_of)
+            ):
+                continue
             related_reference, related_label = _evo_reference(conn, related_id)
             history.append(
                 _link(
@@ -347,7 +404,7 @@ def _resolve_evo_node(
             "valid_until": row[16],
         },
         sources=sources,
-        context=_nearby_capture_links(conn, context_timestamp),
+        context=_nearby_capture_links(conn, context_timestamp, as_of=as_of),
         history=history,
     )
 
@@ -416,6 +473,7 @@ def _resolve_activity(
     original: str,
     identifier: str,
     receipt: str | None,
+    as_of: datetime | None,
 ) -> dict[str, Any] | None:
     from .model.activity_source import ActivitySource, is_activity_identity
 
@@ -461,7 +519,7 @@ def _resolve_activity(
             "participant_ids": event.participant_ids,
         },
         sources=sources,
-        context=_nearby_capture_links(conn, event.occurred_at),
+        context=_nearby_capture_links(conn, event.occurred_at, as_of=as_of),
     )
 
 
@@ -574,7 +632,12 @@ def _resolve_geometry(
     )
 
 
-def resolve_evidence(conn: sqlite3.Connection, reference: str) -> dict[str, Any]:
+def resolve_evidence(
+    conn: sqlite3.Connection,
+    reference: str,
+    *,
+    as_of: datetime | str | None = None,
+) -> dict[str, Any]:
     """Resolve one receipt or object id into a progressive-disclosure node.
 
     ``sources`` are explicit lineage already stored by Persome. ``context`` is
@@ -583,6 +646,7 @@ def resolve_evidence(conn: sqlite3.Connection, reference: str) -> dict[str, Any]
     derived object.
     """
     original = str(reference or "").strip()
+    cutoff = _normalise_as_of(as_of)
     identifier, path_hint, receipt = parse_reference(original)
     if not identifier:
         return _base(
@@ -599,9 +663,15 @@ def resolve_evidence(conn: sqlite3.Connection, reference: str) -> dict[str, Any]
     # checked before generic activities; bare ids use the same deterministic
     # order and then fall through to captures/model geometry.
     resolvers = (
-        lambda: _resolve_entry(conn, original=original, identifier=identifier, receipt=receipt),
-        lambda: _resolve_evo_node(conn, original=original, identifier=identifier, receipt=receipt),
-        lambda: _resolve_activity(conn, original=original, identifier=identifier, receipt=receipt),
+        lambda: _resolve_entry(
+            conn, original=original, identifier=identifier, receipt=receipt, as_of=cutoff
+        ),
+        lambda: _resolve_evo_node(
+            conn, original=original, identifier=identifier, receipt=receipt, as_of=cutoff
+        ),
+        lambda: _resolve_activity(
+            conn, original=original, identifier=identifier, receipt=receipt, as_of=cutoff
+        ),
         lambda: _resolve_capture(conn, original=original, identifier=identifier),
         lambda: _resolve_geometry(conn, original=original, identifier=identifier),
     )

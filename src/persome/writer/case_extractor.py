@@ -86,6 +86,8 @@ def _iter_block_lines(block: tl_store.TimelineBlock) -> list[str]:
     Uses the LLM-normalized ``entries`` plus any ``action_trace`` action strings
     (action traces capture command/tool steps where errors and fixes surface).
     """
+    if not block.eligible_for_modeling:
+        return []
     lines: list[str] = []
     for entry in block.entries:
         text = str(entry).strip()

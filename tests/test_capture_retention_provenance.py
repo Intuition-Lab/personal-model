@@ -7,8 +7,10 @@ import os
 import time
 from pathlib import Path
 
+from persome import paths
 from persome.capture import scheduler as scheduler_mod
 from persome.capture import screenshot_crypto
+from persome.config import load as load_config
 
 _HOUR = 3600
 _DAY = 86400
@@ -60,6 +62,25 @@ def test_extended_retention_off_strips_input_anchor(ac_root: Path) -> None:
     stats = scheduler_mod.cleanup_buffer(retention_hours=72, screenshot_retention_hours=24)
     assert stats["stripped"] == 1
     assert not _has_screenshot(path)
+
+
+def test_screenshot_strip_does_not_invalidate_content_head(ac_root: Path) -> None:
+    out = _capture_dict(ts="2026-04-22T14:00:00+08:00", text="stable content")
+    runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+    capture_id = runner.commit_prebuilt(out)
+    assert capture_id is not None
+    path = paths.capture_buffer_dir() / f"{capture_id}.json"
+    _age_file(path, seconds_old=30 * _HOUR)
+    scheduler_mod._set_active_runner(runner)
+    try:
+        stats = scheduler_mod.cleanup_buffer(
+            retention_hours=72,
+            screenshot_retention_hours=24,
+        )
+        assert stats["stripped"] == 1
+        assert runner.commit_prebuilt({**out, "timestamp": "2026-04-22T14:00:01+08:00"}) is None
+    finally:
+        scheduler_mod._set_active_runner(None)
 
 
 def test_input_anchor_kept_when_extended_retention_is_on(ac_root: Path) -> None:

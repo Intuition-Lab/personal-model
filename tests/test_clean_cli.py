@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from persome import cli, paths
 from persome.evomem.models import MemoryLayer, MemoryNode
 from persome.evomem.store import NodeStore
+from persome.store import capture_content_receipts, fts, schema_faces
 from persome.store import entries as entries_mod
-from persome.store import fts, schema_faces
 
 
 def _seed_capture() -> None:
@@ -29,6 +33,27 @@ def _seed_capture() -> None:
         )
 
 
+def _seed_capture_receipt() -> None:
+    with fts.cursor() as conn:
+        capture_content_receipts.record_success(
+            conn,
+            fingerprint="f" * 64,
+            capture_id="synthetic-capture",
+            committed_at="2026-07-10T08:00:00+00:00",
+        )
+
+
+def _copy_live_index(target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with fts.cursor() as source:
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    target.chmod(0o600)
+
+
 def _seed_model() -> None:
     with fts.cursor() as conn:
         entries_mod.create_file(
@@ -43,8 +68,13 @@ def _seed_model() -> None:
             content="Synthetic personal-model fact.",
             tags=["synthetic"],
         )
-        schema_faces.upsert_root(
+        schema_faces.upsert_root_with_receipt(
             conn,
+            receipt=schema_faces.make_input_receipt(
+                producer="root_synthesis",
+                sampled_at=datetime(2026, 7, 10, 8, 0, tzinfo=UTC),
+                input_value={"members": [entry_id], "profile": []},
+            ),
             signature="Synthetic root.",
             members=[entry_id],
             anchors=["self"],
@@ -63,17 +93,84 @@ def _seed_model() -> None:
 
 def test_clean_captures_removes_files_and_index_rows(ac_root) -> None:
     _seed_capture()
+    _seed_capture_receipt()
     capture_file = paths.capture_buffer_dir() / "synthetic.json"
     capture_file.write_text("{}")
+    snapshot = paths.backup_dir() / "evo-20260710.db"
+    quarantine = paths.root() / "index.db.corrupt.capture-clean-test"
+    _copy_live_index(snapshot)
+    _copy_live_index(quarantine)
 
     assert cli._clean_captures() == (1, 1)
     assert not capture_file.exists()
     with fts.cursor() as conn:
         assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+    for database_copy in (snapshot, quarantine):
+        with sqlite3.connect(database_copy) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("merge", [False, True])
+def test_rebuild_captures_receipt_boundary(
+    ac_root: Path,
+    merge: bool,
+) -> None:
+    _seed_capture()
+    _seed_capture_receipt()
+    args = ["rebuild-captures-index"] + (["--merge"] if merge else [])
+
+    result = CliRunner().invoke(cli.app, args)
+
+    assert result.exit_code == 0, result.output
+    with fts.cursor() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("merge", [False, True])
+def test_capture_rebuild_rolls_back_receipt_reset_on_failure(
+    ac_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    merge: bool,
+) -> None:
+    _seed_capture()
+    _seed_capture_receipt()
+    capture_file = paths.capture_buffer_dir() / "replacement.json"
+    capture_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-07-10T08:01:00+00:00",
+                "window_meta": {
+                    "app_name": "TestApp",
+                    "bundle_id": "test.app",
+                    "title": "Replacement",
+                },
+                "focused_element": {"role": "AXTextArea", "value": "replacement"},
+                "visible_text": "replacement",
+                "url": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        fts,
+        "insert_capture",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    args = ["rebuild-captures-index"] + (["--merge"] if merge else [])
+    result = CliRunner().invoke(cli.app, args)
+
+    assert result.exit_code != 0
+    with fts.cursor() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 1
 
 
 def test_clean_memory_removes_canonical_model_exports_and_backups(ac_root, monkeypatch) -> None:
     _seed_capture()
+    _seed_capture_receipt()
     _seed_model()
     paths.exports_dir().mkdir()
     (paths.exports_dir() / "model.json").write_text("{}")
@@ -105,7 +202,26 @@ def test_clean_memory_removes_canonical_model_exports_and_backups(ac_root, monke
         assert conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM evo_nodes").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM schema_faces").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM schema_input_receipts").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 1
+
+
+def test_clean_memory_table_boundary_includes_gator_state() -> None:
+    assert {
+        "memory_delta_items",
+        "memory_delta_window_claims",
+        "model_candidate_evidence",
+        "model_candidate_decisions",
+        "model_candidates",
+        "owner_alias_evidence",
+        "owner_aliases",
+        "event_occurrences",
+        "relation_edge_effects",
+        "schema_input_receipts",
+        "source_imports",
+    } <= set(cli._MODEL_TABLES)
+    assert "capture_content_receipts" not in cli._MODEL_TABLES
 
 
 def test_clean_all_keeps_only_install_configuration(ac_root, monkeypatch) -> None:

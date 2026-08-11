@@ -187,6 +187,73 @@ def test_point_receipt_exposes_human_readable_version_history(ac_root) -> None:
     assert old["history"][0]["label"] == "The user now prefers concise answers with evidence."
 
 
+def test_historical_evidence_hides_future_successor_and_nearby_capture(ac_root) -> None:
+    store = NodeStore()
+    store.save(
+        MemoryNode(
+            node_id="point-before",
+            content="The earlier wording.",
+            layer=MemoryLayer.L2_FACT,
+            file_name="user-preferences.md",
+            gmt_created=datetime(2026, 1, 1, tzinfo=UTC),
+            occurred_at="2026-02-01T10:00:00+00:00",
+            valid_from="2026-01-01T00:00:00+00:00",
+        )
+    )
+    store.save_and_supersede(
+        MemoryNode(
+            node_id="point-after",
+            content="The future correction.",
+            layer=MemoryLayer.L2_FACT,
+            file_name="user-preferences.md",
+            gmt_created=datetime(2026, 3, 1, tzinfo=UTC),
+            valid_from="2026-03-01T00:00:00+00:00",
+        ),
+        old_id="point-before",
+    )
+
+    with fts.cursor() as conn:
+        for capture_id, timestamp in (
+            ("capture-before-cutoff", "2026-02-01T09:59:00+00:00"),
+            ("capture-after-cutoff", "2026-02-01T10:05:00+00:00"),
+        ):
+            fts.insert_capture(
+                conn,
+                id=capture_id,
+                timestamp=timestamp,
+                app_name="Editor",
+                bundle_id="com.test.editor",
+                window_title="Evidence review",
+                focused_role="AXTextArea",
+                focused_value="",
+                visible_text="Reviewing the evidence",
+                url="",
+            )
+
+        historical = resolve_evidence(
+            conn,
+            "point-before",
+            as_of="2026-02-01T10:00:00Z",
+        )
+        at_successor = resolve_evidence(
+            conn,
+            "point-before",
+            as_of="2026-03-01T00:00:00Z",
+        )
+        now = resolve_evidence(conn, "point-before")
+
+    assert historical["history"] == []
+    assert [item["id"] for item in historical["context"]] == ["capture-before-cutoff"]
+    assert "point-after" not in json.dumps(historical)
+    assert "capture-after-cutoff" not in json.dumps(historical)
+    assert [item["id"] for item in at_successor["history"]] == ["point-after"]
+    assert [item["id"] for item in now["history"]] == ["point-after"]
+    assert {item["id"] for item in now["context"]} == {
+        "capture-before-cutoff",
+        "capture-after-cutoff",
+    }
+
+
 def test_aggregate_geometry_reuses_snapshot_point_labels(ac_root, monkeypatch) -> None:
     store = NodeStore()
     store.save(

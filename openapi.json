@@ -355,7 +355,7 @@
           "model"
         ],
         "summary": "Model Evidence",
-        "description": "Resolve one model receipt or object id into its evidence and nearby context.\n\nExplicit stored lineage is returned in ``sources``. Time-adjacent captures\nare returned separately in ``context`` and are never presented as direct\nprovenance. ``label`` is the human-readable display title; Point version\nlinks are returned separately in ``history``. Unknown or expired references\nfail open with ``status=missing`` so a historical receipt remains inspectable\neven after raw retention ends.",
+        "description": "Resolve one model receipt or object id into its evidence and nearby context.\n\nExplicit stored lineage is returned in ``sources``. Time-adjacent captures\nare returned separately in ``context`` and are never presented as direct\nprovenance. ``label`` is the human-readable display title; Point version\nlinks are returned separately in ``history``. Unknown or expired references\nfail open with ``status=missing`` so a historical receipt remains inspectable\neven after raw retention ends. When ``as_of`` is present, future successor\nlinks and nearby captures after that cutoff are omitted.",
         "operationId": "model_evidence_model_evidence_get",
         "parameters": [
           {
@@ -368,6 +368,25 @@
               "maxLength": 1024,
               "title": "Ref"
             }
+          },
+          {
+            "name": "as_of",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Historical cutoff for version history and nearby context.",
+              "title": "As Of"
+            },
+            "description": "Historical cutoff for version history and nearby context."
           }
         ],
         "responses": {

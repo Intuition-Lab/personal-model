@@ -3,6 +3,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
 import { MODEL_COLORS as COLORS, MODEL_PALETTE } from "./palette.mjs";
 import {
+  coalesceProjectedLines,
   computeClusterLayout,
   fittedOverviewPose,
   pickScreenTarget,
@@ -11,7 +12,11 @@ import {
 import {
   focusKeysForSelection,
   handleSearchShortcut,
+  lineKnownAt,
+  modelPollingFingerprint,
+  pointKnownAt,
   pointSearchMetadata,
+  pointVisibleAt,
   pointerUpOutcome,
   prepareSearchEntries,
   rankSearchEntries,
@@ -21,6 +26,7 @@ import {
 } from "./explore.mjs";
 import {
   evidenceBreadcrumb,
+  evidenceRequestPath,
   evidenceOverview,
   indexLinePresentations,
   modelNodeLabelIndex,
@@ -146,9 +152,11 @@ scene.add(violetLight);
 let graph = new THREE.Group();
 scene.add(graph);
 let model = { points: [], lines: [], faces: [], volumes: [], root: null, stats: {} };
+let modelPointById = new Map();
 let sceneModel = { points: [], lines: [], faces: [], volumes: [], root: null };
 let modelFingerprint = "";
 let modelGeneratedAt = "";
+let modelHealthFingerprint = "";
 let cutoff = new Date();
 let minTime = new Date();
 let maxTime = new Date();
@@ -179,6 +187,7 @@ let lineNavigatorItems = [];
 let selectionTargets = new Map();
 let positions = new Map();
 let items = new Map();
+let searchItems = new Map();
 let sceneNodeLabels = new Map();
 let linePresentations = new Map();
 let layerObjects = freshLayerObjects();
@@ -370,6 +379,7 @@ function registerPickable(object, layer, kind, item) {
   register(object, layer);
   pickables.push(object);
   items.set(selectionKey(kind, item.id), item);
+  searchItems.set(selectionKey(kind, item.id), item);
   return object;
 }
 
@@ -531,7 +541,9 @@ function registerScreenLinePickable(lineObject, item, start, end) {
   lineObject.userData.pickSegment = { start: start.clone(), end: end.clone() };
   lineObject.userData.baseOpacity = Number(lineObject.material.opacity || 0);
   screenLinePickables.push(lineObject);
-  items.set(selectionKey("line", item.id), item);
+  const key = selectionKey("line", item.id);
+  items.set(key, item);
+  searchItems.set(key, item);
   return lineObject;
 }
 
@@ -579,6 +591,7 @@ function disposeGraph() {
   selectionTargets = new Map();
   positions = new Map();
   items = new Map();
+  searchItems = new Map();
   sceneNodeLabels = new Map();
   linePresentations = new Map();
   layerObjects = freshLayerObjects();
@@ -587,8 +600,8 @@ function disposeGraph() {
   focusLabelsKey = "";
 }
 
-function addPoint(point, position, baseRadius, showLabel, promoted) {
-  const active = point.is_latest && point.status === "active";
+function addPoint(point, position, baseRadius, showLabel, promoted, currentAtCutoff) {
+  const active = currentAtCutoff;
   const clusterScale = promoted ? 1 : 0.72;
   const radius = (active ? baseRadius : baseRadius * 0.68) * clusterScale;
   const geometry = new THREE.SphereGeometry(radius, 14, 10);
@@ -836,8 +849,8 @@ function addRoot(root) {
 
 function addModelLine(line) {
   if (!visibleAt(line)) return;
-  const start = positions.get(line.source);
-  const end = positions.get(line.target);
+  const start = positionForGraphId(line.source);
+  const end = positionForGraphId(line.target);
   if (!start || !end) return;
   const evolution = line.kind === "evolution";
   const sourceCluster = currentLayout?.pointClusterById.get(line.source);
@@ -854,6 +867,12 @@ function addModelLine(line) {
     !evolution,
   );
   registerScreenLinePickable(lineObject, line, start, end);
+}
+
+function positionForGraphId(id) {
+  const pointId = currentLayout?.endpointPointIds?.get?.(id);
+  const contextId = currentLayout?.endpointContextIds?.get?.(id);
+  return positions.get(pointId || contextId || id);
 }
 
 function addOrbitRing(radius, color, opacity, rotation, layer) {
@@ -891,18 +910,14 @@ function buildScene({
   selectionReplacement = null,
 } = {}) {
   disposeGraph();
-  const visiblePoints = model.points.filter(visibleAt).sort((a, b) => a.id.localeCompare(b.id));
+  modelPointById = new Map(model.points.map((point) => [point.id, point]));
+  const visiblePoints = model.points
+    .filter((point) => pointVisibleAt(point, cutoff, modelPointById))
+    .sort((a, b) => a.id.localeCompare(b.id));
   const visibleFaces = model.faces.filter(visibleAt);
   const visibleVolumes = model.volumes.filter(visibleAt);
   const visibleRoot = model.root && visibleAt(model.root) ? model.root : null;
   const visibleLines = model.lines.filter(visibleAt);
-  sceneModel = {
-    points: visiblePoints,
-    lines: visibleLines,
-    faces: visibleFaces,
-    volumes: visibleVolumes,
-    root: visibleRoot,
-  };
   currentLayout = computeClusterLayout({
     points: visiblePoints,
     lines: visibleLines,
@@ -910,6 +925,19 @@ function buildScene({
     volumes: visibleVolumes,
     root: visibleRoot,
   });
+  const projectedLines = coalesceProjectedLines(visibleLines, currentLayout);
+  const renderedSceneLines = projectedLines.lines;
+  currentLayout.diagnostics.projectedRelationLinesCollapsed = Math.max(
+    0,
+    visibleLines.length - renderedSceneLines.length,
+  );
+  sceneModel = {
+    points: visiblePoints,
+    lines: renderedSceneLines,
+    faces: visibleFaces,
+    volumes: visibleVolumes,
+    root: visibleRoot,
+  };
   positions = new Map(
     [...currentLayout.positions].map(([id, position]) => [id, new THREE.Vector3(...position)])
   );
@@ -921,20 +949,44 @@ function buildScene({
   const labeledFaces = strongestIds(visibleFaces, 10);
   const labeledVolumes = strongestIds(visibleVolumes, 6);
   visiblePoints.forEach((point) => {
-    const active = point.is_latest && point.status === "active";
+    const active = pointVisibleAt(point, cutoff, modelPointById);
     const promoted = currentLayout.pointClusterById.get(point.id)?.startsWith("face:") || false;
     const showLabel = labelEveryPoint || (promoted && (
       currentLayout.directPointIds.has(point.id) || (active && hash(point.id) < 0.035)
     ));
-    addPoint(point, positions.get(point.id), currentLayout.pointRadius, showLabel, promoted);
+    addPoint(point, positions.get(point.id), currentLayout.pointRadius, showLabel, promoted, active);
+  });
+  // Historical and inactive Points remain searchable and inspectable even
+  // though the constellation only renders the chain head valid at this time.
+  model.points.filter((point) => pointKnownAt(point, cutoff)).forEach((point) => {
+    const key = selectionKey("point", point.id);
+    if (!searchItems.has(key)) searchItems.set(key, point);
   });
   currentLayout.contextIds.forEach(addContextNode);
-  visibleLines.forEach(addModelLine);
-  const renderedLineItems = visibleLines.filter(
-    (line) => positions.has(line.source) && positions.has(line.target),
+  renderedSceneLines.forEach(addModelLine);
+  const renderedLineItems = renderedSceneLines.filter(
+    (line) => positionForGraphId(line.source) && positionForGraphId(line.target),
   );
-  sceneNodeLabels = modelNodeLabelIndex(sceneModel);
-  linePresentations = indexLinePresentations(renderedLineItems, sceneModel, sceneNodeLabels);
+  sceneNodeLabels = modelNodeLabelIndex(
+    sceneModel,
+    currentLayout.endpointPointIds,
+    currentLayout.endpointContextIds,
+  );
+  const searchLines = model.lines.filter(
+    (line) => lineKnownAt(line, model, cutoff, modelPointById),
+  );
+  const searchModel = {
+    ...sceneModel,
+    points: model.points.filter((point) => pointKnownAt(point, cutoff)),
+    lines: searchLines,
+  };
+  const searchNodeLabels = modelNodeLabelIndex(
+    searchModel,
+    currentLayout.endpointPointIds,
+    currentLayout.endpointContextIds,
+  );
+  linePresentations = indexLinePresentations(searchLines, searchModel, searchNodeLabels);
+  searchLines.forEach((line) => searchItems.set(selectionKey("line", line.id), line));
   renderLineExplorer(renderedLineItems);
   visibleFaces.forEach((face) => addFace(face, labeledFaces.has(face.id)));
   visibleVolumes.forEach((volume) => addVolume(volume, labeledVolumes.has(volume.id)));
@@ -1078,11 +1130,13 @@ function searchWeight(kind, item, pointDetail = null) {
 }
 
 function rebuildSearchEntries() {
-  const entries = [...items.entries()].map(([key, item]) => {
+  const entries = [...searchItems.entries()].map(([key, item]) => {
     const separator = key.indexOf(":");
     const kind = separator > 0 ? key.slice(0, separator) : "context";
     const lineDetail = kind === "line" ? linePresentations.get(item.id) : null;
-    const pointDetail = kind === "point" ? pointSearchMetadata(item, cutoff) : null;
+    const pointDetail = kind === "point"
+      ? pointSearchMetadata(item, cutoff, modelPointById)
+      : null;
     return {
       key,
       kind,
@@ -1153,9 +1207,9 @@ function renderSearchResults() {
   searchEmptyEl.hidden = searchMatches.length > 0;
   searchSummaryEl.textContent = query
     ? (searchMatches.length
-      ? `Top ${searchMatches.length} matches in this model view.`
-      : "No matching object in this model view.")
-    : `Showing ${searchMatches.length} anchors from this model view.`;
+      ? `Top ${searchMatches.length} matches in this model and its history.`
+      : "No matching object in this model or its history.")
+    : `Showing ${searchMatches.length} anchors from this model and its history.`;
   setSearchActiveIndex(searchActiveIndex);
 }
 
@@ -1182,13 +1236,14 @@ function closeSearch(restoreFocus = true) {
 }
 
 function selectSearchMatch(entry) {
-  const item = items.get(entry.key);
+  const item = searchItems.get(entry.key);
   if (!item) {
     rebuildSearchEntries();
     renderSearchResults();
     return;
   }
-  const layer = kindLayers[entry.kind];
+  const rendered = items.has(entry.key);
+  const layer = rendered ? kindLayers[entry.kind] : null;
   if (layer && !layerVisible[layer]) {
     layerVisible[layer] = true;
     applyLayerVisibility();
@@ -1196,7 +1251,7 @@ function selectSearchMatch(entry) {
   }
   closeSearch(false);
   showDetails(entry.kind, item, openSearchButton);
-  flyToSelection(entry.kind, entry.id);
+  if (rendered) flyToSelection(entry.kind, entry.id);
   document.getElementById("close-detail").focus({ preventScroll: true });
 }
 
@@ -1382,7 +1437,22 @@ function createConstellationBlob(shareModel, shareGraphModel = model) {
     camera.updateProjectionMatrix();
     camera.updateMatrixWorld(true);
     renderer.render(scene, camera);
-    drawConstellationCard(context, renderer.domElement, shareModel);
+    const renderedLines = sceneModel.lines.filter(
+      (line) => positionForGraphId(line.source) && positionForGraphId(line.target),
+    );
+    const renderedShareModel = {
+      ...shareModel,
+      stats: {
+        ...(shareModel.stats || {}),
+        points: sceneModel.points.length,
+        evolution_lines: renderedLines.filter((line) => line.kind === "evolution").length,
+        relation_lines: renderedLines.filter((line) => line.kind === "relation").length,
+        faces: sceneModel.faces.length,
+        volumes: sceneModel.volumes.length,
+        roots: Number(Boolean(sceneModel.root)),
+      },
+    };
+    drawConstellationCard(context, renderer.domElement, renderedShareModel);
   } finally {
     renderer.setPixelRatio(viewState.pixelRatio);
     renderer.setSize(viewState.rendererSize.x, viewState.rendererSize.y, false);
@@ -1545,7 +1615,8 @@ function applyMaterialFocus(object, focusing, relevant) {
 }
 
 function syncSelectionState() {
-  const selectionVisible = selected && !focusVisualsSuspended;
+  const selectedKey = selected ? selectionKey(selected.kind, selected.id) : null;
+  const selectionVisible = selectedKey && items.has(selectedKey) && !focusVisualsSuspended;
   const activeKey = selectionVisible ? selectionKey(selected.kind, selected.id) : null;
   const focusKeys = selectionVisible
     ? focusKeysForSelection(sceneModel, currentLayout, selected)
@@ -1828,7 +1899,11 @@ async function loadEvidence(reference) {
   loading.textContent = "Resolving evidence…";
   detailReceiptsEl.appendChild(loading);
   try {
-    const response = await fetch(`./evidence?ref=${encodeURIComponent(reference)}`, {
+    // Now keeps the original endpoint shape. Time travel adds an explicit
+    // server boundary so a nested drill-down cannot reveal a successor or
+    // nearby capture that had not happened at the selected cutoff.
+    const evidenceCutoff = Number(slider.value) < 100 ? cutoff : null;
+    const response = await fetch(evidenceRequestPath(reference, evidenceCutoff), {
       cache: "no-store",
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -1849,11 +1924,11 @@ async function loadEvidence(reference) {
 
 function renderNodeEvidence(kind, item) {
   detailMode = "node";
-  evidenceRequest += 1;
+  const request = ++evidenceRequest;
   detailReceiptsEl.replaceChildren();
   renderBreadcrumbs();
 
-  const cards = nodeEvidenceCards(item, model);
+  const cards = nodeEvidenceCards(item, model, cutoff);
   const shown = Math.min(cards.length, EVIDENCE_CARD_LIMIT);
   const countEl = document.getElementById("detail-evidence-count");
   // Say what is actually on screen. Claiming 34 and rendering 12 is the kind of
@@ -1879,7 +1954,7 @@ function renderNodeEvidence(kind, item) {
     fetch(`./node?id=${encodeURIComponent(item.id)}`)
       .then((response) => response.ok ? response.json() : null)
       .then((data) => {
-        if (!data || !selected || detailMode !== "node"
+        if (!data || !selected || request !== evidenceRequest || detailMode !== "node"
           || selected.kind !== kind || selected.id !== item.id) return;
         (data.raw || []).slice(0, 3).forEach((raw) => {
           const row = document.createElement("div");
@@ -1894,7 +1969,7 @@ function renderNodeEvidence(kind, item) {
 
 function renderOverview(kind, item) {
   detailSummaryEl.replaceChildren();
-  const overview = evidenceOverview(kind, item, model);
+  const overview = evidenceOverview(kind, item, model, cutoff);
   const copy = document.createElement("p");
   copy.textContent = overview.copy;
   detailSummaryEl.append(copy);
@@ -1905,7 +1980,7 @@ function renderOverview(kind, item) {
 
 function renderNodeHistory(item) {
   detailHistoryEl.replaceChildren();
-  const history = nodeHistoryCards(item, model);
+  const history = nodeHistoryCards(item, model, cutoff);
   const count = document.getElementById("detail-history-count");
   if (count) count.textContent = history.length ? String(history.length) : "";
   if (!history.length) {
@@ -2333,27 +2408,6 @@ function updateCutoff() {
   sliderLabel.textContent = fraction >= 1 ? "Now" : cutoff.toISOString().slice(0, 10);
 }
 
-function fingerprint(nextModel) {
-  return JSON.stringify({
-    points: nextModel.points.map((item) => [
-      item.id, item.status, item.is_latest, item.content, item.valid_from, item.valid_until,
-    ]),
-    lines: nextModel.lines.map((item) => [item.id, item.predicate, item.valid_from]),
-    faces: nextModel.faces.map((item) => [
-      item.id, item.status, item.observations, item.signature, item.members,
-    ]),
-    volumes: nextModel.volumes.map((item) => [
-      item.id, item.status, item.observations, item.signature, item.members,
-    ]),
-    root: nextModel.root ? [nextModel.root.id, nextModel.root.signature] : null,
-    build: [
-      nextModel.build?.build_id || null,
-      nextModel.build?.status || null,
-      nextModel.build?.core_commit || null,
-    ],
-  });
-}
-
 function showModelLoadError(error) {
   const message = document.createElement("p");
   message.textContent = error?.name === "AbortError"
@@ -2411,10 +2465,21 @@ async function loadModelOnce(force, selectionReplacement = null) {
   try {
     const payload = await fetchModelGraph();
     errorEl.hidden = true;
-    const nextFingerprint = fingerprint(payload.model);
-    if (!force && nextFingerprint === modelFingerprint) return true;
+    const nextHealthFingerprint = JSON.stringify(payload.index_health || null);
+    if (
+      !force
+      && payload.generated_at === modelGeneratedAt
+      && nextHealthFingerprint === modelHealthFingerprint
+    ) return true;
+    const nextFingerprint = modelPollingFingerprint(payload.model, payload.index_health || null);
+    if (!force && nextFingerprint === modelFingerprint) {
+      modelGeneratedAt = payload.generated_at || "";
+      modelHealthFingerprint = nextHealthFingerprint;
+      return true;
+    }
     model = payload.model;
     modelGeneratedAt = payload.generated_at || "";
+    modelHealthFingerprint = nextHealthFingerprint;
     modelFingerprint = nextFingerprint;
     updateHealthBanner(payload.index_health || null);
     shareReady = Boolean(
@@ -2423,6 +2488,14 @@ async function loadModelOnce(force, selectionReplacement = null) {
     setShareBusy(false);
     updateTimelineBounds();
     buildScene({ selectionReplacement });
+    // A poll can update a Line or structural object in place while its drawer
+    // is open. Rebind the selection to the fresh snapshot and redraw the
+    // drawer, unless the owner is in the middle of editing a Point.
+    if (selected && !editingItem) {
+      const freshItem = items.get(selectionKey(selected.kind, selected.id))
+        || searchItems.get(selectionKey(selected.kind, selected.id));
+      if (freshItem) showDetails(selected.kind, freshItem, selectionReturnFocus);
+    }
     return true;
   } catch (error) {
     shareReady = false;
@@ -2480,8 +2553,8 @@ function resetCamera() {
 function selectionPosition(kind, id) {
   if (kind === "line") {
     const line = sceneModel.lines.find((item) => item.id === id);
-    const start = line ? positions.get(line.source) : null;
-    const end = line ? positions.get(line.target) : null;
+    const start = line ? positionForGraphId(line.source) : null;
+    const end = line ? positionForGraphId(line.target) : null;
     if (start && end) return start.clone().lerp(end, 0.5);
   }
   return positions.get(id)?.clone() || null;
@@ -3006,9 +3079,17 @@ clearFocusButton.addEventListener("click", showAllModel);
 cardButton.addEventListener("click", exportHumanCard);
 shareButton.addEventListener("click", shareConstellationToX);
 
-slider.addEventListener("input", () => {
+function rebuildAtSelectedCutoff() {
+  // Detail data is cutoff-bound. Closing the selection both removes already
+  // rendered future evidence and increments evidenceRequest, so an unbounded
+  // Now request that resolves after time travel cannot repopulate the drawer.
+  clearSelection(false);
   updateCutoff();
   buildScene();
+}
+
+slider.addEventListener("input", () => {
+  rebuildAtSelectedCutoff();
 });
 
 document.getElementById("play").addEventListener("click", (event) => {
@@ -3020,14 +3101,16 @@ document.getElementById("play").addEventListener("click", (event) => {
     button.setAttribute("aria-pressed", "false");
     return;
   }
-  if (Number(slider.value) >= 100) slider.value = "0";
+  if (Number(slider.value) >= 100) {
+    slider.value = "0";
+    rebuildAtSelectedCutoff();
+  }
   button.textContent = "Ⅱ";
   button.setAttribute("aria-pressed", "true");
   playTimer = window.setInterval(() => {
     const next = Number(slider.value) + 2;
     slider.value = String(Math.min(100, next));
-    updateCutoff();
-    buildScene();
+    rebuildAtSelectedCutoff();
     if (next >= 100) button.click();
   }, 240);
 });
@@ -3309,6 +3392,8 @@ await loadModel(true);
 window.setInterval(() => {
   // Parsing a multi-megabyte snapshot and fingerprinting every Point takes long
   // enough to drop frames. Never do it under the owner's finger.
-  if (livePointers.size) return;
+  // An inline owner draft is equally important: a background refresh must not
+  // retire the selected Point and silently discard or wedge that editor.
+  if (livePointers.size || editingItem || editInFlight) return;
   loadModel(false);
 }, 5000);

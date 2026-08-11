@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   evidenceBreadcrumb,
   evidenceOverview,
+  evidenceRequestPath,
   indexLinePresentations,
   linePresentation,
   modelNodeLabelIndex,
@@ -28,6 +29,18 @@ const currentPoint = {
   status: "active",
 };
 const model = { points: [oldPoint, currentPoint] };
+
+test("adds a historical cutoff to evidence drill-down but keeps Now compatible", () => {
+  const reference = "⟨point-old:user preferences.md⟩";
+  const cutoff = new Date("2026-02-01T10:00:00Z");
+  const historical = new URL(evidenceRequestPath(reference, cutoff), "http://localhost/model/");
+  const now = new URL(evidenceRequestPath(reference), "http://localhost/model/");
+
+  assert.equal(historical.searchParams.get("ref"), reference);
+  assert.equal(historical.searchParams.get("as_of"), "2026-02-01T10:00:00.000Z");
+  assert.equal(now.searchParams.get("ref"), reference);
+  assert.equal(now.searchParams.has("as_of"), false);
+});
 
 test("turns aggregate receipts into human-readable evidence cards", () => {
   const face = {
@@ -62,6 +75,91 @@ test("labels version history and drill-down breadcrumbs with content", () => {
   assert.equal(evidenceBreadcrumb({ label: history.label }), history.label);
 });
 
+test("does not reveal a future successor in a historical cutoff", () => {
+  const predecessor = {
+    ...oldPoint,
+    superseded_by: ["point-future"],
+  };
+  const future = {
+    id: "point-future",
+    content: "A correction that starts later.",
+    valid_from: "2026-03-01T00:00:00Z",
+  };
+
+  assert.deepEqual(
+    nodeHistoryCards(
+      predecessor,
+      { points: [predecessor, future] },
+      new Date("2026-02-01T00:00:00Z"),
+    ),
+    [],
+  );
+  assert.equal(
+    nodeHistoryCards(
+      predecessor,
+      { points: [predecessor, future] },
+      new Date("2026-03-01T00:00:00Z"),
+    )[0].id,
+    "point-future",
+  );
+});
+
+test("uses successor creation time when valid_from is absent", () => {
+  const predecessor = {
+    ...oldPoint,
+    superseded_by: ["point-created-later"],
+  };
+  const future = {
+    id: "point-created-later",
+    content: "A later-created correction.",
+    created_at: "2026-03-01T00:00:00Z",
+  };
+
+  assert.deepEqual(
+    nodeHistoryCards(
+      predecessor,
+      { points: [predecessor, future] },
+      new Date("2026-02-01T00:00:00Z"),
+    ),
+    [],
+  );
+  assert.equal(
+    nodeHistoryCards(
+      predecessor,
+      { points: [predecessor, future] },
+      new Date("2026-03-01T00:00:00Z"),
+    )[0].id,
+    "point-created-later",
+  );
+});
+
+test("omits future Point receipts instead of exposing a generic drill-down", () => {
+  const future = {
+    id: "point-future-evidence",
+    content: "A future correction that must stay hidden.",
+    receipt: "⟨point-future-evidence:user-preferences.md⟩",
+    created_at: "2026-03-01T00:00:00Z",
+  };
+  const face = { member_receipts: [future.receipt] };
+
+  assert.deepEqual(
+    nodeEvidenceCards(
+      face,
+      { points: [future] },
+      new Date("2026-02-01T00:00:00Z"),
+    ),
+    [],
+  );
+  assert.equal(
+    nodeEvidenceCards(
+      face,
+      { points: [future] },
+      new Date("2026-03-01T00:00:00Z"),
+    )[0].id,
+    future.id,
+  );
+});
+
 test("presents line endpoints without exposing raw node IDs or replacing the predicate", () => {
   const relation = linePresentation({
     id: "relation-private-7",
@@ -79,6 +177,47 @@ test("presents line endpoints without exposing raw node IDs or replacing the pre
   assert.equal(relation.target, "Context node");
   assert.ok(!JSON.stringify(relation).includes("point-current"));
   assert.ok(!JSON.stringify(relation).includes("private-context-id"));
+});
+
+test("labels canonical Line endpoints through their rendered entity Point", () => {
+  const entityModel = {
+    points: [{ id: "entity-acme", content: "Acme Labs" }],
+  };
+  const labels = modelNodeLabelIndex(
+    entityModel,
+    new Map([["acme labs", "entity-acme"]]),
+  );
+  const relation = linePresentation({
+    id: "relation-acme",
+    kind: "relation",
+    predicate: "engaged_with",
+    source: "self",
+    target: "acme labs",
+  }, entityModel, labels);
+
+  assert.equal(relation.source, "You");
+  assert.equal(relation.target, "Acme Labs");
+});
+
+test("labels folded context variants with their shared display identity", () => {
+  const labels = modelNodeLabelIndex(
+    { points: [] },
+    new Map(),
+    new Map([
+      ["self", "self"],
+      ["ACME LABS", "Acme Labs"],
+    ]),
+  );
+  const relation = linePresentation({
+    id: "relation-context",
+    kind: "relation",
+    predicate: "engaged_with",
+    source: "self",
+    target: "ACME LABS",
+  }, { points: [] }, labels);
+
+  assert.equal(relation.source, "You");
+  assert.equal(relation.target, "Acme Labs");
 });
 
 test("indexes node labels once and presents each Line once without rescanning model nodes", () => {

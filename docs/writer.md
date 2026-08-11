@@ -52,6 +52,7 @@ live Point/Line path is:
 
 ```text
 new timeline window + structured focus evidence
+  -> canonical SQLite window claim before inference
   -> one memory_delta LLM extraction
   -> owner-alias evidence + quote / roster / predicate / confidence gates
   -> repeated owner evidence resolves names and handles to reserved self
@@ -63,7 +64,22 @@ new timeline window + structured focus evidence
 Every proposed item must quote session evidence. Entity references must resolve
 through the identity roster or appear explicitly in the session. Relations use
 a closed predicate set. Low-confidence or unsupported items are dropped and
-counted.
+counted. Repeated entity candidates inside one reply are grouped by normalized
+kind and identity before the immutable item ledger. The strongest quoted
+variant wins deterministically; conflicting active/ended claims fail closed as
+a whole instead of making the persisted window permanently unseedable. Nested
+assertion, relation, and event references are rewritten to that same winner;
+endpoint kind lookup uses the same normalized identity defensively on replay.
+
+Before this gate, timeline provenance is a hard Gator boundary. Memory delta reads only
+shape-validated `llm`, trusted `imported`, or backward-compatible `legacy` blocks. `metadata_only`, `llm_empty`,
+`llm_malformed`, and `llm_failed` windows are consumed without an extraction call or geometry
+write; `sessions.delta_end` still advances. Reducer fallback wording therefore cannot become a
+Point or Line merely because it is non-empty.
+
+`llm` is an admission/provenance class, not proof that every normalized clause is independently
+grounded. Per-entry source receipts and locally verified evidence spans remain a planned hardening
+step; downstream quote checks must not treat this label alone as factual verification.
 
 The roster always includes the reserved `self` endpoint. The same LLM pass may
 propose `owner_alias_candidates` only when quoted session evidence identifies a
@@ -74,23 +90,64 @@ of `self`. A quoted explicit
 first-person identity statement may promote immediately. Promotion retires an
 already-minted duplicate person projection without deleting its audit history.
 
+PersonGraph does not copy Point-backed person facts into additional
+`person-event` Points. A unique matching raw identity Point can become the
+`person-entity` head through an atomic, auditable supersession; later Point facts remain
+their own receipt-bearing evidence and do not increment sightings. Point identity maintenance and
+entry interactions use separate bounded batches, with eligible Points selected before derived rows
+and applied first so entry recency cannot evict the identity bridge. Reducer entry events still
+populate the person timeline, and a stable source event stays deduplicated through a
+slug-to-display-name adoption.
+
 Configured `memory_delta.owner_aliases` remain a trusted override, but ordinary
 operation does not require users to discover or fill the setting themselves.
 Persome's own localhost `/model` output is removed from the delta evidence so a
 rendered Face, Volume, or Root cannot train the next model window on itself.
 
+New entity and assertion items first enter `model_candidates`. The same canonical
+candidate needs receipts from two known, distinct sessions before the itemized
+apply mints a Point; more windows from one session cannot satisfy the gate. An
+already-live Point remains usable immediately, and explicit owner corrections
+retain their separate authority path.
+
 The deterministic `self engaged_with <entity>` attention floor is direct
-observational evidence, so it becomes an active Line on the first applied
-window. LLM semantic relations remain shadow candidates. Repeated deterministic
+observational evidence, so it becomes an active Line when that entity Point is
+already known or crosses its candidate threshold. LLM semantic relations remain shadow candidates. Repeated deterministic
 co-occurrence increments their independent observation count; the background
 structural build promotes only candidates meeting the evidence floor and
 per-identity fan-out cap.
 
-Persist-before-apply is deliberate. `apply_status` is `pending`, `applied`, or
-`failed`; a retry reuses the stored window payload and only resumes apply.
-`sessions.delta_end` advances only after success, keeping cost and
-relation-observation counts idempotent. Terminal finalization processes only
-the remaining tail.
+Persist-before-apply is deliberate. A separate `memory_delta_window_claims` row canonicalizes UTC
+window bounds and serializes extraction before the LLM call. Its lease/token CAS lets a crashed
+claim be reclaimed without allowing the stale worker to bind a second payload; legacy and
+owner-edit audit rows remain append-only and outside this uniqueness policy.
+
+`apply_status` is `pending`, `applied`, or `failed`; a retry reuses the stored window payload and only
+resumes apply. The parent payload and its ordered `memory_delta_items` ledger are inserted in one
+transaction. Each item has a leased claim and an immutable payload hash. The parent becomes
+`applied` only when every item is terminal and deterministic apply returns no item errors.
+Rows created before the item ledger are treated conservatively: an explicit `not_requested` row can
+use the preserved context-free legacy apply, but a `pending` or `failed` row with model effects is
+not automatically replayed because a subset may already have committed without a durable receipt.
+It remains failed for audit/repair instead of risking a second additive observation.
+Open active/shadow relations have a canonical unique `edge_key` (`knows` is symmetric); a dirty
+legacy collision is reported and never merged implicitly. Default MAX reinforcement and event
+occurrence upsert are retry-idempotent. Additive reinforcement uses a relation-specific
+`relation_edge_effects` receipt: the receipt and `observations + 1` commit atomically, so replay after
+a process crash cannot count the same entity-floor or co-occurrence effect twice. Relation-ending
+items use the same durable effect namespace and atomically bind their receipt to the closed validity
+interval, preventing an acknowledgement retry from creating another closed Line. Item acknowledgements
+also persist a geometry-changed bit; recovery can therefore schedule the structural rebuild even if
+the process died after every item committed but before the parent delta became `applied`.
+
+Windowed event identity separates occurrence from series. `event:occurrence:<id>` derives from the
+session, canonical window, and item key; the series ID derives conservatively from normalized title
+and sorted canonical participants. A retry reuses one occurrence, while the same event in a later
+window is a distinct occurrence in the same series. Pre-window legacy title hashes are preserved.
+
+`sessions.delta_end` advances only after the window reaches its terminal writer outcome. Long recovery ranges are processed oldest-first in bounded
+`max_blocks` slices; a direct oversized call fails closed instead of silently claiming a truncated
+window. Terminal finalization processes only the remaining tail.
 
 When `apply_enabled=false`, the delta remains an audit artifact and the legacy
 classifier regains the terminal durable-fact role. This is a compatibility and
@@ -159,6 +216,12 @@ Face. Owner-scoped Faces anchor to `self`; collaborators mentioned only in the
 supporting receipts are not added as hull identities. Re-mining supersedes the
 prior schema in place.
 
+Production Face writes use a canonical `(producer, UTC day, input hash)` receipt. Re-running the
+same fact bundle on the same day does not append another observation or trigger promotion; a later
+day is a distinct resample. All structural stages in one explicit build use that build's start time,
+so a run crossing midnight cannot split one sample into two receipt days. Legacy unreceipted APIs
+remain for explicit compatibility paths.
+
 ### Volumes
 
 `cross_domain_sweeper` compares stable, topic-distinct schemas using a
@@ -176,11 +239,18 @@ pairs receives budget before those rejected retries return. Low-confidence
 `forming` collisions remain dormant and never contribute promotion evidence.
 Deferred candidates remain eligible for later structural builds.
 
+Volume writes use the same receipt policy, including distinct derived receipts for the parent Faces
+that receive an emergent contribution. A same-day rebuild therefore cannot satisfy the two-sample
+promotion threshold by replaying one collision.
+
 ### Root
 
 `root_synthesis` compresses active Face/Volume/profile evidence into at most one
 Root under a token budget. A new valid Root supersedes the old one; missing or
 failed input never replaces a valid Root with empty content.
+The canonical input receipt includes the selected Volumes, Faces, durable profile, and token budget.
+An identical same-day input is detected before the sequential LLM call and checked atomically again
+at write time, so it neither spends another synthesis call nor supersedes the current Root.
 
 ## Compaction and forgetting
 

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from persome import paths
 from persome.capture import scheduler as scheduler_mod
+from persome.config import load as load_config
 from persome.store import fts
 
 
@@ -46,6 +47,174 @@ def _capture_dict(
             "height": 50,
         },
     }
+
+
+def test_same_surface_trigger_keeps_s1_nul_sanitization() -> None:
+    out = _capture_dict(
+        ts="2026-08-11T00:00:00+00:00",
+        app="Editor",
+        title="Same title",
+        value="",
+        text="same surface",
+    )
+    trigger = {
+        "event_type": "UserMouseClick",
+        "app_name": "Editor",
+        "bundle_id": "com.test.editor",
+        "window_title": "Same title",
+        "details": {"element": {"role": "AXButton", "value": "\0stale\0"}},
+    }
+    out["trigger"] = trigger
+    out["ax_tree"] = {
+        "apps": [
+            {
+                "name": "Editor",
+                "bundle_id": "com.test.editor",
+                "is_frontmost": True,
+                "windows": [],
+            }
+        ]
+    }
+    scheduler_mod.s1_parser.enrich(out)
+    assert out["trigger"]["details"]["element"]["value"] == "stale"
+
+    reconciled = scheduler_mod._reconcile_trigger_surface(out, trigger)
+
+    assert reconciled is not None
+    assert reconciled["details"]["element"]["value"] == "stale"
+    assert "\0" not in json.dumps(reconciled)
+
+
+def test_same_surface_trigger_keeps_confirmed_placeholder_removed() -> None:
+    phrase = "Ask for follow-up changes"
+    element = {
+        "role": "AXTextArea",
+        "value": phrase,
+        "is_editable": True,
+        "children": [
+            {
+                "role": "AXGroup",
+                "domClassList": ["placeholder"],
+                "children": [{"role": "AXStaticText", "value": phrase}],
+            }
+        ],
+    }
+    trigger = {
+        "event_type": "UserMouseClick",
+        "app_name": "Editor",
+        "bundle_id": "com.test.editor",
+        "window_title": "Same title",
+        "details": {"element": {"role": "AXTextArea", "value": phrase}},
+    }
+    out = _capture_dict(
+        ts="2026-08-11T00:00:00+00:00",
+        app="Editor",
+        title="Same title",
+        value="",
+        text="same surface",
+    )
+    out["trigger"] = trigger
+    out["ax_tree"] = {
+        "apps": [
+            {
+                "name": "Editor",
+                "bundle_id": "com.test.editor",
+                "is_frontmost": True,
+                "focused_element": element,
+                "windows": [{"title": "Same title", "elements": [element]}],
+            }
+        ]
+    }
+    scheduler_mod.s1_parser.enrich(out)
+    assert out["trigger"]["details"]["element"].get("value", "") == ""
+
+    reconciled = scheduler_mod._reconcile_trigger_surface(out, trigger)
+
+    assert reconciled is not None
+    assert reconciled["details"]["element"].get("value", "") == ""
+    assert phrase not in json.dumps(reconciled)
+
+
+def test_changed_window_title_drops_stale_action_details() -> None:
+    out = _capture_dict(
+        ts="2026-08-11T00:00:00+00:00",
+        app="Editor",
+        title="Observed title",
+        value="",
+        text="same surface",
+    )
+    trigger = {
+        "event_type": "UserMouseClick",
+        "app_name": "Editor",
+        "bundle_id": "com.test.editor",
+        "window_title": "Event-time title",
+        "details": {"x": 10, "y": 20},
+    }
+    out["trigger"] = trigger
+
+    reconciled = scheduler_mod._reconcile_trigger_surface(out, trigger)
+
+    assert reconciled == {
+        "event_type": "QueuedSurfaceRefresh",
+        "source_event_type": "UserMouseClick",
+        "app_name": "Editor",
+        "bundle_id": "com.test.editor",
+        "window_title": "Observed title",
+    }
+
+
+def test_backlogged_worker_rebinds_trigger_and_session_to_observed_surface(
+    ac_root: Path,
+    monkeypatch,
+) -> None:
+    built = [0]
+
+    def build_for_current_surface(_cfg, _provider, trigger):
+        built[0] += 1
+        out = _capture_dict(
+            ts=f"2026-08-11T00:00:0{built[0]}+00:00",
+            app="C",
+            title="Current C",
+            value="",
+            text="current surface C",
+        )
+        out["window_meta"]["bundle_id"] = "com.example.c"
+        out["trigger"] = dict(trigger)
+        return out
+
+    monkeypatch.setattr(scheduler_mod, "_build_capture", build_for_current_surface)
+    seen: list[dict] = []
+    runner = scheduler_mod._CaptureRunner(
+        load_config().capture,
+        provider=object(),
+        pre_capture_hook=seen.append,
+    )
+    for name in ("a", "b", "c"):
+        assert runner.run_threaded(
+            {
+                "event_type": "AXFocusedWindowChanged",
+                "app_name": name.upper(),
+                "bundle_id": f"com.example.{name}",
+                "window_title": f"Event {name.upper()}",
+                "details": {"source": name},
+            }
+        )
+
+    runner.start_worker()
+    runner.stop_worker()
+
+    files = list(paths.capture_buffer_dir().glob("*.json"))
+    assert len(files) == 1
+    persisted = json.loads(files[0].read_text(encoding="utf-8"))
+    assert persisted["window_meta"]["bundle_id"] == "com.example.c"
+    assert persisted["trigger"] == {
+        "event_type": "QueuedSurfaceRefresh",
+        "source_event_type": "AXFocusedWindowChanged",
+        "app_name": "C",
+        "bundle_id": "com.example.c",
+        "window_title": "Current C",
+    }
+    assert seen == [persisted["trigger"]]
 
 
 def test_write_capture_indexes_into_fts(ac_root: Path) -> None:
@@ -282,6 +451,99 @@ def test_cleanup_eviction_also_drops_fts(ac_root: Path) -> None:
     assert written[-1].stem in remaining
 
 
+def test_time_retention_removes_head_receipt_and_readmits_same_content(
+    ac_root: Path,
+) -> None:
+    runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+    scheduler_mod._set_active_runner(runner)
+    try:
+        first = _capture_dict(
+            ts="2026-08-10T00:00:00+00:00",
+            app="Cursor",
+            title="static.py",
+            value="unchanged",
+            text="unchanged",
+        )
+        first_id = runner.commit_prebuilt(first)
+        assert first_id is not None
+        first_path = paths.capture_buffer_dir() / f"{first_id}.json"
+        old = time.time() - 2 * 3600
+        os.utime(first_path, (old, old))
+
+        stats = scheduler_mod.cleanup_buffer(retention_hours=1)
+
+        assert stats["deleted"] == 1
+        assert not first_path.exists()
+        with fts.cursor() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+
+        second = {**first, "timestamp": "2026-08-11T00:00:00+00:00"}
+        assert runner.commit_prebuilt(second) is not None
+        assert len(list(paths.capture_buffer_dir().glob("*.json"))) == 1
+    finally:
+        scheduler_mod._set_active_runner(None)
+
+
+def test_hard_cap_eviction_removes_head_receipt_and_readmits_same_content(
+    ac_root: Path,
+) -> None:
+    runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+    scheduler_mod._set_active_runner(runner)
+    try:
+        large = "x" * 1_100_000
+        first = _capture_dict(
+            ts="2026-08-10T00:00:00+00:00",
+            app="Cursor",
+            title="large.py",
+            value=large,
+            text=large,
+        )
+        first_id = runner.commit_prebuilt(first)
+        assert first_id is not None
+
+        stats = scheduler_mod.cleanup_buffer(retention_hours=24 * 365, max_mb=1)
+
+        assert stats["evicted"] == 1
+        assert list(paths.capture_buffer_dir().glob("*.json")) == []
+        with fts.cursor() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+
+        second = {**first, "timestamp": "2026-08-11T00:00:00+00:00"}
+        assert runner.commit_prebuilt(second) is not None
+        assert len(list(paths.capture_buffer_dir().glob("*.json"))) == 1
+    finally:
+        scheduler_mod._set_active_runner(None)
+
+
+def test_missing_file_reconciliation_removes_legacy_stale_receipt(
+    ac_root: Path,
+) -> None:
+    runner = scheduler_mod._CaptureRunner(load_config().capture, provider=None)
+    scheduler_mod._set_active_runner(runner)
+    try:
+        first = _capture_dict(
+            ts="2026-08-10T00:00:00+00:00",
+            app="Cursor",
+            title="missing.py",
+            value="missing",
+            text="missing",
+        )
+        first_id = runner.commit_prebuilt(first)
+        assert first_id is not None
+        (paths.capture_buffer_dir() / f"{first_id}.json").unlink()
+
+        stats = scheduler_mod.cleanup_buffer(retention_hours=24 * 365)
+
+        assert stats == {"deleted": 0, "stripped": 0, "thumbnailed": 0, "evicted": 0}
+        with fts.cursor() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM capture_content_receipts").fetchone()[0] == 0
+        second = {**first, "timestamp": "2026-08-11T00:00:00+00:00"}
+        assert runner.commit_prebuilt(second) is not None
+    finally:
+        scheduler_mod._set_active_runner(None)
+
+
 def test_hard_cap_continues_after_unlink_failure(ac_root: Path, monkeypatch) -> None:
     written: list[Path] = []
     for i in range(3):
@@ -370,8 +632,19 @@ def test_prune_does_not_delete_row_inserted_after_candidate_snapshot(
             return [("old",)]
 
     class _Conn:
-        def execute(self, sql: str):  # type: ignore[no-untyped-def]
-            return _Rows() if sql == "SELECT id FROM captures" else self
+        def execute(self, sql: str, _params=()):  # type: ignore[no-untyped-def]
+            if sql == "SELECT id FROM captures":
+                return _Rows()
+            if sql == "SELECT DISTINCT capture_id FROM capture_content_receipts":
+                return type(
+                    "_ReceiptRows",
+                    (),
+                    {
+                        "fetchall": lambda self: [],
+                        "__iter__": lambda self: iter(()),
+                    },
+                )()
+            return self
 
     @contextmanager
     def fake_cursor():  # type: ignore[no-untyped-def]

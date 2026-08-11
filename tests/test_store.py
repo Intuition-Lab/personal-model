@@ -745,6 +745,105 @@ def test_client_connect_requires_current_runtime_schema(
         raw.close()
 
 
+def test_client_rejects_previous_daemon_schema_revision(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fts.initialize_runtime_schema()
+    with fts.cursor() as conn:
+        # A previous daemon may have a self-consistent fingerprint receipt;
+        # the exact revision still has to reject version skew before a new
+        # client reads columns that daemon never created.
+        conn.execute(
+            "UPDATE runtime_metadata SET value=? WHERE key='schema_revision'",
+            ("2026-07-15.1",),
+        )
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    with pytest.raises(RuntimeError, match="not initialized for this Persome version"):
+        fts.connect()
+
+
+def test_runtime_owner_upgrades_previous_schema_revision(ac_root: Path) -> None:
+    fts.initialize_runtime_schema()
+    with fts.cursor() as conn:
+        conn.execute(
+            "UPDATE runtime_metadata SET value=? WHERE key='schema_revision'",
+            ("2026-08-11.3",),
+        )
+
+    assert fts.initialize_runtime_schema() == fts._RUNTIME_SCHEMA_REVISION  # noqa: SLF001
+    with fts.cursor() as conn:
+        revision = conn.execute(
+            "SELECT value FROM runtime_metadata WHERE key='schema_revision'"
+        ).fetchone()[0]
+    assert revision == fts._RUNTIME_SCHEMA_REVISION  # noqa: SLF001
+
+
+def test_runtime_schema_revision_four_installs_capture_content_receipts(
+    ac_root: Path,
+) -> None:
+    assert fts._RUNTIME_SCHEMA_REVISION == "2026-08-11.4"  # noqa: SLF001
+
+    assert fts.initialize_runtime_schema() == "2026-08-11.4"
+
+    with fts.cursor() as conn:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ("capture_content_receipts",),
+        ).fetchone()
+        revision = conn.execute(
+            "SELECT value FROM runtime_metadata WHERE key='schema_revision'"
+        ).fetchone()[0]
+    assert table is not None
+    assert revision == "2026-08-11.4"
+
+
+def test_runtime_owner_refuses_future_schema_revision_without_republishing(
+    ac_root: Path,
+) -> None:
+    fts.initialize_runtime_schema()
+    future = "2099-01-01.1"
+    with fts.cursor() as conn:
+        # A future release may intentionally remove or replace an old-owned
+        # table. If the compatibility check runs only after ``connect()`` schema
+        # setup, this sentinel is silently recreated before refusal.
+        conn.execute("DROP TABLE timeline_blocks")
+        conn.execute(
+            "UPDATE runtime_metadata SET value=? WHERE key='schema_revision'",
+            (future,),
+        )
+        before_schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        before_fingerprint = conn.execute(
+            "SELECT value FROM runtime_metadata WHERE key='schema_fingerprint'"
+        ).fetchone()[0]
+
+    # The ordinary owner connection must reject before WAL/schema setup, not
+    # only when explicit initialization eventually checks the receipt.
+    with pytest.raises(RuntimeError, match="newer.*refusing to downgrade"):
+        fts.open_runtime_owner()
+
+    conn = sqlite3.connect(paths.index_db())
+    try:
+        receipt = dict(
+            conn.execute(
+                "SELECT key, value FROM runtime_metadata "
+                "WHERE key IN ('schema_revision', 'schema_fingerprint')"
+            ).fetchall()
+        )
+        after_schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        timeline_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='timeline_blocks'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert receipt == {
+        "schema_revision": future,
+        "schema_fingerprint": before_fingerprint,
+    }
+    assert after_schema_version == before_schema_version
+    assert timeline_exists is None
+
+
 def test_client_connect_rejects_schema_receipt_mismatch(
     ac_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

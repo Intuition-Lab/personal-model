@@ -53,6 +53,7 @@ def _seed_blocks(start: datetime) -> list[timeline_store.TimelineBlock]:
                 entries=[f"[Cursor] edited file_{i}.py, involving nothing"],
                 apps_used=["Cursor"],
                 capture_count=6,
+                normalization_status="legacy",
             )
             timeline_store.insert(conn, b)
             bs.append(b)
@@ -134,6 +135,7 @@ def test_reducer_prompt_does_not_replay_earlier_same_day_tasks(ac_root: Path, fa
             entries=["[Cursor] fixed an MCP startup test, involving server.py"],
             apps_used=["Cursor"],
             capture_count=3,
+            normalization_status="legacy",
         )
     ]
     fake_llm.set_default(
@@ -190,6 +192,195 @@ def test_reducer_no_blocks_marks_reduced_no_write(ac_root: Path) -> None:
         row = session_store.get_by_id(conn, "sess_empty")
     assert row is not None
     assert row.status == "reduced"
+
+
+def test_reducer_consumes_ineligible_terminal_blocks_without_llm_or_event(
+    ac_root: Path, fake_llm
+) -> None:
+    start = datetime(2026, 4, 21, 11, 10, tzinfo=_TZ)
+    end = start + timedelta(minutes=5)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=["[Cursor] active, involving —"],
+                apps_used=["Cursor"],
+                capture_count=2,
+                normalization_status="llm_failed",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess_ineligible_terminal",
+                start_time=start,
+                end_time=end,
+                status="ended",
+            ),
+        )
+
+    result = session_reducer.reduce_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id="sess_ineligible_terminal",
+        start_time=start,
+        end_time=end,
+    )
+
+    assert result.consumed is True
+    assert result.written is False
+    assert fake_llm.calls == []
+    assert not (paths.memory_dir() / "event-2026-04-21.md").exists()
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_ineligible_terminal")
+    assert row is not None
+    assert row.status == "reduced"
+    assert row.flush_end == end
+
+
+def test_reducer_consumes_ineligible_active_blocks_and_advances_watermark(
+    ac_root: Path, fake_llm
+) -> None:
+    start = datetime(2026, 4, 21, 11, 20, tzinfo=_TZ)
+    now = start + timedelta(minutes=5)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=now,
+                entries=[],
+                apps_used=["System Settings"],
+                capture_count=1,
+                normalization_status="metadata_only",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess_ineligible_active",
+                start_time=start,
+                status="active",
+            ),
+        )
+
+    result = session_reducer.flush_active_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id="sess_ineligible_active",
+        session_start=start,
+        now=now,
+    )
+
+    assert result is not None
+    assert result.consumed is True
+    assert result.written is False
+    assert fake_llm.calls == []
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_ineligible_active")
+    assert row is not None
+    assert row.status == "active"
+    assert row.flush_end == now
+
+
+def test_reducer_prompt_uses_only_eligible_blocks_but_consumes_full_window(
+    ac_root: Path, fake_llm
+) -> None:
+    start = datetime(2026, 4, 21, 11, 30, tzinfo=_TZ)
+    middle = start + timedelta(minutes=5)
+    end = middle + timedelta(minutes=5)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=middle,
+                entries=["[Cursor] fixed the grounded parser test"],
+                apps_used=["Cursor"],
+                normalization_status="llm",
+            ),
+        )
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=middle,
+                end_time=end,
+                entries=["[Mail] active, involving —"],
+                apps_used=["Mail"],
+                normalization_status="llm_failed",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess_mixed_quality",
+                start_time=start,
+                status="active",
+            ),
+        )
+    fake_llm.set_default(
+        "reducer",
+        json.dumps(
+            {
+                "summary": "Fixed the parser test.",
+                "sub_tasks": ["[11:30-11:35, Cursor] fixed the parser test"],
+            }
+        ),
+    )
+
+    result = session_reducer.flush_active_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id="sess_mixed_quality",
+        session_start=start,
+        now=end,
+    )
+
+    assert result is not None and result.written
+    prompt = json.dumps(fake_llm.calls[0]["messages"], ensure_ascii=False)
+    assert "grounded parser test" in prompt
+    assert "active, involving" not in prompt
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_mixed_quality")
+    assert row is not None and row.flush_end == end
+
+
+def test_reducer_empty_subtasks_are_consumed_without_generic_fallback(
+    ac_root: Path, fake_llm
+) -> None:
+    start = datetime(2026, 4, 21, 11, 50, tzinfo=_TZ)
+    end = start + timedelta(minutes=5)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=["[Cursor] inspected a local file"],
+                apps_used=["Cursor"],
+                normalization_status="llm",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess_empty_subtasks",
+                start_time=start,
+                end_time=end,
+                status="ended",
+            ),
+        )
+    fake_llm.set_default("reducer", json.dumps({"summary": "", "sub_tasks": []}))
+
+    result = session_reducer.reduce_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id="sess_empty_subtasks",
+        start_time=start,
+        end_time=end,
+    )
+
+    assert result.consumed is True
+    assert result.written is False
+    assert not (paths.memory_dir() / "event-2026-04-21.md").exists()
 
 
 def test_reducer_llm_failure_schedules_retry(ac_root: Path, fake_llm) -> None:
@@ -365,6 +556,7 @@ def test_terminal_reduce_after_flush_covers_trailing_window(
                     entries=[f"[Cursor] step_{i}, involving nothing"],
                     apps_used=["Cursor"],
                     capture_count=3,
+                    normalization_status="legacy",
                 ),
             )
         # Pretend a flush already consumed the first block.

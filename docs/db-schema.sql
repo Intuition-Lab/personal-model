@@ -141,6 +141,7 @@ CREATE TABLE timeline_blocks (
     attention_surface TEXT NOT NULL DEFAULT '',
     attention_confidence REAL NOT NULL DEFAULT 0.0,
     attention_rung TEXT NOT NULL DEFAULT '',
+    normalization_status TEXT NOT NULL DEFAULT 'legacy',
     UNIQUE(start_time, end_time)
 );
 
@@ -188,10 +189,31 @@ CREATE TRIGGER captures_au AFTER UPDATE ON captures BEGIN
     VALUES (new.rowid, new.app_name, new.window_title, new.focused_value, new.visible_text, new.url);
 END;
 
+-- ---- store/capture_content_receipts.py ----
+
+CREATE TABLE capture_content_receipts (
+        sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+        fingerprint  TEXT NOT NULL,
+        capture_id   TEXT NOT NULL,
+        committed_at TEXT NOT NULL
+    );
+
+CREATE INDEX ix_capture_content_receipts_fingerprint
+        ON capture_content_receipts(fingerprint, sequence);
+
 -- ---- store/relation_edges.py ----
+
+CREATE TABLE relation_edge_effects (
+    effect_key           TEXT PRIMARY KEY,
+    edge_id              TEXT NOT NULL,
+    edge_key             TEXT NOT NULL,
+    applied_observations INTEGER NOT NULL CHECK (applied_observations = 1),
+    created_at           TEXT NOT NULL
+);
 
 CREATE TABLE relation_edges (
     edge_id      TEXT PRIMARY KEY,
+    edge_key     TEXT NOT NULL,          -- canonical logical identity; not a display label
     src_identity TEXT NOT NULL,          -- stable canonical identity, never a version node ID
     dst_identity TEXT NOT NULL,
     predicate    TEXT NOT NULL,          -- one closed-set predicate
@@ -211,6 +233,126 @@ CREATE TABLE relation_edges (
 CREATE INDEX ix_edges_dst ON relation_edges(dst_identity, valid_from);
 
 CREATE INDEX ix_edges_src ON relation_edges(src_identity, valid_from);
+
+CREATE INDEX ix_relation_edge_effects_edge_id ON relation_edge_effects(edge_id);
+
+CREATE UNIQUE INDEX uq_relation_edges_open_edge_key
+ON relation_edges(edge_key)
+WHERE valid_to IS NULL AND status IN ('active', 'shadow')
+;
+
+-- ---- store/event_occurrences.py ----
+
+CREATE TABLE event_occurrences (
+    occurrence_id TEXT PRIMARY KEY,
+    series_id TEXT NOT NULL,
+    delta_id INTEGER,
+    session_id TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    participants TEXT NOT NULL DEFAULT '[]',
+    quote TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, window_start, window_end, item_key)
+);
+
+CREATE INDEX ix_event_occurrences_series
+        ON event_occurrences(series_id, window_start);
+
+CREATE INDEX ix_event_occurrences_session
+        ON event_occurrences(session_id, window_start);
+
+-- ---- store/memory_delta_items.py ----
+
+CREATE TABLE memory_delta_items (
+    delta_id INTEGER NOT NULL,
+    item_kind TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    payload_hash TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    claim_token TEXT NOT NULL DEFAULT '',
+    lease_until TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    effect_kind TEXT NOT NULL DEFAULT '',
+    effect_id TEXT NOT NULL DEFAULT '',
+    geometry_changed INTEGER CHECK (geometry_changed IN (0, 1)),
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (delta_id, item_kind, item_key)
+);
+
+CREATE INDEX ix_memory_delta_items_state
+    ON memory_delta_items(delta_id, state, ordinal);
+
+CREATE UNIQUE INDEX uq_memory_delta_items_ordinal
+    ON memory_delta_items(delta_id, ordinal);
+
+-- ---- store/model_candidates.py ----
+
+CREATE TABLE model_candidate_decisions (
+        decision_id    TEXT PRIMARY KEY,
+        candidate_key  TEXT NOT NULL,
+        from_status    TEXT NOT NULL,
+        to_status      TEXT NOT NULL,
+        source_kind    TEXT NOT NULL,
+        source_receipt TEXT NOT NULL,
+        reason         TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL,
+        UNIQUE(candidate_key, source_kind, source_receipt),
+        FOREIGN KEY(candidate_key) REFERENCES model_candidates(candidate_key)
+    );
+
+CREATE TABLE model_candidate_evidence (
+        evidence_receipt TEXT PRIMARY KEY,
+        candidate_key    TEXT NOT NULL,
+        session_id       TEXT NOT NULL,
+        window_start     TEXT NOT NULL,
+        window_end       TEXT NOT NULL,
+        source_kind      TEXT NOT NULL,
+        quote            TEXT NOT NULL,
+        confidence       REAL NOT NULL,
+        payload_hash     TEXT NOT NULL,
+        created_at       TEXT NOT NULL,
+        UNIQUE(candidate_key, session_id, window_start, window_end),
+        FOREIGN KEY(candidate_key) REFERENCES model_candidates(candidate_key)
+    );
+
+CREATE TABLE model_candidates (
+        candidate_key        TEXT PRIMARY KEY,
+        candidate_kind       TEXT NOT NULL,
+        subject              TEXT NOT NULL,
+        text                 TEXT NOT NULL,
+        canonical_subject    TEXT NOT NULL,
+        canonical_text       TEXT NOT NULL,
+        status               TEXT NOT NULL,
+        evidence_count       INTEGER NOT NULL DEFAULT 0,
+        independent_sessions INTEGER NOT NULL DEFAULT 0,
+        first_seen_at         TEXT NOT NULL,
+        last_seen_at          TEXT NOT NULL,
+        promoted_at           TEXT,
+        rejected_at           TEXT,
+        decision_source       TEXT NOT NULL DEFAULT 'observation',
+        CHECK(candidate_kind IN ('person','org','project','artifact','assertion')),
+        CHECK(status IN ('pending','rejected','promoted'))
+    );
+
+CREATE INDEX ix_model_candidate_decisions_candidate
+        ON model_candidate_decisions(candidate_key, created_at)
+    ;
+
+CREATE INDEX ix_model_candidate_evidence_candidate
+        ON model_candidate_evidence(candidate_key, created_at)
+    ;
+
+CREATE INDEX ix_model_candidates_status
+        ON model_candidates(status, last_seen_at)
+    ;
 
 -- ---- store/contradictions.py ----
 
@@ -255,6 +397,19 @@ CREATE INDEX idx_health_events_provider_time
 
 -- ---- store/memory_deltas.py ----
 
+CREATE TABLE memory_delta_window_claims (
+    session_id TEXT NOT NULL,
+    window_key TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    state TEXT NOT NULL,
+    claim_token TEXT NOT NULL DEFAULT '',
+    lease_until TEXT NOT NULL DEFAULT '',
+    delta_id INTEGER,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, window_key)
+);
+
 CREATE TABLE memory_deltas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -266,8 +421,12 @@ CREATE TABLE memory_deltas (
     apply_status TEXT NOT NULL DEFAULT 'unknown',
     window_start TEXT NOT NULL DEFAULT '',
     window_end TEXT NOT NULL DEFAULT '',
-    is_final INTEGER NOT NULL DEFAULT 1
+    is_final INTEGER NOT NULL DEFAULT 1,
+    item_ledger_version INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE UNIQUE INDEX idx_memory_delta_window_claim_delta
+    ON memory_delta_window_claims(delta_id) WHERE delta_id IS NOT NULL;
 
 CREATE INDEX idx_memory_deltas_created ON memory_deltas(created_at DESC);
 
@@ -358,10 +517,23 @@ CREATE TABLE schema_faces (
     created_at   TEXT NOT NULL
 , anchors TEXT NOT NULL DEFAULT '[]');
 
+CREATE TABLE schema_input_receipts (
+    producer    TEXT NOT NULL,
+    sample_day TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    level       INTEGER NOT NULL,
+    object_id   TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (producer, sample_day, input_hash)
+);
+
 CREATE INDEX ix_cross_domain_probe_age
     ON cross_domain_probe_state(last_probed_at, pair_key);
 
 CREATE INDEX ix_faces_status ON schema_faces(status, level);
+
+CREATE INDEX ix_schema_input_receipts_object
+    ON schema_input_receipts(object_id, level);
 
 -- ---- source_import.py ----
 

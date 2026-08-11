@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -67,6 +68,49 @@ def _norm_ended(item: dict) -> bool:
     return item.get("ended") is True
 
 
+def _coalesce_entity_candidates(items: list[dict]) -> tuple[list[dict], int]:
+    """Collapse one window's repeated semantic entity candidates.
+
+    The item ledger intentionally gives an entity one stable key per
+    ``kind + normalized identity``.  LLMs can nevertheless repeat that entity
+    with casing, whitespace, quote, or confidence drift in the same reply.  A
+    deterministic winner keeps that harmless drift from turning the whole
+    window into an immutable-ledger collision.  Conflicting lifecycle claims
+    are not evidence variants, so they fail closed as a group.
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for item in items:
+        canonical = item.get("ref") or item.get("new_entity") or ""
+        key = (str(item.get("kind") or ""), identity_mod.norm(str(canonical)))
+        groups.setdefault(key, []).append(item)
+
+    clean: list[dict] = []
+    dropped = 0
+    for candidates in groups.values():
+        lifecycle = {bool(candidate.get("ended")) for candidate in candidates}
+        if len(lifecycle) != 1:
+            dropped += len(candidates)
+            continue
+
+        def rank(candidate: dict) -> tuple[float, int, str]:
+            try:
+                confidence = float(candidate.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            quote = str(candidate.get("quote") or "")
+            stable = json.dumps(
+                candidate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return (-confidence, -len(quote), stable)
+
+        clean.append(min(candidates, key=rank))
+        dropped += len(candidates) - 1
+    return clean, dropped
+
+
 # Injectable LLM seam (mirrors case_extractor): resolved lazily so the
 # ``fake_llm`` fixture's monkeypatched ``llm_mod.call_llm`` is picked up.
 LlmCallFn = Callable[..., Any]
@@ -85,6 +129,31 @@ class DeltaResult:
     counts: dict[str, int] = field(default_factory=dict)
     dropped: int = 0
     skipped_reason: str = ""
+    # ``None`` preserves the conservative legacy/recovery fallback. Fresh
+    # itemized applies set an exact value so pending candidates do not schedule
+    # a structural rebuild before any Point or Line changed.
+    geometry_changed: bool | None = None
+
+
+def _geometry_changed(apply_result: Any) -> bool:
+    return any(
+        int(getattr(apply_result, field, 0) or 0) > 0
+        for field in (
+            "entities_minted",
+            "assertions_minted",
+            "edges_new",
+            "edges_reinforced",
+            "edges_closed",
+            "events_minted",
+            "floor_edges",
+            "supersedes_applied",
+        )
+    )
+
+
+def window_block_limit(cfg: Any) -> int:
+    """Bound one prompt while reserving one read slot to detect overflow."""
+    return max(1, min(int(getattr(cfg.memory_delta, "max_blocks", 120)), 199))
 
 
 def _safe_json(text: str) -> dict:
@@ -146,6 +215,8 @@ def _render_blocks(blocks: list[tl_store.TimelineBlock]) -> str:
     """
     parts: list[str] = []
     for b in blocks:
+        if not b.eligible_for_modeling:
+            continue
         raw_entries = list(b.entries or [])
         entries = [entry for entry in raw_entries if not _is_local_model_output(entry)]
         if not entries:
@@ -270,6 +341,8 @@ def gate_delta(
     clean: dict[str, list[dict]] = {h: [] for h in _HEADS}
     clean["owner_alias_candidates"] = list(owner_candidates or [])
     dropped = 0
+    entity_identity_rewrites: dict[str, dict[str, str]] = {}
+    ambiguous_entity_identities: set[str] = set()
     protected_owner_keys = {
         identity_mod.norm(alias) for alias in (protected_owner_aliases or []) if alias
     }
@@ -287,6 +360,12 @@ def gate_delta(
         unresolved = canonical.get("new_entity")
         if unresolved and identity_mod.norm(unresolved) in protected_owner_keys:
             return None
+        key = identity_mod.norm(canonical.get("ref") or unresolved or "")
+        if key in ambiguous_entity_identities:
+            return None
+        replacement = entity_identity_rewrites.get(key)
+        if replacement is not None:
+            return dict(replacement)
         return canonical
 
     for item in raw.get("entities") or []:
@@ -308,6 +387,28 @@ def gate_delta(
             )
         else:
             dropped += 1
+
+    clean["entities"], entity_duplicates = _coalesce_entity_candidates(clean["entities"])
+    dropped += entity_duplicates
+    entity_kinds: dict[str, str] = {}
+    for entity in clean["entities"]:
+        canonical = str(entity.get("ref") or entity.get("new_entity") or "")
+        key = identity_mod.norm(canonical)
+        kind = str(entity.get("kind") or "")
+        if not key:
+            continue
+        previous_kind = entity_kinds.get(key)
+        if previous_kind is not None and previous_kind != kind:
+            # Identity objects do not carry a kind. If one normalized label is
+            # proposed as two kinds in the same window, nested references are
+            # ambiguous and must fail closed rather than inherit list order.
+            entity_identity_rewrites.pop(key, None)
+            ambiguous_entity_identities.add(key)
+            continue
+        if key not in ambiguous_entity_identities:
+            entity_kinds[key] = kind
+            identity_key = "ref" if entity.get("ref") else "new_entity"
+            entity_identity_rewrites[key] = {identity_key: canonical}
 
     for item in raw.get("assertions") or []:
         subject = ident(item.get("subject")) if isinstance(item, dict) else None
@@ -401,6 +502,29 @@ def gate_delta(
     return clean, dropped
 
 
+def _release_claim(
+    claim: deltas_store.WindowClaim | None,
+    *,
+    session_id: str,
+    start_time: datetime,
+    end_time: datetime,
+) -> None:
+    """Release only the token still owned after a handled pre-persist failure."""
+    if claim is None or not claim.acquired:
+        return
+    try:
+        with fts.cursor() as conn:
+            deltas_store.fail_claim(
+                conn,
+                session_id=session_id,
+                window_start=start_time,
+                window_end=end_time,
+                token=claim.token,
+            )
+    except Exception:  # noqa: BLE001 - lease expiry remains the crash recovery path
+        logger.warning("memory_delta %s: could not release failed claim", session_id, exc_info=True)
+
+
 def run_after_session(
     cfg: Any,
     *,
@@ -410,7 +534,12 @@ def run_after_session(
     llm_call: LlmCallFn | None = None,
     is_final: bool = True,
 ) -> DeltaResult:
-    """Consolidate one bounded session window into a shadow memory_delta row."""
+    """Consolidate one bounded session window into a shadow memory_delta row.
+
+    Every bounded extraction path claims its canonical window before the LLM.
+    Legacy append rows remain valid because the claim lives in a separate
+    table and the base ``memory_deltas`` table keeps its historical shape.
+    """
     result = DeltaResult(session_id=session_id)
     if not getattr(cfg.memory_delta, "enabled", False):
         result.skipped_reason = "disabled"
@@ -419,13 +548,14 @@ def run_after_session(
         result.skipped_reason = "no_window"
         return result
 
-    max_blocks = int(getattr(cfg.memory_delta, "max_blocks", 120))
+    max_blocks = window_block_limit(cfg)
     try:
         with fts.cursor() as conn:
-            # newest-first + limit gives the window's most recent max_blocks;
-            # reversed back to chronological order for the event log.
-            blocks = list(
-                reversed(tl_store.query_range(conn, start_time, end_time, limit=max_blocks))
+            blocks = tl_store.query_range_oldest(
+                conn,
+                start_time,
+                end_time,
+                limit=max_blocks + 1,
             )
     except Exception:  # noqa: BLE001 — fail-open, never disturb the writer chain
         logger.warning("memory_delta %s: block read failed", session_id, exc_info=True)
@@ -434,11 +564,39 @@ def run_after_session(
     if not blocks:
         result.skipped_reason = "no_blocks"
         return result
+    if len(blocks) > max_blocks:
+        # The shared agent splits long recovery ranges before calling us. A
+        # direct caller must not let a truncated prompt claim the full window.
+        result.skipped_reason = "window_too_large"
+        return result
+
+    if not any(block.eligible_for_modeling for block in blocks):
+        result.skipped_reason = "no_eligible_evidence"
+        return result
 
     roster_entries = _load_roster(cfg)
     session_text = _render_blocks(blocks)
     if not session_text.strip():
         result.skipped_reason = "model_output_only"
+        return result
+
+    try:
+        with fts.cursor() as conn:
+            window_claim = deltas_store.claim_window(
+                conn,
+                session_id=session_id,
+                window_start=start_time,
+                window_end=end_time,
+            )
+    except Exception:  # noqa: BLE001 - do not call the LLM without a durable claim
+        logger.warning("memory_delta %s: window claim failed", session_id, exc_info=True)
+        result.skipped_reason = "claim_failed"
+        return result
+    if not window_claim.acquired:
+        result.delta_id = window_claim.delta_id
+        result.skipped_reason = (
+            "already_processed" if window_claim.delta_id else "claim_in_progress"
+        )
         return result
 
     _cache = {"type": "ephemeral"}
@@ -467,11 +625,23 @@ def run_after_session(
         response = call(cfg, STAGE, messages)
         raw = _safe_json(llm_mod.extract_text(response))
     except Exception:  # noqa: BLE001 — LLM errors never disturb the chain
+        _release_claim(
+            window_claim,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
         logger.warning("memory_delta %s: LLM call failed", session_id, exc_info=True)
         result.skipped_reason = "llm_failed"
         return result
 
     if not raw:
+        _release_claim(
+            window_claim,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
         result.skipped_reason = "unparseable"
         return result
 
@@ -504,10 +674,11 @@ def run_after_session(
                 protected_owner_aliases=owner_identity.reserved_aliases(cfg, conn=conn),
             )
             dropped = candidate_dropped + gated_dropped
-            delta_id = deltas_store.insert(
+            delta_id = deltas_store.insert_for_claim(
                 conn,
                 session_id=session_id,
                 payload=clean,
+                token=window_claim.token,
                 model=cfg.model_for(STAGE).model,
                 dropped=dropped,
                 apply_status=(
@@ -519,7 +690,17 @@ def run_after_session(
                 window_end=end_time,
                 is_final=is_final,
             )
+    except deltas_store.ClaimLostError:
+        logger.info("memory_delta %s: window claim was replaced before persist", session_id)
+        result.skipped_reason = "claim_lost"
+        return result
     except Exception:  # noqa: BLE001
+        _release_claim(
+            window_claim,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
         logger.warning("memory_delta %s: persist failed", session_id, exc_info=True)
         result.skipped_reason = "persist_failed"
         return result
@@ -529,22 +710,48 @@ def run_after_session(
             from . import delta_apply
 
             with fts.cursor() as conn:
-                ar = delta_apply.apply_delta(conn, cfg, clean)
-                deltas_store.set_apply_status(conn, delta_id, "applied")
-            logger.info(
-                "memory_delta %s: applied (entities +%d/=%d, edges +%d~%d closed %d, events %d)",
-                session_id,
-                ar.entities_minted,
-                ar.entities_seen,
-                ar.edges_new,
-                ar.edges_reinforced,
-                ar.edges_closed,
-                ar.events_minted,
-            )
-            result.applied = True
+                ar = delta_apply.apply_persisted_delta(
+                    conn,
+                    cfg,
+                    clean,
+                    delta_id=delta_id,
+                    session_id=session_id,
+                    window_start=start_time,
+                    window_end=end_time,
+                )
+                if ar.errors:
+                    deltas_store.set_apply_status(conn, delta_id, "failed")
+                elif ar.skipped_reason == "item_in_progress":
+                    deltas_store.set_apply_status(conn, delta_id, "pending")
+                else:
+                    deltas_store.set_apply_status(conn, delta_id, "applied")
+            if ar.errors:
+                result.skipped_reason = "apply_failed"
+                logger.warning(
+                    "memory_delta %s: apply completed with %d item error(s): %s",
+                    session_id,
+                    len(ar.errors),
+                    "; ".join(ar.errors[:3]),
+                )
+            elif ar.skipped_reason == "item_in_progress":
+                result.skipped_reason = "apply_in_progress"
+            else:
+                logger.info(
+                    "memory_delta %s: applied (entities +%d/=%d, edges +%d~%d closed %d, events %d)",
+                    session_id,
+                    ar.entities_minted,
+                    ar.entities_seen,
+                    ar.edges_new,
+                    ar.edges_reinforced,
+                    ar.edges_closed,
+                    ar.events_minted,
+                )
+                result.applied = True
+                result.geometry_changed = _geometry_changed(ar) or ar.geometry_changed is not False
         except Exception:  # noqa: BLE001 — apply
             with fts.cursor() as conn:
                 deltas_store.set_apply_status(conn, delta_id, "failed")
+            result.skipped_reason = "apply_failed"
             logger.warning("memory_delta %s: apply failed", session_id, exc_info=True)
 
     result.written = True
@@ -616,15 +823,43 @@ def _ensure_window(
     Active and terminal modeling are retryable. A retry must not spend another
     LLM call or reinforce relation observations twice after a successful run.
     """
-    if start_time is None or end_time is None or start_time >= end_time:
+    if start_time is None or end_time is None:
+        return DeltaResult(session_id=session_id, skipped_reason="no_window")
+    try:
+        deltas_store.canonical_window_key(start_time, end_time)
+    except (TypeError, ValueError):
         return DeltaResult(session_id=session_id, skipped_reason="no_window")
     with fts.cursor() as conn:
-        existing = deltas_store.latest_for_window(
+        existing = deltas_store.persisted_for_window(
             conn,
             session_id,
             window_start=start_time,
             window_end=end_time,
         )
+        if existing is None:
+            existing = deltas_store.latest_for_window(
+                conn,
+                session_id,
+                window_start=start_time,
+                window_end=end_time,
+            )
+            if existing is not None:
+                try:
+                    deltas_store.remember_persisted_window(
+                        conn,
+                        session_id=session_id,
+                        window_start=start_time,
+                        window_end=end_time,
+                        delta_id=int(existing["id"]),
+                    )
+                except sqlite3.Error:
+                    # Reusing the already persisted legacy row is safe even if
+                    # its optional canonical backfill loses a startup race.
+                    logger.debug(
+                        "memory_delta %s: legacy claim backfill failed",
+                        session_id,
+                        exc_info=True,
+                    )
         if existing is None and allow_legacy:
             legacy = deltas_store.latest_for_session(conn, session_id)
             if legacy is not None and not str(legacy["window_end"] or ""):
@@ -645,6 +880,10 @@ def _ensure_window(
         skipped_reason="already_processed",
     )
     status = str(existing["apply_status"] or "unknown")
+    prior_apply_status = status
+    legacy_unwindowed = not str(existing["window_start"] or "") or not str(
+        existing["window_end"] or ""
+    )
     try:
         payload = json.loads(existing["payload"] or "{}")
     except (TypeError, ValueError):
@@ -658,13 +897,85 @@ def _ensure_window(
     }:
         return result
 
+    # Before the item ledger existed, a pending/failed row could already have
+    # committed any subset of its effects. There is no durable fact that lets
+    # recovery distinguish "not attempted" from "effect committed, parent ack
+    # lost". Never synthesize new receipts and replay an additive Line in that
+    # ambiguous state; leave the row failed for explicit audit/repair. A
+    # not_requested row is safe because it explicitly records that application
+    # never began.
+    ledger_version = int(existing["item_ledger_version"] or 0)
+    has_effect_items = any(
+        isinstance(payload.get(head), list)
+        and any(isinstance(item, dict) for item in payload.get(head) or [])
+        for head in ("entities", "assertions", "relations", "events")
+    )
+    if (
+        ledger_version < deltas_store.ITEM_LEDGER_VERSION
+        and status in {"pending", "failed"}
+        and has_effect_items
+    ):
+        result.applied = False
+        result.skipped_reason = "legacy_apply_ambiguous"
+        logger.warning(
+            "memory_delta %s: legacy row %d may contain partial effects; refusing replay",
+            session_id,
+            result.delta_id,
+        )
+        return result
+
     try:
         from . import delta_apply
 
         with fts.cursor() as conn:
-            delta_apply.apply_delta(conn, cfg, payload)
-            deltas_store.set_apply_status(conn, result.delta_id, "applied")
+            ledger_geometry_changed: bool | None = False
+            if legacy_unwindowed:
+                # A pre-window row has no occurrence/candidate provenance to
+                # recover. Preserve its historical context-free apply instead
+                # of laundering this recovery call's bounds into new receipts.
+                ar = delta_apply.apply_delta(
+                    conn,
+                    cfg,
+                    payload,
+                    delta_id=result.delta_id,
+                )
+            else:
+                ar = delta_apply.apply_persisted_delta(
+                    conn,
+                    cfg,
+                    payload,
+                    delta_id=result.delta_id,
+                    session_id=session_id,
+                    window_start=start_time,
+                    window_end=end_time,
+                )
+                ledger_geometry_changed = ar.geometry_changed
+            status = "failed" if ar.errors else "applied"
+            if ar.skipped_reason == "item_in_progress":
+                status = "pending"
+            deltas_store.set_apply_status(conn, result.delta_id, status)
+        if ar.errors:
+            result.skipped_reason = "apply_failed"
+            logger.warning(
+                "memory_delta %s: retry completed with %d item error(s): %s",
+                session_id,
+                len(ar.errors),
+                "; ".join(ar.errors[:3]),
+            )
+            return result
+        if ar.skipped_reason == "item_in_progress":
+            result.skipped_reason = "apply_in_progress"
+            return result
         result.applied = True
+        # A prior failed apply may have committed an idempotent effect before
+        # losing its item acknowledgement. The successful replay then reports
+        # zero new effects, but the structure still changed since the watermark
+        # last advanced and must be rebuilt.
+        result.geometry_changed = (
+            _geometry_changed(ar)
+            or ledger_geometry_changed is not False
+            or prior_apply_status == "failed"
+        )
         result.skipped_reason = "resumed_apply"
     except Exception:  # noqa: BLE001 - leave retryable state for the next finalizer run
         with fts.cursor() as conn:

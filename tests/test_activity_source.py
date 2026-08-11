@@ -17,6 +17,7 @@ from persome.model.activity_source import (
 )
 from persome.session import store as session_store
 from persome.store import entries as entries_store
+from persome.store import event_occurrences as occurrences_store
 from persome.store import fts
 from persome.timeline import store as timeline_store
 
@@ -69,6 +70,7 @@ def _seed_sources(conn) -> str:
             entries=["[Editor] revised the Runtime documentation with Test Contact"],
             apps_used=["Editor"],
             capture_count=1,
+            normalization_status="legacy",
         ),
     )
     session_store.insert(
@@ -130,6 +132,130 @@ def test_activity_source_can_exclude_legacy_intents(ac_root) -> None:
         events = ActivitySource(conn, include_legacy_intents=False).events()
     assert {event.source_kind for event in events} == {"entry", "session"}
     assert all(not event.stable_id.startswith("event:intent:") for event in events)
+
+
+def test_activity_source_prefers_grounded_entry_over_duplicate_session_event(ac_root) -> None:
+    start = datetime(2026, 7, 10, 11, 0, tzinfo=TZ)
+    end = start + timedelta(minutes=5)
+    with fts.cursor() as conn:
+        entries_store.create_file(
+            conn,
+            name="event-2026-07-10.md",
+            description="Synthetic reducer output",
+            tags=["event"],
+        )
+        entry_id = entries_store.append_entry(
+            conn,
+            name="event-2026-07-10.md",
+            content="Reviewed the grounded runtime plan.",
+            tags=["session", "sid:same-occurrence"],
+        )
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=["Reviewed the grounded runtime plan."],
+                normalization_status="llm",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="same-occurrence", start_time=start, end_time=end, status="reduced"
+            ),
+        )
+        source = ActivitySource(conn, include_legacy_intents=False)
+        events = source.events()
+        exact_session = source.event("event:session:same-occurrence")
+
+    assert [event.stable_id for event in events] == [f"event:entry:{entry_id}"]
+    assert exact_session is not None
+
+
+def test_activity_source_prefers_occurrence_but_retains_exact_legacy_lookups(ac_root) -> None:
+    start = datetime(2026, 7, 10, 11, 0, tzinfo=TZ)
+    end = start + timedelta(minutes=5)
+    with fts.cursor() as conn:
+        entries_store.create_file(
+            conn,
+            name="event-2026-07-10.md",
+            description="Synthetic reducer output",
+            tags=["event"],
+        )
+        entry_id = entries_store.append_entry(
+            conn,
+            name="event-2026-07-10.md",
+            content="Reviewed the grounded runtime plan with Test Contact.",
+            tags=["session", "sid:occurrence-session"],
+        )
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=["Reviewed the grounded runtime plan with Test Contact."],
+                normalization_status="llm",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="occurrence-session", start_time=start, end_time=end, status="reduced"
+            ),
+        )
+        occurrence, _ = occurrences_store.upsert(
+            conn,
+            session_id="occurrence-session",
+            window_start=start,
+            window_end=end,
+            item_key="review-1",
+            title="Reviewed the grounded runtime plan",
+            participants=["Test Contact"],
+            quote="Reviewed the grounded runtime plan with Test Contact.",
+            confidence=0.9,
+        )
+        source = ActivitySource(
+            conn,
+            include_legacy_intents=False,
+            participant_resolver=lambda names, _summary: [
+                "person:test-contact" for name in names if name == "Test Contact"
+            ],
+        )
+        events = source.events()
+        exact_occurrence = source.event(occurrence.endpoint)
+        exact_entry = source.event(f"event:entry:{entry_id}")
+        exact_session = source.event("event:session:occurrence-session")
+
+    assert [event.stable_id for event in events] == [occurrence.endpoint]
+    assert exact_occurrence is not None
+    assert exact_occurrence.source_kind == "occurrence"
+    assert exact_occurrence.source_receipt == occurrence.source_receipt
+    assert exact_occurrence.participant_ids == ["person:test-contact"]
+    assert exact_entry is not None
+    assert exact_session is not None
+
+
+def test_activity_source_excludes_heuristic_reducer_entries(ac_root) -> None:
+    with fts.cursor() as conn:
+        entries_store.create_file(
+            conn,
+            name="event-2026-07-10.md",
+            description="Synthetic fallback",
+            tags=["event"],
+        )
+        entry_id = entries_store.append_entry(
+            conn,
+            name="event-2026-07-10.md",
+            content="Worked in a window, involving —",
+            tags=["session", "sid:heuristic-session", "heuristic"],
+        )
+        source = ActivitySource(conn, include_legacy_intents=False)
+        events = source.events()
+        exact = source.event(f"event:entry:{entry_id}")
+
+    assert events == []
+    assert exact is None
 
 
 def test_exact_activity_lookup_is_not_limited_to_recent_feed(ac_root) -> None:
@@ -215,6 +341,16 @@ def test_activity_source_treats_legacy_naive_entry_as_historical_local_time(
                     status="reduced",
                 ),
             )
+            timeline_store.insert(
+                conn,
+                timeline_store.TimelineBlock(
+                    start_time=datetime.fromisoformat("2026-07-11T02:30:00+00:00"),
+                    end_time=datetime.fromisoformat("2026-07-11T03:00:00+00:00"),
+                    entries=["Reviewed a grounded session summary."],
+                    apps_used=["Cursor"],
+                    normalization_status="llm",
+                ),
+            )
             events = ActivitySource(conn, include_legacy_intents=False, limit=1).events()
 
         assert [event.stable_id for event in events] == ["event:session:newer-session"]
@@ -233,6 +369,7 @@ def test_activity_source_treats_legacy_naive_entry_as_historical_local_time(
         ("event:intent:42", "event:intent:42"),
         ("event:entry:e1", "event:entry:e1"),
         ("event:session:s1", "event:session:s1"),
+        ("event:occurrence:a1", "event:occurrence:a1"),
     ],
 )
 def test_legacy_namespace_adapter(raw: str, expected: str) -> None:

@@ -104,6 +104,7 @@ def test_produce_block_round_trips_entries(ac_root: Path, fake_llm) -> None:
         " accepting the proposed time. Involving: Test Contact."
         " Helpful intent: meeting with Test Contact at \u660e\u5929\u4e0b\u53485\u70b9."
     ]
+    assert block.normalization_status == "llm"
 
 
 def test_produce_block_accepts_entries_only(ac_root: Path, fake_llm) -> None:
@@ -119,6 +120,90 @@ def test_produce_block_accepts_entries_only(ac_root: Path, fake_llm) -> None:
 
     assert block is not None
     assert block.entries == ["[WeChat] something happened"]
+    assert block.normalization_status == "llm"
+
+
+def test_explicit_empty_entries_remain_non_modeling(ac_root: Path, fake_llm) -> None:
+    start = datetime(2026, 4, 21, 17, 13, tzinfo=_TZ)
+    win_start, win_end = _seed_window(start)
+    fake_llm.set_default("timeline", json.dumps({"entries": []}))
+
+    block = aggregator.produce_block_for_window(
+        config_mod.load(ac_root / "config.toml"), start=win_start, end=win_end
+    )
+
+    assert block is not None
+    assert block.entries == []
+    assert block.normalization_status == "llm_empty"
+    assert block.eligible_for_modeling is False
+
+
+def test_metadata_only_capture_persists_without_calling_llm(ac_root: Path, fake_llm) -> None:
+    start = datetime(2026, 4, 21, 17, 14, tzinfo=_TZ)
+    payload = {
+        "timestamp": (start + timedelta(seconds=10)).isoformat(),
+        "schema_version": 2,
+        "trigger": {"event_type": "AXApplicationActivated"},
+        "window_meta": {
+            "app_name": "System Settings",
+            "title": "Privacy & Security",
+            "bundle_id": "com.apple.systempreferences",
+        },
+        "focused_element": {"role": "AXGroup", "is_editable": False},
+        "visible_text": "",
+    }
+    capture = paths.capture_buffer_dir() / f"{_stem(start + timedelta(seconds=10))}.json"
+    capture.write_text(json.dumps(payload), encoding="utf-8")
+
+    block = aggregator.produce_block_for_window(
+        config_mod.load(ac_root / "config.toml"),
+        start=start,
+        end=start + timedelta(minutes=1),
+    )
+
+    assert block is not None
+    assert block.entries == []
+    assert block.normalization_status == "metadata_only"
+    assert block.eligible_for_modeling is False
+    assert fake_llm.calls == []
+
+
+def test_timeline_entries_are_exact_deduplicated_and_generic_noise_is_dropped(
+    ac_root: Path, fake_llm
+) -> None:
+    start = datetime(2026, 4, 21, 17, 14, tzinfo=_TZ) + timedelta(minutes=1)
+    win_start, win_end = _seed_window(start)
+    fake_llm.set_default(
+        "timeline",
+        json.dumps(
+            {
+                "entries": [
+                    "[WeChat] confirmed the release plan",
+                    " [WECHAT]   confirmed the release plan ",
+                    "[WeChat] active, involving —",
+                ]
+            }
+        ),
+    )
+
+    block = aggregator.produce_block_for_window(
+        config_mod.load(ac_root / "config.toml"), start=win_start, end=win_end
+    )
+
+    assert block is not None
+    assert block.entries == ["[WeChat] confirmed the release plan"]
+    assert block.normalization_status == "llm"
+
+
+def test_new_timeline_block_without_provenance_fails_closed() -> None:
+    block = timeline_store.TimelineBlock(
+        start_time=datetime(2026, 4, 21, 17, 14, tzinfo=_TZ),
+        end_time=datetime(2026, 4, 21, 17, 15, tzinfo=_TZ),
+        entries=["This text has no declared producer provenance."],
+    )
+
+    assert block.normalization_status == "unknown"
+    assert block.eligible_for_modeling is False
 
 
 def test_produce_block_handles_malformed_llm_json(ac_root: Path, fake_llm) -> None:
@@ -132,6 +217,55 @@ def test_produce_block_handles_malformed_llm_json(ac_root: Path, fake_llm) -> No
 
     assert block is not None
     assert block.entries  # heuristic fallback
+    assert block.normalization_status == "llm_malformed"
+    assert block.eligible_for_modeling is False
+
+
+def test_timeline_rejects_non_string_entry_elements(ac_root: Path, fake_llm) -> None:
+    start = datetime(2026, 4, 21, 17, 15, tzinfo=_TZ) + timedelta(minutes=1)
+    win_start, win_end = _seed_window(start)
+    fake_llm.set_default(
+        "timeline",
+        json.dumps(
+            {
+                "entries": [
+                    "[Cursor] reviewed grounded code",
+                    {"fabricated": "shape"},
+                    42,
+                ]
+            }
+        ),
+    )
+
+    block = aggregator.produce_block_for_window(
+        config_mod.load(ac_root / "config.toml"), start=win_start, end=win_end
+    )
+
+    assert block is not None
+    assert block.normalization_status == "llm_malformed"
+    assert block.eligible_for_modeling is False
+    assert not any("fabricated" in entry or entry == "42" for entry in block.entries)
+
+
+def test_timeline_exception_keeps_debug_fallback_but_blocks_modeling(
+    ac_root: Path, monkeypatch
+) -> None:
+    start = datetime(2026, 4, 21, 17, 16, tzinfo=_TZ)
+    win_start, win_end = _seed_window(start)
+
+    def fail_llm(*args, **kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(aggregator.llm_mod, "call_llm", fail_llm)
+    block = aggregator.produce_block_for_window(
+        config_mod.load(ac_root / "config.toml"), start=win_start, end=win_end
+    )
+
+    assert block is not None
+    assert block.entries
+    assert block.focus_excerpt
+    assert block.normalization_status == "llm_failed"
+    assert block.eligible_for_modeling is False
 
 
 def test_produce_block_records_calls_with_json_mode(ac_root: Path, fake_llm) -> None:
@@ -404,11 +538,13 @@ def test_ensure_schema_migrates_legacy_table(ac_root: Path) -> None:
         # Re-run ensure_schema and confirm current optional columns appear.
         timeline_store.ensure_schema(conn)
         row = conn.execute(
-            "SELECT skill_hints, focus_structured FROM timeline_blocks WHERE id = 'tlb-legacy'"
+            "SELECT skill_hints, focus_structured, normalization_status "
+            "FROM timeline_blocks WHERE id = 'tlb-legacy'"
         ).fetchone()
         assert row is not None
         assert row["skill_hints"] == "[]"
         assert row["focus_structured"] == ""
+        assert row["normalization_status"] == "legacy"
 
         # And _row_to_block must still round-trip the legacy row.
         full = conn.execute("SELECT * FROM timeline_blocks WHERE id = 'tlb-legacy'").fetchone()
@@ -416,6 +552,7 @@ def test_ensure_schema_migrates_legacy_table(ac_root: Path) -> None:
         assert block.id == "tlb-legacy"
         assert block.entries == ["[Test] legacy entry"]
         assert block.skill_hints == []
+        assert block.eligible_for_modeling is True
 
 
 def test_row_to_block_defaults_when_column_missing() -> None:
@@ -754,6 +891,9 @@ def test_produce_block_replays_placeholder_without_focus_evidence(ac_root: Path,
     )
 
     assert block is not None
+    assert block.normalization_status == "metadata_only"
+    assert block.entries == []
+    assert fake_llm.calls == []
     assert phrase not in "\n".join(block.entries)
     assert phrase not in block.focus_excerpt
     assert phrase not in block.focus_structured

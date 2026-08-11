@@ -94,6 +94,8 @@ def _aggregate(
     lower = _aware(since).astimezone(UTC) if since is not None else None
     upper = _aware(until).astimezone(UTC) if until is not None else None
     for block in blocks:
+        if not block.eligible_for_modeling:
+            continue
         surface = _clean_surface(block.attention_surface)
         if not surface:
             continue

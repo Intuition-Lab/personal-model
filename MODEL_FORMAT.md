@@ -96,12 +96,22 @@ file_name, tags, confidence, conflicted, receipt
 ```
 
 `is_latest` identifies a current chain head; historical Points remain available
-for audit and time travel.
+for audit and time travel. The snapshot retains both, while the default constellation renders only
+the chain head valid at its selected cutoff. Historical versions remain available through cutoff-
+bounded search, History, receipts, and evolution Lines rather than appearing beside the current
+Point as another live sphere. Historical evidence requests carry the same `as_of` boundary, so
+future successors and later nearby captures are not returned during drill-down; **Now** remains
+unbounded.
 
 The memory owner is the reserved identity `self`, not a person Point. Names and
 handles learned from quoted owner-identity evidence resolve to `self`; if an
 owner alias was previously minted as a person, promotion retires that live
 projection while preserving its historical Point receipts.
+
+For the default windowed writer, a previously unseen machine-derived entity or assertion is not a
+Point yet. It is held in the owner-local candidate ledger until two distinct known sessions support
+the same canonical candidate. Same-session retries and extra windows are audit evidence, not
+independent promotion votes. Owner edits and already-live Points use their existing authority paths.
 
 ### Line
 
@@ -111,16 +121,25 @@ Lines have two forms:
 - `kind: relation`: a semantic/entity relation with predicate, confidence,
   validity, and provenance.
 
+Relation endpoints retain canonical identity strings in the public contract. The viewer resolves an
+unambiguous canonical endpoint to the current entity Point for placement and creates a context node
+only when no safe match exists. Case, width, and whitespace variants share one projected context
+node, and semantically identical projected Lines render once while every original Line remains in
+local search and evidence audit. The projection does not rewrite the Line or mutate snapshot IDs.
+
 Activity-derived relation Lines carry the atomic source triplet
 `source_kind`, `source_id`, and `source_receipt`. New activity identities use
-`event:entry:<id>` or `event:session:<id>`. `event:intent:<id>` exists only for
-read-only migration of old data.
+`event:occurrence:<id>`, `event:entry:<id>`, or `event:session:<id>`. A windowed
+memory-delta event uses `source_kind: occurrence`; its stable occurrence ID is
+separate from the recurring series ID stored in `event_occurrences`.
+`event:intent:<id>` exists only for read-only migration of old data.
 
 ### Face
 
 A Face is one active level-1 `schema_faces` row. It contains a behavioral
 signature, members, observations, confidence, provenance, anchors, and source
-receipts. Promotion requires stable repeated support.
+receipts. Promotion requires stable repeated support. Production observations are deduplicated by
+producer, UTC sample day, and canonical input hash before they can increment the count.
 
 Every projected Point and schema object carries `edit_refusal`: an empty string when the owner can
 correct it, otherwise a stable reason code naming why not — a newer version exists, the object was
@@ -142,13 +161,15 @@ mistaken for a derived one.
 A Volume is one active level-2 cross-domain schema. It relates behavior across
 otherwise separate owner-scoped topics and carries the same audit fields as a
 Face. Person schemas are excluded so evidence about a collaborator cannot be
-fused into the memory owner's behavior.
+fused into the memory owner's behavior. A same-day replay of one cross-domain input cannot satisfy
+the two-resample promotion threshold.
 
 ### Root
 
 `root` is `null` or one active level-3 apex. More than one live Root is a
 contract error. Root receipts aggregate evidence through its members so the
-summary can be expanded back to Points.
+summary can be expanded back to Points. Identical same-day synthesis input reuses its input receipt
+and does not supersede the resident Root.
 
 ## Receipts
 

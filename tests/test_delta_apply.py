@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from persome.evomem.engine import EvoMemory
+from persome.store import event_occurrences as occurrences_store
 from persome.store import fts
 from persome.store import relation_edges as edges_store
 from persome.writer import delta_apply
 
 
-def _apply(clean: dict) -> delta_apply.ApplyResult:
+def _apply(clean: dict, **context) -> delta_apply.ApplyResult:
     with fts.cursor() as conn:
-        return delta_apply.apply_delta(conn, None, clean, memory=EvoMemory())
+        return delta_apply.apply_delta(conn, None, clean, memory=EvoMemory(), **context)
 
 
 def _apply_cfg(clean: dict, **flags) -> delta_apply.ApplyResult:
@@ -225,6 +228,49 @@ def test_ended_relation_closes_edge(ac_root):
     assert vt is not None
 
 
+def test_itemized_ended_relation_replay_does_not_duplicate_closed_line(ac_root):
+    clean = {
+        "entities": [{"ref": "Alice", "kind": "person", "ended": False, "quote": "x"}],
+        "relations": [
+            {
+                "src": {"ref": "self"},
+                "dst": {"ref": "Alice"},
+                "predicate": "reports_to",
+                "polarity": "0",
+                "ended": True,
+                "quote": "no longer reports to Alice",
+                "confidence": 0.9,
+            }
+        ],
+        "events": [],
+        "assertions": [],
+    }
+    with fts.cursor() as conn:
+        first = delta_apply.ApplyResult()
+        delta_apply._apply_relations(
+            conn,
+            clean,
+            {"Alice": "person"},
+            first,
+            effect_key="memory-delta:1:relation:end-alice",
+        )
+        replay = delta_apply.ApplyResult()
+        delta_apply._apply_relations(
+            conn,
+            clean,
+            {"Alice": "person"},
+            replay,
+            effect_key="memory-delta:1:relation:end-alice",
+        )
+        rows = conn.execute(
+            "SELECT edge_id, valid_to FROM relation_edges WHERE predicate='reports_to'"
+        ).fetchall()
+
+    assert (first.edges_new, first.edges_closed) == (1, 1)
+    assert (replay.edges_new, replay.edges_reinforced, replay.edges_closed) == (0, 0, 0)
+    assert len(rows) == 1 and rows[0][1] is not None
+
+
 def test_events_mint_activity_point_and_edge(ac_root):
     clean = {
         "entities": [],
@@ -239,15 +285,139 @@ def test_events_mint_activity_point_and_edge(ac_root):
         ],
         "assertions": [],
     }
-    r = _apply(clean)
+    start = datetime(2026, 8, 11, 2, 0, tzinfo=UTC)
+    r = _apply(
+        clean,
+        delta_id=7,
+        session_id="event-session",
+        window_start=start,
+        window_end=start + timedelta(minutes=5),
+    )
     assert r.events_minted == 1
     with fts.cursor() as conn:
         conn.row_factory = None
         row = conn.execute(
-            "SELECT src_identity, dst_identity, predicate FROM relation_edges"
+            "SELECT src_identity, dst_identity, predicate, source_kind, source_id, "
+            "source_receipt FROM relation_edges"
         ).fetchone()
-    assert row is not None and row[0] == "self" and row[1].startswith("event:")
+        occurrence = conn.execute("SELECT * FROM event_occurrences").fetchone()
+    assert row is not None and row[0] == "self" and row[1].startswith("event:occurrence:")
     assert row[2] == "participates_in"
+    assert row[3] == "occurrence"
+    assert row[4] == row[1].removeprefix("event:occurrence:")
+    assert occurrences_store.parse_receipt(row[5]) == row[4]
+    assert occurrence is not None
+
+
+def test_event_retry_is_one_occurrence_but_later_window_is_same_series(ac_root):
+    clean = {
+        "entities": [],
+        "relations": [],
+        "events": [
+            {
+                "title": "Weekly review",
+                "participants": [{"ref": "self"}],
+                "quote": "Reviewed the launch plan.",
+                "confidence": 0.9,
+            }
+        ],
+        "assertions": [],
+    }
+    start = datetime(2026, 8, 11, 2, 0, tzinfo=UTC)
+    context = {
+        "session_id": "event-session",
+        "window_start": start,
+        "window_end": start + timedelta(minutes=5),
+    }
+    first = _apply(clean, delta_id=1, **context)
+    retry = _apply(clean, delta_id=1, **context)
+    later = _apply(
+        clean,
+        delta_id=2,
+        session_id="event-session",
+        window_start=start + timedelta(minutes=5),
+        window_end=start + timedelta(minutes=10),
+    )
+
+    with fts.cursor() as conn:
+        conn.row_factory = None
+        rows = conn.execute(
+            "SELECT occurrence_id, series_id FROM event_occurrences ORDER BY window_start"
+        ).fetchall()
+
+    assert first.events_minted == 1
+    assert retry.events_minted == 0
+    assert later.events_minted == 1
+    assert len(rows) == 2
+    assert rows[0][0] != rows[1][0]
+    assert rows[0][1] == rows[1][1]
+
+
+def test_event_participant_change_splits_series(ac_root):
+    start = datetime(2026, 8, 11, 2, 0, tzinfo=UTC)
+
+    def clean(participant: str) -> dict:
+        return {
+            "entities": [],
+            "relations": [],
+            "events": [
+                {
+                    "title": "Weekly review",
+                    "participants": [{"ref": participant}],
+                    "quote": "Reviewed the launch plan.",
+                    "confidence": 0.9,
+                }
+            ],
+            "assertions": [],
+        }
+
+    for offset, participant in enumerate(("Alice", "Bob")):
+        _apply(
+            clean(participant),
+            session_id="event-session",
+            window_start=start + timedelta(minutes=offset * 5),
+            window_end=start + timedelta(minutes=(offset + 1) * 5),
+        )
+
+    with fts.cursor() as conn:
+        conn.row_factory = None
+        series = [row[0] for row in conn.execute("SELECT series_id FROM event_occurrences")]
+    assert len(set(series)) == 2
+
+
+def test_legacy_event_endpoint_remains_title_hash_without_fake_occurrence(ac_root):
+    clean = {
+        "entities": [],
+        "relations": [],
+        "events": [
+            {
+                "title": "Historical review",
+                "participants": [{"ref": "self"}],
+                "quote": "Reviewed the launch plan.",
+                "confidence": 0.9,
+            }
+        ],
+        "assertions": [],
+    }
+    _apply(clean)
+    expected = "event:" + hashlib.sha1(b"Historical review").hexdigest()[:12]
+
+    with fts.cursor() as conn:
+        conn.row_factory = None
+        endpoint = conn.execute(
+            "SELECT dst_identity FROM relation_edges WHERE predicate='participates_in'"
+        ).fetchone()[0]
+        occurrence_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_occurrences'"
+        ).fetchone()
+        occurrence_count = (
+            conn.execute("SELECT COUNT(*) FROM event_occurrences").fetchone()[0]
+            if occurrence_table is not None
+            else 0
+        )
+
+    assert endpoint == expected
+    assert occurrence_count == 0
 
 
 def test_empty_and_malformed_fail_open(ac_root):
@@ -390,6 +560,37 @@ def test_org_nesting_part_of(ac_root):
             ).fetchone()[0]
             == 1
         )
+
+
+def test_relation_kind_lookup_uses_normalized_entity_identity(ac_root):
+    clean = {
+        "entities": [
+            {"new_entity": "ACME LABS", "kind": "org", "ended": False, "quote": "x"},
+            {"new_entity": "Holding Co", "kind": "org", "ended": False, "quote": "x"},
+        ],
+        "relations": [
+            {
+                "src": {"new_entity": "Acme   Labs"},
+                "dst": {"new_entity": "holding co"},
+                "predicate": "part_of",
+                "polarity": "0",
+                "ended": False,
+                "quote": "Acme Labs is part of Holding Co",
+                "confidence": 0.9,
+            }
+        ],
+        "events": [],
+        "assertions": [],
+    }
+
+    result = _apply(clean)
+
+    assert result.edges_new == 1
+    with fts.cursor() as conn:
+        row = conn.execute(
+            "SELECT src_kind, dst_kind FROM relation_edges WHERE predicate='part_of'"
+        ).fetchone()
+    assert tuple(row) == ("org", "org")
 
 
 def test_classifier_retired_when_apply_enabled(ac_root):

@@ -21,6 +21,7 @@ from ..logger import get
 from ..session import store as session_store
 from ..store import fts
 from ..store import memory_deltas as deltas_store
+from ..timeline import store as tl_store
 from . import classifier as classifier_mod
 from . import memory_delta as memory_delta_mod
 from . import pattern_detector as pattern_detector_mod
@@ -54,11 +55,29 @@ def _event_path(row: session_store.SessionRow) -> str:
 
 
 def _delta_completed(cfg: Config, delta: Any) -> bool:
-    benign = {"disabled", "no_blocks", "no_window", "already_processed", "resumed_apply"}
+    benign = {
+        "disabled",
+        "no_blocks",
+        "no_eligible_evidence",
+        "no_window",
+        "already_processed",
+        "resumed_apply",
+        # A pre-ledger pending/failed apply cannot be replayed safely because
+        # any additive subset may already have committed. Quarantine the parent
+        # row, but let the session watermark move past this terminal audit state.
+        "legacy_apply_ambiguous",
+    }
     complete = bool(delta.written or delta.skipped_reason in benign)
     if getattr(cfg.memory_delta, "apply_enabled", False):
         complete = complete and bool(
-            delta.applied or delta.skipped_reason in {"no_blocks", "no_window"}
+            delta.applied
+            or delta.skipped_reason
+            in {
+                "no_blocks",
+                "no_eligible_evidence",
+                "no_window",
+                "legacy_apply_ambiguous",
+            }
         )
     return complete
 
@@ -70,8 +89,31 @@ def _advance_delta_watermark(
 ) -> None:
     with fts.cursor() as conn:
         session_store.set_delta_end(conn, session_id, window_end)
-        if sum(delta.counts.values()) > 0:
+        geometry_changed = getattr(delta, "geometry_changed", None)
+        if geometry_changed is True or (
+            geometry_changed is None and sum(delta.counts.values()) > 0
+        ):
             session_store.increment_system_state(conn, "model_structure_dirty")
+
+
+def _bounded_unpersisted_target(
+    cfg: Config,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> datetime:
+    """Return the end of the oldest prompt-sized block slice."""
+    limit = memory_delta_mod.window_block_limit(cfg)
+    with fts.cursor() as conn:
+        blocks = tl_store.query_range_oldest(
+            conn,
+            window_start,
+            window_end,
+            limit=limit + 1,
+        )
+    if len(blocks) <= limit:
+        return window_end
+    return blocks[limit - 1].end_time
 
 
 def _model_delta_range(
@@ -107,7 +149,11 @@ def _model_delta_range(
                 persisted_final = bool(persisted["is_final"])
             except (TypeError, ValueError):
                 persisted_end = None
-        target = persisted_end or window_end
+        target = persisted_end or _bounded_unpersisted_target(
+            cfg,
+            window_start=cursor,
+            window_end=window_end,
+        )
         use_terminal = persisted_final or (terminal and target == window_end)
         ensure = (
             memory_delta_mod.ensure_after_session

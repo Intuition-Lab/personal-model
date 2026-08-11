@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from persome.config import Config
@@ -108,6 +108,7 @@ def test_behavior_signature_traces_occurred_at(ac_root):
                 capture_count=3,
                 id="blk-1",
                 created_at=t,
+                normalization_status="legacy",
             ),
         )
         entries_mod.create_file(conn, name="project-a.md", description="d", tags=["t"])
@@ -186,16 +187,50 @@ def test_resweep_is_idempotent(ac_root):
                 "confidence": 0.82,
             }
         )
-        r1 = sweeper.sweep_cross_domain(Config(), conn, llm_call=fake)
-        r2 = sweeper.sweep_cross_domain(Config(), conn, llm_call=fake)
-        assert r1.written_count == 1
-        assert r2.written_count == 1
-        assert r2.written[0].updated_in_place is True
-        # the fused file holds exactly one live entry (re-sweep superseded in place)
+        uncounted = fake
+        calls = 0
+
+        def fake(messages):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            calls += 1
+            return uncounted(messages)
+
+        sampled = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
+        r1 = sweeper.sweep_cross_domain(Config(), conn, llm_call=fake, sampled_at=sampled)
         name = r1.written[0].path
+        path = files_mod.memory_path(name)
+        projection_before = path.read_text(encoding="utf-8")
+        r2 = sweeper.sweep_cross_domain(
+            Config(), conn, llm_call=fake, sampled_at=sampled + timedelta(hours=1)
+        )
+        assert r1.written_count == 1
+        assert r2.written_count == 0
+        assert r2.pairs_probed == 0
+        assert calls == 1
+        assert path.read_text(encoding="utf-8") == projection_before
+        # the fused file holds exactly one live entry (same-day replay is a no-op)
         parsed = files_mod.read_file(files_mod.memory_path(name))
         live = [e for e in parsed.entries if not e.superseded_by]
         assert len(live) == 1
+        volume = conn.execute(
+            "SELECT status, observations, footprints FROM schema_faces"
+            " WHERE level=2 AND valid_to IS NULL"
+        ).fetchone()
+        assert tuple(volume[:2]) == ("shadow", 1)
+        assert len(json.loads(volume[2])) == 1
+
+        next_day = sweeper.sweep_cross_domain(
+            Config(), conn, llm_call=fake, sampled_at=sampled + timedelta(days=1)
+        )
+        assert next_day.written_count == 1
+        assert next_day.written[0].updated_in_place is True
+        assert calls == 2
+        resampled = conn.execute(
+            "SELECT status, observations, footprints FROM schema_faces"
+            " WHERE level=2 AND valid_to IS NULL"
+        ).fetchone()
+        assert tuple(resampled[:2]) == ("active", 2)
+        assert len(json.loads(resampled[2])) == 2
 
 
 def test_no_collision_writes_nothing(ac_root):
@@ -437,7 +472,7 @@ def test_failed_volume_evidence_is_not_recorded_as_promotable(ac_root, monkeypat
         )
         monkeypatch.setattr(
             schema_faces,
-            "record_face",
+            "record_face_with_receipt",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("face write failed")),
         )
         collision = _fake_llm(

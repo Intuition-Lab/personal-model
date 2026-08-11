@@ -133,6 +133,8 @@ def test_import_folder_is_read_only_private_and_idempotent(ac_root: Path, tmp_pa
         assert session.status == "ended"
         blocks = timeline_store.query_range(conn, session.start_time, session.end_time, limit=10)
     assert len(blocks) == 1
+    assert blocks[0].normalization_status == "imported"
+    assert blocks[0].eligible_for_modeling is True
     assert "Work/plan.md" in blocks[0].focus_excerpt
     assert original in blocks[0].focus_excerpt
     assert "private config" not in blocks[0].focus_excerpt
@@ -262,9 +264,11 @@ def test_imported_session_windows_never_drift_into_the_future(
     result = source_import.import_folder(vault)
 
     with fts.cursor() as conn:
-        starts = [
-            session_store.get_by_id(conn, session_id).start_time
-            for session_id in result.session_ids
-        ]
+        sessions = [session_store.get_by_id(conn, session_id) for session_id in result.session_ids]
+    assert all(session is not None for session in sessions)
+    starts = [session.start_time for session in sessions if session is not None]
+    ends = [session.end_time for session in sessions if session is not None]
+    observed_after = source_import.datetime.now().astimezone()
     assert starts == sorted(starts)
-    assert starts[-1] <= source_import.datetime.now().astimezone()
+    assert starts[-1] <= observed_after
+    assert ends[-1] <= observed_after

@@ -97,9 +97,16 @@ instruction without constructing or sending an unbounded result. This keeps
 historical shadow Points and their evolution/receipt chain in the canonical
 contract while keeping transport behavior safe.
 
+New machine-derived entity and assertion Points remain outside the snapshot as auditable candidates
+until the same canonical candidate has evidence from two known, distinct sessions. Repeated windows
+inside one session do not satisfy that independence gate. Existing Points and explicit owner edits
+retain their established authority.
+
 A Face becomes active only after mined and emergent signals agree across stable footprints. A
 Volume has one honest producer (the cross-domain sweeper), so it becomes active after two stable
-sweeper resamples. This preserves the two-observation bar without inventing a second extractor.
+sweeper resamples. Production samples carry `(producer, UTC day, canonical input hash)` receipts, so
+a same-day retry cannot provide a second vote. Root synthesis uses the same receipt boundary to
+avoid replacing the live apex for an identical same-day input.
 
 ## Viewer layout
 
@@ -115,8 +122,23 @@ unpromoted evidence remains in deterministic source clusters instead of a flat g
 The layout is append-stable for normal chronological growth: existing nodes keep their local
 coordinates while later evidence expands the surrounding cloud. `window.__persomeLayoutState`
 exposes aggregate layout health for local visual smoke tests without exposing node content or IDs.
+The constellation renders only the Point chain head valid at the selected cutoff. Superseded and
+other snapshot-retained inactive Points stay in local search, History, and evidence surfaces, but
+are not drawn beside the current head; archived and unlinked retired/withdrawn records remain in
+the durable store rather than the live snapshot. A relation endpoint that names an unambiguous
+current entity Point reuses that Point's position; the viewer creates a context node only when no
+such Point exists. Context identities fold NFKC, whitespace, and case variants for placement. If
+legacy Lines then resolve to the same endpoints, predicate, and polarity, the constellation draws a
+single stroke while retaining every original Line in local search and evidence detail. The visible
+representative is the strongest individual Line by observations, confidence, and evidence
+completeness; observations are never summed across legacy variants.
 
-Search is a local view over the objects visible at the current model-history cutoff. It ranks
+Search is a local view over current objects plus audit history that already existed at the selected
+model-history cutoff. It never reveals a successor before its effective start (`valid_from`, then
+`created_at`, then `occurred_at`). Evidence drill-down carries that cutoff to the Runtime as
+`as_of`; the response excludes future `next_version` links and time-adjacent captures after the
+cutoff, including nested drill-downs. Moving the cutoff closes any open detail/evidence drawer and
+invalidates its in-flight request before rebuilding the slice. **Now** keeps the unbounded evidence response. It ranks
 human-readable text from the already-loaded snapshot; it does not call another service, persist
 queries, or expand the canonical model. Choosing a result opens the same detail surface as selecting
 its rendered object. Point heads that are active at the selected cutoff rank ahead of shadow and
@@ -264,8 +286,10 @@ it outright.
 
 Relation edges may carry the nullable triplet `source_kind`, `source_id`, and `source_receipt`.
 The triplet is atomic: callers either provide all three fields or none. Activity-derived edges use
-new stable IDs `event:entry:<id>` or `event:session:<id>`. `event:intent:<id>`
-is read-only compatibility for an old store.
+stable IDs `event:occurrence:<id>`, `event:entry:<id>`, or `event:session:<id>`.
+Occurrence receipts resolve through the owner-only `event_occurrences` projection; occurrence
+identity is window-specific while series identity groups only equal normalized titles and canonical
+participant sets. `event:intent:<id>` is read-only compatibility for an old store.
 
 The read-only `resolve_evidence` MCP tool and authenticated `GET /model/evidence?ref=...` endpoint
 return `label` for human display and retain `reference` as the stable technical handle. Explicit

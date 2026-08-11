@@ -12,6 +12,7 @@ import json
 import queue
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 from .. import index_health, paths
 from ..config import CaptureConfig, Config
 from ..logger import get
+from ..store import capture_content_receipts as content_receipt_store
 from ..store import fts as fts_store
 from ..store import mobile_events as mobile_event_store
 from . import (
@@ -74,12 +76,19 @@ def _should_trigger_ocr(cfg: CaptureConfig, meta: dict[str, str]) -> bool:
 # funnels pushed payloads through the same content-dedup and session hook as the
 # in-daemon capture loop.
 # None when no capture task is running (CLI one-shots / tests / capture disabled).
+_CONTENT_RECEIPT_STATE_LOCK = threading.RLock()
 _active_runner: _CaptureRunner | None = None
 
 
 def _set_active_runner(runner: _CaptureRunner | None) -> None:
     global _active_runner
-    _active_runner = runner
+    with _CONTENT_RECEIPT_STATE_LOCK:
+        # Construction loads receipts before publication.  Re-read inside the
+        # publication lock so a direct write interleaved between those two steps
+        # cannot publish a runner with a stale permanent head.
+        if runner is not None:
+            runner._load_content_receipts()
+        _active_runner = runner
 
 
 def capture_now() -> Path | None:
@@ -369,6 +378,68 @@ def _build_capture(
     return _finalize_capture(cfg, out, ocr_jpeg_provider=_daemon_ocr_jpeg_provider(cfg))
 
 
+def _reconcile_trigger_surface(
+    out: dict[str, Any],
+    trigger: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Bind a queued event to the surface actually sampled by the worker.
+
+    Watcher events are queued immediately, while ``window_meta`` and AX content
+    are sampled later on the single capture worker. Under backlog the foreground
+    can move from A to C before A's trigger executes. Persisting A beside C's
+    content would also move the session manager back to A. Preserve the source
+    event type on the same stable surface, but downgrade a cross-surface event to
+    a non-actionable refresh and discard its now-stale click details.
+    """
+    if trigger is None:
+        return None
+    stored_trigger = out.get("trigger")
+    sanitized_trigger = stored_trigger if isinstance(stored_trigger, dict) else trigger
+    meta = out.get("window_meta") or {}
+    actual_app = str(meta.get("app_name") or "")
+    actual_bundle = str(meta.get("bundle_id") or "")
+    actual_title = str(meta.get("title") or "")
+    trigger_app = str(trigger.get("app_name") or "")
+    trigger_bundle = str(trigger.get("bundle_id") or "")
+    trigger_title = str(trigger.get("window_title") or "")
+
+    def surface(bundle_id: str, app_name: str) -> tuple[str, str]:
+        if bundle_id:
+            return ("bundle", bundle_id)
+        if app_name:
+            return ("app", app_name)
+        return ("unknown", "")
+
+    source_surface = surface(trigger_bundle, trigger_app)
+    actual_surface = surface(actual_bundle, actual_app)
+    mismatch = (
+        source_surface[0] != "unknown"
+        and actual_surface[0] != "unknown"
+        and source_surface != actual_surface
+    )
+    changed_window = bool(trigger_title and actual_title and trigger_title != actual_title)
+    if mismatch or changed_window:
+        reconciled: dict[str, Any] = {
+            "event_type": "QueuedSurfaceRefresh",
+            "source_event_type": str(sanitized_trigger.get("event_type") or ""),
+        }
+    else:
+        # `_build_capture` has already run the S1 NUL/placeholder sanitizer on
+        # this projection. Never resurrect the raw queue payload here.
+        reconciled = dict(sanitized_trigger)
+
+    # Only overwrite with observed values. An AX provider that cannot identify
+    # the current app should not erase the watcher's last known surface.
+    if actual_app:
+        reconciled["app_name"] = actual_app
+    if actual_bundle:
+        reconciled["bundle_id"] = actual_bundle
+    if actual_title:
+        reconciled["window_title"] = actual_title
+    out["trigger"] = reconciled
+    return reconciled
+
+
 def _ingest_ocr_jpeg_provider(payload: dict[str, Any]) -> Callable[[], bytes | None]:
     """OCR JPEG source for the ingest path: decode the JPEG the Swift app pushed.
 
@@ -489,7 +560,7 @@ def ingest_capture(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
     if runner is not None:
         stem = runner.commit_prebuilt(out)
         return {"id": stem, "deduped": stem is None, "skipped": False}
-    path = _write_capture(out)
+    path = _write_capture_and_invalidate_content_receipts(out)
     return {"id": path.stem, "deduped": False, "skipped": False}
 
 
@@ -673,7 +744,10 @@ def ingest_mobile_event(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
         if runner is not None:
             stem = runner.commit_prebuilt(out, force=True, capture_id=capture_id)
         else:
-            stem = _write_capture(out, capture_id=capture_id).stem
+            stem = _write_capture_and_invalidate_content_receipts(
+                out,
+                capture_id=capture_id,
+            ).stem
         if stem != capture_id:
             raise RuntimeError("mobile capture persistence returned the wrong identity")
         with fts_store.cursor() as conn:
@@ -747,6 +821,65 @@ def _write_capture(out: dict[str, Any], *, capture_id: str | None = None) -> Pat
     return path
 
 
+def _write_capture_and_invalidate_content_receipts(
+    out: dict[str, Any],
+    *,
+    capture_id: str | None = None,
+) -> Path:
+    """Direct-write one capture without leaving an older durable dedup head.
+
+    Production normally commits through ``_CaptureRunner``, which advances the
+    in-memory head and its durable receipt together.  A one-shot/fallback write
+    has no runner-owned head to publish, so keeping an older receipt would make
+    a later restart mistake that older observation for the latest content.
+
+    A private marker is durable before the raw write.  It closes both crash
+    windows around JSON persistence and SQLite invalidation without relying on
+    mutable capture mtimes (screenshot decay legitimately rewrites old JSON).
+    Runner startup consumes the marker only after clearing durable receipts.
+    """
+    marker = paths.capture_content_receipt_invalidation_marker()
+    with _CONTENT_RECEIPT_STATE_LOCK, fts_store.database_activity():
+        paths.atomic_write_private_text(marker, "pending\n")
+        try:
+            path = _write_capture(out, capture_id=capture_id)
+        except BaseException:
+            # The raw write may already have crossed its atomic rename before a
+            # later operation raised. Keep the marker and fail open on reload.
+            runner = _active_runner
+            if runner is not None:
+                runner._last_fingerprint = None
+                runner._recent_fingerprints.clear()
+            raise
+
+        invalidated = False
+        try:
+            with fts_store.cursor() as conn:
+                content_receipt_store.clear(conn)
+            invalidated = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "capture content receipt invalidation failed; durable marker retained: %s",
+                exc,
+            )
+        if invalidated:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError as exc:
+                # A leftover marker only causes another conservative clear on
+                # startup; it can never suppress evidence.
+                logger.warning("capture receipt invalidation marker cleanup failed: %s", exc)
+
+        # The no-runner decision can race daemon startup.  If a runner appeared
+        # while the direct write was in flight, its loaded cache is stale even
+        # when durable invalidation succeeded (and especially when it failed).
+        runner = _active_runner
+        if runner is not None:
+            runner._last_fingerprint = None
+            runner._recent_fingerprints.clear()
+        return path
+
+
 def _index_capture(file_stem: str, out: dict[str, Any]) -> bool:
     """Insert/upsert the capture's S1 fields into the FTS5 index.
 
@@ -783,27 +916,51 @@ def _index_capture(file_stem: str, out: dict[str, Any]) -> bool:
 
 
 def _content_fingerprint(out: dict[str, Any]) -> str:
-    """Hash the content-bearing fields of a capture for consecutive-duplicate detection.
+    """Hash stable S1 semantics for bounded, restart-safe duplicate detection.
 
-    Excludes timestamp, trigger metadata, screenshots, and the raw ax_tree (which
-    contains coordinate noise). Focuses on what actually drives downstream stages:
-    the window identity + what the user can see + what they've typed.
+    Window title remains part of the exact context identity: two Slack/Chrome
+    windows can expose identical empty-state text while representing different
+    sessions. Dynamic-title bursts are handled by the upstream surface gate.
+    Timestamp, trigger metadata, screenshots, and raw AX geometry are excluded.
     """
     meta = out.get("window_meta") or {}
     focused = out.get("focused_element") or {}
-    payload = "\x1f".join(
-        [
-            meta.get("bundle_id") or "",
-            meta.get("title") or "",
-            focused.get("role") or "",
-            focused.get("value") or "",
-            out.get("visible_text") or "",
-            out.get("url") or "",
-            str((out.get("mobile_event") or {}).get("device", {}).get("id") or ""),
-            str((out.get("mobile_event") or {}).get("event_id") or ""),
-        ]
-    )
-    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+    mobile = out.get("mobile_event") or {}
+    device = mobile.get("device") or {}
+
+    def text(value: object) -> str:
+        return "" if value is None else str(value)
+
+    bundle_id = text(meta.get("bundle_id"))
+    app_name = text(meta.get("app_name"))
+    if bundle_id:
+        surface = f"bundle:{bundle_id}"
+    elif app_name:
+        surface = f"app:{app_name}"
+    else:
+        surface = "unknown:"
+    focused_value = text(focused.get("value"))
+    visible_text = text(out.get("visible_text"))
+    url = text(out.get("url"))
+    mobile_device_id = text(device.get("id"))
+    mobile_event_id = text(mobile.get("event_id"))
+    payload = {
+        "focused_role": text(focused.get("role")),
+        "focused_value": focused_value,
+        "mobile_device_id": mobile_device_id,
+        "mobile_event_id": mobile_event_id,
+        "surface": surface,
+        "title": text(meta.get("title")),
+        "url": url,
+        "visible_text": visible_text,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8", errors="replace")
+    return "v2:" + hashlib.sha256(encoded).hexdigest()
 
 
 def capture_once(
@@ -823,7 +980,7 @@ def capture_once(
     out = _build_capture(cfg, provider, trigger)
     if out is None:
         return None
-    return _write_capture(out)
+    return _write_capture_and_invalidate_content_receipts(out)
 
 
 class _CaptureRunner:
@@ -833,13 +990,14 @@ class _CaptureRunner:
     queue, so the watcher reader thread never blocks on AX / screenshot I/O
     and a runaway burst of events can never spawn unbounded threads.
 
-    Also enforces *consecutive-duplicate dedup*: if the content fingerprint
-    (bundle+title+focused value+visible_text+url) matches the previously
-    written capture, the new one is dropped. Time-based dedup in the
-    dispatcher handles rapid-fire bursts; this handles a static screen
-    (e.g. the lock screen overnight) that keeps generating identical
-    captures. When deduped, the ``pre_capture_hook`` is NOT fired, so the
-    session manager's idle timer isn't reset by meaningless repetition.
+    Also enforces bounded content dedup. While its backing raw capture remains
+    retained, the latest successfully persisted fingerprint remains duplicate
+    without a timer, including across restart. Raw retention removes the matching
+    receipt so the same context can be sampled again. A recently successful
+    non-head fingerprint catches A -> B -> A burst noise within
+    ``same_window_dedup_seconds``. When deduped, the ``pre_capture_hook`` is NOT
+    fired, so the session manager's idle timer isn't reset by meaningless
+    repetition.
     """
 
     # Bounded queue for backpressure. Captures are de-duplicated by the
@@ -864,8 +1022,119 @@ class _CaptureRunner:
         self._capture_receipt_hook = capture_receipt_hook
         self._lock = threading.Lock()
         self._last_fingerprint: str | None = None
+        self._recent_fingerprints: OrderedDict[str, float] = OrderedDict()
+        self._load_content_receipts()
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=self._MAX_PENDING)
         self._worker: threading.Thread | None = None
+
+    @staticmethod
+    def _receipt_epoch(value: str) -> float | None:
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.timestamp()
+        except (OSError, OverflowError, TypeError, ValueError):
+            return None
+
+    def _load_content_receipts(self) -> None:
+        """Restore the durable head/history; database failures fail open."""
+        with _CONTENT_RECEIPT_STATE_LOCK:
+            # Reloads are also used after raw-retention reconciliation. Clear
+            # first so a failed/corrupt receipt read fails open instead of
+            # retaining a head whose backing capture has just been erased.
+            self._last_fingerprint = None
+            self._recent_fingerprints.clear()
+            marker = paths.capture_content_receipt_invalidation_marker()
+            invalidation_pending = marker.exists()
+            try:
+                with fts_store.cursor() as conn:
+                    if invalidation_pending:
+                        content_receipt_store.clear(conn)
+                    receipts = content_receipt_store.load_recent(
+                        conn,
+                        limit=content_receipt_store.RECEIPT_LIMIT,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("capture content receipt load failed; dedup starts empty: %s", exc)
+                return
+            if invalidation_pending:
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError as exc:
+                    # Retaining the marker repeats a safe clear on next load.
+                    logger.warning("capture receipt invalidation marker cleanup failed: %s", exc)
+
+            if not receipts:
+                return
+            newest = receipts[0]
+            newest_epoch = self._receipt_epoch(newest.committed_at)
+            newest_backing = paths.capture_buffer_dir() / f"{newest.capture_id}.json"
+            # Never promote an older receipt to the permanent head when the true
+            # newest receipt lost its evidence.  A missing/corrupt newest row is
+            # uncertainty about ordering, so the safe policy is a full fail-open.
+            if newest_epoch is None or not newest_backing.is_file():
+                logger.warning(
+                    "newest capture content receipt has no valid backing; dedup starts empty"
+                )
+                return
+
+            valid_receipts: list[tuple[content_receipt_store.CaptureContentReceipt, float]] = []
+            for receipt in receipts:
+                committed_epoch = self._receipt_epoch(receipt.committed_at)
+                backing_capture = paths.capture_buffer_dir() / f"{receipt.capture_id}.json"
+                if committed_epoch is not None and backing_capture.is_file():
+                    valid_receipts.append((receipt, committed_epoch))
+            self._last_fingerprint = newest.fingerprint
+            wall_now = time.time()
+            monotonic_now = time.monotonic()
+            for receipt, committed_epoch in reversed(valid_receipts):
+                wall_age = max(0.0, wall_now - committed_epoch)
+                self._recent_fingerprints[receipt.fingerprint] = monotonic_now - wall_age
+                self._recent_fingerprints.move_to_end(receipt.fingerprint)
+
+    def _duplicate_reason(self, fingerprint: str, *, now_monotonic: float) -> str | None:
+        if fingerprint == self._last_fingerprint:
+            return "head"
+        last_committed = self._recent_fingerprints.get(fingerprint)
+        if last_committed is None:
+            return None
+        age = now_monotonic - last_committed
+        if 0.0 <= age < self._cfg.same_window_dedup_seconds:
+            return "recent"
+        return None
+
+    def _remember_success(self, fingerprint: str, *, committed_monotonic: float) -> None:
+        self._last_fingerprint = fingerprint
+        self._recent_fingerprints[fingerprint] = committed_monotonic
+        self._recent_fingerprints.move_to_end(fingerprint)
+        while len(self._recent_fingerprints) > content_receipt_store.RECEIPT_LIMIT:
+            self._recent_fingerprints.popitem(last=False)
+
+    @staticmethod
+    def _committed_at(epoch: float) -> str:
+        return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="microseconds")
+
+    def _record_content_receipt(
+        self,
+        *,
+        fingerprint: str,
+        path: Path,
+        committed_epoch: float,
+    ) -> None:
+        try:
+            with fts_store.cursor() as conn:
+                content_receipt_store.record_success(
+                    conn,
+                    fingerprint=fingerprint,
+                    capture_id=path.stem,
+                    committed_at=self._committed_at(committed_epoch),
+                    keep=content_receipt_store.RECEIPT_LIMIT,
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Capture JSON already committed. Failing open can admit one duplicate
+            # after restart, whereas a false success receipt could lose evidence.
+            logger.warning("capture content receipt write failed; continuing fail-open: %s", exc)
 
     def start_worker(self) -> None:
         """Spawn the dedicated worker thread. Idempotent."""
@@ -908,7 +1177,8 @@ class _CaptureRunner:
                 if out is None:
                     self._publish_receipt(None, capture_gate_reason(self._cfg) or "capture-skipped")
                     return
-                self._commit(out, trigger)
+                committed_trigger = _reconcile_trigger_surface(out, trigger)
+                self._commit(out, committed_trigger)
             except Exception as exc:  # noqa: BLE001
                 logger.error("capture failed: %s", exc, exc_info=True)
 
@@ -983,35 +1253,70 @@ class _CaptureRunner:
         static screen does not refresh the session idle timer).
         """
         fingerprint = _content_fingerprint(out)
-        if not force and fingerprint == self._last_fingerprint:
-            meta = out.get("window_meta") or {}
-            logger.debug(
-                "capture skipped (content dedup): trigger=%s app=%r title=%r",
-                (trigger or {}).get("event_type"),
-                meta.get("app_name"),
-                (meta.get("title") or "")[:60],
+        # Keep the duplicate decision, JSON/index write, and durable receipt
+        # inside one maintenance boundary. Otherwise `clean captures` can delete
+        # the JSON and index between the write and receipt, leaving a stale head
+        # that suppresses the first future frame after the clean.
+        # The module-level lock also serializes live retention/reconciliation.
+        # Lock order is always runner._lock -> receipt-state lock -> DB activity;
+        # cleanup never acquires runner._lock, avoiding an inverse-order deadlock.
+        with _CONTENT_RECEIPT_STATE_LOCK, fts_store.database_activity():
+            duplicate_reason = (
+                None
+                if force
+                else self._duplicate_reason(
+                    fingerprint,
+                    now_monotonic=time.monotonic(),
+                )
             )
-            return None
-        self._last_fingerprint = fingerprint
-        path = (
-            _write_capture(out)
-            if capture_id is None
-            else _write_capture(out, capture_id=capture_id)
-        )
+            if duplicate_reason is not None:
+                meta = out.get("window_meta") or {}
+                logger.debug(
+                    "capture skipped (content dedup %s): trigger=%s app=%r title=%r",
+                    duplicate_reason,
+                    (trigger or {}).get("event_type"),
+                    meta.get("app_name"),
+                    (meta.get("title") or "")[:60],
+                )
+                return None
+            path = (
+                _write_capture(out)
+                if capture_id is None
+                else _write_capture(out, capture_id=capture_id)
+            )
+            # Never advance either state before `_write_capture` returns: a full
+            # disk/index exception must remain retryable, not become a false dedup.
+            committed_epoch = time.time()
+            committed_monotonic = time.monotonic()
+            self._remember_success(
+                fingerprint,
+                committed_monotonic=committed_monotonic,
+            )
+            self._record_content_receipt(
+                fingerprint=fingerprint,
+                path=path,
+                committed_epoch=committed_epoch,
+            )
         reason = str((out.get("trigger") or {}).get("event_type") or "capture")
         self._publish_receipt(path, reason)
-        if self._pre_capture_hook is not None and trigger is not None:
+        committed_trigger = out.get("trigger")
+        if (
+            self._pre_capture_hook is not None
+            and trigger is not None
+            and isinstance(committed_trigger, dict)
+        ):
             try:
-                self._pre_capture_hook(trigger)
+                self._pre_capture_hook(committed_trigger)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("pre_capture_hook failed: %s", exc)
         return path
 
-    def run_threaded(self, trigger: dict[str, Any] | None) -> None:
-        """Enqueue a capture for the worker thread; drop with a warning if full."""
+    def run_threaded(self, trigger: dict[str, Any] | None) -> bool:
+        """Enqueue a capture, returning whether the bounded queue accepted it."""
         try:
             self._queue.put_nowait(trigger)
             index_health.record_queue_accept()
+            return True
         except queue.Full:
             index_health.record_queue_drop()
             logger.warning(
@@ -1019,6 +1324,7 @@ class _CaptureRunner:
                 self._queue.qsize(),
                 (trigger or {}).get("event_type") if trigger else "heartbeat",
             )
+            return False
 
 
 async def run_forever(
@@ -1077,10 +1383,10 @@ async def run_forever(
             await asyncio.Event().wait()
             return
 
-        def _on_capture(trigger: dict[str, Any] | None) -> None:
+        def _on_capture(trigger: dict[str, Any] | None) -> bool:
             # Hook firing is deferred into the runner so content-deduped captures
             # (e.g. overnight lock-screen repeats) don't refresh the session timer.
-            runner.run_threaded(trigger)
+            return runner.run_threaded(trigger)
 
         if cfg.event_driven:
             watcher = AXWatcherProcess()
@@ -1165,10 +1471,51 @@ def cleanup_buffer(
     extended_retention_enabled: bool = False,
     actionable_retention_days: int = 7,
 ) -> dict[str, int]:
+    """Apply raw retention while keeping durable dedup state evidence-backed.
+
+    Capture commits take the runner lock and then ``_CONTENT_RECEIPT_STATE_LOCK``.
+    Cleanup takes only the latter, so it can serialize the DB/filesystem sweep
+    with every runner without ever inverting that lock order. After the sweep,
+    reload the active runner from the reconciled store; any database uncertainty
+    clears its memory instead of preserving a receipt for erased evidence.
+    """
+    with _CONTENT_RECEIPT_STATE_LOCK, fts_store.database_activity():
+        stats, receipt_state_consistent = _cleanup_buffer_with_receipt_state_locked(
+            retention_hours,
+            processed_before_ts,
+            screenshot_retention_hours=screenshot_retention_hours,
+            screenshot_thumbnail_hours=screenshot_thumbnail_hours,
+            max_mb=max_mb,
+            extended_retention_enabled=extended_retention_enabled,
+            actionable_retention_days=actionable_retention_days,
+        )
+        runner = _active_runner
+        if runner is not None:
+            if receipt_state_consistent:
+                runner._load_content_receipts()
+            else:
+                runner._last_fingerprint = None
+                runner._recent_fingerprints.clear()
+        return stats
+
+
+def _cleanup_buffer_with_receipt_state_locked(
+    retention_hours: int,
+    processed_before_ts: str | None = None,
+    *,
+    screenshot_retention_hours: int | None = None,
+    screenshot_thumbnail_hours: int | None = None,
+    max_mb: int = 0,
+    extended_retention_enabled: bool = False,
+    actionable_retention_days: int = 7,
+) -> tuple[dict[str, int], bool]:
     buf = paths.capture_buffer_dir()
     if not buf.exists():
-        _prune_missing_capture_rows(buf)
-        return {"deleted": 0, "stripped": 0, "thumbnailed": 0, "evicted": 0}
+        reconciled = _prune_missing_capture_rows(buf)
+        return (
+            {"deleted": 0, "stripped": 0, "thumbnailed": 0, "evicted": 0},
+            reconciled,
+        )
 
     now = time.time()
     delete_cutoff = now - retention_hours * 3600
@@ -1194,6 +1541,7 @@ def cleanup_buffer(
         logger.warning("invalid capture cleanup watermark; treating every frame as unabsorbed")
 
     deleted = stripped = thumbnailed = evicted = 0
+    receipt_state_consistent = True
     surviving: list[tuple[float, Path, int]] = []  # (mtime, path, size_after_pass)
     expired: list[tuple[float, Path, int]] = []
 
@@ -1274,6 +1622,7 @@ def cleanup_buffer(
         # the reconciliation pass below removes any stale searchable rows once
         # the database is available again.
         index_removed = _delete_captures_from_fts([p.stem for _, p, _ in expired])
+        receipt_state_consistent = receipt_state_consistent and index_removed
         for record in expired:
             try:
                 record[1].unlink()
@@ -1292,6 +1641,7 @@ def cleanup_buffer(
                 if total <= limit:
                     break
                 index_removed = _delete_captures_from_fts([path.stem])
+                receipt_state_consistent = receipt_state_consistent and index_removed
                 captured_at = parse_capture_path_timestamp(path)
                 is_absorbed = not has_watermark or (
                     absorbed_before is not None
@@ -1313,14 +1663,17 @@ def cleanup_buffer(
 
     # A transient DB failure must not defeat the hard disk cap. Files still win
     # that boundary; once SQLite recovers, reconcile any stale searchable rows.
-    _prune_missing_capture_rows(buf)
+    receipt_state_consistent = _prune_missing_capture_rows(buf) and receipt_state_consistent
 
-    return {
-        "deleted": deleted,
-        "stripped": stripped,
-        "thumbnailed": thumbnailed,
-        "evicted": evicted,
-    }
+    return (
+        {
+            "deleted": deleted,
+            "stripped": stripped,
+            "thumbnailed": thumbnailed,
+            "evicted": evicted,
+        },
+        receipt_state_consistent,
+    )
 
 
 def _delete_captures_from_fts(stems: list[str]) -> bool:
@@ -1333,6 +1686,7 @@ def _delete_captures_from_fts(stems: list[str]) -> bool:
             try:
                 for stem in stems:
                     fts_store.delete_capture(conn, stem)
+                content_receipt_store.delete_for_captures(conn, stems)
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
@@ -1368,13 +1722,25 @@ def _prune_missing_capture_rows(buf: Path) -> bool:
                 candidates = {
                     str(row[0]) for row in conn.execute("SELECT id FROM captures").fetchall()
                 }
+                content_receipt_store.ensure_schema(conn)
+                receipt_capture_ids = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT DISTINCT capture_id FROM capture_content_receipts"
+                    ).fetchall()
+                }
                 present = (
                     {p.stem for p in buf.iterdir() if p.is_file() and p.suffix == ".json"}
                     if buf.is_dir()
                     else set()
                 )
-                for stem in candidates - present:
+                missing = candidates - present
+                for stem in missing:
                     fts_store.delete_capture(conn, stem)
+                content_receipt_store.delete_for_captures(
+                    conn,
+                    list((candidates | receipt_capture_ids) - present),
+                )
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")

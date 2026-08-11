@@ -4,7 +4,11 @@ import test from "node:test";
 import {
   focusKeysForSelection,
   handleSearchShortcut,
+  lineKnownAt,
+  modelPollingFingerprint,
+  pointKnownAt,
   pointSearchMetadata,
+  pointVisibleAt,
   pointerUpOutcome,
   prepareSearchEntries,
   rankSearchEntries,
@@ -12,6 +16,97 @@ import {
   recoverInvalidSceneSelection,
   shouldHandleModelGesture,
 } from "../../resources/model_assets/explore.mjs";
+
+test("poll fingerprint changes for in-place Line presentation edits", () => {
+  const line = {
+    id: "relation-stable-id",
+    kind: "relation",
+    source: "self",
+    target: "acme",
+    predicate: "engaged_with",
+    label: "works with",
+    quote: "Reviewed the proposal",
+    provenance: "observed",
+    confidence: 0.8,
+    observations: 2,
+    polarity: "0",
+    valid_from: "2026-01-01T00:00:00Z",
+    created_at: "2026-01-01T00:00:00Z",
+  };
+  const model = { points: [], lines: [line], faces: [], volumes: [], root: null };
+  const original = modelPollingFingerprint(model);
+
+  for (const [field, value] of [
+    ["status", "shadow"],
+    ["source", "point-owner"],
+    ["target", "other-company"],
+    ["label", "advises"],
+    ["predicate", "advises"],
+    ["polarity", "-"],
+    ["confidence", 0.95],
+    ["observations", 3],
+  ]) {
+    assert.notEqual(
+      modelPollingFingerprint({ ...model, lines: [{ ...line, [field]: value }] }),
+      original,
+      field,
+    );
+  }
+});
+
+test("poll fingerprint changes when index health degrades or recovers", () => {
+  const model = { points: [], lines: [], faces: [], volumes: [], root: null };
+  const healthy = modelPollingFingerprint(model, null);
+  const degraded = modelPollingFingerprint(model, {
+    status: "degraded",
+    note: "capture indexing is failing",
+  });
+
+  assert.notEqual(degraded, healthy);
+  assert.notEqual(
+    modelPollingFingerprint(model, { status: "unknown", note: "report is stale" }),
+    degraded,
+  );
+  assert.equal(modelPollingFingerprint(model, null), healthy);
+});
+
+test("poll fingerprint covers every snapshot field and ignores the generation clock", () => {
+  const point = {
+    id: "point-stable",
+    content: "A current claim",
+    file_name: "person-alex.md",
+    tags: "entity",
+    receipt: "⟨point-stable:person-alex.md⟩",
+  };
+  const root = {
+    id: "root-stable",
+    signature: "Current synthesis",
+    observations: 2,
+    confidence: 0.8,
+    provenance: "observed",
+  };
+  const model = { points: [point], lines: [], faces: [], volumes: [], root };
+  const original = modelPollingFingerprint(model);
+
+  for (const [collection, field, value] of [
+    ["points", "file_name", "person-alex-retyped.md"],
+    ["points", "receipt", "⟨point-stable:person-alex-retyped.md⟩"],
+    ["points", "edit_refusal", "object_not_active"],
+    ["root", "observations", 3],
+    ["root", "confidence", 0.95],
+    ["root", "provenance", "authored"],
+  ]) {
+    const changed = collection === "root"
+      ? { ...model, root: { ...root, [field]: value } }
+      : { ...model, points: [{ ...point, [field]: value }] };
+    assert.notEqual(modelPollingFingerprint(changed), original, `${collection}.${field}`);
+  }
+
+  assert.equal(
+    modelPollingFingerprint({ ...model, generated_at: "2026-08-11T09:00:00Z" }),
+    modelPollingFingerprint({ ...model, generated_at: "2026-08-11T09:00:15Z" }),
+  );
+});
 
 test("keeps an in-progress claim focused when the search chord is pressed", () => {
   let prevented = false;
@@ -38,6 +133,105 @@ test("keeps an in-progress claim focused when the search chord is pressed", () =
   assert.equal(handleSearchShortcut(event, false, () => { opened = true; }), true);
   assert.equal(prevented, true);
   assert.equal(opened, true);
+});
+
+test("renders only the Point chain head valid at the selected time", () => {
+  const predecessor = {
+    id: "old",
+    is_latest: false,
+    status: "shadow",
+    valid_from: "2026-01-01T00:00:00Z",
+    valid_until: "2026-03-01T00:00:00Z",
+  };
+  const successor = {
+    id: "new",
+    is_latest: true,
+    status: "active",
+    valid_from: "2026-03-01T00:00:00Z",
+    valid_until: null,
+  };
+
+  assert.equal(pointVisibleAt(predecessor, new Date("2026-02-01T00:00:00Z")), true);
+  assert.equal(pointVisibleAt(successor, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(pointVisibleAt(predecessor, new Date("2026-04-01T00:00:00Z")), false);
+  assert.equal(pointVisibleAt(successor, new Date("2026-04-01T00:00:00Z")), true);
+  assert.equal(pointVisibleAt({ ...successor, status: "shadow" }, new Date("2026-04-01T00:00:00Z")), false);
+  assert.equal(pointKnownAt(successor, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(pointKnownAt(successor, new Date("2026-03-01T00:00:00Z")), true);
+  assert.deepEqual(
+    pointSearchMetadata(successor, new Date("2026-02-01T00:00:00Z")),
+    {
+      state: "future",
+      subtitle: "Modeled observation · not yet valid at this date",
+      aliases: ["future", "not yet valid"],
+      weightAdjustment: -56,
+    },
+  );
+  const model = {
+    points: [predecessor, successor],
+  };
+  const evolution = { kind: "evolution", source: "old", target: "new" };
+  assert.equal(lineKnownAt(evolution, model, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(lineKnownAt(evolution, model, new Date("2026-03-01T00:00:00Z")), true);
+});
+
+test("uses creation time when older Points do not carry valid_from", () => {
+  const point = {
+    id: "created-later",
+    is_latest: true,
+    status: "active",
+    created_at: "2026-03-01T00:00:00Z",
+  };
+
+  assert.equal(pointVisibleAt(point, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(pointKnownAt(point, new Date("2026-02-01T00:00:00Z")), false);
+  assert.equal(
+    pointSearchMetadata(point, new Date("2026-02-01T00:00:00Z")).state,
+    "future",
+  );
+  assert.equal(pointVisibleAt(point, new Date("2026-03-01T00:00:00Z")), true);
+
+  const occurredOnly = { ...point, created_at: "", occurred_at: "2026-04-01T00:00:00Z" };
+  assert.equal(pointKnownAt(occurredOnly, new Date("2026-03-01T00:00:00Z")), false);
+  assert.equal(pointKnownAt(occurredOnly, new Date("2026-04-01T00:00:00Z")), true);
+});
+
+test("infers a predecessor end from its successor when valid_until is absent", () => {
+  const predecessor = {
+    id: "entity-old",
+    is_latest: false,
+    status: "shadow",
+    created_at: "2026-01-01T00:00:00Z",
+    superseded_by: ["entity-new"],
+  };
+  const successor = {
+    id: "entity-new",
+    is_latest: true,
+    status: "active",
+    created_at: "2026-03-01T00:00:00Z",
+    supersedes: ["entity-old"],
+  };
+  const pointById = new Map([
+    [predecessor.id, predecessor],
+    [successor.id, successor],
+  ]);
+
+  assert.equal(
+    pointVisibleAt(predecessor, new Date("2026-02-01T00:00:00Z"), pointById),
+    true,
+  );
+  assert.equal(
+    pointVisibleAt(successor, new Date("2026-02-01T00:00:00Z"), pointById),
+    false,
+  );
+  assert.equal(
+    pointVisibleAt(predecessor, new Date("2026-03-01T00:00:00Z"), pointById),
+    false,
+  );
+  assert.equal(
+    pointVisibleAt(successor, new Date("2026-03-01T00:00:00Z"), pointById),
+    true,
+  );
 });
 
 test("preserves ordinary panel scrolling but captures pinch everywhere", () => {
@@ -351,6 +545,57 @@ test("focuses a Point's semantic cluster and directly connected relations", () =
     "face:face-work",
   ]));
   assert.equal(focus.has("point:point-c"), false);
+});
+
+test("focuses canonical Line endpoints through their rendered entity Points", () => {
+  const model = {
+    ...modelFixture(),
+    lines: [{ id: "line-entity", source: "self", target: "Acme" }],
+  };
+  const layout = {
+    ...layoutFixture(),
+    endpointPointIds: new Map([["Acme", "point-a"]]),
+  };
+
+  assert.deepEqual(
+    focusKeysForSelection(model, layout, { kind: "line", id: "line-entity" }),
+    new Set(["line:line-entity", "context:self", "point:point-a"]),
+  );
+  assert.ok(
+    focusKeysForSelection(model, layout, { kind: "point", id: "point-a" })
+      .has("line:line-entity"),
+  );
+});
+
+test("focuses case variants through their shared context node", () => {
+  const model = {
+    points: [],
+    faces: [],
+    volumes: [],
+    root: null,
+    lines: [
+      { id: "line-upper", source: "self", target: "Acme Labs" },
+      { id: "line-lower", source: "self", target: "acme labs" },
+    ],
+  };
+  const layout = {
+    endpointPointIds: new Map(),
+    endpointContextIds: new Map([
+      ["self", "self"],
+      ["Acme Labs", "Acme Labs"],
+      ["acme labs", "Acme Labs"],
+    ]),
+  };
+
+  assert.deepEqual(
+    focusKeysForSelection(model, layout, { kind: "context", id: "Acme Labs" }),
+    new Set([
+      "context:Acme Labs",
+      "line:line-upper",
+      "line:line-lower",
+      "context:self",
+    ]),
+  );
 });
 
 test("focuses only the adjacent hierarchy shell for high-level selections", () => {

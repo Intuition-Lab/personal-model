@@ -7,6 +7,8 @@ append-only stamping, and ``edges_as_of`` valid-time + status filtering.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from persome.evomem.models import MemoryStatus
@@ -38,6 +40,9 @@ def test_ensure_schema_idempotent_and_indexes(ac_root) -> None:
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='relation_edges'"
         ).fetchone()
+        effects_tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='relation_edge_effects'"
+        ).fetchone()
         idx = {
             r[0]
             for r in conn.execute(
@@ -45,7 +50,361 @@ def test_ensure_schema_idempotent_and_indexes(ac_root) -> None:
             ).fetchall()
         }
     assert tbl is not None
-    assert {"ix_edges_src", "ix_edges_dst"} <= idx
+    assert effects_tbl is not None
+    assert {"ix_edges_src", "ix_edges_dst", "uq_relation_edges_open_edge_key"} <= idx
+
+
+def test_canonical_edge_key_is_shared_and_knows_is_symmetric() -> None:
+    assert edges.canonical_edge_key(" Alice ", "Bob", "knows") == edges.canonical_edge_key(
+        "Bob", "Alice", edges.Predicate.KNOWS
+    )
+    assert edges.canonical_edge_key(
+        "event:legacy-1", "Alice", "participates_in"
+    ) == edges.canonical_edge_key("event:intent:legacy-1", "Alice", "participates_in")
+    assert edges.canonical_edge_key("Alice", "Bob", "reports_to") != edges.canonical_edge_key(
+        "Bob", "Alice", "reports_to"
+    )
+
+
+def test_open_edge_unique_close_reopen_and_retired_non_conflict(ac_root) -> None:
+    common = dict(
+        predicate="knows",
+        src_kind="person",
+        dst_kind="person",
+        provenance="inferred",
+        confidence=0.8,
+    )
+    with fts.cursor() as conn:
+        first = edges.add_edge(conn, src_identity="Alice", dst_identity="Bob", **common)
+        with pytest.raises(sqlite3.IntegrityError):
+            edges.add_edge(
+                conn,
+                src_identity="Bob",
+                dst_identity="Alice",
+                status=MemoryStatus.ACTIVE,
+                **common,
+            )
+
+        assert edges.close_edge(conn, edge_id=first, at=T_2026_06)
+        reopened = edges.add_edge(
+            conn,
+            src_identity="Bob",
+            dst_identity="Alice",
+            status=MemoryStatus.ACTIVE,
+            **common,
+        )
+        archived = edges.add_edge(
+            conn,
+            src_identity="Alice",
+            dst_identity="Bob",
+            status=MemoryStatus.ARCHIVED,
+            **common,
+        )
+        superseded = edges.add_edge(
+            conn,
+            src_identity="Bob",
+            dst_identity="Alice",
+            status=MemoryStatus.SUPERSEDED,
+            **common,
+        )
+        rows = conn.execute(
+            "SELECT edge_id, valid_to, status, edge_key FROM relation_edges ORDER BY edge_id"
+        ).fetchall()
+
+    assert {str(row[0]) for row in rows} == {first, reopened, archived, superseded}
+    assert len({str(row[3]) for row in rows}) == 1
+    assert sum(row[1] is None and row[2] in {"active", "shadow"} for row in rows) == 1
+
+
+def test_effect_key_makes_additive_reinforcement_exactly_once(ac_root) -> None:
+    with fts.cursor() as conn:
+        edge_id = edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity="Alice",
+            predicate="engaged_with",
+            src_kind="self",
+            dst_kind="person",
+            provenance="inferred",
+            confidence=0.8,
+            status="active",
+            effect_key="delta:1:engaged:self:alice",
+        )
+        assert (
+            edges.reinforce_edge(
+                conn,
+                edge_id=edge_id,
+                observations=1,
+                additive=True,
+                effect_key="delta:1:engaged:self:alice",
+            )
+            is False
+        )
+        assert edges.reinforce_edge(
+            conn,
+            edge_id=edge_id,
+            observations=1,
+            additive=True,
+            effect_key="delta:2:engaged:self:alice",
+        )
+        conn.row_factory = None
+        observations = conn.execute(
+            "SELECT observations FROM relation_edges WHERE edge_id=?", (edge_id,)
+        ).fetchone()[0]
+        receipts = conn.execute(
+            "SELECT effect_key, applied_observations FROM relation_edge_effects"
+            " WHERE edge_id=? ORDER BY effect_key",
+            (edge_id,),
+        ).fetchall()
+
+    assert observations == 2
+    assert receipts == [
+        ("delta:1:engaged:self:alice", 1),
+        ("delta:2:engaged:self:alice", 1),
+    ]
+
+
+def test_effect_retry_is_noop_after_same_logical_edge_closes_and_reopens(ac_root) -> None:
+    common = dict(
+        src_identity="self",
+        dst_identity="Alice",
+        predicate="engaged_with",
+        src_kind="self",
+        dst_kind="person",
+        provenance="inferred",
+        confidence=0.8,
+        status="active",
+    )
+    with fts.cursor() as conn:
+        old_edge = edges.add_edge(
+            conn,
+            effect_key="delta:1:engaged:self:alice",
+            **common,
+        )
+        assert edges.close_edge(conn, edge_id=old_edge)
+        reopened = edges.add_edge(conn, **common)
+
+        assert (
+            edges.reinforce_edge(
+                conn,
+                edge_id=reopened,
+                observations=1,
+                additive=True,
+                effect_key="delta:1:engaged:self:alice",
+            )
+            is False
+        )
+        observations = conn.execute(
+            "SELECT observations FROM relation_edges WHERE edge_id=?", (reopened,)
+        ).fetchone()[0]
+
+    assert observations == 1
+
+
+def test_ended_effect_creates_or_closes_one_interval_exactly_once(ac_root) -> None:
+    common = dict(
+        src_identity="self",
+        dst_identity="Alice",
+        predicate="reports_to",
+        src_kind="self",
+        dst_kind="person",
+        provenance="inferred",
+        confidence=0.8,
+        status="shadow",
+        polarity="0",
+    )
+    with fts.cursor() as conn:
+        first = edges.end_edge_with_effect(
+            conn,
+            effect_key="delta:1:relation:self-reports-to-alice:end",
+            **common,
+        )
+        replay = edges.end_edge_with_effect(
+            conn,
+            effect_key="delta:1:relation:self-reports-to-alice:end",
+            **common,
+        )
+        rows = conn.execute(
+            "SELECT edge_id, valid_to FROM relation_edges WHERE edge_key=?",
+            (edges.canonical_edge_key("self", "Alice", "reports_to"),),
+        ).fetchall()
+        receipt_count = conn.execute(
+            "SELECT COUNT(*) FROM relation_edge_effects WHERE effect_key=?",
+            ("delta:1:relation:self-reports-to-alice:end",),
+        ).fetchone()[0]
+
+    assert first.created and first.applied
+    assert replay.edge_id == first.edge_id
+    assert not replay.created and not replay.applied
+    assert len(rows) == 1 and rows[0][1] is not None
+    assert receipt_count == 1
+
+
+def test_ended_effect_closes_previously_open_interval(ac_root) -> None:
+    common = dict(
+        src_identity="self",
+        dst_identity="Alice",
+        predicate="reports_to",
+        src_kind="self",
+        dst_kind="person",
+        provenance="inferred",
+        confidence=0.8,
+        status="shadow",
+        polarity="0",
+    )
+    with fts.cursor() as conn:
+        edge_id = edges.add_edge(conn, **common)
+        ended = edges.end_edge_with_effect(
+            conn,
+            effect_key="delta:2:relation:self-reports-to-alice:end",
+            **common,
+        )
+        valid_to = conn.execute(
+            "SELECT valid_to FROM relation_edges WHERE edge_id=?", (edge_id,)
+        ).fetchone()[0]
+
+    assert ended.edge_id == edge_id
+    assert not ended.created and ended.applied
+    assert valid_to is not None
+
+
+def test_effect_key_collision_rolls_back_new_edge_and_rejects_other_edge(ac_root) -> None:
+    common = dict(
+        predicate="engaged_with",
+        src_kind="person",
+        dst_kind="person",
+        provenance="inferred",
+        confidence=0.8,
+        status="active",
+    )
+    with fts.cursor() as conn:
+        first = edges.add_edge(
+            conn,
+            src_identity="Alice",
+            dst_identity="Bob",
+            effect_key="effect:globally-unique",
+            **common,
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            edges.add_edge(
+                conn,
+                src_identity="Carol",
+                dst_identity="Dave",
+                effect_key="effect:globally-unique",
+                **common,
+            )
+        second = edges.add_edge(
+            conn,
+            src_identity="Carol",
+            dst_identity="Dave",
+            **common,
+        )
+        with pytest.raises(edges.RelationEdgeEffectConflict):
+            edges.reinforce_edge(
+                conn,
+                edge_id=second,
+                observations=1,
+                additive=True,
+                effect_key="effect:globally-unique",
+            )
+        conn.row_factory = None
+        rows = conn.execute(
+            "SELECT edge_id, observations FROM relation_edges ORDER BY edge_id"
+        ).fetchall()
+        receipt = conn.execute(
+            "SELECT edge_id FROM relation_edge_effects WHERE effect_key='effect:globally-unique'"
+        ).fetchone()
+
+    assert {row[0] for row in rows} == {first, second}
+    assert all(row[1] == 1 for row in rows)
+    assert receipt == (first,)
+
+
+def test_effect_receipt_rolls_back_when_additive_increment_fails(ac_root) -> None:
+    with fts.cursor() as conn:
+        edge_id = edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity="Alice",
+            predicate="engaged_with",
+            src_kind="self",
+            dst_kind="person",
+            provenance="inferred",
+            confidence=0.8,
+            status="active",
+        )
+        conn.execute(
+            "CREATE TRIGGER fail_relation_observation_update"
+            " BEFORE UPDATE OF observations ON relation_edges"
+            " BEGIN SELECT RAISE(ABORT, 'synthetic update failure'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic update failure"):
+            edges.reinforce_edge(
+                conn,
+                edge_id=edge_id,
+                observations=1,
+                additive=True,
+                effect_key="effect:must-rollback",
+            )
+        conn.row_factory = None
+        observations = conn.execute(
+            "SELECT observations FROM relation_edges WHERE edge_id=?", (edge_id,)
+        ).fetchone()[0]
+        receipt = conn.execute(
+            "SELECT 1 FROM relation_edge_effects WHERE effect_key='effect:must-rollback'"
+        ).fetchone()
+
+    assert observations == 1
+    assert receipt is None
+
+
+def test_dirty_open_edge_migration_fails_closed_without_summing() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE relation_edges (
+            edge_id TEXT PRIMARY KEY, src_identity TEXT NOT NULL,
+            dst_identity TEXT NOT NULL, predicate TEXT NOT NULL, label TEXT,
+            valid_from TEXT NOT NULL, valid_to TEXT, provenance TEXT NOT NULL,
+            confidence REAL NOT NULL, quote TEXT, status TEXT NOT NULL,
+            created_at TEXT NOT NULL, observations INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO relation_edges VALUES
+            ('e1','Alice','Bob','knows',NULL,'2026-01-01',NULL,
+             'inferred',0.5,NULL,'shadow','2026-01-01',2),
+            ('e2','Bob','Alice','knows',NULL,'2026-02-01',NULL,
+             'inferred',0.7,NULL,'active','2026-02-01',7);
+        """
+    )
+
+    with pytest.raises(edges.RelationEdgeMigrationError) as raised:
+        edges.ensure_schema(conn)
+
+    message = str(raised.value)
+    assert "e1" in message and "e2" in message
+    assert "observations were not summed" in message
+    assert conn.execute(
+        "SELECT edge_id, observations FROM relation_edges ORDER BY edge_id"
+    ).fetchall() == [("e1", 2), ("e2", 7)]
+    assert "uq_relation_edges_open_edge_key" not in {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+
+    # Explicit adjudication (closing one history row) makes the migration safe;
+    # the closed row remains intact and receives the same canonical audit key.
+    conn.execute("UPDATE relation_edges SET valid_to='2026-02-01' WHERE edge_id='e1'")
+    edges.ensure_schema(conn)
+    assert (
+        len(
+            {
+                row[0]
+                for row in conn.execute(
+                    "SELECT edge_key FROM relation_edges WHERE edge_id IN ('e1','e2')"
+                )
+            }
+        )
+        == 1
+    )
 
 
 def test_add_edge_defaults_shadow_open_and_returns_id(ac_root) -> None:
@@ -589,8 +948,6 @@ def test_polarity_closed_set(ac_root) -> None:
 
 
 def test_ensure_schema_backfills_axis_columns(ac_root) -> None:
-    import sqlite3
-
     # simulate a pre-axis DB: the originally-shipped CREATE (no extra columns)
     c = sqlite3.connect(":memory:")
     c.execute(
