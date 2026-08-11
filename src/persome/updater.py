@@ -465,8 +465,10 @@ def _child_environment(*, include_source: Path | None = None) -> dict[str, str]:
     env["PYTHONNOUSERSITE"] = "1"
     for variable in (
         "SSL_CERT_FILE",
+        "PYTHONEXECUTABLE",
         "PYTHONHOME",
         "PYTHONPATH",
+        "PYTHONPLATLIBDIR",
         "VIRTUAL_ENV",
         "__PYVENV_LAUNCHER__",
     ):

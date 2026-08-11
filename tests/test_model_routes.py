@@ -473,6 +473,7 @@ class TestViewPage:
         layout = routes.model_asset("layout.mjs")
         explore = routes.model_asset("explore.mjs")
         evidence = routes.model_asset("evidence.mjs")
+        palette = routes.model_asset("palette.mjs")
         share = routes.model_asset("share.mjs")
         viewer = routes.model_asset("viewer.js")
         css = routes.model_asset("viewer.css")
@@ -483,13 +484,17 @@ class TestViewPage:
         assert b"rankSearchEntries" in explore.body
         assert b"focusKeysForSelection" in explore.body
         assert b"nodeEvidenceCards" in evidence.body
+        assert b"MODEL_PALETTE" in palette.body
+        assert b"MODEL_COLORS" in palette.body
         assert b"humanCard" in share.body
         assert b"buildXIntentUrl" in share.body
         assert b"drawHumanCard" in share.body
         assert b"drawConstellationCard" in share.body
         assert b'from "./layout.mjs"' in viewer.body
         assert b'from "./explore.mjs"' in viewer.body
+        assert b'from "./palette.mjs"' in viewer.body
         assert b'from "./share.mjs"' in viewer.body
+        assert b'from "./palette.mjs"' in share.body
         assert b"model.points" in viewer.body
         assert b"model.lines" in viewer.body
         assert b"model.faces" in viewer.body
@@ -522,10 +527,10 @@ class TestViewPage:
         assert b".build-state--building" in css.body
         assert b".build-state--degraded" in css.body
         assert b".build-state--complete" in css.body
-        assert b"--build-color: #8d8799" in css.body
-        assert b"--build-color: var(--line)" in css.body
-        assert b"--build-color: var(--root)" in css.body
-        assert b"--build-color: var(--point)" in css.body
+        assert b"--build-color: var(--dim)" in css.body
+        assert b"--build-color: var(--warning)" in css.body
+        assert b"--build-color: var(--danger)" in css.body
+        assert b"--build-color: var(--success)" in css.body
         assert b"controls.zoomToCursor = true" in viewer.body
         # The wheel is the viewer's, not OrbitControls'. Its wheel path lands
         # the whole delta in one step while orbit and pan glide under damping,
@@ -604,6 +609,7 @@ class TestViewPage:
         assert viewer.media_type == "text/javascript"
         assert layout.media_type == "text/javascript"
         assert explore.media_type == "text/javascript"
+        assert palette.media_type == "text/javascript"
         assert share.media_type == "text/javascript"
         assert css.media_type == "text/css"
 
@@ -663,7 +669,7 @@ class TestViewPage:
         assert ".mobile-guide" in css
         assert "bottom: 76px" in css
         assert "min-height: 44px" in css
-        assert "color: #aaa4b6" in css
+        assert "color: var(--muted)" in css
         assert "max-height: min(66dvh, 620px)" in css
         assert "env(safe-area-inset-bottom)" in css
 

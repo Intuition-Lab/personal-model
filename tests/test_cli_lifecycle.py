@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import shlex
+import subprocess
 import time
 from types import SimpleNamespace
 
@@ -176,7 +177,14 @@ def test_background_spawn_execs_fresh_interpreter_and_transfers_lock(
         return 4242
 
     monkeypatch.delattr(cli.sys, "frozen", raising=False)
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     monkeypatch.setenv("PERSOME_PARENT_PID", "1234")
+    monkeypatch.setenv("PYTHONEXECUTABLE", "/tmp/foreign-python")
+    monkeypatch.setenv("PYTHONHOME", "/tmp/foreign-python")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/foreign-package")
+    monkeypatch.setenv("PYTHONPLATLIBDIR", "/tmp/foreign-lib")
+    monkeypatch.setenv("VIRTUAL_ENV", "/tmp/foreign-venv")
+    monkeypatch.setenv("__PYVENV_LAUNCHER__", "/tmp/foreign-python")
     monkeypatch.setattr(cli.os, "posix_spawn", fake_posix_spawn)
 
     assert cli._spawn_background_runtime(lock, capture_only=True) == 4242
@@ -193,6 +201,14 @@ def test_background_spawn_execs_fresh_interpreter_and_transfers_lock(
     assert seen["setsid"] is True
     assert seen["env"][cli._BACKGROUND_DAEMON_LOCK_FD_ENV] == "3"
     assert "PERSOME_PARENT_PID" not in seen["env"]
+    assert seen["env"]["PYTHONSAFEPATH"] == "1"
+    assert "PYTHONNOUSERSITE" not in seen["env"]
+    assert "PYTHONEXECUTABLE" not in seen["env"]
+    assert "PYTHONHOME" not in seen["env"]
+    assert "PYTHONPATH" not in seen["env"]
+    assert "PYTHONPLATLIBDIR" not in seen["env"]
+    assert "VIRTUAL_ENV" not in seen["env"]
+    assert "__PYVENV_LAUNCHER__" not in seen["env"]
     assert seen["file_actions"] == [
         (cli.os.POSIX_SPAWN_DUP2, 91, 3),
         (cli.os.POSIX_SPAWN_CLOSE, 91),
@@ -200,6 +216,50 @@ def test_background_spawn_execs_fresh_interpreter_and_transfers_lock(
         (cli.os.POSIX_SPAWN_DUP2, 0, 1),
         (cli.os.POSIX_SPAWN_DUP2, 0, 2),
     ]
+
+
+def test_background_spawn_cannot_import_persome_from_caller_working_directory(
+    ac_root, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caller_directory = tmp_path / "foreign-cwd"
+    caller_directory.mkdir()
+    fake_package = caller_directory / "persome"
+    fake_package.mkdir()
+    (fake_package / "__init__.py").write_text("", encoding="utf-8")
+    marker = caller_directory / "cwd-package-imported"
+    (fake_package / "cli.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_posix_spawn(
+        _executable: str,
+        command: list[str],
+        env: dict[str, str],
+        **_kwargs: object,
+    ) -> int:
+        seen.update(command=command, env=env)
+        return 4242
+
+    monkeypatch.delattr(cli.sys, "frozen", raising=False)
+    monkeypatch.chdir(caller_directory)
+    monkeypatch.setenv("PYTHONPATH", str(caller_directory))
+    monkeypatch.setattr(cli.os, "posix_spawn", fake_posix_spawn)
+
+    assert cli._spawn_background_runtime(_FakeLock(), capture_only=False) == 4242
+    command = seen["command"]
+    result = subprocess.run(
+        [*command[:3], "--help"],
+        cwd=caller_directory,
+        env=seen["env"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
 
 
 def test_background_spawn_uses_fd_four_when_parent_lock_is_fd_three(
