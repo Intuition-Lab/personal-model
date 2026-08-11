@@ -25,6 +25,7 @@ retrieval; ``edges_as_of`` is the read primitive P0-3 / P1 build on.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from collections.abc import Iterable
@@ -35,6 +36,10 @@ from ..evomem.models import MemoryStatus
 from ..logger import get
 
 logger = get("persome.store.relation_edges")
+
+
+class RelationEdgeMigrationError(RuntimeError):
+    """The legacy edge set cannot be made canonically unique without adjudication."""
 
 
 class EntityKind(StrEnum):
@@ -94,9 +99,10 @@ _LEGAL_ENDPOINTS: dict[Predicate, frozenset[tuple[EntityKind, EntityKind]]] = {
 }
 
 
-SCHEMA = """
+_TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS relation_edges (
     edge_id      TEXT PRIMARY KEY,
+    edge_key     TEXT NOT NULL,          -- canonical logical identity; not a display label
     src_identity TEXT NOT NULL,          -- stable canonical identity, never a version node ID
     dst_identity TEXT NOT NULL,
     predicate    TEXT NOT NULL,          -- one closed-set predicate
@@ -111,10 +117,23 @@ CREATE TABLE IF NOT EXISTS relation_edges (
     observations INTEGER NOT NULL DEFAULT 1,  -- monotone supporting-evidence count
     last_observed_at TEXT,               -- latest reinforcement in ISO 8601
     recall_count INTEGER NOT NULL DEFAULT 0  -- increments when a delivered chain uses this edge
-);
-CREATE INDEX IF NOT EXISTS ix_edges_src ON relation_edges(src_identity, valid_from);
-CREATE INDEX IF NOT EXISTS ix_edges_dst ON relation_edges(dst_identity, valid_from);
+)
 """
+
+_ORDINARY_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS ix_edges_src ON relation_edges(src_identity, valid_from)",
+    "CREATE INDEX IF NOT EXISTS ix_edges_dst ON relation_edges(dst_identity, valid_from)",
+)
+_OPEN_EDGE_INDEX = "uq_relation_edges_open_edge_key"
+_OPEN_EDGE_INDEX_SQL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS {_OPEN_EDGE_INDEX}
+ON relation_edges(edge_key)
+WHERE valid_to IS NULL AND status IN ('active', 'shadow')
+"""
+
+# Kept as the importable base schema string. ``ensure_schema`` installs the
+# partial unique index only after its fail-closed legacy-data preflight.
+SCHEMA = ";\n".join((_TABLE_SCHEMA.strip(), *_ORDINARY_INDEXES)) + ";\n"
 
 
 # stamp neutral '0'; the LLM relation pass may stamp ± when the quote carries
@@ -123,6 +142,10 @@ POLARITIES = frozenset({"+", "-", "0"})
 
 # Columns added after the first shipped schema — ensure_schema back-fills them on old DBs.
 _EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+    # Nullable only for ALTER TABLE compatibility. Fresh databases use the
+    # NOT NULL declaration above, and the migration fills every legacy row
+    # before installing the partial unique index.
+    ("edge_key", "TEXT"),
     ("observations", "INTEGER NOT NULL DEFAULT 1"),
     ("last_observed_at", "TEXT"),
     ("recall_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -140,16 +163,127 @@ _EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def canonical_edge_parts(
+    src_identity: str, dst_identity: str, predicate: str | Predicate
+) -> tuple[str, str, str]:
+    """Return the shared logical identity parts for one relation.
+
+    Activity identities retain the existing ``event:<id>`` compatibility
+    normalization. ``knows`` is symmetric, so endpoint order is irrelevant;
+    every other predicate remains directed.
+    """
+    from ..model.activity_source import normalize_activity_identity
+
+    pred = Predicate(str(predicate)).value
+    src = normalize_activity_identity(str(src_identity).strip())
+    dst = normalize_activity_identity(str(dst_identity).strip())
+    if not src or not dst:
+        raise ValueError("relation_edges: src_identity / dst_identity must be non-empty")
+    if pred == Predicate.KNOWS.value:
+        src, dst = sorted((src, dst))
+    return src, dst, pred
+
+
+def canonical_edge_key(src_identity: str, dst_identity: str, predicate: str | Predicate) -> str:
+    """Return a collision-safe, stable database key for a logical relation."""
+    return json.dumps(
+        canonical_edge_parts(src_identity, dst_identity, predicate),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _migration_rows(conn: sqlite3.Connection) -> list[tuple[object, ...]]:
+    previous_factory = conn.row_factory
+    conn.row_factory = None
+    try:
+        return list(
+            conn.execute(
+                "SELECT edge_id, src_identity, dst_identity, predicate, status, valid_to,"
+                " observations, edge_key FROM relation_edges ORDER BY edge_id"
+            ).fetchall()
+        )
+    finally:
+        conn.row_factory = previous_factory
+
+
+def _backfill_canonical_keys(conn: sqlite3.Connection) -> None:
+    """Fill legacy keys, refusing ambiguous open rows instead of merging them."""
+    updates: list[tuple[str, str]] = []
+    open_rows: dict[str, list[tuple[str, str, int]]] = {}
+    invalid: list[tuple[str, str]] = []
+    for edge_id, src, dst, predicate, status, valid_to, observations, stored_key in _migration_rows(
+        conn
+    ):
+        eid = str(edge_id)
+        try:
+            key = canonical_edge_key(str(src), str(dst), str(predicate))
+        except ValueError as exc:
+            invalid.append((eid, str(exc)))
+            continue
+        if stored_key != key:
+            updates.append((key, eid))
+        if valid_to is None and str(status) in {
+            MemoryStatus.ACTIVE.value,
+            MemoryStatus.SHADOW.value,
+        }:
+            open_rows.setdefault(key, []).append((eid, str(status), int(observations or 1)))
+
+    collisions = {key: rows for key, rows in open_rows.items() if len(rows) > 1}
+    if invalid or collisions:
+        details: list[str] = []
+        for edge_id, reason in invalid[:10]:
+            details.append(f"invalid edge_id={edge_id}: {reason}")
+        for key, rows in list(collisions.items())[:10]:
+            members = ", ".join(
+                f"{edge_id}(status={status}, observations={observations})"
+                for edge_id, status, observations in rows
+            )
+            details.append(f"edge_key={key}: {members}")
+        omitted = len(invalid) + len(collisions) - len(details)
+        if omitted > 0:
+            details.append(f"... and {omitted} more conflict groups")
+        raise RelationEdgeMigrationError(
+            "relation_edges canonical-key migration refused: existing open edges conflict; "
+            "no rows were merged and observations were not summed. " + "; ".join(details)
+        )
+
+    if updates:
+        conn.executemany("UPDATE relation_edges SET edge_key=? WHERE edge_id=?", updates)
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     from . import fts
 
     if fts.is_client_process():
         return
-    conn.executescript(SCHEMA)
-    have = {row[1] for row in conn.execute("PRAGMA table_info(relation_edges)").fetchall()}
-    for name, decl in _EXTRA_COLUMNS:
-        if name not in have:
-            conn.execute(f"ALTER TABLE relation_edges ADD COLUMN {name} {decl}")
+    savepoint = f"relation_edges_schema_{uuid.uuid4().hex}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        conn.execute(_TABLE_SCHEMA)
+        for statement in _ORDINARY_INDEXES:
+            conn.execute(statement)
+        have = {row[1] for row in conn.execute("PRAGMA table_info(relation_edges)").fetchall()}
+        for name, decl in _EXTRA_COLUMNS:
+            if name not in have:
+                conn.execute(f"ALTER TABLE relation_edges ADD COLUMN {name} {decl}")
+
+        index_exists = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                (_OPEN_EDGE_INDEX,),
+            ).fetchone()
+            is not None
+        )
+        if not index_exists:
+            _backfill_canonical_keys(conn)
+            conn.execute(_OPEN_EDGE_INDEX_SQL)
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        logger.error("relation_edges schema migration failed closed", exc_info=True)
+        raise
 
 
 def _now_iso() -> str:
@@ -210,6 +344,7 @@ def add_edge(
     dst = str(dst_identity).strip()
     if not src or not dst:
         raise ValueError("relation_edges: src_identity / dst_identity must be non-empty")
+    edge_key = canonical_edge_key(src, dst, pred)
     st = MemoryStatus(str(status))
 
     obs = int(observations)
@@ -233,14 +368,15 @@ def add_edge(
     conn.execute(
         """
         INSERT INTO relation_edges
-            (edge_id, src_identity, dst_identity, predicate, label, valid_from,
+            (edge_id, edge_key, src_identity, dst_identity, predicate, label, valid_from,
              valid_to, provenance, confidence, quote, status, created_at, observations,
              src_kind, dst_kind, polarity, last_observed_at, source_kind, source_id,
              source_receipt)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             eid,
+            edge_key,
             src,
             dst,
             pred.value,
@@ -263,6 +399,17 @@ def add_edge(
     )
     conn.commit()
     return eid
+
+
+def find_open_edge(conn: sqlite3.Connection, *, edge_key: str) -> str | None:
+    """Resolve one canonical key to its open active/shadow row, if present."""
+    ensure_schema(conn)
+    row = conn.execute(
+        "SELECT edge_id FROM relation_edges WHERE edge_key=? AND valid_to IS NULL"
+        " AND status IN ('active','shadow')",
+        (str(edge_key),),
+    ).fetchone()
+    return str(row[0]) if row is not None else None
 
 
 def close_edge(conn: sqlite3.Connection, *, edge_id: str, at: str | None = None) -> bool:
@@ -335,7 +482,14 @@ def reinforce_edge(
     count = attention weight. MAX-of-1 (the caller passing 1 every session) would freeze
     it at 1 (the point-layer bug); increment fixes it. Callers must fire once per session
     (the session-end callback does); a re-run repair is the deterministic recompute from
-    ``memory_deltas`` distinct-session count. ``confidence`` **likewise only
+    ``memory_deltas`` distinct-session count. Unlike the default MAX mode, an
+    additive call against an already-open edge is not retry-idempotent: this
+    table has no per-effect receipt ledger with which to distinguish a retry
+    from genuinely new evidence. The relation upsert prevents a loser in a
+    concurrent *creation* race from incrementing again, but callers remain
+    responsible for once-per-effect delivery after the edge exists.
+
+    ``confidence`` **likewise only
     ratchets up (MAX), INDEPENDENTLY of whether ``observations`` grew** (issue #453): the
     two axes move on their own gates, so a caller that keeps ``observations`` pinned (the
     LLM `reports_to` pass and the activity pass both default `observations=1`) can still

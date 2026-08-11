@@ -120,8 +120,10 @@ only when no safe match exists; it does not rewrite the Line or mutate snapshot 
 
 Activity-derived relation Lines carry the atomic source triplet
 `source_kind`, `source_id`, and `source_receipt`. New activity identities use
-`event:entry:<id>` or `event:session:<id>`. `event:intent:<id>` exists only for
-read-only migration of old data.
+`event:occurrence:<id>`, `event:entry:<id>`, or `event:session:<id>`. A windowed
+memory-delta event uses `source_kind: occurrence`; its stable occurrence ID is
+separate from the recurring series ID stored in `event_occurrences`.
+`event:intent:<id>` exists only for read-only migration of old data.
 
 ### Face
 

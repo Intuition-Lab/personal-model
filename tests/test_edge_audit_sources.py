@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from persome.evomem import edge_audit
 from persome.store import entries as entries_store
+from persome.store import event_occurrences as occurrences
 from persome.store import fts
 from persome.store import relation_edges as edges
 
@@ -61,6 +62,81 @@ def test_missing_entry_source_is_structural_hallucination(ac_root) -> None:
         )
         row = conn.execute("SELECT * FROM relation_edges WHERE edge_id=?", (edge_id,)).fetchone()
         verdict = edge_audit.audit_edge(conn, row)
+    assert verdict.verdict == "structural_hallucination"
+    assert verdict.checks["source_exists"] is False
+
+
+def test_occurrence_activity_edge_audits_against_occurrence_receipt(ac_root) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    with fts.cursor() as conn:
+        start = datetime(2026, 8, 11, 2, 0, tzinfo=UTC)
+        occurrence, _ = occurrences.upsert(
+            conn,
+            session_id="session-1",
+            window_start=start,
+            window_end=start + timedelta(minutes=5),
+            item_key="review-1",
+            title="Weekly review",
+            participants=["self"],
+            quote="Reviewed the Persome runtime architecture.",
+            confidence=0.9,
+        )
+        edge_id = edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity=occurrence.endpoint,
+            predicate="participates_in",
+            src_kind="self",
+            dst_kind="event",
+            provenance="inferred",
+            confidence=0.9,
+            quote="Reviewed the Persome runtime architecture.",
+            source_kind="occurrence",
+            source_id=occurrence.occurrence_id,
+            source_receipt=occurrence.source_receipt,
+        )
+        row = conn.execute("SELECT * FROM relation_edges WHERE edge_id=?", (edge_id,)).fetchone()
+        verdict = edge_audit.audit_edge(conn, row)
+
+    assert verdict.verdict == "valid"
+    assert verdict.checks["source_exists"] is True
+    assert verdict.checks["quote_traceable"] is True
+
+
+def test_occurrence_activity_edge_rejects_mismatched_receipt(ac_root) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    with fts.cursor() as conn:
+        start = datetime(2026, 8, 11, 2, 0, tzinfo=UTC)
+        occurrence, _ = occurrences.upsert(
+            conn,
+            session_id="session-1",
+            window_start=start,
+            window_end=start + timedelta(minutes=5),
+            item_key="review-1",
+            title="Weekly review",
+            participants=["self"],
+            quote="Reviewed the Persome runtime architecture.",
+            confidence=0.9,
+        )
+        edge_id = edges.add_edge(
+            conn,
+            src_identity="self",
+            dst_identity=occurrence.endpoint,
+            predicate="participates_in",
+            src_kind="self",
+            dst_kind="event",
+            provenance="inferred",
+            confidence=0.9,
+            quote="Reviewed the Persome runtime architecture.",
+            source_kind="occurrence",
+            source_id=occurrence.occurrence_id,
+            source_receipt="⟨00000000000000000000:event_occurrences⟩",
+        )
+        row = conn.execute("SELECT * FROM relation_edges WHERE edge_id=?", (edge_id,)).fetchone()
+        verdict = edge_audit.audit_edge(conn, row)
+
     assert verdict.verdict == "structural_hallucination"
     assert verdict.checks["source_exists"] is False
 

@@ -31,6 +31,17 @@ capture evidence
   Historical Points and evolution Lines remain audit-searchable after they occurred.
 - Canonical relation endpoints reuse an unambiguous current entity Point. A context node is created
   only when no safe Point match exists; reserved `self` and ambiguous identities fail closed.
+- A canonical session-window claim is acquired before memory-delta extraction. Timezone-equivalent
+  bounds share one key; a lease/token compare-and-swap prevents a stale worker from binding a second
+  payload after recovery.
+- Open active/shadow relation Lines have one canonical database key. `knows` is symmetric; all other
+  predicates remain directed. Legacy collisions stop relation migration without merging rows or
+  summing observation counts.
+- Windowed events use a stable occurrence ID derived from session, canonical window, and item key.
+  Recurring events share a narrower series ID only when normalized title and canonical participants
+  agree. Legacy title-hash endpoints remain untouched instead of receiving fabricated provenance.
+- A parent delta is `applied` only when deterministic apply reports no item errors. Partial failure
+  remains retryable and visible as `failed`.
 
 ## Evidence and compatibility
 
@@ -48,7 +59,7 @@ the next promotion hardening slice.
 1. Per-entry source receipts and evidence-span validation before normalized claims can promote.
 2. Candidate-state Point/Line promotion based on independent session receipts instead of ordinary
    first sighting.
-3. Canonical memory-delta window claims and item-level apply receipts.
-4. Unique open relation keys with dirty-data preflight and fail-closed migration.
-5. Event occurrence identity separated from recurring event series identity.
-6. Independent input receipts for Face and Volume resamples.
+3. Item-level apply receipts, including exactly-once additive Line reinforcement after a process
+   crash. Window-level claims are already enforced but cannot prove every effect committed once.
+4. An owner-visible dirty-data repair workflow for legacy open-Line collision reports.
+5. Independent input receipts for Face, Volume, and Root resamples.

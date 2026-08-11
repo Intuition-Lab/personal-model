@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from ..capture.timestamps import parse_capture_timestamp
+from ..store import event_occurrences as occurrences_store
 from ..timeline import store as timeline_store
 
 ACTIVITY_PREFIX = "event:"
-SOURCE_KINDS = frozenset({"entry", "session", "intent"})
+SOURCE_KINDS = frozenset({"occurrence", "entry", "session", "intent"})
 _DONE_INTENT_STATUSES = ("consumed", "completed")
 
 ParticipantResolver = Callable[[list[str], str], list[str]]
@@ -95,13 +96,19 @@ class ActivitySource:
         previous_factory = self._conn.row_factory
         self._conn.row_factory = sqlite3.Row
         try:
-            entry_events, entry_session_ids = self._entry_events()
+            occurrence_events, occurrence_session_ids = self._occurrence_events()
+            entry_events, entry_session_ids = self._entry_events(
+                exclude_session_ids=occurrence_session_ids
+            )
             # A reducer entry is the richer, receipt-bearing representation of
             # its session.  Do not emit a second logical occurrence from the
             # same session range when that grounded entry is already present.
             events = [
+                *occurrence_events,
                 *entry_events,
-                *self._session_events(exclude_session_ids=entry_session_ids),
+                *self._session_events(
+                    exclude_session_ids=occurrence_session_ids | entry_session_ids
+                ),
             ]
             if self._include_legacy:
                 events.extend(self._legacy_intent_events())
@@ -133,6 +140,10 @@ class ActivitySource:
         previous_factory = self._conn.row_factory
         self._conn.row_factory = sqlite3.Row
         try:
+            if kind == "occurrence":
+                occurrence = occurrences_store.get(self._conn, source_id)
+                return self._occurrence_event(occurrence) if occurrence is not None else None
+
             if kind == "entry":
                 try:
                     row = self._conn.execute(
@@ -170,6 +181,18 @@ class ActivitySource:
             return self._legacy_intent_event(row) if row is not None else None
         finally:
             self._conn.row_factory = previous_factory
+
+    def _occurrence_event(self, occurrence: occurrences_store.EventOccurrence) -> ActivityEvent:
+        context = "\n".join(part for part in (occurrence.title, occurrence.quote) if part)
+        return ActivityEvent(
+            stable_id=occurrence.endpoint,
+            occurred_at=occurrence.window_end,
+            summary=occurrence.title,
+            participant_ids=self._resolve(list(occurrence.participants), context),
+            source_kind="occurrence",
+            source_id=occurrence.occurrence_id,
+            source_receipt=occurrence.source_receipt,
+        )
 
     def _entry_event(self, row: sqlite3.Row) -> ActivityEvent | None:
         entry_id, path, timestamp, content = map(lambda value: value or "", row[:4])
@@ -242,7 +265,18 @@ class ActivitySource:
             source_receipt=f"⟨{source_id}:intents⟩",
         )
 
-    def _entry_events(self) -> tuple[list[ActivityEvent], set[str]]:
+    def _occurrence_events(self) -> tuple[list[ActivityEvent], set[str]]:
+        occurrences = occurrences_store.recent(self._conn, limit=self._limit)
+        return (
+            [self._occurrence_event(occurrence) for occurrence in occurrences],
+            {occurrence.session_id for occurrence in occurrences if occurrence.session_id},
+        )
+
+    def _entry_events(
+        self,
+        *,
+        exclude_session_ids: set[str] | None = None,
+    ) -> tuple[list[ActivityEvent], set[str]]:
         try:
             rows = self._conn.execute(
                 "SELECT id, path, timestamp, content, tags FROM entries "
@@ -254,14 +288,20 @@ class ActivitySource:
             return [], set()
         events: list[ActivityEvent] = []
         session_ids: set[str] = set()
+        excluded = exclude_session_ids or set()
         for row in rows:
+            tagged_sessions = {
+                tag.removeprefix("sid:").strip()
+                for tag in str(row[4] or "").split()
+                if tag.startswith("sid:") and tag.removeprefix("sid:").strip()
+            }
+            if tagged_sessions & excluded:
+                continue
             event = self._entry_event(row)
             if event is None:
                 continue
             events.append(event)
-            for tag in str(row[4] or "").split():
-                if tag.startswith("sid:") and tag.removeprefix("sid:").strip():
-                    session_ids.add(tag.removeprefix("sid:").strip())
+            session_ids.update(tagged_sessions)
         return events, session_ids
 
     def _session_events(

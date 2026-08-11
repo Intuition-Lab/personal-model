@@ -272,8 +272,10 @@ it outright.
 
 Relation edges may carry the nullable triplet `source_kind`, `source_id`, and `source_receipt`.
 The triplet is atomic: callers either provide all three fields or none. Activity-derived edges use
-new stable IDs `event:entry:<id>` or `event:session:<id>`. `event:intent:<id>`
-is read-only compatibility for an old store.
+stable IDs `event:occurrence:<id>`, `event:entry:<id>`, or `event:session:<id>`.
+Occurrence receipts resolve through the owner-only `event_occurrences` projection; occurrence
+identity is window-specific while series identity groups only equal normalized titles and canonical
+participant sets. `event:intent:<id>` is read-only compatibility for an old store.
 
 The read-only `resolve_evidence` MCP tool and authenticated `GET /model/evidence?ref=...` endpoint
 return `label` for human display and retain `reference` as the stable technical handle. Explicit

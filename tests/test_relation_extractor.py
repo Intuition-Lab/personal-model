@@ -12,6 +12,8 @@ gates (ungrounded / off-roster / off-predicate / low-confidence), fail-open, emp
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -158,6 +160,51 @@ def test_idempotent_across_runs(ac_root):
     assert second.deterministic_count == 0  # existing open edges not re-added
     assert second.reinforced == 0  # same evidence → MAX no-op, no fake reinforcement
     assert len(_all_edges()) == 3
+
+
+def test_concurrent_canonical_creation_reuses_one_open_edge_without_additive_retry(ac_root):
+    # Initialize once before the barrier so this test isolates edge insertion,
+    # not first-database setup locking.
+    with fts.cursor() as conn:
+        edges.ensure_schema(conn)
+
+    barrier = threading.Barrier(2)
+
+    def write(src: str, dst: str) -> rx._Tally:
+        with fts.cursor() as conn:
+            tally = rx._Tally()
+            barrier.wait(timeout=5)
+            rx._upsert_shadow(
+                conn,
+                {},
+                tally,
+                src=src,
+                dst=dst,
+                predicate=edges.Predicate.KNOWS,
+                confidence=0.8,
+                quote="same effect retry",
+                label=None,
+                observations=1,
+                src_kind="person",
+                dst_kind="person",
+                additive=True,
+                status="active",
+            )
+            return tally
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tallies = list(pool.map(lambda pair: write(*pair), [("Alice", "Bob"), ("Bob", "Alice")]))
+
+    with fts.cursor() as conn:
+        rows = conn.execute(
+            "SELECT src_identity, dst_identity, status, observations FROM relation_edges"
+            " WHERE valid_to IS NULL AND status IN ('active','shadow')"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][2] == "active"
+    assert rows[0][3] == 1
+    assert sum(tally.new for tally in tallies) == 1
+    assert sum(tally.reinforced for tally in tallies) == 0
 
 
 def test_new_evidence_reinforces_strength(ac_root):

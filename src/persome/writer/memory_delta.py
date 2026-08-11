@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -408,6 +409,29 @@ def gate_delta(
     return clean, dropped
 
 
+def _release_claim(
+    claim: deltas_store.WindowClaim | None,
+    *,
+    session_id: str,
+    start_time: datetime,
+    end_time: datetime,
+) -> None:
+    """Release only the token still owned after a handled pre-persist failure."""
+    if claim is None or not claim.acquired:
+        return
+    try:
+        with fts.cursor() as conn:
+            deltas_store.fail_claim(
+                conn,
+                session_id=session_id,
+                window_start=start_time,
+                window_end=end_time,
+                token=claim.token,
+            )
+    except Exception:  # noqa: BLE001 - lease expiry remains the crash recovery path
+        logger.warning("memory_delta %s: could not release failed claim", session_id, exc_info=True)
+
+
 def run_after_session(
     cfg: Any,
     *,
@@ -417,7 +441,12 @@ def run_after_session(
     llm_call: LlmCallFn | None = None,
     is_final: bool = True,
 ) -> DeltaResult:
-    """Consolidate one bounded session window into a shadow memory_delta row."""
+    """Consolidate one bounded session window into a shadow memory_delta row.
+
+    Every bounded extraction path claims its canonical window before the LLM.
+    Legacy append rows remain valid because the claim lives in a separate
+    table and the base ``memory_deltas`` table keeps its historical shape.
+    """
     result = DeltaResult(session_id=session_id)
     if not getattr(cfg.memory_delta, "enabled", False):
         result.skipped_reason = "disabled"
@@ -458,6 +487,25 @@ def run_after_session(
         result.skipped_reason = "model_output_only"
         return result
 
+    try:
+        with fts.cursor() as conn:
+            window_claim = deltas_store.claim_window(
+                conn,
+                session_id=session_id,
+                window_start=start_time,
+                window_end=end_time,
+            )
+    except Exception:  # noqa: BLE001 - do not call the LLM without a durable claim
+        logger.warning("memory_delta %s: window claim failed", session_id, exc_info=True)
+        result.skipped_reason = "claim_failed"
+        return result
+    if not window_claim.acquired:
+        result.delta_id = window_claim.delta_id
+        result.skipped_reason = (
+            "already_processed" if window_claim.delta_id else "claim_in_progress"
+        )
+        return result
+
     _cache = {"type": "ephemeral"}
     messages: list[dict[str, Any]] = [
         {
@@ -484,11 +532,23 @@ def run_after_session(
         response = call(cfg, STAGE, messages)
         raw = _safe_json(llm_mod.extract_text(response))
     except Exception:  # noqa: BLE001 — LLM errors never disturb the chain
+        _release_claim(
+            window_claim,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
         logger.warning("memory_delta %s: LLM call failed", session_id, exc_info=True)
         result.skipped_reason = "llm_failed"
         return result
 
     if not raw:
+        _release_claim(
+            window_claim,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
         result.skipped_reason = "unparseable"
         return result
 
@@ -521,10 +581,11 @@ def run_after_session(
                 protected_owner_aliases=owner_identity.reserved_aliases(cfg, conn=conn),
             )
             dropped = candidate_dropped + gated_dropped
-            delta_id = deltas_store.insert(
+            delta_id = deltas_store.insert_for_claim(
                 conn,
                 session_id=session_id,
                 payload=clean,
+                token=window_claim.token,
                 model=cfg.model_for(STAGE).model,
                 dropped=dropped,
                 apply_status=(
@@ -536,7 +597,17 @@ def run_after_session(
                 window_end=end_time,
                 is_final=is_final,
             )
+    except deltas_store.ClaimLostError:
+        logger.info("memory_delta %s: window claim was replaced before persist", session_id)
+        result.skipped_reason = "claim_lost"
+        return result
     except Exception:  # noqa: BLE001
+        _release_claim(
+            window_claim,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
         logger.warning("memory_delta %s: persist failed", session_id, exc_info=True)
         result.skipped_reason = "persist_failed"
         return result
@@ -546,22 +617,43 @@ def run_after_session(
             from . import delta_apply
 
             with fts.cursor() as conn:
-                ar = delta_apply.apply_delta(conn, cfg, clean)
-                deltas_store.set_apply_status(conn, delta_id, "applied")
-            logger.info(
-                "memory_delta %s: applied (entities +%d/=%d, edges +%d~%d closed %d, events %d)",
-                session_id,
-                ar.entities_minted,
-                ar.entities_seen,
-                ar.edges_new,
-                ar.edges_reinforced,
-                ar.edges_closed,
-                ar.events_minted,
-            )
-            result.applied = True
+                ar = delta_apply.apply_delta(
+                    conn,
+                    cfg,
+                    clean,
+                    delta_id=delta_id,
+                    session_id=session_id,
+                    window_start=start_time,
+                    window_end=end_time,
+                )
+                if ar.errors:
+                    deltas_store.set_apply_status(conn, delta_id, "failed")
+                else:
+                    deltas_store.set_apply_status(conn, delta_id, "applied")
+            if ar.errors:
+                result.skipped_reason = "apply_failed"
+                logger.warning(
+                    "memory_delta %s: apply completed with %d item error(s): %s",
+                    session_id,
+                    len(ar.errors),
+                    "; ".join(ar.errors[:3]),
+                )
+            else:
+                logger.info(
+                    "memory_delta %s: applied (entities +%d/=%d, edges +%d~%d closed %d, events %d)",
+                    session_id,
+                    ar.entities_minted,
+                    ar.entities_seen,
+                    ar.edges_new,
+                    ar.edges_reinforced,
+                    ar.edges_closed,
+                    ar.events_minted,
+                )
+                result.applied = True
         except Exception:  # noqa: BLE001 — apply
             with fts.cursor() as conn:
                 deltas_store.set_apply_status(conn, delta_id, "failed")
+            result.skipped_reason = "apply_failed"
             logger.warning("memory_delta %s: apply failed", session_id, exc_info=True)
 
     result.written = True
@@ -633,15 +725,43 @@ def _ensure_window(
     Active and terminal modeling are retryable. A retry must not spend another
     LLM call or reinforce relation observations twice after a successful run.
     """
-    if start_time is None or end_time is None or start_time >= end_time:
+    if start_time is None or end_time is None:
+        return DeltaResult(session_id=session_id, skipped_reason="no_window")
+    try:
+        deltas_store.canonical_window_key(start_time, end_time)
+    except (TypeError, ValueError):
         return DeltaResult(session_id=session_id, skipped_reason="no_window")
     with fts.cursor() as conn:
-        existing = deltas_store.latest_for_window(
+        existing = deltas_store.persisted_for_window(
             conn,
             session_id,
             window_start=start_time,
             window_end=end_time,
         )
+        if existing is None:
+            existing = deltas_store.latest_for_window(
+                conn,
+                session_id,
+                window_start=start_time,
+                window_end=end_time,
+            )
+            if existing is not None:
+                try:
+                    deltas_store.remember_persisted_window(
+                        conn,
+                        session_id=session_id,
+                        window_start=start_time,
+                        window_end=end_time,
+                        delta_id=int(existing["id"]),
+                    )
+                except sqlite3.Error:
+                    # Reusing the already persisted legacy row is safe even if
+                    # its optional canonical backfill loses a startup race.
+                    logger.debug(
+                        "memory_delta %s: legacy claim backfill failed",
+                        session_id,
+                        exc_info=True,
+                    )
         if existing is None and allow_legacy:
             legacy = deltas_store.latest_for_session(conn, session_id)
             if legacy is not None and not str(legacy["window_end"] or ""):
@@ -679,8 +799,29 @@ def _ensure_window(
         from . import delta_apply
 
         with fts.cursor() as conn:
-            delta_apply.apply_delta(conn, cfg, payload)
-            deltas_store.set_apply_status(conn, result.delta_id, "applied")
+            ar = delta_apply.apply_delta(
+                conn,
+                cfg,
+                payload,
+                delta_id=result.delta_id,
+                session_id=session_id,
+                window_start=start_time,
+                window_end=end_time,
+            )
+            deltas_store.set_apply_status(
+                conn,
+                result.delta_id,
+                "failed" if ar.errors else "applied",
+            )
+        if ar.errors:
+            result.skipped_reason = "apply_failed"
+            logger.warning(
+                "memory_delta %s: retry completed with %d item error(s): %s",
+                session_id,
+                len(ar.errors),
+                "; ".join(ar.errors[:3]),
+            )
+            return result
         result.applied = True
         result.skipped_reason = "resumed_apply"
     except Exception:  # noqa: BLE001 - leave retryable state for the next finalizer run
