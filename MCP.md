@@ -52,7 +52,7 @@ Example client configuration:
 |---|---|
 | `list_memories` | List durable Markdown memory files. |
 | `read_memory` | Read a memory file with time, tag, and tail filters. |
-| `search` | Search durable memory with lexical and optional dense retrieval. |
+| `search` | Search durable memory with lexical and optional dense retrieval; latency-sensitive ranked-hit consumers may pass `include_chains=false` to skip relation-chain narration. |
 | `read_receipt` | Resolve an entry ID to local provenance. |
 | `related_events` | Retrieve time-adjacent context around one memory entry: overlapping timeline blocks plus nearest captures, anchored on parseable `occurred_at` else write time. Context is observed data, not evidence for the entry. |
 | `resolve_evidence` | Resolve any model ID or receipt one layer down with human labels; separates direct sources, nearby context, and Point history. |
