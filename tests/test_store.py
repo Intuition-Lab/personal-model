@@ -745,6 +745,24 @@ def test_client_connect_requires_current_runtime_schema(
         raw.close()
 
 
+def test_client_rejects_previous_daemon_schema_revision(
+    ac_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fts.initialize_runtime_schema()
+    with fts.cursor() as conn:
+        # A previous daemon may have a self-consistent fingerprint receipt;
+        # the exact revision still has to reject version skew before a new
+        # client reads columns that daemon never created.
+        conn.execute(
+            "UPDATE runtime_metadata SET value=? WHERE key='schema_revision'",
+            ("2026-07-15.1",),
+        )
+
+    monkeypatch.setattr(fts, "_CLIENT_PROCESS", True)
+    with pytest.raises(RuntimeError, match="not initialized for this Persome version"):
+        fts.connect()
+
+
 def test_client_connect_rejects_schema_receipt_mismatch(
     ac_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

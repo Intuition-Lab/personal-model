@@ -141,6 +141,7 @@ CREATE TABLE timeline_blocks (
     attention_surface TEXT NOT NULL DEFAULT '',
     attention_confidence REAL NOT NULL DEFAULT 0.0,
     attention_rung TEXT NOT NULL DEFAULT '',
+    normalization_status TEXT NOT NULL DEFAULT 'legacy',
     UNIQUE(start_time, end_time)
 );
 

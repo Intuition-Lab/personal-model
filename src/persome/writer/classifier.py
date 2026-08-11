@@ -238,6 +238,11 @@ def _focus_entries_in_range(
     sid_tag = f"sid:{session_id}"
     matches: list[files_mod.ParsedEntry] = []
     for e in parsed.entries:
+        # Exhausted reducer retries leave a visible audit entry tagged
+        # ``heuristic``.  It is useful for diagnosis, but is not grounded
+        # enough to drive the legacy durable-memory writer.
+        if "heuristic" in e.tags:
+            continue
         if sid_tag not in e.tags:
             continue
         ts = _parse_entry_ts(e.timestamp)
@@ -290,13 +295,14 @@ def _focus_entries(
     except Exception:  # noqa: BLE001
         return []
     sid_tag = f"sid:{session_id}"
-    matches = [e for e in parsed.entries if sid_tag in e.tags]
+    eligible_entries = [e for e in parsed.entries if "heuristic" not in e.tags]
+    matches = [e for e in eligible_entries if sid_tag in e.tags]
     if matches:
         return matches
-    for e in parsed.entries:
+    for e in eligible_entries:
         if e.id == fallback_entry_id:
             return [e]
-    return [parsed.entries[-1]] if parsed.entries else []
+    return [eligible_entries[-1]] if eligible_entries else []
 
 
 def _render_timeline_blocks(
@@ -310,6 +316,7 @@ def _render_timeline_blocks(
           FROM timeline_blocks
          WHERE persome_epoch(end_time) > persome_epoch(?)
            AND persome_epoch(start_time) < persome_epoch(?)
+           AND normalization_status IN ('legacy', 'llm', 'imported')
          ORDER BY persome_epoch(start_time) ASC
         """,
         (start.isoformat(), end.isoformat()),

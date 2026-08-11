@@ -136,14 +136,43 @@ function timestamp(value, fallback = Number.NaN) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-export function pointSearchMetadata(point, cutoff = new Date()) {
+function temporalStart(item) {
+  for (const value of [item?.valid_from, item?.created_at, item?.occurred_at]) {
+    const parsed = timestamp(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Number.NaN;
+}
+
+function pointTemporalEnd(point, pointById = null) {
+  const candidates = [];
+  const explicitEnd = timestamp(point?.valid_until);
+  if (Number.isFinite(explicitEnd)) candidates.push(explicitEnd);
+  if (pointById?.get) {
+    (point?.superseded_by || []).forEach((successorId) => {
+      const successorStart = temporalStart(pointById.get(successorId));
+      if (Number.isFinite(successorStart)) candidates.push(successorStart);
+    });
+  }
+  return candidates.length ? Math.min(...candidates) : Number.NaN;
+}
+
+export function pointSearchMetadata(point, cutoff = new Date(), pointById = null) {
   const status = String(point?.status || "").trim().toLocaleLowerCase();
   const cutoffTime = timestamp(cutoff, Date.now());
-  const validFrom = timestamp(point?.valid_from);
-  const validUntil = timestamp(point?.valid_until);
+  const validFrom = temporalStart(point);
+  const validUntil = pointTemporalEnd(point, pointById);
   const started = !Number.isFinite(validFrom) || validFrom <= cutoffTime;
   const ended = Number.isFinite(validUntil) && validUntil <= cutoffTime;
   const insideValidity = started && !ended;
+  if (!started) {
+    return {
+      state: "future",
+      subtitle: "Modeled observation · not yet valid at this date",
+      aliases: ["future", "not yet valid"],
+      weightAdjustment: INACTIVE_POINT_PENALTY,
+    };
+  }
   // Superseding a Point rewrites its present-day lifecycle fields to
   // is_latest=false/status=shadow. Before its valid_until, however, that
   // predecessor is the head at the selected historical cutoff.
@@ -183,6 +212,25 @@ export function pointSearchMetadata(point, cutoff = new Date()) {
     aliases: [inactiveState, "inactive", "not active"],
     weightAdjustment: INACTIVE_POINT_PENALTY,
   };
+}
+
+export function pointVisibleAt(point, cutoff = new Date(), pointById = null) {
+  return pointSearchMetadata(point, cutoff, pointById).state === "current";
+}
+
+export function pointKnownAt(point, cutoff = new Date()) {
+  const validFrom = temporalStart(point);
+  return !Number.isFinite(validFrom) || validFrom <= timestamp(cutoff, Date.now());
+}
+
+export function lineKnownAt(line, model, cutoff = new Date(), pointById = null) {
+  if (line?.kind === "evolution") {
+    const target = pointById?.get?.(line.target)
+      || (model?.points || []).find((point) => point.id === line.target);
+    return Boolean(target) && pointKnownAt(target, cutoff);
+  }
+  const started = temporalStart(line);
+  return !Number.isFinite(started) || started <= timestamp(cutoff, Date.now());
 }
 
 function scoreEntry(entry, terms, normalizedQuery) {
@@ -275,6 +323,7 @@ export function focusKeysForSelection(model, layout, selection) {
   const faces = new Set((model?.faces || []).map((item) => item.id));
   const volumes = new Set((model?.volumes || []).map((item) => item.id));
   const rootId = model?.root?.id;
+  const pointForEndpoint = (id) => layout?.endpointPointIds?.get?.(id) || null;
   const kindForId = (id) => {
     if (points.has(id)) return "point";
     if (faces.has(id)) return "face";
@@ -285,7 +334,10 @@ export function focusKeysForSelection(model, layout, selection) {
   const add = (kind, id) => {
     if (id) focus.add(selectionKey(kind, id));
   };
-  const addEndpoint = (id) => add(kindForId(id), id);
+  const addEndpoint = (id) => {
+    const pointId = pointForEndpoint(id);
+    add(pointId ? "point" : kindForId(id), pointId || id);
+  };
   const addLine = (line) => {
     if (!line) return;
     add("line", line.id);
@@ -311,7 +363,9 @@ export function focusKeysForSelection(model, layout, selection) {
 
   if (selection.kind === "point" || selection.kind === "context") {
     (model?.lines || [])
-      .filter((line) => line.source === selection.id || line.target === selection.id)
+      .filter((line) => [line.source, line.target].some((endpoint) => (
+        endpoint === selection.id || pointForEndpoint(endpoint) === selection.id
+      )))
       .forEach(addLine);
   }
 

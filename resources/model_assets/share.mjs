@@ -163,13 +163,21 @@ export function drawHumanCard(context, model = {}) {
 
 export function shareStats(model = {}) {
   const stats = model.stats || {};
-  const lineCount = (stats.evolution_lines || 0) + (stats.relation_lines || 0);
+  const own = (key) => Object.prototype.hasOwnProperty.call(stats, key);
+  const numeric = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const count = (key, fallback) => own(key) ? numeric(stats[key]) : fallback;
+  const lineCount = own("evolution_lines") || own("relation_lines")
+    ? numeric(stats.evolution_lines) + numeric(stats.relation_lines)
+    : model.lines?.length || 0;
   return [
-    ["POINTS", stats.points || model.points?.length || 0],
-    ["LINES", lineCount || model.lines?.length || 0],
-    ["FACES", stats.faces || model.faces?.length || 0],
-    ["VOLUMES", stats.volumes || model.volumes?.length || 0],
-    ["ROOT", stats.roots || Number(Boolean(model.root))],
+    ["POINTS", count("points", model.points?.length || 0)],
+    ["LINES", lineCount],
+    ["FACES", count("faces", model.faces?.length || 0)],
+    ["VOLUMES", count("volumes", model.volumes?.length || 0)],
+    ["ROOT", count("roots", Number(Boolean(model.root)))],
   ];
 }
 

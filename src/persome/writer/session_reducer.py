@@ -56,6 +56,7 @@ class ReduceResult:
     session_id: str
     succeeded: bool  # LLM produced parseable output
     written: bool  # entry landed in event-YYYY-MM-DD.md
+    consumed: bool = False  # window watermark advanced without requiring an entry
     entry_id: str = ""
     path: str = ""
     sub_tasks: list[str] = field(default_factory=list)
@@ -154,7 +155,7 @@ def flush_active_session(
             window_end=now,
             is_final=False,
         )
-        return result if result.written else None
+        return result if result.written or result.consumed else None
 
 
 def _reduce_window_locked(
@@ -217,9 +218,31 @@ def _reduce_window_locked(
             is_final=is_final,
         )
 
+    eligible_blocks = [block for block in blocks if block.eligible_for_modeling]
+    if not eligible_blocks:
+        last_block_end = blocks[-1].end_time
+        new_flush_end = max(window_end, last_block_end)
+        session_store.set_flush_end(conn, session_id, new_flush_end)
+        if is_final:
+            session_store.mark_reduced(conn, session_id)
+        logger.info(
+            "session %s: consumed %d non-modeling timeline blocks without reducer output",
+            session_id,
+            len(blocks),
+        )
+        return ReduceResult(
+            session_id=session_id,
+            succeeded=True,
+            written=False,
+            consumed=True,
+            start_time=session_start,
+            end_time=session_end,
+            is_final=is_final,
+        )
+
     payload = _call_reducer_llm(
         cfg,
-        blocks,
+        eligible_blocks,
         window_start,
         window_end,
     )
@@ -249,7 +272,7 @@ def _reduce_window_locked(
                 session_id,
                 _MAX_RETRIES,
             )
-            payload = _heuristic_payload(blocks)
+            payload = _heuristic_payload(eligible_blocks)
             succeeded = False
         else:
             next_retry_at = datetime.now().astimezone() + timedelta(
@@ -282,7 +305,22 @@ def _reduce_window_locked(
     summary = str(payload.get("summary") or "").strip()
     sub_tasks = [str(t).strip() for t in (payload.get("sub_tasks") or []) if str(t).strip()]
     if not sub_tasks:
-        sub_tasks = _heuristic_payload(blocks)["sub_tasks"]
+        last_block_end = blocks[-1].end_time
+        new_flush_end = max(window_end, last_block_end)
+        session_store.set_flush_end(conn, session_id, new_flush_end)
+        if is_final:
+            session_store.mark_reduced(conn, session_id)
+        logger.info("session %s: reducer returned no sub-tasks; consumed without entry", session_id)
+        return ReduceResult(
+            session_id=session_id,
+            succeeded=True,
+            written=False,
+            consumed=True,
+            summary=summary,
+            start_time=session_start,
+            end_time=session_end,
+            is_final=is_final,
+        )
     sub_tasks = [_attach_drill_down_breadcrumb(s) for s in sub_tasks]
 
     entry_id, path_name = _append_event_entry(
@@ -318,6 +356,7 @@ def _reduce_window_locked(
         session_id=session_id,
         succeeded=succeeded,
         written=True,
+        consumed=True,
         entry_id=entry_id,
         path=path_name,
         sub_tasks=sub_tasks,

@@ -280,6 +280,7 @@ def import_folder(root: Path, *, source_type: str = "folder") -> ImportResult:
                         f"Source: {source_type}\nPath: {relative}\n"
                         f"Content SHA-256: {digest}\n\n{part}"
                     ),
+                    normalization_status="imported",
                 )
                 timeline_store.insert(conn, block)
                 session_store.insert(

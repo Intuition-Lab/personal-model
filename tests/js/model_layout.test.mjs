@@ -144,6 +144,75 @@ test("does not widen a rootless degraded hierarchy", () => {
   });
 });
 
+test("reuses a canonical entity Point instead of drawing a duplicate context node", () => {
+  const entity = {
+    ...point(0, "org-acme.md"),
+    id: "entity-acme",
+    content: " Acme\u00a0Labs ",
+    tags: "entity",
+  };
+  const personEntity = {
+    ...point(1, "person-alex.md"),
+    id: "entity-alex",
+    content: "Alex",
+    tags: "person-entity",
+  };
+  const layout = computeClusterLayout({
+    points: [entity, personEntity],
+    lines: [
+      { id: "relation-acme", kind: "relation", source: "self", target: "acme labs" },
+      { id: "relation-alex", kind: "relation", source: "self", target: "Alex" },
+    ],
+    faces: [],
+    volumes: [],
+    root: null,
+  });
+
+  assert.equal(layout.endpointPointIds.get("acme labs"), entity.id);
+  assert.equal(layout.positions.has("acme labs"), false);
+  assert.ok(layout.positions.has(entity.id));
+  assert.equal(layout.contextIds.includes("acme labs"), false);
+  assert.equal(layout.contextIds.includes("self"), true);
+  assert.equal(layout.endpointPointIds.get("Alex"), personEntity.id);
+  assert.equal(layout.contextIds.includes("Alex"), false);
+  assert.equal(layout.diagnostics.resolvedEntityEndpoints, 2);
+});
+
+test("does not guess when multiple live entity Points claim the same identity", () => {
+  const duplicate = (id) => ({
+    ...point(0, `person-${id}.md`),
+    id,
+    content: "Alex",
+    tags: "entity",
+  });
+  const layout = computeClusterLayout({
+    points: [duplicate("entity-a"), duplicate("entity-b")],
+    lines: [{ id: "relation-alex", kind: "relation", source: "self", target: "Alex" }],
+    faces: [],
+    volumes: [],
+    root: null,
+  });
+
+  assert.equal(layout.endpointPointIds.has("Alex"), false);
+  assert.equal(layout.contextIds.includes("Alex"), true);
+});
+
+test("keeps self and non-entity labels as context endpoints", () => {
+  const layout = computeClusterLayout({
+    points: [
+      { ...point(0), id: "entity-self", content: "self", tags: "entity" },
+      { ...point(1), id: "fact-acme", content: "Acme", tags: "fact" },
+    ],
+    lines: [{ id: "relation", kind: "relation", source: "self", target: "Acme" }],
+    faces: [],
+    volumes: [],
+    root: null,
+  });
+
+  assert.deepEqual(layout.contextIds, ["Acme", "self"]);
+  assert.equal(layout.endpointPointIds.size, 0);
+});
+
 test("steps fitted zoom predictably through rapid actions and clamps its range", () => {
   assert.equal(zoomMath.percentForDistance(12, 12), 100);
   assert.equal(zoomMath.percentForDistance(12, 24), 50);

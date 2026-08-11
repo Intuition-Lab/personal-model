@@ -197,3 +197,32 @@ def test_classifier_skips_when_event_daily_missing(ac_root: Path) -> None:
     )
     assert result.committed is False
     assert "no entries" in result.skipped_reason
+
+
+def test_classifier_does_not_promote_heuristic_reducer_entry(ac_root: Path) -> None:
+    name = "event-2026-04-24.md"
+    with fts.cursor() as conn:
+        entries_mod.create_file(
+            conn,
+            name=name,
+            description="Synthetic reducer fallback",
+            tags=["event", "session", "daily"],
+        )
+        entry_id = entries_mod.append_entry(
+            conn,
+            name=name,
+            content="Worked in a window, involving —",
+            tags=["session", "sid:sess_heuristic", "heuristic"],
+        )
+
+    cfg = config_mod.load(ac_root / "config.toml")
+    cfg.memory_delta.apply_enabled = False
+    result = classifier_mod.classify_after_reduce(
+        cfg,
+        session_id="sess_heuristic",
+        event_daily_path=name,
+        just_written_entry_id=entry_id,
+    )
+
+    assert result.committed is False
+    assert "no entries" in result.skipped_reason

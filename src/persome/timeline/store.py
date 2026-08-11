@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS timeline_blocks (
     attention_surface TEXT NOT NULL DEFAULT '',
     attention_confidence REAL NOT NULL DEFAULT 0.0,
     attention_rung TEXT NOT NULL DEFAULT '',
+    normalization_status TEXT NOT NULL DEFAULT 'legacy',
     UNIQUE(start_time, end_time)
 );
 CREATE INDEX IF NOT EXISTS idx_tlb_start ON timeline_blocks(start_time);
@@ -81,6 +82,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE timeline_blocks ADD COLUMN attention_rung TEXT NOT NULL DEFAULT ''"
         )
+    if "normalization_status" not in cols:
+        # Existing blocks predate the provenance signal. Keep their historical
+        # behavior instead of retroactively guessing whether they came from an
+        # LLM, a fallback, or an import.
+        conn.execute(
+            "ALTER TABLE timeline_blocks "
+            "ADD COLUMN normalization_status TEXT NOT NULL DEFAULT 'legacy'"
+        )
+
+
+MODEL_ELIGIBLE_NORMALIZATION_STATUSES = frozenset({"legacy", "llm", "imported"})
 
 
 @dataclass
@@ -117,6 +129,16 @@ class TimelineBlock:
     attention_surface: str = ""
     attention_confidence: float = 0.0
     attention_rung: str = ""
+    # Provenance of ``entries``. Only grounded LLM output, trusted imports, and
+    # pre-migration legacy rows are allowed to become personal-model evidence.
+    # New producers must opt into a known provenance class.  The DB migration
+    # separately labels pre-column rows ``legacy``; using that as the Python
+    # default would let a future producer silently bypass the quality gate.
+    normalization_status: str = "unknown"
+
+    @property
+    def eligible_for_modeling(self) -> bool:
+        return self.normalization_status in MODEL_ELIGIBLE_NORMALIZATION_STATUSES
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -157,8 +179,9 @@ def insert(conn: sqlite3.Connection, block: TimelineBlock) -> None:
         INSERT OR IGNORE INTO timeline_blocks
             (id, start_time, end_time, timezone, entries, apps_used, capture_count,
              created_at, skill_hints, action_trace, focus_excerpt,
-             focus_structured, attention_surface, attention_confidence, attention_rung)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             focus_structured, attention_surface, attention_confidence, attention_rung,
+             normalization_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             block.id,
@@ -176,6 +199,7 @@ def insert(conn: sqlite3.Connection, block: TimelineBlock) -> None:
             block.attention_surface,
             block.attention_confidence,
             block.attention_rung,
+            block.normalization_status,
         ),
     )
 
@@ -281,6 +305,31 @@ def query_range(
     return [_row_to_block(r) for r in rows]
 
 
+def query_range_oldest(
+    conn: sqlite3.Connection,
+    since: datetime | None,
+    until: datetime | None,
+    limit: int = 50,
+) -> list[TimelineBlock]:
+    """Query a contained range oldest first, with a bounded result."""
+    clauses: list[str] = []
+    params: list[str | int] = []
+    if since:
+        clauses.append("persome_epoch(start_time) >= persome_epoch(?)")
+        params.append(since.isoformat())
+    if until:
+        clauses.append("persome_epoch(end_time) <= persome_epoch(?)")
+        params.append(until.isoformat())
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(min(max(1, limit), 200))
+    rows = conn.execute(
+        f"SELECT * FROM timeline_blocks {where} "  # noqa: S608
+        "ORDER BY persome_epoch(start_time) ASC LIMIT ?",
+        params,
+    ).fetchall()
+    return [_row_to_block(r) for r in rows]
+
+
 def query_overlapping(
     conn: sqlite3.Connection,
     window_start: datetime,
@@ -373,6 +422,10 @@ def _row_to_block(row: sqlite3.Row | tuple) -> TimelineBlock:
         attention_rung = get("attention_rung") or ""  # type: ignore[call-overload]
     except (IndexError, KeyError):
         attention_rung = ""
+    try:
+        normalization_status = get("normalization_status") or "legacy"  # type: ignore[call-overload]
+    except (IndexError, KeyError):
+        normalization_status = "legacy"
     return TimelineBlock(
         id=get("id"),  # type: ignore[call-overload]
         start_time=datetime.fromisoformat(get("start_time")),  # type: ignore[call-overload]
@@ -389,6 +442,7 @@ def _row_to_block(row: sqlite3.Row | tuple) -> TimelineBlock:
         attention_surface=attention_surface,
         attention_confidence=attention_confidence,
         attention_rung=attention_rung,
+        normalization_status=normalization_status,
     )
 
 

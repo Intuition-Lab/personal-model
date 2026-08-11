@@ -411,8 +411,10 @@ def _recent_timeline_blocks(
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-         SELECT start_time, end_time, entries, apps_used, capture_count
+         SELECT start_time, end_time, entries, apps_used, capture_count,
+                normalization_status
           FROM timeline_blocks
+         WHERE normalization_status IN ('legacy', 'llm', 'imported')
          ORDER BY persome_epoch(end_time) DESC
          LIMIT ?
         """,
@@ -435,6 +437,7 @@ def _recent_timeline_blocks(
                 "entries": entries,
                 "apps_used": apps,
                 "capture_count": r["capture_count"] or 0,
+                "normalization_status": r["normalization_status"] or "legacy",
             }
         )
     # Newest first looks weird in a context block; reverse to time-ordered.
@@ -456,7 +459,7 @@ def current_context(
       * ``recent_captures_fulltext`` — top M captures deduped by (app, window),
         carrying the FULL visible_text + focused_element.value so the model can
         actually read what's on screen
-      * ``recent_timeline_blocks`` — the last K LLM-summarized 1-min blocks
+      * ``recent_timeline_blocks`` — the last K model-eligible normalized/imported blocks
     """
     with fts_store.cursor() as conn:
         rows = fts_store.recent_captures(

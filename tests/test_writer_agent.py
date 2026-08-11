@@ -50,6 +50,7 @@ def test_writer_run_reduces_pending_and_classifies(ac_root: Path, monkeypatch) -
                 entries=["[Cursor] editing, involving —"],
                 apps_used=["Cursor"],
                 capture_count=1,
+                normalization_status="legacy",
             ),
         )
         session_store.insert(
@@ -162,6 +163,7 @@ def test_terminal_finalizer_applies_default_person_model(
                 ],
                 apps_used=["Feishu"],
                 capture_count=1,
+                normalization_status="llm",
             ),
         )
         session_store.insert(
@@ -227,6 +229,7 @@ def test_active_session_flush_mints_model_before_session_end(
                 entries=["[Feishu] \u548c\u5f20\u4e09\u786e\u8ba4\u4e86\u8bc4\u5ba1\u7ed3\u8bba"],
                 apps_used=["Feishu"],
                 capture_count=1,
+                normalization_status="llm",
             ),
         )
         session_store.insert(
@@ -274,6 +277,168 @@ def test_active_session_flush_mints_model_before_session_end(
     assert dirty == "1"
 
 
+def test_active_model_chunks_long_window_oldest_first(ac_root: Path, fake_llm) -> None:
+    start = datetime(2026, 7, 10, 10, 10, tzinfo=_TZ)
+    end = start + timedelta(minutes=5)
+    entry = "[Feishu] \u548c\u5f20\u4e09\u786e\u8ba4\u4e86\u8bc4\u5ba1\u7ed3\u8bba"
+    with fts.cursor() as conn:
+        for index in range(5):
+            block_start = start + timedelta(minutes=index)
+            timeline_store.insert(
+                conn,
+                timeline_store.TimelineBlock(
+                    start_time=block_start,
+                    end_time=block_start + timedelta(minutes=1),
+                    entries=[entry],
+                    apps_used=["Feishu"],
+                    capture_count=1,
+                    normalization_status="llm",
+                ),
+            )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(id="sess_chunked", start_time=start, status="active"),
+        )
+        session_store.set_flush_end(conn, "sess_chunked", end)
+
+    fake_llm.set_default(
+        "memory_delta",
+        json.dumps(
+            {
+                "entities": [
+                    {
+                        "new_entity": "\u5f20\u4e09",
+                        "kind": "person",
+                        "quote": "\u548c\u5f20\u4e09\u786e\u8ba4\u4e86\u8bc4\u5ba1\u7ed3\u8bba",
+                        "confidence": 0.9,
+                    }
+                ],
+                "assertions": [],
+                "relations": [],
+                "events": [],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    cfg = config_mod.load(ac_root / "config.toml")
+    cfg.memory_delta.max_blocks = 2
+
+    result = agent.model_active_session(cfg, session_id="sess_chunked")
+
+    assert result.completed
+    assert len(fake_llm.calls) == 3
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_chunked")
+        windows = conn.execute(
+            "SELECT window_start, window_end FROM memory_deltas WHERE session_id=? ORDER BY id",
+            ("sess_chunked",),
+        ).fetchall()
+    assert row is not None and row.delta_end == end
+    assert [(item["window_start"], item["window_end"]) for item in windows] == [
+        (start.isoformat(), (start + timedelta(minutes=2)).isoformat()),
+        ((start + timedelta(minutes=2)).isoformat(), (start + timedelta(minutes=4)).isoformat()),
+        ((start + timedelta(minutes=4)).isoformat(), end.isoformat()),
+    ]
+
+
+def test_active_no_signal_window_advances_delta_without_geometry(ac_root: Path, fake_llm) -> None:
+    start = datetime(2026, 7, 10, 10, 30, tzinfo=_TZ)
+    end = start + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=[],
+                apps_used=["System Settings"],
+                capture_count=1,
+                normalization_status="metadata_only",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess_live_no_signal",
+                start_time=start,
+                status="active",
+            ),
+        )
+        session_store.set_flush_end(conn, "sess_live_no_signal", end)
+
+    result = agent.model_active_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id="sess_live_no_signal",
+    )
+
+    assert result.completed is True
+    assert result.delta.skipped_reason == "no_eligible_evidence"
+    assert fake_llm.calls == []
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_live_no_signal")
+        delta_count = conn.execute(
+            "SELECT count(*) FROM memory_deltas WHERE session_id=?",
+            ("sess_live_no_signal",),
+        ).fetchone()[0]
+        geometry_tables = {
+            item[0]
+            for item in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('evo_nodes', 'relation_edges')"
+            ).fetchall()
+        }
+    assert row is not None and row.delta_end == end
+    assert delta_count == 0
+    assert geometry_tables == set()
+
+
+def test_terminal_no_signal_window_marks_modeled_without_geometry(ac_root: Path, fake_llm) -> None:
+    start = datetime(2026, 7, 10, 10, 40, tzinfo=_TZ)
+    end = start + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            timeline_store.TimelineBlock(
+                start_time=start,
+                end_time=end,
+                entries=["[Mail] active, involving —"],
+                apps_used=["Mail"],
+                capture_count=1,
+                normalization_status="llm_failed",
+            ),
+        )
+        session_store.insert(
+            conn,
+            session_store.SessionRow(
+                id="sess_terminal_no_signal",
+                start_time=start,
+                end_time=end,
+                status="reduced",
+            ),
+        )
+
+    result = agent.finalize_session(
+        config_mod.load(ac_root / "config.toml"),
+        session_id="sess_terminal_no_signal",
+    )
+
+    assert result.completed is True
+    assert result.delta.skipped_reason == "no_eligible_evidence"
+    assert fake_llm.calls == []
+    with fts.cursor() as conn:
+        row = session_store.get_by_id(conn, "sess_terminal_no_signal")
+        geometry_tables = {
+            item[0]
+            for item in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('evo_nodes', 'relation_edges')"
+            ).fetchall()
+        }
+    assert row is not None and row.modeled_at is not None
+    assert row.delta_end == end
+    assert geometry_tables == set()
+
+
 def test_active_model_resumes_failed_apply_before_new_tail(ac_root: Path, fake_llm) -> None:
     start = datetime(2026, 7, 10, 11, 0, tzinfo=_TZ)
     middle = start + timedelta(minutes=1)
@@ -291,6 +456,7 @@ def test_active_model_resumes_failed_apply_before_new_tail(ac_root: Path, fake_l
                     entries=[text],
                     apps_used=["Feishu"],
                     capture_count=1,
+                    normalization_status="llm",
                 ),
             )
         session_store.insert(

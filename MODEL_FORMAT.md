@@ -96,7 +96,10 @@ file_name, tags, confidence, conflicted, receipt
 ```
 
 `is_latest` identifies a current chain head; historical Points remain available
-for audit and time travel.
+for audit and time travel. The snapshot retains both, while the default constellation renders only
+the chain head valid at its selected cutoff. Historical versions remain available through cutoff-
+bounded search, History, receipts, and evolution Lines rather than appearing beside the current
+Point as another live sphere.
 
 The memory owner is the reserved identity `self`, not a person Point. Names and
 handles learned from quoted owner-identity evidence resolve to `self`; if an
@@ -110,6 +113,10 @@ Lines have two forms:
 - `kind: evolution`: one Point supersedes another;
 - `kind: relation`: a semantic/entity relation with predicate, confidence,
   validity, and provenance.
+
+Relation endpoints retain canonical identity strings in the public contract. The viewer resolves an
+unambiguous canonical endpoint to the current entity Point for placement and creates a context node
+only when no safe match exists; it does not rewrite the Line or mutate snapshot IDs.
 
 Activity-derived relation Lines carry the atomic source triplet
 `source_kind`, `source_id`, and `source_receipt`. New activity identities use

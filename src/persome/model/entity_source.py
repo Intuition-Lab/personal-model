@@ -113,7 +113,7 @@ class EntitySource:
             return []
         try:
             rows = self._conn.execute(
-                "SELECT id, path, timestamp, content FROM entries "
+                "SELECT id, path, timestamp, content, tags FROM entries "
                 "WHERE prefix = 'event' AND superseded = 0 "
                 "ORDER BY persome_epoch(timestamp) DESC LIMIT ?",
                 (self._limit,),
@@ -122,6 +122,8 @@ class EntitySource:
             return []
         out: list[EntityEvent] = []
         for row in rows:
+            if "heuristic" in str(row[4] or "").split():
+                continue
             entry_id = str(row[0] or "")
             content = str(row[3] or "").strip()
             folded = content.casefold()

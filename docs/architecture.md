@@ -35,6 +35,10 @@ flowchart LR
     SNAP --> VIEW["localhost /model"]
 ```
 
+The cross-stage admission rules in [Gator](gator.md) distinguish retained observation from model
+evidence. Metadata-only and degraded timeline windows advance processing watermarks without entering
+the Point/Line or structural-model writers.
+
 ### State formation
 
 1. With `capture.source="daemon"`, the source-versioned Swift watcher emits AX

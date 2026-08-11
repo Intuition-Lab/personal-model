@@ -12,11 +12,13 @@ from __future__ import annotations
 import functools
 import json
 import sqlite3
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from ..capture.timestamps import capture_timestamp_epoch
 from ..config import Config
 from ..logger import get
 from ..prompts import load as load_prompt
@@ -26,6 +28,8 @@ from . import llm as llm_mod
 from . import tools as tools_mod
 
 logger = get("persome.writer")
+
+_EligibleIntervals = tuple[tuple[float, float], ...]
 
 
 @dataclass
@@ -126,6 +130,7 @@ def _collect_candidates(
       - event_memory: durable past activity entries with receipts
     """
     candidates: dict[str, Any] = {}
+    eligible_intervals = _eligible_timeline_intervals(conn, lookback_start, window_end)
 
     # 1. App sequences from timeline_blocks
     app_seqs = _find_repeated_app_sequences(conn, lookback_start, window_end, min_occurrences)
@@ -134,18 +139,36 @@ def _collect_candidates(
 
     # 2. Repeated window titles from captures_fts
     titles = _find_repeated_captures_field(
-        conn, lookback_start, window_end, "window_title", min_occurrences
+        conn,
+        lookback_start,
+        window_end,
+        "window_title",
+        min_occurrences,
+        eligible_intervals=eligible_intervals,
     )
     if titles:
         candidates["repeated_titles"] = titles
 
     # 3. Repeated URLs from captures_fts
-    urls = _find_repeated_captures_field(conn, lookback_start, window_end, "url", min_occurrences)
+    urls = _find_repeated_captures_field(
+        conn,
+        lookback_start,
+        window_end,
+        "url",
+        min_occurrences,
+        eligible_intervals=eligible_intervals,
+    )
     if urls:
         candidates["repeated_urls"] = urls
 
     # 4. Time-of-day clusters from sessions
-    time_clusters = _find_time_clusters(conn, lookback_start, window_end, min_occurrences)
+    time_clusters = _find_time_clusters(
+        conn,
+        lookback_start,
+        window_end,
+        min_occurrences,
+        eligible_intervals=eligible_intervals,
+    )
     if time_clusters:
         candidates["time_clusters"] = time_clusters
 
@@ -161,7 +184,7 @@ def _collect_event_memory(
     conn: sqlite3.Connection, lookback_start: datetime, window_end: datetime
 ) -> list[dict[str, str]]:
     rows = conn.execute(
-        "SELECT id, path, timestamp, content FROM entries "
+        "SELECT id, path, timestamp, tags, content FROM entries "
         "WHERE prefix = 'event' AND superseded = 0 AND timestamp >= ? AND timestamp < ? "
         "ORDER BY timestamp DESC LIMIT 20",
         (lookback_start.isoformat(), window_end.isoformat()),
@@ -175,7 +198,7 @@ def _collect_event_memory(
             "receipt": f"⟨{row['id']}:{row['path']}⟩",
         }
         for row in rows
-        if str(row["content"] or "").strip()
+        if str(row["content"] or "").strip() and "heuristic" not in str(row["tags"] or "").split()
     ]
 
 
@@ -188,6 +211,63 @@ def _render_event_memory_lines(events: list[dict[str, str]]) -> list[str]:
         lines.append(f"- [{event['timestamp']}] {event['summary']} receipt={event['receipt']}")
     lines.append("")
     return lines
+
+
+def _eligible_timeline_intervals(
+    conn: sqlite3.Connection,
+    start: datetime,
+    end: datetime,
+) -> _EligibleIntervals:
+    """Read and merge eligible timeline spans once for downstream filtering.
+
+    Calling ``persome_epoch`` on both sides of a correlated SQL subquery makes
+    SQLite rescan every timeline row for every capture.  One sorted scan plus
+    binary-search membership keeps the seven-day pattern pass bounded by the
+    number of captures and blocks rather than their product.
+    """
+    rows = conn.execute(
+        """
+        SELECT start_time, end_time
+          FROM timeline_blocks
+         WHERE normalization_status IN ('legacy', 'llm', 'imported')
+           AND persome_epoch(end_time) > persome_epoch(?)
+           AND persome_epoch(start_time) < persome_epoch(?)
+         ORDER BY persome_epoch(start_time) ASC
+        """,
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    merged: list[tuple[float, float]] = []
+    for row in rows:
+        lower = capture_timestamp_epoch(row[0])
+        upper = capture_timestamp_epoch(row[1])
+        if lower is None or upper is None or upper <= lower:
+            continue
+        if merged and lower <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], upper))
+        else:
+            merged.append((lower, upper))
+    return tuple(merged)
+
+
+def _instant_in_intervals(value: object, intervals: _EligibleIntervals) -> bool:
+    instant = capture_timestamp_epoch(value)
+    if instant is None or not intervals:
+        return False
+    index = bisect_right(intervals, (instant, float("inf"))) - 1
+    return index >= 0 and instant < intervals[index][1]
+
+
+def _range_overlaps_intervals(
+    start: object,
+    end: object,
+    intervals: _EligibleIntervals,
+) -> bool:
+    lower = capture_timestamp_epoch(start)
+    upper = capture_timestamp_epoch(end)
+    if lower is None or upper is None or upper <= lower or not intervals:
+        return False
+    index = bisect_left(intervals, (upper,)) - 1
+    return index >= 0 and intervals[index][1] > lower
 
 
 def _find_repeated_app_sequences(
@@ -212,6 +292,7 @@ def _find_repeated_app_sequences(
           FROM timeline_blocks
          WHERE persome_epoch(start_time) >= persome_epoch(?)
            AND persome_epoch(start_time) < persome_epoch(?)
+           AND normalization_status IN ('legacy', 'llm', 'imported')
          ORDER BY persome_epoch(start_time) ASC
         """,
         (start.isoformat(), end.isoformat()),
@@ -250,6 +331,8 @@ def _find_repeated_captures_field(
     end: datetime,
     field: str,
     min_occurrences: int,
+    *,
+    eligible_intervals: _EligibleIntervals | None = None,
 ) -> list[dict[str, Any]]:
     """Find repeated non-empty values in a ``captures`` column.
 
@@ -259,14 +342,21 @@ def _find_repeated_captures_field(
 
     The bounded window keeps pattern detection aligned with the session slice.
     """
+    intervals = (
+        eligible_intervals
+        if eligible_intervals is not None
+        else _eligible_timeline_intervals(conn, start, end)
+    )
+    if not intervals:
+        return []
     rows = conn.execute(
         f"""
-        SELECT {field}, timestamp, app_name
-          FROM captures
-         WHERE persome_epoch(timestamp) >= persome_epoch(?)
-           AND persome_epoch(timestamp) < persome_epoch(?)
-           AND {field} != ''
-         ORDER BY persome_epoch(timestamp) ASC
+        SELECT c.{field}, c.timestamp, c.app_name
+          FROM captures AS c
+         WHERE persome_epoch(c.timestamp) >= persome_epoch(?)
+           AND persome_epoch(c.timestamp) < persome_epoch(?)
+           AND c.{field} != ''
+         ORDER BY persome_epoch(c.timestamp) ASC
         """,
         (start.isoformat(), end.isoformat()),
     ).fetchall()
@@ -277,6 +367,8 @@ def _find_repeated_captures_field(
     value_counts: Counter[str] = Counter()
     value_examples: dict[str, list[dict[str, str]]] = {}
     for r in rows:
+        if not _instant_in_intervals(r["timestamp"], intervals):
+            continue
         val = r[field]
         if not val or len(val) < 3:
             continue
@@ -304,16 +396,25 @@ def _find_time_clusters(
     start: datetime,
     end: datetime,
     min_occurrences: int,
+    *,
+    eligible_intervals: _EligibleIntervals | None = None,
 ) -> list[dict[str, Any]]:
     """Find sessions that start at similar times with similar dominant apps."""
+    intervals = (
+        eligible_intervals
+        if eligible_intervals is not None
+        else _eligible_timeline_intervals(conn, start, end)
+    )
+    if not intervals:
+        return []
     rows = conn.execute(
         """
-         SELECT start_time, end_time
-          FROM sessions
-         WHERE persome_epoch(start_time) >= persome_epoch(?)
-           AND persome_epoch(start_time) < persome_epoch(?)
-           AND status IN ('reduced', 'ended')
-         ORDER BY persome_epoch(start_time) ASC
+        SELECT s.start_time, s.end_time
+          FROM sessions AS s
+         WHERE persome_epoch(s.start_time) >= persome_epoch(?)
+           AND persome_epoch(s.start_time) < persome_epoch(?)
+           AND s.status IN ('reduced', 'ended')
+         ORDER BY persome_epoch(s.start_time) ASC
         """,
         (start.isoformat(), end.isoformat()),
     ).fetchall()
@@ -325,6 +426,8 @@ def _find_time_clusters(
     hour_counts: Counter[tuple[int, int]] = Counter()  # (hour, weekday)
     hour_examples: dict[tuple[int, int], list[str]] = {}
     for r in rows:
+        if not _range_overlaps_intervals(r["start_time"], r["end_time"], intervals):
+            continue
         try:
             dt = datetime.fromisoformat(r["start_time"])
             key = (dt.hour, dt.weekday())
@@ -378,6 +481,7 @@ def _assemble_raw_context(
         "- Any other routine or habit repeated across independent sessions",
         "",
     ]
+    eligible_intervals = _eligible_timeline_intervals(conn, lookback_start, window_end)
 
     # Timeline blocks
     blocks = conn.execute(
@@ -386,6 +490,7 @@ def _assemble_raw_context(
           FROM timeline_blocks
          WHERE persome_epoch(start_time) >= persome_epoch(?)
            AND persome_epoch(start_time) < persome_epoch(?)
+           AND normalization_status IN ('legacy', 'llm', 'imported')
          ORDER BY persome_epoch(start_time) ASC
          LIMIT 200
         """,
@@ -402,18 +507,24 @@ def _assemble_raw_context(
         parts.append("")
 
     # Captures
-    caps = conn.execute(
+    capture_rows = conn.execute(
         """
-        SELECT timestamp, app_name, window_title, url
-          FROM captures
-         WHERE persome_epoch(timestamp) >= persome_epoch(?)
-           AND persome_epoch(timestamp) < persome_epoch(?)
-           AND (window_title != '' OR url != '')
-         ORDER BY persome_epoch(timestamp) ASC
-         LIMIT 200
+        SELECT c.timestamp, c.app_name, c.window_title, c.url
+          FROM captures AS c
+         WHERE persome_epoch(c.timestamp) >= persome_epoch(?)
+           AND persome_epoch(c.timestamp) < persome_epoch(?)
+           AND (c.window_title != '' OR c.url != '')
+         ORDER BY persome_epoch(c.timestamp) ASC
         """,
         (lookback_start.isoformat(), window_end.isoformat()),
-    ).fetchall()
+    )
+    caps: list[sqlite3.Row] = []
+    for capture in capture_rows:
+        if not _instant_in_intervals(capture["timestamp"], eligible_intervals):
+            continue
+        caps.append(capture)
+        if len(caps) >= 200:
+            break
     if caps:
         parts.append("### Captures")
         for c in caps:

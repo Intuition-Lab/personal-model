@@ -115,8 +115,16 @@ unpromoted evidence remains in deterministic source clusters instead of a flat g
 The layout is append-stable for normal chronological growth: existing nodes keep their local
 coordinates while later evidence expands the surrounding cloud. `window.__persomeLayoutState`
 exposes aggregate layout health for local visual smoke tests without exposing node content or IDs.
+The constellation renders only the Point chain head valid at the selected cutoff. Superseded and
+other snapshot-retained inactive Points stay in local search, History, and evidence surfaces, but
+are not drawn beside the current head; archived and unlinked retired/withdrawn records remain in
+the durable store rather than the live snapshot. A relation endpoint that names an unambiguous
+current entity Point reuses that Point's position; the viewer creates a context node only when no
+such Point exists.
 
-Search is a local view over the objects visible at the current model-history cutoff. It ranks
+Search is a local view over current objects plus audit history that already existed at the selected
+model-history cutoff. It never reveals a successor before its effective start (`valid_from`, then
+`created_at`, then `occurred_at`). It ranks
 human-readable text from the already-loaded snapshot; it does not call another service, persist
 queries, or expand the canonical model. Choosing a result opens the same detail surface as selecting
 its rendered object. Point heads that are active at the selected cutoff rank ahead of shadow and

@@ -17,13 +17,20 @@ from persome.timeline.store import TimelineBlock
 from persome.writer import memory_delta as delta_mod
 
 
-def _block(start: datetime, entries: list[str], apps: list[str]) -> TimelineBlock:
+def _block(
+    start: datetime,
+    entries: list[str],
+    apps: list[str],
+    *,
+    normalization_status: str = "legacy",
+) -> TimelineBlock:
     return TimelineBlock(
         start_time=start,
         end_time=start + timedelta(minutes=1),
         entries=entries,
         apps_used=apps,
         capture_count=len(entries),
+        normalization_status=normalization_status,
     )
 
 
@@ -84,6 +91,23 @@ def test_flag_off_is_a_strict_noop(ac_root, fake_llm) -> None:
     assert fake_llm.calls == []  # no LLM call, no row
     with fts.cursor() as conn:
         assert deltas_store.recent(conn) == []
+
+
+def test_direct_oversized_window_fails_closed_instead_of_truncating(ac_root, fake_llm) -> None:
+    start, end = _seed_session_blocks([SESSION_ENTRY, SESSION_ENTRY, SESSION_ENTRY])
+    cfg = _cfg()
+    cfg.memory_delta.max_blocks = 2
+
+    result = delta_mod.run_after_session(
+        cfg,
+        session_id="s-too-large",
+        start_time=start,
+        end_time=end,
+    )
+
+    assert result.skipped_reason == "window_too_large"
+    assert result.written is False
+    assert fake_llm.calls == []
 
 
 def test_delta_persisted_shadow_with_counts(ac_root, fake_llm) -> None:
@@ -248,6 +272,7 @@ def test_render_blocks_excludes_local_model_output_and_mixed_focus(ac_root) -> N
         apps_used=["Google Chrome", "Feishu"],
         capture_count=2,
         focus_excerpt="Root: Kevin is the owner",
+        normalization_status="legacy",
     )
 
     rendered = delta_mod._render_blocks([block])
@@ -364,6 +389,74 @@ def test_no_blocks_skips_without_llm(ac_root, fake_llm) -> None:
         _cfg(), session_id="s8", start_time=now - timedelta(minutes=5), end_time=now
     )
     assert result.skipped_reason == "no_blocks" and fake_llm.calls == []
+
+
+def test_no_eligible_evidence_skips_without_llm(ac_root, fake_llm) -> None:
+    start = datetime(2026, 7, 2, 10, 0).astimezone()
+    end = start + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            _block(
+                start,
+                ["[Cursor] active, involving —"],
+                ["Cursor"],
+                normalization_status="llm_failed",
+            ),
+        )
+
+    result = delta_mod.run_after_session(
+        _cfg(), session_id="s-ineligible", start_time=start, end_time=end
+    )
+
+    assert result.skipped_reason == "no_eligible_evidence"
+    assert result.written is False
+    assert fake_llm.calls == []
+    with fts.cursor() as conn:
+        assert deltas_store.latest_for_session(conn, "s-ineligible") is None
+
+
+def test_mixed_quality_prompt_and_quote_gate_exclude_ineligible_text(ac_root, fake_llm) -> None:
+    start = datetime(2026, 7, 2, 10, 10).astimezone()
+    middle = start + timedelta(minutes=1)
+    end = middle + timedelta(minutes=1)
+    with fts.cursor() as conn:
+        timeline_store.insert(
+            conn,
+            _block(start, [SESSION_ENTRY], ["Feishu"], normalization_status="llm"),
+        )
+        timeline_store.insert(
+            conn,
+            _block(
+                middle,
+                ["[Mail] Secret Phantom approved a fabricated launch"],
+                ["Mail"],
+                normalization_status="llm_malformed",
+            ),
+        )
+    fake_llm.set_default(
+        delta_mod.STAGE,
+        _payload(
+            entities=[
+                {
+                    "new_entity": "Secret Phantom",
+                    "kind": "person",
+                    "quote": "Secret Phantom approved a fabricated launch",
+                    "confidence": 0.9,
+                }
+            ],
+            assertions=[],
+        ),
+    )
+
+    result = delta_mod.run_after_session(
+        _cfg(), session_id="s-mixed-quality", start_time=start, end_time=end
+    )
+
+    prompt = json.dumps(fake_llm.calls[0]["messages"], ensure_ascii=False)
+    assert "Secret Phantom" not in prompt
+    assert result.counts["entities"] == 0
+    assert result.dropped == 1
 
 
 def test_stats_aggregates_latest_per_session(ac_root, fake_llm) -> None:

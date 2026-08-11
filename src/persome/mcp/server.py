@@ -1736,7 +1736,8 @@ def build_server(
                                         visible_text and focused_element.value
                                         — the actual content on screen.
           recent_timeline_blocks      : the last ~8 1-minute timeline blocks
-                                        (LLM-summarized activity slices) so
+                                        eligible normalized/imported activity
+                                        slices, with normalization_status, so
                                         you can see how the current moment
                                         was reached.
 

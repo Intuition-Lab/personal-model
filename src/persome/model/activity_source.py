@@ -95,7 +95,14 @@ class ActivitySource:
         previous_factory = self._conn.row_factory
         self._conn.row_factory = sqlite3.Row
         try:
-            events = [*self._entry_events(), *self._session_events()]
+            entry_events, entry_session_ids = self._entry_events()
+            # A reducer entry is the richer, receipt-bearing representation of
+            # its session.  Do not emit a second logical occurrence from the
+            # same session range when that grounded entry is already present.
+            events = [
+                *entry_events,
+                *self._session_events(exclude_session_ids=entry_session_ids),
+            ]
             if self._include_legacy:
                 events.extend(self._legacy_intent_events())
             unique = {event.stable_id: event for event in events}
@@ -129,7 +136,7 @@ class ActivitySource:
             if kind == "entry":
                 try:
                     row = self._conn.execute(
-                        "SELECT id, path, timestamp, content FROM entries "
+                        "SELECT id, path, timestamp, content, tags FROM entries "
                         "WHERE id = ? AND prefix = 'event' LIMIT 1",
                         (source_id,),
                     ).fetchone()
@@ -166,6 +173,9 @@ class ActivitySource:
 
     def _entry_event(self, row: sqlite3.Row) -> ActivityEvent | None:
         entry_id, path, timestamp, content = map(lambda value: value or "", row[:4])
+        tags = str(row[4] or "").split() if len(row) > 4 else []
+        if "heuristic" in tags:
+            return None
         entry_id = str(entry_id).strip()
         summary = str(content).strip()
         if not entry_id or not summary:
@@ -191,10 +201,14 @@ class ActivitySource:
         except sqlite3.Error:
             blocks = []
         summary = "\n".join(
-            entry.strip() for block in blocks for entry in block.entries if entry and entry.strip()
+            entry.strip()
+            for block in blocks
+            if block.eligible_for_modeling
+            for entry in block.entries
+            if entry and entry.strip()
         )[:2000]
         if not summary:
-            summary = f"Session ended at {end.isoformat()}"
+            return None
         return ActivityEvent(
             stable_id=f"event:session:{session_id}",
             occurred_at=end.isoformat(),
@@ -228,19 +242,33 @@ class ActivitySource:
             source_receipt=f"⟨{source_id}:intents⟩",
         )
 
-    def _entry_events(self) -> list[ActivityEvent]:
+    def _entry_events(self) -> tuple[list[ActivityEvent], set[str]]:
         try:
             rows = self._conn.execute(
-                "SELECT id, path, timestamp, content FROM entries "
+                "SELECT id, path, timestamp, content, tags FROM entries "
                 "WHERE prefix = 'event' AND superseded = 0 "
                 "ORDER BY persome_epoch(timestamp) DESC LIMIT ?",
                 (self._limit,),
             ).fetchall()
         except sqlite3.Error:
-            return []
-        return [event for row in rows if (event := self._entry_event(row)) is not None]
+            return [], set()
+        events: list[ActivityEvent] = []
+        session_ids: set[str] = set()
+        for row in rows:
+            event = self._entry_event(row)
+            if event is None:
+                continue
+            events.append(event)
+            for tag in str(row[4] or "").split():
+                if tag.startswith("sid:") and tag.removeprefix("sid:").strip():
+                    session_ids.add(tag.removeprefix("sid:").strip())
+        return events, session_ids
 
-    def _session_events(self) -> list[ActivityEvent]:
+    def _session_events(
+        self,
+        *,
+        exclude_session_ids: set[str] | None = None,
+    ) -> list[ActivityEvent]:
         try:
             rows = self._conn.execute(
                 "SELECT id, start_time, end_time FROM sessions "
@@ -250,7 +278,13 @@ class ActivitySource:
             ).fetchall()
         except sqlite3.Error:
             return []
-        return [event for row in rows if (event := self._session_event(row)) is not None]
+        excluded = exclude_session_ids or set()
+        return [
+            event
+            for row in rows
+            if str(row[0] or "") not in excluded
+            if (event := self._session_event(row)) is not None
+        ]
 
     def _legacy_intent_events(self) -> list[ActivityEvent]:
         placeholders = ",".join("?" * len(_DONE_INTENT_STATUSES))

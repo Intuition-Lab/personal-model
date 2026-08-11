@@ -38,6 +38,7 @@ def _insert_block(entries: list[str], *, minutes_ago: int = 30) -> None:
         entries=entries,
         apps_used=["Terminal"],
         capture_count=len(entries),
+        normalization_status="legacy",
     )
     with fts.cursor() as conn:
         tl_store.insert(conn, block)
@@ -64,6 +65,7 @@ def test_prefilter_pairs_error_with_following_resolution() -> None:
     block = tl_store.TimelineBlock(
         start_time=datetime.now().astimezone(),
         end_time=datetime.now().astimezone() + timedelta(minutes=1),
+        normalization_status="legacy",
         entries=[
             "\u8fd0\u884c pytest \u65f6\u62a5\u9519 ModuleNotFoundError: no module named foo",
             "\u68c0\u67e5\u53d1\u73b0\u662f\u4f9d\u8d56\u6ca1\u88c5",
@@ -80,6 +82,7 @@ def test_prefilter_drops_error_without_resolution() -> None:
     block = tl_store.TimelineBlock(
         start_time=datetime.now().astimezone(),
         end_time=datetime.now().astimezone() + timedelta(minutes=1),
+        normalization_status="legacy",
         entries=[
             "\u6784\u5efa\u5931\u8d25 build failed with exit code 1",
             "\u53c8\u8bd5\u4e86\u4e00\u6b21\u8fd8\u662f\u4e0d\u884c",
@@ -94,6 +97,7 @@ def test_prefilter_ignores_plain_noise() -> None:
     block = tl_store.TimelineBlock(
         start_time=datetime.now().astimezone(),
         end_time=datetime.now().astimezone() + timedelta(minutes=1),
+        normalization_status="legacy",
         entries=[
             "\u6253\u5f00\u4e86 Safari \u6d4f\u89c8\u7f51\u9875",
             "\u5728\u5fae\u4fe1\u91cc\u56de\u590d\u4e86\u5f20\u4e09",

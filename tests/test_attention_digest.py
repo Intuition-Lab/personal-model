@@ -23,7 +23,15 @@ _NOW = datetime(2026, 6, 18, 18, 0, tzinfo=_TZ)
 _CFG = SimpleNamespace(attention_digest_enabled=True)
 
 
-def _blk(minute: int, surface: str, *, hour: int = 17, rung: str = "editing", conf: float = 0.8):
+def _blk(
+    minute: int,
+    surface: str,
+    *,
+    hour: int = 17,
+    rung: str = "editing",
+    conf: float = 0.8,
+    normalization_status: str = "legacy",
+):
     start = datetime(2026, 6, 18, hour, minute, tzinfo=_TZ)
     return timeline_store.TimelineBlock(
         start_time=start,
@@ -31,6 +39,7 @@ def _blk(minute: int, surface: str, *, hour: int = 17, rung: str = "editing", co
         attention_surface=surface,
         attention_rung=rung,
         attention_confidence=conf,
+        normalization_status=normalization_status,
     )
 
 
@@ -61,6 +70,27 @@ def test_no_dwell_is_skipped(ac_root: Path) -> None:
     assert not result.committed
     assert result.skipped_reason == "no dwell"
     assert _latest_digests() == []
+
+
+def test_ineligible_attention_never_becomes_a_durable_fact(ac_root: Path) -> None:
+    _insert([_blk(m, "Window-title-only", normalization_status="metadata_only") for m in range(8)])
+
+    result = attention_digest.run_attention_digest(_CFG, now=_NOW)
+
+    assert not result.committed
+    assert result.skipped_reason == "no dwell"
+    assert _latest_digests() == []
+
+
+def test_attention_digest_counts_only_eligible_blocks(ac_root: Path) -> None:
+    blocks = [_blk(m, "GroundedProj", normalization_status="llm") for m in range(5)]
+    blocks += [_blk(10 + m, "FailedProj", normalization_status="llm_failed") for m in range(8)]
+    _insert(blocks)
+
+    result = attention_digest.run_attention_digest(_CFG, now=_NOW)
+
+    assert result.committed
+    assert result.surfaces == ["GroundedProj"]
 
 
 def test_digest_written_ranked_and_floored(ac_root: Path) -> None:
@@ -141,6 +171,7 @@ def test_same_rendered_dwell_with_new_receipt_still_supersedes(ac_root: Path) ->
                 attention_surface="ProjA",
                 attention_rung="editing",
                 attention_confidence=0.8,
+                normalization_status="legacy",
             )
         ]
     )
@@ -188,6 +219,7 @@ def test_legacy_naive_block_times_do_not_break_aware_day_bounds(ac_root: Path) -
                 attention_surface="LegacyProj",
                 attention_rung="editing",
                 attention_confidence=0.8,
+                normalization_status="legacy",
             )
         )
     _insert(blocks)

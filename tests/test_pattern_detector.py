@@ -8,6 +8,7 @@ from typing import Any
 
 from persome import config as config_mod
 from persome import paths
+from persome.session import store as session_store
 from persome.store import entries as entries_store
 from persome.store import fts
 from persome.timeline import store as timeline_store
@@ -28,7 +29,7 @@ def _response(tool_calls: list | None = None, text: str = "") -> Any:
     return SimpleNamespace(choices=[choice])
 
 
-def _seed_timeline_blocks(conn) -> None:
+def _seed_timeline_blocks(conn, *, normalization_status: str = "legacy") -> None:
     """Insert timeline blocks with repeated app sequences."""
     base = datetime(2026, 5, 11, 9, 0, tzinfo=_TZ)
     for i in range(3):
@@ -39,6 +40,7 @@ def _seed_timeline_blocks(conn) -> None:
             entries=["Opened Mail, Slack, Cursor"],
             apps_used=["Mail", "Slack", "Cursor"],
             capture_count=3,
+            normalization_status=normalization_status,
         )
         timeline_store.insert(conn, block)
 
@@ -287,6 +289,78 @@ def test_collect_candidates_finds_app_sequences(ac_root: Path) -> None:
     assert title["count"] == 3
 
 
+def test_pattern_candidates_and_raw_context_exclude_ineligible_windows(ac_root: Path) -> None:
+    start = datetime(2026, 5, 11, 8, 0, tzinfo=_TZ)
+    end = datetime(2026, 5, 11, 10, 0, tzinfo=_TZ)
+    with fts.cursor() as conn:
+        _seed_timeline_blocks(conn, normalization_status="metadata_only")
+        _seed_captures(conn)
+
+        candidates = pd_mod._collect_candidates(
+            conn,
+            lookback_start=start,
+            window_end=end,
+            min_occurrences=2,
+        )
+        context = pd_mod._assemble_raw_context(
+            conn,
+            lookback_start=start,
+            window_end=end,
+            event_daily_path="event-2026-05-11.md",
+            session_id="sess_metadata_only",
+        )
+
+    assert "app_sequences" not in candidates
+    assert "repeated_titles" not in candidates
+    assert "project-persome — Cursor" not in context
+
+
+def test_time_clusters_require_eligible_timeline_evidence(ac_root: Path) -> None:
+    starts = [
+        datetime(2026, 5, 4, 9, 0, tzinfo=_TZ),
+        datetime(2026, 5, 11, 9, 0, tzinfo=_TZ),
+    ]
+    with fts.cursor() as conn:
+        for index, start in enumerate(starts):
+            end = start + timedelta(minutes=30)
+            session_store.insert(
+                conn,
+                session_store.SessionRow(
+                    id=f"sess_cluster_{index}",
+                    start_time=start,
+                    end_time=end,
+                    status="ended",
+                ),
+            )
+            timeline_store.insert(
+                conn,
+                timeline_store.TimelineBlock(
+                    start_time=start,
+                    end_time=start + timedelta(minutes=1),
+                    entries=[],
+                    apps_used=["Cursor"],
+                    normalization_status="metadata_only",
+                ),
+            )
+
+        clusters = pd_mod._find_time_clusters(
+            conn,
+            starts[0] - timedelta(days=1),
+            starts[-1] + timedelta(days=1),
+            min_occurrences=2,
+        )
+        conn.execute("UPDATE timeline_blocks SET normalization_status='legacy'")
+        eligible_clusters = pd_mod._find_time_clusters(
+            conn,
+            starts[0] - timedelta(days=1),
+            starts[-1] + timedelta(days=1),
+            min_occurrences=2,
+        )
+
+    assert clusters == []
+    assert eligible_clusters[0]["count"] == 2
+
+
 def test_collect_candidates_uses_durable_event_memory_not_intents(ac_root: Path) -> None:
     with fts.cursor() as conn:
         entries_store.create_file(
@@ -301,6 +375,12 @@ def test_collect_candidates_uses_durable_event_memory_not_intents(ac_root: Path)
             content="Reviewed the runtime architecture twice this week.",
             tags=["work"],
         )
+        heuristic_id = entries_store.append_entry(
+            conn,
+            name="event-2026-05-11.md",
+            content="Worked in a window, involving —",
+            tags=["session", "heuristic"],
+        )
         candidates = pd_mod._collect_candidates(
             conn,
             lookback_start=datetime.now().astimezone() - timedelta(days=1),
@@ -311,6 +391,7 @@ def test_collect_candidates_uses_durable_event_memory_not_intents(ac_root: Path)
     assert "intents" not in candidates
     assert candidates["event_memory"][0]["id"] == entry_id
     assert candidates["event_memory"][0]["receipt"] == (f"⟨{entry_id}:event-2026-05-11.md⟩")
+    assert heuristic_id not in {event["id"] for event in candidates["event_memory"]}
 
 
 def test_pattern_detector_renders_durable_event_memory(ac_root: Path) -> None:

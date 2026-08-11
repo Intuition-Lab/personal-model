@@ -142,6 +142,8 @@ def _schema_behavior_signature(
             limit=200,
         )
         for b in blocks:
+            if not b.eligible_for_modeling:
+                continue
             if b.id in seen_block_ids:
                 continue
             seen_block_ids.add(b.id)
