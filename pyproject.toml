@@ -72,14 +72,14 @@ Documentation = "https://github.com/Intuition-Lab/personal-model/tree/main/docs"
 pypi-distribution = "personal-model"
 
 [build-system]
-requires = ["hatchling==1.31.0"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.uv]
 # Lock the complete PEP 517 backend closure for `uv sync`/`uv run`. Release
 # builds additionally verify the wheel hashes in build-constraints.txt.
 build-constraint-dependencies = [
-    "hatchling==1.31.0",
+    "hatchling==1.32.0",
     "packaging==26.2",
     "pathspec==1.1.1",
     "pluggy==1.6.0",
