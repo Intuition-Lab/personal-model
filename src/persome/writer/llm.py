@@ -167,6 +167,11 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         if role == "assistant" and message.get("tool_calls"):
             normalized["tool_calls"] = message["tool_calls"]
+        if role == "assistant" and message.get("reasoning_content"):
+            # Thinking-mode providers (DeepSeek, Kimi) require the reasoning
+            # content of earlier assistant turns to be passed back verbatim;
+            # run_tool_loop stores it on the message for exactly this reason.
+            normalized["reasoning_content"] = message["reasoning_content"]
         if role == "tool":
             normalized["tool_call_id"] = message.get("tool_call_id")
         out.append(normalized)
@@ -898,8 +903,9 @@ def run_tool_loop(
         except AttributeError:
             pass
         if tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
+            rebuilt_calls: list[dict[str, Any]] = []
+            for i, c in enumerate(tool_calls):
+                rebuilt: dict[str, Any] = {
                     "id": c["id"] or f"call_{iteration}_{i}",
                     "type": "function",
                     "function": {
@@ -907,8 +913,13 @@ def run_tool_loop(
                         "arguments": json.dumps(c["arguments"], ensure_ascii=False),
                     },
                 }
-                for i, c in enumerate(tool_calls)
-            ]
+                # Providers such as Gemini 3 attach per-tool-call data (the
+                # thought signature) that must be echoed back on the next
+                # request or it is rejected; keep it on the rebuilt call.
+                if c.get("extra_content"):
+                    rebuilt["extra_content"] = c["extra_content"]
+                rebuilt_calls.append(rebuilt)
+            assistant_msg["tool_calls"] = rebuilt_calls
         messages.append(assistant_msg)
 
         if not tool_calls:
@@ -1049,11 +1060,18 @@ def extract_tool_calls(response: Any) -> list[dict[str, Any]]:
             args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
         except json.JSONDecodeError:
             args = {}
-        out.append(
-            {
-                "id": getattr(c, "id", None) or c.get("id"),
-                "name": name,
-                "arguments": args,
-            }
+        call: dict[str, Any] = {
+            "id": getattr(c, "id", None) or c.get("id"),
+            "name": name,
+            "arguments": args,
+        }
+        # Keep provider extensions attached to the tool call (e.g. Gemini's
+        # thought_signature under extra_content). SDK objects expose them via
+        # model_extra / attribute access; dict-shaped calls via .get.
+        extra_content = (
+            c.get("extra_content") if isinstance(c, dict) else getattr(c, "extra_content", None)
         )
+        if extra_content:
+            call["extra_content"] = extra_content
+        out.append(call)
     return out
