@@ -149,3 +149,160 @@ def test_run_tool_loop_logs_token_usage(monkeypatch):
     log_text = " ".join(logged)
     assert "prompt_tokens" in log_text
     assert "42" in log_text
+
+
+# ──────────────────────────────────────────────────────────────
+# Provider extensions on tool calls (#126): Gemini thought
+# signatures (extra_content) and DeepSeek reasoning_content
+# must survive the loop and reach the next request verbatim.
+# ──────────────────────────────────────────────────────────────
+
+_EXTRA_CONTENT = {"google": {"thought_signature": "sig-from-first-reply"}}
+
+
+def _signed_tool_response():
+    from types import SimpleNamespace
+
+    fn = SimpleNamespace(name="search_memory", arguments='{"query": "morning routine"}')
+    call = SimpleNamespace(
+        id="function-call-search_memory", function=fn, extra_content=_EXTRA_CONTENT
+    )
+    msg = SimpleNamespace(content=None, tool_calls=[call], reasoning_content="thinking it over")
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=msg, finish_reason="tool_calls")],
+        usage=None,
+    )
+
+
+def test_extract_tool_calls_preserves_extra_content():
+    calls = llm_mod.extract_tool_calls(_signed_tool_response())
+
+    assert calls == [
+        {
+            "id": "function-call-search_memory",
+            "name": "search_memory",
+            "arguments": {"query": "morning routine"},
+            "extra_content": _EXTRA_CONTENT,
+        }
+    ]
+
+
+def test_extract_tool_calls_preserves_extra_content_from_sdk_object():
+    from openai.types.chat import ChatCompletion
+
+    completion = ChatCompletion.model_validate(
+        {
+            "id": "chatcmpl-1",
+            "created": 0,
+            "model": "gemini-3.5-flash",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "function-call-search_memory",
+                                "type": "function",
+                                "function": {
+                                    "name": "search_memory",
+                                    "arguments": '{"query": "morning routine"}',
+                                },
+                                "extra_content": _EXTRA_CONTENT,
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+
+    calls = llm_mod.extract_tool_calls(completion)
+
+    assert calls[0]["extra_content"] == _EXTRA_CONTENT
+
+
+def test_extract_tool_calls_without_extra_content_is_unchanged():
+    from types import SimpleNamespace
+
+    fn = SimpleNamespace(name="search_memory", arguments="{}")
+    call = SimpleNamespace(id="c0", function=fn)
+    msg = SimpleNamespace(content=None, tool_calls=[call])
+    resp = SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="tool_calls")])
+
+    assert llm_mod.extract_tool_calls(resp) == [
+        {"id": "c0", "name": "search_memory", "arguments": {}}
+    ]
+
+
+def _run_signed_loop(monkeypatch) -> list[dict[str, Any]]:
+    responses = iter([_signed_tool_response(), llm_mod._build_response("done")])
+    monkeypatch.setattr(llm_mod, "call_llm", lambda cfg, stage, **kw: next(responses))
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "morning routine?"},
+    ]
+    llm_mod.run_tool_loop(
+        _make_cfg(llm_retry_attempts=1),
+        "classifier",
+        messages,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_memory",
+                    "description": "search",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        dispatch_fn=_noop_dispatch,
+        valid_tool_names={"search_memory"},
+        state=_State(),
+        max_iter=3,
+    )
+    return messages
+
+
+def test_run_tool_loop_keeps_extra_content_on_rebuilt_tool_call(monkeypatch):
+    messages = _run_signed_loop(monkeypatch)
+
+    assistant = next(m for m in messages if m.get("role") == "assistant" and m.get("tool_calls"))
+    assert assistant["tool_calls"][0]["extra_content"] == _EXTRA_CONTENT
+
+
+def test_to_openai_messages_sends_back_extra_content_and_reasoning_content(
+    monkeypatch,
+):
+    messages = _run_signed_loop(monkeypatch)
+
+    wire = llm_mod._to_openai_messages(messages)
+    assistant = next(m for m in wire if m.get("role") == "assistant" and m.get("tool_calls"))
+    assert assistant["tool_calls"][0]["extra_content"] == _EXTRA_CONTENT
+    assert assistant["reasoning_content"] == "thinking it over"
+
+
+def test_to_openai_messages_without_reasoning_content_is_unchanged():
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c0",
+                    "type": "function",
+                    "function": {"name": "search_memory", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+    wire = llm_mod._to_openai_messages(messages)
+
+    assert wire[1] == messages[1]
+    assert "reasoning_content" not in wire[1]
+    assert "extra_content" not in wire[1]["tool_calls"][0]
