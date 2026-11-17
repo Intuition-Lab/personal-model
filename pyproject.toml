@@ -42,6 +42,7 @@ dependencies = [
     "cryptography>=42.0,<49; platform_system == 'Darwin' and platform_machine == 'x86_64'",
     "cryptography>=50.0.0; platform_system != 'Darwin' or platform_machine != 'x86_64'",
     "anthropic>=0.50",
+    "llm-prices>=1.4.0",
     "openai>=1.75,<3",
     "tomlkit>=0.13,<1",
     # On-device OCR for AX-poor apps (WeChat/Feishu). PP-OCRv6 via paddleocr on the
