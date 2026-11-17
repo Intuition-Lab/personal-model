@@ -49,6 +49,25 @@ def test_calculate_usd_prefix_match():
     assert abs(cost - 3.0) < 1e-9  # $3/1M input
 
 
+def test_calculate_usd_opus_list_price():
+    """claude-opus-4-7 is $5/$25 per 1M, cache read $0.50, 5-minute cache write $6.25."""
+    usage = {
+        "prompt_tokens": 1_000_000,
+        "completion_tokens": 1_000_000,
+        "cache_read_tokens": 1_000_000,
+        "cache_creation_tokens": 1_000_000,
+    }
+    for model in ("claude-opus-4-7", "claude-opus-4-8"):
+        cost = calculate_usd(model, usage)
+        assert cost is not None
+        assert abs(cost - 36.75) < 1e-9
+
+
+def test_calculate_usd_deepseek_keeps_table():
+    usage = {"prompt_tokens": 1_000_000, "completion_tokens": 0}
+    assert abs(calculate_usd("deepseek-chat", usage) - 0.27) < 1e-9
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Test 2: unknown model returns None
 # ──────────────────────────────────────────────────────────────────────────
